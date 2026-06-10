@@ -1,0 +1,393 @@
+"""
+Streamlit Web UI — ReAct Agent + 工具调用可视化
+Day 3 版本：并行工具调用、Token 预算管理、System Prompt、结构化 UI
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from pathlib import Path
+
+# ── 配置日志（在加载任何模块之前）──────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s',
+    datefmt='%H:%M:%S',
+)
+# 日志级别由 agent_core.py 统一管理，这里不再重复配置
+# （避免 Streamlit 热重载导致 handler 重复添加）
+
+# ── 加载 .env 文件（必须在最前面）────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
+
+# ── 项目根目录加入 sys.path ────────────────────────────────────
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# ── 必须先设 PATH 再 import streamlit ──────────────────────────
+import streamlit as st
+
+# ── 页面配置（必须是第一个 Streamlit 命令）────────────────────
+st.set_page_config(
+    page_title="Agent Dev Playground",
+    page_icon="🤖",
+    layout="wide",
+)
+
+st.title("🤖 Agent 开发学习平台")
+st.caption("Day 3 — 生产级优化 · 并行工具 · Token 预算 · System Prompt")
+
+# ── Import Agent Core ────────────────────────────────────────────
+from agent_core.llm.router import (
+    LLMRouter,
+    LLMConfig,
+    StreamChunk,
+    UsageStats,
+)
+from agent_core.agent_core import ReactAgent
+from agent_core.tools.base import ToolRegistry
+from agent_core.tools.builtin import register_builtin_tools
+
+
+# ── Session State 初始化 ───────────────────────────────────────
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "agent" not in st.session_state:
+    st.session_state.agent = None
+if "token_stats" not in st.session_state:
+    st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
+if "current_thinking" not in st.session_state:
+    st.session_state.current_thinking = ""
+if "tool_logs" not in st.session_state:
+    st.session_state.tool_logs = []
+if "system_prompt" not in st.session_state:
+    st.session_state.system_prompt = ""  # P2 新增：System Prompt
+
+
+# ── 侧边栏：LLM 配置 ─────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ LLM 配置")
+
+    # 从 .env 读取默认厂商
+    default_provider = os.getenv("DEFAULT_PROVIDER", "zhipu").lower()
+    provider_index = 2  # 默认 zhipu
+    if default_provider in ["anthropic", "openai", "zhipu"]:
+        provider_index = ["anthropic", "openai", "zhipu"].index(default_provider)
+
+    provider = st.selectbox(
+        "厂商",
+        options=["anthropic", "openai", "zhipu"],
+        index=provider_index,
+    )
+
+    model_options = {
+        "anthropic": [
+            "claude-sonnet-4-20250514",
+            "claude-opus-4-20250514",
+            "claude-haiku-4-20250514",
+        ],
+        "openai": [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "o3-mini",
+        ],
+        "zhipu": [
+            "GLM-5.1",
+            "glm-5-turbo",
+            "GLM-4.7",
+        ],
+    }
+    model = st.selectbox("模型", options=model_options[provider])
+
+    # API Key
+    env_key_map = {
+        "anthropic": "ANTHROPIC_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "zhipu": "ZHIPU_API_KEY",
+    }
+    env_key_var = env_key_map.get(provider, "OPENAI_API_KEY")
+    default_key = os.getenv(env_key_var, "")
+    api_key = st.text_input(
+        "API Key（留空则使用 .env）",
+        value=default_key,
+        type="password",
+    )
+    if not api_key:
+        api_key = default_key
+
+    temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
+    max_tokens = st.number_input("Max Tokens", 256, 16384, 4096, 256)
+    max_turns = st.number_input("最大工具调用轮次", 1, 20, 10, 1)
+
+    st.divider()
+    st.subheader("📝 System Prompt")
+    system_prompt = st.text_area(
+        "系统提示词（留空则不使用）",
+        value=st.session_state.system_prompt,
+        height=100,
+        help="设置 Agent 的角色和行为规则",
+    )
+    st.session_state.system_prompt = system_prompt  # 保存到 session_state
+
+    st.divider()
+    st.subheader("📊 Token 消耗（本次会话）")
+    stats = st.session_state.token_stats
+    st.metric("Input", f"{stats['input']:,}")
+    st.metric("Output", f"{stats['output']:,}")
+    st.metric("Thinking", f"{stats['thinking']:,}")
+    st.metric("Total", f"{stats['input'] + stats['output'] + stats['thinking']:,}")
+
+    st.divider()
+    st.subheader("📊 Agent 状态")
+    if st.session_state.agent:
+        agent = st.session_state.agent
+        st.metric("History 长度", f"{len(agent.history)} 条")
+        # 估算 Token
+        est_tokens = sum(agent._estimate_message_tokens(m) for m in agent.history)
+        st.metric("预估 Token", f"{est_tokens:,}")
+        st.caption(f"预算: {agent.max_context_tokens:,}")
+        
+        # 显示最后一条消息的 role
+        if agent.history:
+            last_role = agent.history[-1].get("role", "unknown")
+            st.caption(f"最后消息: {last_role}")
+
+    # 历史记录查看器
+    if st.session_state.agent and st.session_state.agent.history:
+        st.divider()
+        st.subheader("📜 历史记录")
+        history = st.session_state.agent.history
+        # 显示最近 5 条
+        recent = history[-5:] if len(history) > 5 else history
+        for i, msg in enumerate(recent):
+            role = msg.get("role", "unknown")
+            content_preview = ""
+            if isinstance(msg.get("content"), str):
+                content_preview = msg["content"][:50]
+            else:
+                content_preview = f"[{len(msg.get('content', []))} blocks]"
+            with st.expander(f"{i+1}. {role}: {content_preview}..."):
+                st.json(msg)
+
+    if st.button("🗑️ 清空会话"):
+        st.session_state.messages = []
+        st.session_state.tool_logs = []
+        st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
+        st.session_state.current_thinking = ""
+        if st.session_state.agent:
+            st.session_state.agent.reset()
+        st.rerun()
+
+
+# ── 初始化 Agent ───────────────────────────────────────────────
+def get_agent():
+    """创建或更新 Agent 实例"""
+    config = LLMConfig(
+        provider=provider.lower(),
+        model=model,
+        api_key=api_key,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+        system_prompt=st.session_state.get("system_prompt", ""),  # P2 新增
+    )
+    router = LLMRouter(config)
+    registry = ToolRegistry()
+    register_builtin_tools(registry)
+    agent = ReactAgent(router, registry, max_turns=max_turns)
+    return agent
+
+
+# ── 初始化/更新 Agent（配置变化时自动重建）───────────────────
+current_config = {
+    "provider": provider,
+    "model": model,
+    "api_key": api_key,
+    "temperature": temperature,
+    "max_tokens": max_tokens,
+    "max_turns": max_turns,
+    "system_prompt": st.session_state.get("system_prompt", ""),
+}
+if (st.session_state.agent is None or
+        st.session_state.get("last_agent_config") != current_config):
+    st.session_state.agent = get_agent()
+    st.session_state.last_agent_config = current_config
+
+agent = st.session_state.agent
+
+
+# ── 运行 ReAct 循环 ──────────────────────────────────────────
+def run_agent(user_input: str):
+    """
+    运行 ReAct Agent，yield 中间过程。
+    返回：(msg_type, content)
+    """
+    for msg_type, content in agent.run(user_input):
+        yield (msg_type, content)
+
+
+# ── 主聊天界面 ────────────────────────────────────────────────
+
+# 渲染历史消息
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        if msg.get("thinking"):
+            with st.expander("💭 思考过程", expanded=False):
+                st.code(msg["thinking"])
+        if msg.get("tool_logs"):
+            with st.expander("🔧 工具调用", expanded=False):
+                for log in msg["tool_logs"]:
+                    if isinstance(log, dict):
+                        if log["type"] == "parallel_start":
+                            st.markdown(f"\n⚡ **并行调用**: {', '.join(log['names'])}")
+                        elif log["type"] == "action":
+                            st.markdown(f"\n🔧 **Action**: `{log['name']}`")
+                            st.caption(f"参数: `{log['input']}`")
+                        elif log["type"] == "result":
+                            icon = "✅" if log["success"] else "❌"
+                            st.markdown(f"{icon} **Observation** (`{log['name']}`)")
+                            output = str(log['output'])
+                            if len(output) > 200:
+                                with st.expander("查看完整结果"):
+                                    st.code(output)
+                            else:
+                                st.code(output)
+                    else:
+                        # 兼容旧格式（纯字符串）
+                        st.markdown(log)
+        st.markdown(msg["content"])
+
+
+# 用户输入
+if prompt := st.chat_input("输入消息..."):
+    if not api_key:
+        st.error("请先在侧边栏填写 API Key（或配置 .env 文件）")
+        st.stop()
+
+    # 显示用户消息
+    with st.chat_message("user"):
+        st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+    # 调用 Agent（流式）
+    with st.chat_message("assistant"):
+        thinking_expander = st.expander("💭 思考过程", expanded=False)
+        tool_expander = st.expander("🔧 工具调用", expanded=True)
+        tool_status = st.status("🔄 思考中...", expanded=True)
+        text_placeholder = st.empty()
+        turn_indicator = st.empty()  # P2 新增：Turn 指示器
+        
+        full_text = ""
+        thinking_text = ""
+        tool_logs = []
+        turn_count = 0  # P2 新增：Turn 计数
+
+        # 逐 chunk 处理
+        for msg_type, content in run_agent(prompt):
+            if msg_type == "text":
+                full_text += content
+                text_placeholder.markdown(full_text + "▌")
+            elif msg_type == "thinking":
+                thinking_text += content
+                # P2 改进：实时流式显示思考过程
+                with thinking_expander:
+                    thinking_expander.markdown(f"**💭 思考过程**\n\n{thinking_text}▌")
+            elif msg_type == "tool_call":
+                # Day 3 支持并行工具调用
+                if content.get("parallel"):
+                    names = content.get("names", [])
+                    tool_status.update(label=f"⚡ 并行执行 {len(names)} 个工具: {', '.join(names)}...")
+                    tool_logs.append({"type": "parallel_start", "names": names})
+                else:
+                    tool_name = content.get("name", "")
+                    tool_input = content.get("input", {})
+                    tool_status.update(label=f"🔧 执行工具: {tool_name}...")
+                    tool_logs.append({"type": "action", "name": tool_name, "input": tool_input})
+            elif msg_type == "tool_result":
+                tool_name = content.get("name", "")
+                tool_output = content.get("output", "")
+                success = content.get("success", False)
+                elapsed = content.get("elapsed", 0)
+                
+                if success:
+                    elapsed_str = f" ({elapsed:.2f}s)" if elapsed else ""
+                    tool_status.update(label=f"✅ {tool_name} 完成{elapsed_str}", state="complete")
+                    tool_logs.append({"type": "result", "name": tool_name, "output": tool_output, "success": True, "elapsed": elapsed})
+                else:
+                    tool_status.update(label=f"❌ {tool_name} 失败", state="error")
+                    tool_logs.append({"type": "result", "name": tool_name, "output": tool_output, "success": False})
+            elif msg_type == "system":
+                # P2 改进：区分 Turn 信息和最终完成
+                if "Turn" in str(content):
+                    turn_count += 1
+                    turn_indicator.markdown(f"📍 **Turn {turn_count}**")
+                    tool_status.update(label=f"🔄 Turn {turn_count}：思考中...")
+                elif "回答完成" in str(content):
+                    turn_indicator.empty()  # 完成后清除 Turn 指示器
+                    tool_status.update(label="✅ 回答完成", state="complete")
+                else:
+                    st.info(content)
+            elif msg_type == "usage":
+                stats = st.session_state.token_stats
+                stats["input"] += content.input_tokens
+                stats["output"] += content.output_tokens
+                stats["thinking"] += content.thinking_tokens
+
+        # 流式结束：清理 UI
+        text_placeholder.markdown(full_text)
+        thinking_expander.empty()  # 清除流式思考过程
+
+        # P2 改进：结构化显示思考过程
+        with thinking_expander:
+            if thinking_text:
+                st.markdown("**💭 LLM 思考过程**")
+                st.code(thinking_text)
+        
+        # P2 改进：结构化显示工具调用
+        with tool_expander:
+            if tool_logs:
+                st.markdown("**🔧 工具调用时间线**")
+                for log in tool_logs:
+                    if log["type"] == "parallel_start":
+                        st.markdown(f"\n⚡ **并行调用**: {', '.join(log['names'])}")
+                    elif log["type"] == "action":
+                        st.markdown(f"\n🔧 **Action**: `{log['name']}`")
+                        st.caption(f"参数: `{log['input']}`")
+                    elif log["type"] == "result":
+                        icon = "✅" if log["success"] else "❌"
+                        elapsed_str = f" ({log.get('elapsed', 0):.2f}s)" if log.get('elapsed') else ""
+                        st.markdown(f"{icon} **Observation** (`{log['name']}`{elapsed_str})")
+                        output = str(log['output'])
+                        # 长结果折叠显示
+                        if len(output) > 200:
+                            with st.expander("查看完整结果"):
+                                st.code(output)
+                        else:
+                            st.code(output)
+            else:
+                st.caption("本轮无工具调用（直接回答）")
+
+        # Token 消耗摘要
+        stats = st.session_state.token_stats
+        st.caption(
+            f"📊 Token: input={stats['input']:,} · "
+            f"output={stats['output']:,} · "
+            f"thinking={stats['thinking']:,} · "
+            f"total={stats['input'] + stats['output'] + stats['thinking']:,}"
+        )
+
+    # 保存助手消息（兼容新旧格式）
+    # 历史消息中 tool_logs 保持 dict 格式，渲染时按结构化显示
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": full_text,
+        "thinking": thinking_text,
+        "tool_logs": tool_logs,
+    })
+
+    # 更新 agent history
+    # （agent.run() 内部已经更新了 agent.history）

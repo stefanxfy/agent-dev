@@ -1,0 +1,34 @@
+# 环境变量（包含 API Key）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+.eggs/
+
+# macOS
+.DS_Store
+.AppleDouble
+._*
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Streamlit
+.streamlit/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+.env/
+
+# Bytecode
+*.pyc
+*.pyo
