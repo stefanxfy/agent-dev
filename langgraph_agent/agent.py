@@ -67,6 +67,8 @@ class LangGraphAgent:
         
         # LangGraph stream 返回每个节点的输出
         last_ai_message = None
+        collected_messages = []  # 收集所有消息用于 history
+        
         for event in compiled_graph.stream(initial_state, config):
             # event 格式：{"node_name": {"messages": [...]}}
             for node_name, node_output in event.items():
@@ -75,6 +77,7 @@ class LangGraphAgent:
                     messages = node_output.get("messages", [])
                     if messages:
                         ai_msg = messages[-1]
+                        collected_messages.append(ai_msg)
                         if hasattr(ai_msg, "content") and ai_msg.content:
                             # 流式输出文本（LangGraph 不支持增量，整体输出）
                             yield ("text", ai_msg.content)
@@ -97,6 +100,7 @@ class LangGraphAgent:
                     # 工具节点输出
                     messages = node_output.get("messages", [])
                     for msg in messages:
+                        collected_messages.append(msg)
                         if hasattr(msg, "name"):
                             yield ("tool_result", {
                                 "name": msg.name,
@@ -118,11 +122,11 @@ class LangGraphAgent:
         else:
             yield ("system", f"⚠️ 达到最大轮次（{self.max_turns}），强制结束")
         
-        # 更新历史记录（用于外部查看）
-        final_state = compiled_graph.get_state(config)
+        # 更新历史记录（从 stream 事件中收集，无需 checkpointer）
+        # 注意：不能用 get_state()，因为没配 checkpointer 会报 ValueError
         self.history = [
-            {"role": msg.type, "content": msg.content}
-            for msg in final_state.values.get("messages", [])
+            {"role": getattr(msg, "type", "unknown"), "content": getattr(msg, "content", "")}
+            for msg in collected_messages
         ]
     
     def reset(self):
