@@ -142,7 +142,11 @@ def get_agent():
     register_builtin_tools(registry)
     
     # 使用 LangGraph Agent（对比自研 ReactAgent）
-    agent = LangGraphAgent(router, registry, max_turns=max_turns)
+    agent = LangGraphAgent(
+        router, registry,
+        max_turns=max_turns,
+        system_prompt=st.session_state.get("system_prompt", ""),
+    )
     return agent
 
 
