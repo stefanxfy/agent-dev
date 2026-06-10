@@ -5,12 +5,13 @@ LangGraph 节点定义
 
 from typing import Literal, Dict, Any
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
 from .state import AgentState
 
 
-def llm_node(state: AgentState, config: dict) -> dict:
+def llm_node(state: AgentState, config: RunnableConfig) -> dict:
     """
     LLM 调用节点。
     对应自研版：agent_core.py 中 for chunk in self.llm.chat(...)
@@ -99,7 +100,7 @@ def llm_node(state: AgentState, config: dict) -> dict:
     }
 
 
-def tool_node(state: AgentState, config: dict) -> dict:
+def tool_node(state: AgentState, config: RunnableConfig) -> dict:
     """
     工具执行节点。
     对应自研版：agent_core.py 中 ThreadPoolExecutor 并行执行工具

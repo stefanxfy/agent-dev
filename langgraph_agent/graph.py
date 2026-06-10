@@ -3,6 +3,27 @@ LangGraph StateGraph 构建
 对比自研版的 while 循环控制流
 """
 
+import warnings
+import os
+
+# 在最前面设置环境变量抑制警告
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+
+# 抑制已知警告（必须在导入 langgraph 之前执行）
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# 抑制 urllib3 OpenSSL 警告
+warnings.filterwarnings("ignore", message=".*NotOpenSSL.*")
+warnings.filterwarnings("ignore", message=".*LibreSSL.*")
+
+# 抑制 LangChain 弃用警告（需要在导入前定义）
+try:
+    from langchain_core.warnings import LangChainPendingDeprecationWarning
+    warnings.filterwarnings("ignore", category=LangChainPendingDeprecationWarning)
+except ImportError:
+    pass  # langchain-core 版本不支持
+
 from langgraph.graph import StateGraph, END
 
 from .state import AgentState
