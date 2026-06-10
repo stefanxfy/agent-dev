@@ -6,3 +6,7 @@ openai>=1.30.0
 pydantic>=2.0.0
 streamlit>=1.38.0
 python-dotenv>=1.0.0
+
+# LangGraph 重构版依赖
+langgraph>=0.2.0
+langchain-core>=0.3.0
