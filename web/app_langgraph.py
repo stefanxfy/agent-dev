@@ -1,6 +1,6 @@
 """
 Streamlit Web UI — LangGraph Agent
-对比自研 ReactAgent，学习框架设计思想
+支持多会话管理（创建/切换/删除/重命名）
 """
 
 from __future__ import annotations
@@ -35,9 +35,6 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🔀 LangGraph Agent")
-st.caption("用 LangGraph 重构 ReAct 循环 · 对比自研版本设计思想")
-
 # ── Import Agents ───────────────────────────────────────────────────
 from agent_core.llm.router import LLMRouter, LLMConfig, UsageStats
 from agent_core.tools.base import ToolRegistry
@@ -54,10 +51,25 @@ if "token_stats" not in st.session_state:
     st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
 if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = ""
+if "active_thread_id" not in st.session_state:
+    st.session_state.active_thread_id = None
 
 
-# ── 侧边栏：LLM 配置 ─────────────────────────────────────────────
+# ── 侧边栏 ─────────────────────────────────────────────────────────
 with st.sidebar:
+    # ━━━ 会话管理 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    st.header("💬 会话管理")
+    
+    # 新建会话按钮（放在这里，但逻辑在 Agent 初始化后）
+    new_session_clicked = st.button("➕ 新建会话", use_container_width=True)
+    
+    # 🔑 会话列表渲染移到 Agent 初始化之后（确保刷新后也能显示）
+    # 这里先占位，下面会填充
+    session_list_placeholder = st.container()
+    
+    st.divider()
+    
+    # ━━━ LLM 配置 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     st.header("⚙️ LLM 配置")
 
     default_provider = os.getenv("DEFAULT_PROVIDER", "zhipu").lower()
@@ -116,14 +128,6 @@ with st.sidebar:
     stats = st.session_state.token_stats
     st.metric("Total", f"{stats['input'] + stats['output'] + stats['thinking']:,}")
 
-    st.divider()
-    if st.button("🗑️ 清空会话"):
-        st.session_state.messages = []
-        st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
-        if st.session_state.agent:
-            st.session_state.agent.reset()
-        st.rerun()
-
 
 # ── 初始化 LangGraph Agent ───────────────────────────────────────
 def get_agent():
@@ -141,7 +145,6 @@ def get_agent():
     registry = ToolRegistry()
     register_builtin_tools(registry)
     
-    # 使用 LangGraph Agent（对比自研 ReactAgent）
     agent = LangGraphAgent(
         router, registry,
         max_turns=max_turns,
@@ -151,6 +154,7 @@ def get_agent():
 
 
 # 配置变化时自动重建 Agent
+# 🔑 注意：重建时保留当前 thread_id（SqliteSaver 自动恢复 checkpoint）
 current_config = {
     "provider": provider,
     "model": model,
@@ -162,13 +166,121 @@ current_config = {
 }
 if (st.session_state.agent is None or
         st.session_state.get("last_agent_config") != current_config):
+    # 保存当前 thread_id（如果有旧 Agent）
+    saved_thread_id = None
+    if st.session_state.agent:
+        saved_thread_id = st.session_state.agent.get_thread_id()
+    
     st.session_state.agent = get_agent()
     st.session_state.last_agent_config = current_config
+    
+    # 恢复之前的 thread_id
+    if saved_thread_id:
+        try:
+            st.session_state.agent.switch_thread(saved_thread_id)
+        except ValueError:
+            pass  # thread_id 不存在则用默认的
 
 agent = st.session_state.agent
 
+# 🔑 页面刷新后从 Checkpointer 恢复当前会话的消息
+if (st.session_state.active_thread_id != agent.get_thread_id()):
+    st.session_state.active_thread_id = agent.get_thread_id()
+    history = agent.get_history()
+    st.session_state.messages = [
+        {"role": msg["role"], "content": msg["content"]}
+        for msg in history
+    ]
+
+# 🔑 处理新建会话按钮点击（在 Agent 初始化后）
+if new_session_clicked:
+    new_id = agent.create_thread()
+    agent.switch_thread(new_id)
+    st.session_state.messages = []
+    st.session_state.active_thread_id = new_id
+    st.rerun()
+
+# 🔑 渲染会话列表（现在 Agent 一定存在）
+with session_list_placeholder:
+    threads = agent.list_threads()
+    
+    for thread in threads:
+        tid = thread["thread_id"]
+        is_active = thread["is_active"]
+        name = thread["name"]
+        
+        # 会话行：名称 + 操作按钮
+        # 🔑 比例 [10, 1, 1] 给名称更多空间，防止窄边栏下图标折叠
+        cols = st.columns([10, 1, 1])
+        
+        with cols[0]:
+            # 当前活跃会话高亮显示
+            if st.button(
+                f"{'🔵 ' if is_active else '⚪ '}{name}",
+                key=f"switch_{tid}",
+                use_container_width=True,
+            ):
+                if not is_active:
+                    agent.switch_thread(tid)
+                    # 从 Checkpointer 恢复历史到 UI
+                    history = agent.get_history()
+                    st.session_state.messages = [
+                        {"role": msg["role"], "content": msg["content"]}
+                        for msg in history
+                    ]
+                    st.session_state.active_thread_id = tid
+                    st.rerun()
+        
+        with cols[1]:
+            # 删除按钮（tertiary 类型更紧凑）
+            if st.button("🗑️", key=f"del_{tid}", help="删除会话", type="tertiary"):
+                agent.delete_thread(tid)
+                # 刷新 UI 消息
+                history = agent.get_history()
+                st.session_state.messages = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in history
+                ]
+                st.rerun()
+        
+        with cols[2]:
+            # 重命名按钮（tertiary 类型更紧凑）
+            if st.button("✏️", key=f"rename_{tid}", help="重命名", type="tertiary"):
+                st.session_state[f"renaming_{tid}"] = True
+        
+        # 重命名输入框
+        if st.session_state.get(f"renaming_{tid}"):
+            new_name = st.text_input(
+                "新名称",
+                value=name,
+                key=f"rename_input_{tid}",
+                label_visibility="collapsed",
+            )
+            rename_cols = st.columns(2)
+            with rename_cols[0]:
+                if st.button("✅", key=f"confirm_rename_{tid}"):
+                    agent.rename_thread(tid, new_name)
+                    st.session_state[f"renaming_{tid}"] = False
+                    st.rerun()
+            with rename_cols[1]:
+                if st.button("❌", key=f"cancel_rename_{tid}"):
+                    st.session_state[f"renaming_{tid}"] = False
+                    st.rerun()
+    
+    if not threads:
+        st.info("暂无会话，点击上方按钮创建")
+
 
 # ── 主聊天界面 ────────────────────────────────────────────────────
+# 🔑 显示当前会话名称
+current_threads = agent.list_threads()
+active_thread = next((t for t in current_threads if t["is_active"]), None)
+if active_thread:
+    st.title(f"🔀 {active_thread['name']}")
+else:
+    st.title("🔀 LangGraph Agent")
+st.caption("用 LangGraph 重构 ReAct 循环 · 支持多会话管理")
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg.get("tool_logs"):
@@ -189,6 +301,8 @@ if prompt := st.chat_input("输入消息..."):
 
     with st.chat_message("assistant"):
         text_placeholder = st.empty()
+        thinking_placeholder = st.empty()
+        thinking_content = []
         tool_expander = st.expander("🔧 工具调用", expanded=True)
         status = st.status("🔄 LangGraph 思考中...", expanded=True)
         
@@ -199,6 +313,14 @@ if prompt := st.chat_input("输入消息..."):
             if msg_type == "text":
                 full_text += content
                 text_placeholder.markdown(full_text + "▌")
+            elif msg_type == "thinking":
+                thinking_content.append(content)
+                thinking_placeholder.markdown(
+                    f'<div style="background:#f0f2f5;padding:8px 12px;border-radius:6px;font-size:0.9em;color:#555;max-height:200px;overflow-y:auto;">'
+                    f'💭 <b>思考过程</b>\n\n{"".join(thinking_content)}▌'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
             elif msg_type == "tool_call":
                 tool_logs.append(f"🔧 调用: {content['name']}")
                 status.update(label=f"🔧 执行工具: {content['name']}...")
@@ -206,8 +328,8 @@ if prompt := st.chat_input("输入消息..."):
                 tool_logs.append(f"✅ 结果: {content['output'][:100]}...")
                 status.update(label=f"✅ {content['name']} 完成")
             elif msg_type == "system":
-                if "完成" in str(content):
-                    status.update(label=content, state="complete")
+                if "完成" in str(content) or "❌" in str(content):
+                    status.update(label=content, state="complete" if "完成" in str(content) else "error")
                 else:
                     status.update(label=content)
             elif msg_type == "usage":
@@ -217,6 +339,15 @@ if prompt := st.chat_input("输入消息..."):
                 stats["thinking"] += getattr(content, "thinking_tokens", 0)
         
         text_placeholder.markdown(full_text)
+        if thinking_content:
+            thinking_placeholder.markdown(
+                f'<div style="background:#f0f2f5;padding:8px 12px;border-radius:6px;font-size:0.9em;color:#555;">'
+                f'💭 <b>思考过程</b>\n\n{"".join(thinking_content)}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            thinking_placeholder.empty()
         
         with tool_expander:
             for log in tool_logs:

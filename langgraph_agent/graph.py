@@ -25,12 +25,13 @@ except ImportError:
     pass  # langchain-core 版本不支持
 
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver  # 🔑 阶段1：内存持久化
 
 from .state import AgentState
 from .nodes import llm_node, tool_node, should_continue, max_turns_check
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     """
     构建并编译 LangGraph 图。
     
@@ -38,6 +39,11 @@ def build_graph():
         START → llm_node → [有工具?] → tool_node → llm_node → ...
                          ↓
                       [无工具] → END
+    
+    🔑 阶段1改进：支持 Checkpointer 持久化
+    - checkpointer=None：无持久化（原版行为）
+    - checkpointer=MemorySaver()：内存持久化（重启后状态丢失，但同会话可恢复）
+    - checkpointer=SqliteSaver()：SQLite 持久化（重启后状态保留）
     
     对比自研版：
         while True:
@@ -70,8 +76,10 @@ def build_graph():
     # tool_node 执行完后回到 llm_node
     graph.add_edge("tool_node", "llm_node")
     
-    return graph.compile()
+    # 🔑 阶段1：编译时注入 Checkpointer
+    return graph.compile(checkpointer=checkpointer)
 
 
-# 构建单例图实例
-compiled_graph = build_graph()
+# 🔑 阶段1改进：不再使用模块级单例，改为动态构建
+# 原因：checkpointer 需要在 Agent 初始化时注入，不能在模块导入时创建
+# 使用方式：LangGraphAgent 内部调用 build_graph(checkpointer)
