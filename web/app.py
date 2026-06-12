@@ -215,6 +215,7 @@ with st.sidebar:
         sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
         st.caption(f"[DEBUG] 找到 {len(sessions)} 个会话")
         if sessions:
+            st.write("**会话列表:**")
             for sess in sessions[:5]:  # 最多显示 5 个
                 sid = sess["session_id"]
                 title = sess.get("title") or "未命名"
