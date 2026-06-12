@@ -310,7 +310,11 @@ class ReactAgent:
                 self._session_manager.add_user_message(user_message)
             except Exception as e:
                 _logger.warning(f"Failed to save user message to session: {e}")
-        
+
+        # 重置 pending 状态（每次 run 独立）
+        self._pending_thinking = ""
+        self._pending_tool_logs = []
+
         # Day 3：检查 Token 预算，必要时截断 history
         self._trim_history()
 
@@ -404,7 +408,7 @@ class ReactAgent:
                     "role": "assistant",
                     "content": full_text,
                 })
-                # Day 4: 保存 assistant 消息到 session（含 thinking/tool_logs）
+                # Day 4: 保存最终回答到 session（含本轮累积的全部 thinking/tool_logs）
                 if self._session_manager:
                     try:
                         self._session_manager.add_assistant_message(
@@ -412,6 +416,9 @@ class ReactAgent:
                             thinking=self._pending_thinking,
                             tool_logs=self._pending_tool_logs,
                         )
+                        # 保存后重置，避免跨 run 累积
+                        self._pending_thinking = ""
+                        self._pending_tool_logs = []
                     except Exception:
                         pass
                 yield ("system", "✅ 回答完成")
@@ -431,19 +438,10 @@ class ReactAgent:
                 assistant_content.insert(0, {"type": "text", "text": full_text})
 
             self.history.append({"role": "assistant", "content": assistant_content})
-            # Day 4: 保存 assistant（多模态）到 session（含当前 thinking）
-            if self._session_manager:
-                try:
-                    self._session_manager.add_assistant_message(
-                        json.dumps(assistant_content, ensure_ascii=False),
-                        thinking=self._pending_thinking,
-                        tool_logs=self._pending_tool_logs,
-                    )
-                except Exception:
-                    pass
 
             # Day 3：并行执行所有工具（如果工具之间无依赖）
             # 如果只有一个工具，串行执行更简单
+            # 注意：先执行工具，再保存 assistant message（确保 tool_logs 完整）
             if len(tool_calls) == 1:
                 # 单工具：串行执行
                 tc = tool_calls[0]
@@ -543,6 +541,14 @@ class ReactAgent:
                             except Exception:
                                 pass
 
+            # Day 4: 保存中间轮次的 assistant message（不带 tool_logs，工具调用链由最终回答统一保存）
+            if self._session_manager:
+                try:
+                    self._session_manager.add_assistant_message(
+                        json.dumps(assistant_content, ensure_ascii=False),
+                    )
+                except Exception:
+                    pass
             # 继续下一轮循环（让 LLM 看到 tool_result）
 
         else:
