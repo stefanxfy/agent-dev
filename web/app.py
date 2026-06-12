@@ -210,11 +210,11 @@ with st.sidebar:
     
     # 加载已有会话
     from agent_core.session.manager import SessionManager
+    st.caption(f"[DEBUG] DATA_DIR={DATA_DIR}")
     try:
-        mgr = SessionManager(data_dir=DATA_DIR)
-        sessions = mgr.list_sessions()
+        sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
+        st.caption(f"[DEBUG] 找到 {len(sessions)} 个会话")
         if sessions:
-            st.caption(f"已有 {len(sessions)} 个会话")
             for sess in sessions[:5]:  # 最多显示 5 个
                 sid = sess["session_id"]
                 title = sess.get("title") or "未命名"
