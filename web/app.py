@@ -5,6 +5,7 @@ Day 3 版本：并行工具调用、Token 预算管理、System Prompt、结构�
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -372,25 +373,32 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                 st.session_state.messages.append({"role": "user", "content": content})
             elif role == "assistant":
                 # content 可能是 str 或 list（包含 tool_use 的数组）
-                if isinstance(content, str) and content:
+                display_content = ""
+                if isinstance(content, list):
+                    # 直接是 list
+                    texts = [item["text"] for item in content
+                             if isinstance(item, dict) and item.get("type") == "text"]
+                    display_content = "".join(texts) if texts else str(content)
+                elif isinstance(content, str):
+                    # 尝试解析为 JSON（可能是 tool_use 数组的字符串形式）
+                    try:
+                        parsed = json.loads(content)
+                        if isinstance(parsed, list):
+                            texts = [item["text"] for item in parsed
+                                     if isinstance(item, dict) and item.get("type") == "text"]
+                            display_content = "".join(texts) if texts else ""
+                        else:
+                            display_content = content
+                    except (json.JSONDecodeError, TypeError):
+                        display_content = content
+
+                if display_content:
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": content,
+                        "content": display_content,
                         "thinking": thinking,
                         "tool_logs": tool_logs,
                     })
-                elif isinstance(content, list):
-                    # 提取 text 部分拼成显示文本
-                    texts = [item["text"] for item in content
-                             if isinstance(item, dict) and item.get("type") == "text"]
-                    display = "".join(texts) if texts else str(content)
-                    if display:
-                        st.session_state.messages.append({
-                            "role": "assistant",
-                            "content": display,
-                            "thinking": thinking,
-                            "tool_logs": tool_logs,
-                        })
     except Exception:
         pass
 
