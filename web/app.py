@@ -65,6 +65,8 @@ if "tool_logs" not in st.session_state:
     st.session_state.tool_logs = []
 if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = ""  # P2 新增：System Prompt
+if "chat_session_id" not in st.session_state:
+    st.session_state.chat_session_id = None
 
 
 # ── 侧边栏：LLM 配置 ─────────────────────────────────────────
@@ -173,6 +175,53 @@ with st.sidebar:
             with st.expander(f"{i+1}. {role}: {content_preview}..."):
                 st.json(msg)
 
+    # ── 会话管理 ────────────────────────────────────────────────
+    st.divider()
+    st.subheader("💾 会话管理")
+    
+    DATA_DIR = str(PROJECT_ROOT / "data" / "sessions")
+    
+    # 新建会话
+    if st.button("➕ 新建会话", key="new_session"):
+        import uuid
+        st.session_state.chat_session_id = str(uuid.uuid4())[:8]
+        st.session_state.agent = None
+        st.session_state.messages = []
+        st.rerun()
+    
+    # 加载已有会话
+    from agent_core.session.manager import SessionManager
+    try:
+        mgr = SessionManager(data_dir=DATA_DIR)
+        sessions = mgr.list_sessions()
+        if sessions:
+            st.caption(f"已有 {len(sessions)} 个会话")
+            for sess in sessions[:5]:  # 最多显示 5 个
+                sid = sess["session_id"]
+                label = sess.get("title") or sid[:12]
+                if st.button(f"📄 {label}", key=f"load_{sid}"):
+                    st.session_state.chat_session_id = sid
+                    st.session_state.agent = None  # 重置 Agent（会重新加载）
+                    st.session_state.messages = []
+                    st.rerun()
+        else:
+            st.caption("暂无会话")
+    except Exception as e:
+        st.caption(f"加载失败: {e}")
+    
+    # 当前会话信息
+    if st.session_state.chat_session_id:
+        st.divider()
+        st.caption(f"**当前会话**: `{st.session_state.chat_session_id}`")
+        try:
+            mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
+            msgs = mgr.get_messages()
+            st.caption(f"消息数: {len(msgs)}")
+        except Exception:
+            pass
+    
+    st.divider()
+    
     if st.button("🗑️ 清空会话"):
         st.session_state.messages = []
         st.session_state.tool_logs = []
@@ -184,7 +233,7 @@ with st.sidebar:
 
 
 # ── 初始化 Agent ───────────────────────────────────────────────
-def get_agent():
+def get_agent(session_id=None):
     """创建或更新 Agent 实例"""
     config = LLMConfig(
         provider=provider.lower(),
@@ -198,7 +247,8 @@ def get_agent():
     router = LLMRouter(config)
     registry = ToolRegistry()
     register_builtin_tools(registry)
-    agent = ReactAgent(router, registry, max_turns=max_turns)
+    # Day 4: 传入 session_id 实现历史持久化
+    agent = ReactAgent(router, registry, max_turns=max_turns, session_id=session_id)
     return agent
 
 
@@ -213,9 +263,34 @@ current_config = {
     "system_prompt": st.session_state.get("system_prompt", ""),
 }
 if (st.session_state.agent is None or
-        st.session_state.get("last_agent_config") != current_config):
-    st.session_state.agent = get_agent()
+        st.session_state.get("last_agent_config") != current_config or
+        st.session_state.get("last_session_id") != st.session_state.chat_session_id):
+    st.session_state.agent = get_agent(st.session_state.chat_session_id)
     st.session_state.last_agent_config = current_config
+    st.session_state.last_session_id = st.session_state.chat_session_id
+
+agent = st.session_state.agent
+
+# 从 session 加载聊天历史（仅首次加载）
+if st.session_state.messages == [] and st.session_state.chat_session_id:
+    try:
+        mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
+        history = mgr.get_messages()
+        for msg in history:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user" and content:
+                st.session_state.messages.append({"role": "user", "content": content})
+            elif role == "assistant":
+                if isinstance(content, str) and content:
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": content,
+                        "thinking": "",
+                        "tool_logs": []
+                    })
+    except Exception:
+        pass
 
 agent = st.session_state.agent
 
