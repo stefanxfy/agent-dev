@@ -272,7 +272,7 @@ def get_agent(session_id=None):
     registry = ToolRegistry()
     register_builtin_tools(registry)
     # Day 4: 传入 session_id 实现历史持久化
-    agent = ReactAgent(router, registry, max_turns=max_turns, session_id=session_id)
+    agent = ReactAgent(router, registry, max_turns=max_turns, session_id=session_id, session_data_dir=DATA_DIR)
     return agent
 
 
