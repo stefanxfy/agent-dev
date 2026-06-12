@@ -186,6 +186,10 @@ class ReactAgent:
             self.history = self._session_manager.get_messages()
             _logger.info(f"Session loaded: {session_id}, {len(self.history)} messages")
 
+        # ── 流式过程中记录 thinking/tool_logs，用于 session 持久化 ───
+        self._pending_thinking: str = ""
+        self._pending_tool_logs: list = []
+
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
     def _estimate_tokens(self, text: str) -> int:
@@ -369,6 +373,7 @@ class ReactAgent:
                 # 思考过程 → 转发给 UI
                 if chunk.thinking_delta:
                     thinking_text += chunk.thinking_delta.thinking
+                    self._pending_thinking += chunk.thinking_delta.thinking
                     yield ("thinking", chunk.thinking_delta.thinking)
 
                 # 工具调用 → 收集（不立即执行，等本轮 LLM 响应结束）
@@ -399,10 +404,14 @@ class ReactAgent:
                     "role": "assistant",
                     "content": full_text,
                 })
-                # Day 4: 保存 assistant 消息到 session
+                # Day 4: 保存 assistant 消息到 session（含 thinking/tool_logs）
                 if self._session_manager:
                     try:
-                        self._session_manager.add_assistant_message(full_text)
+                        self._session_manager.add_assistant_message(
+                            full_text,
+                            thinking=self._pending_thinking,
+                            tool_logs=self._pending_tool_logs,
+                        )
                     except Exception:
                         pass
                 yield ("system", "✅ 回答完成")
@@ -422,11 +431,13 @@ class ReactAgent:
                 assistant_content.insert(0, {"type": "text", "text": full_text})
 
             self.history.append({"role": "assistant", "content": assistant_content})
-            # Day 4: 保存 assistant（多模态）到 session
+            # Day 4: 保存 assistant（多模态）到 session（含当前 thinking）
             if self._session_manager:
                 try:
                     self._session_manager.add_assistant_message(
-                        json.dumps(assistant_content, ensure_ascii=False)
+                        json.dumps(assistant_content, ensure_ascii=False),
+                        thinking=self._pending_thinking,
+                        tool_logs=self._pending_tool_logs,
                     )
                 except Exception:
                     pass
@@ -437,6 +448,7 @@ class ReactAgent:
                 # 单工具：串行执行
                 tc = tool_calls[0]
                 yield ("tool_call", {"name": tc.tool_name, "input": tc.tool_input, "parallel": False})
+                self._pending_tool_logs.append({"type": "action", "name": tc.tool_name, "input": tc.tool_input})
                 
                 start_time = time.time()
                 result = self.tools.execute(tc.tool_name, tc.tool_input, max_retries=3)
@@ -450,6 +462,7 @@ class ReactAgent:
                         "success": True,
                         "elapsed": elapsed,
                     })
+                    self._pending_tool_logs.append({"type": "result", "name": tc.tool_name, "output": tool_output, "success": True})
                 else:
                     tool_output = f"工具执行失败: {result['error']}"
                     yield ("tool_result", {
@@ -458,6 +471,7 @@ class ReactAgent:
                         "success": False,
                         "elapsed": elapsed,
                     })
+                    self._pending_tool_logs.append({"type": "result", "name": tc.tool_name, "output": tool_output, "success": False})
                     if turn >= self.max_turns:
                         yield ("system", f"⚠️ 工具执行失败且达到最大轮次，结束循环")
                         return
@@ -473,6 +487,7 @@ class ReactAgent:
                 # Day 3：多工具并行执行
                 tool_names = [tc.tool_name for tc in tool_calls]
                 yield ("tool_call", {"names": tool_names, "parallel": True})
+                self._pending_tool_logs.append({"type": "parallel_start", "names": tool_names})
                 
                 start_time = time.time()
                 
@@ -509,6 +524,7 @@ class ReactAgent:
                                 "success": True,
                                 "elapsed": elapsed,
                             })
+                            self._pending_tool_logs.append({"type": "result", "name": tc.tool_name, "output": tool_output, "success": True})
                         else:
                             tool_output = f"工具执行失败: {result['error']}"
                             yield ("tool_result", {
@@ -517,6 +533,7 @@ class ReactAgent:
                                 "success": False,
                                 "elapsed": elapsed,
                             })
+                            self._pending_tool_logs.append({"type": "result", "name": tc.tool_name, "output": tool_output, "success": False})
 
                         self.history.append(_make_tool_result_block(tc.tool_use_id, tool_output))
                         # Day 4: 保存 tool_result 到 session

@@ -354,8 +354,8 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
         history = mgr.get_messages()
         for msg in history:
-            # Entry 结构：{"type": "user/assistant", "content": {"role": ..., "content": ...}}
-            # content 字段本身是内层 dict
+            # Entry 结构：{"type": "user/assistant", "content": {"role": ..., "content": ...}, "thinking": ..., "tool_logs": ...}
+            # thinking/tool_logs 存在 entry 顶层（通过 **extra 传入）
             inner = msg.get("content", {})
             if isinstance(inner, dict):
                 role = inner.get("role", "")
@@ -363,6 +363,10 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
             else:
                 role = msg.get("type", "")
                 content = inner
+
+            # 从 entry 顶层取 thinking 和 tool_logs（由 agent_core 存储）
+            thinking = msg.get("thinking", "") or ""
+            tool_logs = msg.get("tool_logs", []) or []
 
             if role == "user" and content:
                 st.session_state.messages.append({"role": "user", "content": content})
@@ -372,8 +376,8 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": content,
-                        "thinking": "",
-                        "tool_logs": []
+                        "thinking": thinking,
+                        "tool_logs": tool_logs,
                     })
                 elif isinstance(content, list):
                     # 提取 text 部分拼成显示文本
@@ -384,8 +388,8 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                         st.session_state.messages.append({
                             "role": "assistant",
                             "content": display,
-                            "thinking": "",
-                            "tool_logs": []
+                            "thinking": thinking,
+                            "tool_logs": tool_logs,
                         })
     except Exception:
         pass
