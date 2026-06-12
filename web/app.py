@@ -354,11 +354,20 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
         history = mgr.get_messages()
         for msg in history:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
+            # Entry 结构：{"type": "user/assistant", "content": {"role": ..., "content": ...}}
+            # content 字段本身是内层 dict
+            inner = msg.get("content", {})
+            if isinstance(inner, dict):
+                role = inner.get("role", "")
+                content = inner.get("content", "")
+            else:
+                role = msg.get("type", "")
+                content = inner
+
             if role == "user" and content:
                 st.session_state.messages.append({"role": "user", "content": content})
             elif role == "assistant":
+                # content 可能是 str 或 list（包含 tool_use 的数组）
                 if isinstance(content, str) and content:
                     st.session_state.messages.append({
                         "role": "assistant",
@@ -366,6 +375,18 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                         "thinking": "",
                         "tool_logs": []
                     })
+                elif isinstance(content, list):
+                    # 提取 text 部分拼成显示文本
+                    texts = [item["text"] for item in content
+                             if isinstance(item, dict) and item.get("type") == "text"]
+                    display = "".join(texts) if texts else str(content)
+                    if display:
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": display,
+                            "thinking": "",
+                            "tool_logs": []
+                        })
     except Exception:
         pass
 
