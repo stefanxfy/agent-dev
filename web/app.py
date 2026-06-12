@@ -411,7 +411,15 @@ for msg in st.session_state.messages:
                     else:
                         # 兼容旧格式（纯字符串）
                         st.markdown(log)
-        st.markdown(msg["content"])
+        # 处理 content：如果是包含 tool_use 的 JSON 数组，提取 text 部分
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # 从 content 数组中提取 text 类型的内容
+            texts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
+            display_content = "".join(texts) if texts else str(content)
+        else:
+            display_content = content
+        st.markdown(display_content)
 
 
 # 用户输入
