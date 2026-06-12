@@ -334,9 +334,7 @@ if (st.session_state.agent is None or
     sid = st.session_state.chat_session_id
     if not sid:
         try:
-            from agent_core.session.manager import SessionManager
-            mgr = SessionManager(data_dir=DATA_DIR)
-            sessions = mgr.list_sessions()
+            sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
             if sessions:
                 sid = sessions[0]["session_id"]  # 用最新的会话
                 st.session_state.chat_session_id = sid
@@ -399,8 +397,8 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                         "thinking": thinking,
                         "tool_logs": tool_logs,
                     })
-    except Exception:
-        pass
+    except Exception as e:
+        logging.warning(f"加载会话历史失败: {e}")
 
 agent = st.session_state.agent
 
