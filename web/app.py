@@ -184,7 +184,16 @@ with st.sidebar:
     # 新建会话
     if st.button("➕ 新建会话", key="new_session"):
         import uuid
-        st.session_state.chat_session_id = str(uuid.uuid4())[:8]
+        from datetime import datetime
+        new_id = str(uuid.uuid4())[:8]
+        # 先创建 session 并设置 title
+        try:
+            mgr = SessionManager(session_id=new_id, data_dir=DATA_DIR)
+            mgr.update_metadata(title=f"会话 {datetime.now().strftime('%H:%M')}")
+            mgr.flush()
+        except Exception:
+            pass
+        st.session_state.chat_session_id = new_id
         st.session_state.agent = None
         st.session_state.messages = []
         st.rerun()
@@ -198,8 +207,10 @@ with st.sidebar:
             st.caption(f"已有 {len(sessions)} 个会话")
             for sess in sessions[:5]:  # 最多显示 5 个
                 sid = sess["session_id"]
-                label = sess.get("title") or sid[:12]
-                if st.button(f"📄 {label}", key=f"load_{sid}"):
+                title = sess.get("title") or "未命名"
+                msg_count = sess.get("message_count", 0)
+                label = f"{title} ({msg_count}条)"
+                if st.button(f"📄 {label}", key=f"load_{sid}", help=sid):
                     st.session_state.chat_session_id = sid
                     st.session_state.agent = None  # 重置 Agent（会重新加载）
                     st.session_state.messages = []
