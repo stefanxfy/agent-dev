@@ -65,8 +65,14 @@ if "tool_logs" not in st.session_state:
     st.session_state.tool_logs = []
 if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = ""  # P2 新增：System Prompt
+# Day 4: 从 URL query params 恢复 session_id（刷新不丢失）
 if "chat_session_id" not in st.session_state:
-    st.session_state.chat_session_id = None
+    # 优先从 URL query param 获取
+    url_sid = st.query_params.get("session", None)
+    if url_sid:
+        st.session_state.chat_session_id = url_sid
+    else:
+        st.session_state.chat_session_id = None
 
 
 # ── 侧边栏：LLM 配置 ─────────────────────────────────────────
@@ -196,6 +202,7 @@ with st.sidebar:
         st.session_state.chat_session_id = new_id
         st.session_state.agent = None
         st.session_state.messages = []
+        st.query_params["session"] = new_id
         st.rerun()
     
     # 加载已有会话
@@ -214,6 +221,7 @@ with st.sidebar:
                     st.session_state.chat_session_id = sid
                     st.session_state.agent = None  # 重置 Agent（会重新加载）
                     st.session_state.messages = []
+                    st.query_params["session"] = sid
                     st.rerun()
         else:
             st.caption("暂无会话")
@@ -276,9 +284,22 @@ current_config = {
 if (st.session_state.agent is None or
         st.session_state.get("last_agent_config") != current_config or
         st.session_state.get("last_session_id") != st.session_state.chat_session_id):
-    st.session_state.agent = get_agent(st.session_state.chat_session_id)
+    # 如果没有 session_id，尝试加载最近的会话
+    sid = st.session_state.chat_session_id
+    if not sid:
+        try:
+            from agent_core.session.manager import SessionManager
+            mgr = SessionManager(data_dir=DATA_DIR)
+            sessions = mgr.list_sessions()
+            if sessions:
+                sid = sessions[0]["session_id"]  # 用最新的会话
+                st.session_state.chat_session_id = sid
+                st.query_params["session"] = sid
+        except Exception:
+            pass
+    st.session_state.agent = get_agent(sid)
     st.session_state.last_agent_config = current_config
-    st.session_state.last_session_id = st.session_state.chat_session_id
+    st.session_state.last_session_id = sid
 
 agent = st.session_state.agent
 
