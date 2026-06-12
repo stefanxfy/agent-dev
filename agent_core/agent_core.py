@@ -8,7 +8,11 @@ Day 3 改进：
 - 错误处理完善（网络超时、API 限流）
 - Debug 日志输出（便于观察 ReAct 过程）
 
-依赖：router.py（已支持 tool_call chunk）
+Day 4 改进：
+- SessionManager 融合：可选 session_id 实现历史持久化
+- 自动从 session 加载历史（Resume语义）
+- 每次交互后自动保存到 session
+- 保持向后兼容（不传 session_id = 纯内存模式）
 """
 
 from __future__ import annotations
@@ -32,22 +36,22 @@ from .tools.base import ToolRegistry
 # ── Debug 日志配置 ───────────────────────────────────────────────
 
 # 创建 logger（使用单例模式防止重复配置）
-logger = logging.getLogger("react_agent")
+_logger = logging.getLogger("react_agent")
 
 # 防重复：检查是否已有同名 StreamHandler（最可靠的方式）
 _has_stream_handler = any(
     isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-    for h in logger.handlers
+    for h in _logger.handlers
 )
 if not _has_stream_handler:
     # 先清除所有旧 handler（包括热重载残留的）
-    for h in list(logger.handlers):
+    for h in list(_logger.handlers):
         try:
-            logger.removeHandler(h)
+            _logger.removeHandler(h)
         except Exception:
             pass
     
-    logger.setLevel(logging.DEBUG)
+    _logger.setLevel(logging.DEBUG)
     
     handler = logging.StreamHandler()
     handler.setLevel(logging.DEBUG)
@@ -56,10 +60,10 @@ if not _has_stream_handler:
         datefmt="%H:%M:%S"
     )
     handler.setFormatter(formatter)
-    logger.addHandler(handler)
+    _logger.addHandler(handler)
     
     # 标记已配置
-    logger._configured = True
+    _logger._configured = True
 
 
 def _format_messages_for_log(messages: list) -> str:
@@ -146,6 +150,10 @@ class ReactAgent:
     循环：
       User → LLM → Thought (text) → Action (tool_use) →
       Tool Result → LLM → ... → Final Answer (text, stop)
+    
+    Day 4: 支持 SessionManager 融合，实现历史持久化。
+    - 传入 session_id → 自动从 session 加载历史，每次交互后保存
+    - 不传 session_id → 纯内存模式（向后兼容）
     """
 
     def __init__(
@@ -154,15 +162,29 @@ class ReactAgent:
         tool_registry: ToolRegistry,
         max_turns: int = 10,
         max_context_tokens: int = 100_000,  # Day 3 新增：Token 预算（默认 100K）
+        session_id: Optional[str] = None,   # Day 4 新增：会话 ID（可选）
+        session_data_dir: Optional[str] = None,  # Day 4 新增：session 数据目录
     ):
         self.llm = llm_router
         self.tools = tool_registry
         self.max_turns = max_turns
-        self.max_context_tokens = max_context_tokens  # Day 3 新增：Token 预算
+        self.max_context_tokens = max_context_tokens
         self.history: list[dict] = []  # LLM messages 格式
         
         # P2 新增：从 LLMConfig 读取 system_prompt
         self.system_prompt = self.llm.config.system_prompt
+        
+        # ── Day 4: SessionManager 融合 ──────────────────────────────
+        self._session_manager: Optional["SessionManager"] = None
+        if session_id:
+            from .session.manager import SessionManager
+            self._session_manager = SessionManager(
+                session_id=session_id,
+                data_dir=session_data_dir,
+            )
+            # 从 session 加载历史（Resume 语义：只加载断链后的消息）
+            self.history = self._session_manager.get_messages()
+            _logger.info(f"Session loaded: {session_id}, {len(self.history)} messages")
 
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
@@ -242,15 +264,48 @@ class ReactAgent:
             removed = self.history.pop(0)
             total_tokens -= self._estimate_message_tokens(removed)
 
+    def _save_to_session(self):
+        """Day 4: 将当前 history 保存到 session（如果启用了 session）"""
+        if self._session_manager is None:
+            return
+        try:
+            # 追加所有未保存的消息到 session
+            for msg in self.history:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "user":
+                    self._session_manager.add_user_message(content)
+                elif role == "assistant":
+                    # assistant 可能是 str 或 list
+                    if isinstance(content, str):
+                        self._session_manager.add_assistant_message(content)
+                    else:
+                        # 多模态 content（包含 tool_use），存储为 JSON
+                        self._session_manager.add_assistant_message(
+                            json.dumps(content, ensure_ascii=False)
+                        )
+            self._session_manager.flush()
+        except Exception as e:
+            _logger.warning(f"Failed to save to session: {e}")
+
     # ── 主循环 ──────────────────────────────────────────────────────
 
     def run(self, user_message: str):
         """
         执行 ReAct 循环，返回生成器。
         流式 yield 所有中间过程（text / thinking / tool_call / tool_result / usage / system）。
+        
+        Day 4: 如果启用了 session，run 结束后自动保存到 session。
         """
-        # 追加用户消息
+        # 追加用户消息（内存）
         self.history.append({"role": "user", "content": user_message})
+        
+        # Day 4: 保存 user message 到 session
+        if self._session_manager:
+            try:
+                self._session_manager.add_user_message(user_message)
+            except Exception as e:
+                _logger.warning(f"Failed to save user message to session: {e}")
         
         # Day 3：检查 Token 预算，必要时截断 history
         self._trim_history()
@@ -277,12 +332,12 @@ class ReactAgent:
             thinking_text = ""
 
             # === 日志：发送给 LLM 的原始消息 ===
-            logger.info("\n" + "=" * 60)
-            logger.info(f"📤 【发送给 LLM】Turn {turn}/{self.max_turns}")
-            logger.info("=" * 60)
-            logger.info(_format_messages_for_log(messages_for_llm))
+            _logger.info("\n" + "=" * 60)
+            _logger.info(f"📤 【发送给 LLM】Turn {turn}/{self.max_turns}")
+            _logger.info("=" * 60)
+            _logger.info(_format_messages_for_log(messages_for_llm))
             if tool_schemas:
-                logger.info(f"\n📋 可用工具: {[t['name'] for t in tool_schemas]}")
+                _logger.info(f"\n📋 可用工具: {[t['name'] for t in tool_schemas]}")
 
             try:
                 llm_chunks = self.llm.chat(
@@ -292,11 +347,17 @@ class ReactAgent:
             except Exception as e:
                 # LLM 调用异常，优雅降级
                 error_msg = f"LLM 调用失败: {type(e).__name__}: {e}"
-                logger.error(error_msg)
+                _logger.error(error_msg)
                 yield ("system", f"❌ {error_msg}")
                 yield ("text", f"抱歉，遇到了技术问题无法回答：{error_msg}")
                 yield ("system", "✅ 回答完成")
                 self.history.append({"role": "assistant", "content": f"抱歉，遇到了技术问题：{e}"})
+                # Day 4: 保存到 session
+                if self._session_manager:
+                    try:
+                        self._session_manager.add_assistant_message(f"抱歉，遇到了技术问题：{e}")
+                    except Exception:
+                        pass
                 return
 
             for chunk in llm_chunks:
@@ -319,16 +380,16 @@ class ReactAgent:
                     yield ("usage", chunk.usage)
 
             # === 日志：LLM 返回的原始内容 ===
-            logger.info("\n" + "=" * 60)
-            logger.info(f"📥 【LLM 返回】Turn {turn}/{self.max_turns}")
-            logger.info("=" * 60)
+            _logger.info("\n" + "=" * 60)
+            _logger.info(f"📥 【LLM 返回】Turn {turn}/{self.max_turns}")
+            _logger.info("=" * 60)
             if full_text:
-                logger.info(f"💬 文本输出:\n{full_text}")
+                _logger.info(f"💬 文本输出:\n{full_text}")
             if thinking_text:
-                logger.info(f"💭 思考过程:\n{thinking_text}")
+                _logger.info(f"💭 思考过程:\n{thinking_text}")
             if tool_calls:
-                logger.info(f"\n🔧 工具调用 ({len(tool_calls)} 个):")
-                logger.info(_format_tool_calls_for_log(tool_calls))
+                _logger.info(f"\n🔧 工具调用 ({len(tool_calls)} 个):")
+                _logger.info(_format_tool_calls_for_log(tool_calls))
 
             # ── 如果没有 tool_call → 最终回答 ───────────────────────
             if not tool_calls:
@@ -338,6 +399,12 @@ class ReactAgent:
                     "role": "assistant",
                     "content": full_text,
                 })
+                # Day 4: 保存 assistant 消息到 session
+                if self._session_manager:
+                    try:
+                        self._session_manager.add_assistant_message(full_text)
+                    except Exception:
+                        pass
                 yield ("system", "✅ 回答完成")
                 break
 
@@ -355,6 +422,14 @@ class ReactAgent:
                 assistant_content.insert(0, {"type": "text", "text": full_text})
 
             self.history.append({"role": "assistant", "content": assistant_content})
+            # Day 4: 保存 assistant（多模态）到 session
+            if self._session_manager:
+                try:
+                    self._session_manager.add_assistant_message(
+                        json.dumps(assistant_content, ensure_ascii=False)
+                    )
+                except Exception:
+                    pass
 
             # Day 3：并行执行所有工具（如果工具之间无依赖）
             # 如果只有一个工具，串行执行更简单
@@ -388,6 +463,12 @@ class ReactAgent:
                         return
 
                 self.history.append(_make_tool_result_block(tc.tool_use_id, tool_output))
+                # Day 4: 保存 tool_result 到 session
+                if self._session_manager:
+                    try:
+                        self._session_manager.add_tool_result(tool_output)
+                    except Exception:
+                        pass
             else:
                 # Day 3：多工具并行执行
                 tool_names = [tc.tool_name for tc in tool_calls]
@@ -438,12 +519,26 @@ class ReactAgent:
                             })
 
                         self.history.append(_make_tool_result_block(tc.tool_use_id, tool_output))
+                        # Day 4: 保存 tool_result 到 session
+                        if self._session_manager:
+                            try:
+                                self._session_manager.add_tool_result(tool_output)
+                            except Exception:
+                                pass
 
             # 继续下一轮循环（让 LLM 看到 tool_result）
 
         else:
             # 循环正常结束（没 break）→ 达到 max_turns
             yield ("system", f"⚠️ 达到最大轮次（{self.max_turns}），强制结束")
+
+        # Day 4: run 结束后 flush session
+        if self._session_manager:
+            try:
+                self._session_manager.flush()
+                _logger.info(f"Session saved: {self._session_manager.session_id}")
+            except Exception as e:
+                _logger.warning(f"Failed to flush session: {e}")
 
     # ── 辅助方法 ────────────────────────────────────────────────────
 
@@ -460,6 +555,38 @@ class ReactAgent:
     def reset(self):
         """重置会话历史"""
         self.history.clear()
+        # Day 4: 同时清空 session
+        if self._session_manager:
+            try:
+                self._session_manager.clear()
+            except Exception:
+                pass
 
     def load_history(self, history: list[dict]):
         self.history = list(history)
+
+    # ── Day 4: Session 相关 ───────────────────────────────────────────
+
+    @property
+    def session_id(self) -> Optional[str]:
+        """获取当前 session_id（如果有）"""
+        return self._session_manager.session_id if self._session_manager else None
+
+    def fork(self, new_session_id: Optional[str] = None) -> Optional[str]:
+        """
+        Fork 当前 session 到新 session。
+        返回新 session_id。
+        如果未启用 session，返回 None。
+        """
+        if self._session_manager is None:
+            return None
+        return self._session_manager.fork(new_session_id)
+
+    def add_compact_boundary(self):
+        """在当前 history 中添加压缩边界标记（用于触发压缩）"""
+        if self._session_manager:
+            self._session_manager.add_compact_boundary()
+
+    def get_session_manager(self) -> Optional["SessionManager"]:
+        """获取 SessionManager 实例（用于高级操作）"""
+        return self._session_manager
