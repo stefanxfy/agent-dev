@@ -210,28 +210,64 @@ with st.sidebar:
     
     # 加载已有会话
     from agent_core.session.manager import SessionManager
-    st.caption(f"[DEBUG] DATA_DIR={DATA_DIR}")
     try:
         sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
-        st.caption(f"[DEBUG] 找到 {len(sessions)} 个会话")
         if sessions:
-            st.write("**会话列表:**")
-            for sess in sessions[:10]:  # 最多显示 10 个
-                sid = sess["session_id"]
-                title = sess.get("title") or "未命名"
-                # 实时读取消息数（list_sessions 不含 message_count）
-                try:
-                    m_mgr = SessionManager(session_id=sid, data_dir=DATA_DIR)
-                    msg_count = len(m_mgr.get_messages())
-                except Exception:
-                    msg_count = sess.get("size", 0) // 100  # 回退：估算
-                label = f"{title} ({msg_count}条)"
-                if st.button(f"📄 {label}", key=f"load_{sid}", help=sid):
-                    st.session_state.chat_session_id = sid
-                    st.session_state.agent = None  # 重置 Agent（会重新加载）
-                    st.session_state.messages = []
-                    st.query_params["session"] = sid
-                    st.rerun()
+            st.write(f"**会话列表** ({len(sessions)}个)")
+            # 使用容器实现滚动
+            with st.container(height=300):
+                for sess in sessions:
+                    sid = sess["session_id"]
+                    title = sess.get("title") or "未命名"
+                    # 实时读取消息数
+                    try:
+                        m_mgr = SessionManager(session_id=sid, data_dir=DATA_DIR)
+                        msg_count = len(m_mgr.get_messages())
+                    except Exception:
+                        msg_count = 0
+                    
+                    # 一行：加载按钮 + 操作按钮
+                    cols = st.columns([4, 1, 1])
+                    with cols[0]:
+                        label = f"📄 {title} ({msg_count}条)"
+                        if st.button(label, key=f"load_{sid}", help=sid):
+                            st.session_state.chat_session_id = sid
+                            st.session_state.agent = None
+                            st.session_state.messages = []
+                            st.query_params["session"] = sid
+                            st.rerun()
+                    with cols[1]:
+                        # 重命名按钮
+                        if st.button("✏️", key=f"rename_{sid}", help="修改标题"):
+                            st.session_state[f"renaming_{sid}"] = True
+                    with cols[2]:
+                        # 删除按钮（当前会话不能删）
+                        if sid != st.session_state.get("chat_session_id"):
+                            if st.button("🗑️", key=f"del_{sid}", help="删除会话"):
+                                try:
+                                    SessionManager.delete_session(sid, data_dir=DATA_DIR)
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"删除失败: {e}")
+                    
+                    # 重命名输入框
+                    if st.session_state.get(f"renaming_{sid}", False):
+                        new_title = st.text_input("新标题", value=title, key=f"title_input_{sid}")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("保存", key=f"save_{sid}"):
+                                try:
+                                    m_mgr = SessionManager(session_id=sid, data_dir=DATA_DIR)
+                                    m_mgr.update_title(new_title)
+                                    m_mgr.flush()
+                                    del st.session_state[f"renaming_{sid}"]
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"保存失败: {e}")
+                        with c2:
+                            if st.button("取消", key=f"cancel_{sid}"):
+                                del st.session_state[f"renaming_{sid}"]
+                                st.rerun()
         else:
             st.caption("暂无会话")
     except Exception as e:
@@ -388,6 +424,17 @@ if prompt := st.chat_input("输入消息..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
+
+    # 自动生成标题（第一条用户消息）
+    if st.session_state.chat_session_id and len(st.session_state.messages) == 1:
+        try:
+            # 取前 20 个字符作为标题
+            title = prompt[:20] + ("..." if len(prompt) > 20 else "")
+            mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
+            mgr.update_title(title)
+            mgr.flush()
+        except Exception:
+            pass  # 标题生成失败不影响主流程
 
     # 调用 Agent（流式）
     with st.chat_message("assistant"):
