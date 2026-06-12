@@ -198,7 +198,7 @@ with st.sidebar:
         # 先创建 session 并设置 title
         try:
             mgr = SessionManager(session_id=new_id, data_dir=DATA_DIR)
-            mgr.update_metadata(title=f"会话 {datetime.now().strftime('%H:%M')}")
+            mgr.update_title(f"会话 {datetime.now().strftime('%H:%M')}")
             mgr.flush()
         except Exception:
             pass
@@ -216,7 +216,7 @@ with st.sidebar:
         st.caption(f"[DEBUG] 找到 {len(sessions)} 个会话")
         if sessions:
             st.write("**会话列表:**")
-            for sess in sessions[:5]:  # 最多显示 5 个
+            for sess in sessions[:10]:  # 最多显示 10 个
                 sid = sess["session_id"]
                 title = sess.get("title") or "未命名"
                 # 实时读取消息数（list_sessions 不含 message_count）
