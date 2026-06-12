@@ -215,7 +215,12 @@ with st.sidebar:
             for sess in sessions[:5]:  # 最多显示 5 个
                 sid = sess["session_id"]
                 title = sess.get("title") or "未命名"
-                msg_count = sess.get("message_count", 0)
+                # 实时读取消息数（list_sessions 不含 message_count）
+                try:
+                    m_mgr = SessionManager(session_id=sid, data_dir=DATA_DIR)
+                    msg_count = len(m_mgr.get_messages())
+                except Exception:
+                    msg_count = sess.get("size", 0) // 100  # 回退：估算
                 label = f"{title} ({msg_count}条)"
                 if st.button(f"📄 {label}", key=f"load_{sid}", help=sid):
                     st.session_state.chat_session_id = sid
