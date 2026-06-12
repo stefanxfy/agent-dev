@@ -24,8 +24,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── 项目根目录加入 sys.path ────────────────────────────────────
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.resolve()  # 使用绝对路径
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ── 全局常量（必须在 sidebar 之外定义）──────────────────────────
+DATA_DIR = str(PROJECT_ROOT / "data" / "sessions")
 
 # ── 必须先设 PATH 再 import streamlit ──────────────────────────
 import streamlit as st
@@ -185,7 +188,7 @@ with st.sidebar:
     st.divider()
     st.subheader("💾 会话管理")
     
-    DATA_DIR = str(PROJECT_ROOT / "data" / "sessions")
+    # DATA_DIR 已移到文件顶部定义
     
     # 新建会话
     if st.button("➕ 新建会话", key="new_session"):
