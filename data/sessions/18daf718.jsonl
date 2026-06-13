@@ -1,3 +1,31 @@
 {"uuid": "d7660274-fb13-4187-9dba-895413271504", "parentUuid": null, "sessionId": "18daf718", "type": "user", "timestamp": "2026-06-13T23:10:22.144017", "message": {"role": "user", "content": "我是小明"}}
 {"uuid": "505e5da0-2bf2-4d77-9ade-b70a0f155aba", "parentUuid": null, "sessionId": "18daf718", "type": "ai-title", "aiTitle": "自我介绍：小明", "genSeq": 1, "timestamp": "2026-06-13T23:10:24.122969"}
 {"uuid": "d0a048cb-2d55-4f8d-8b9a-72e0502ef12e", "parentUuid": "d7660274-fb13-4187-9dba-895413271504", "sessionId": "18daf718", "type": "assistant", "timestamp": "2026-06-13T23:10:31.990020", "message": {"role": "assistant", "content": "你好，小明！👋 很高兴认识你！😊\n\n我是你的AI助手，可以帮你做很多事情，比如：\n\n- 🔍 **搜索信息** — 帮你查找网上的资料\n- 🧮 **数学计算** — 帮你算数学题\n- 💬 **聊天问答** — 回答你的各种问题\n\n有什么我可以帮你的吗？随时告诉我哦！😄"}, "thinking": "", "tool_logs": []}
+{"uuid": "e3bb0c88-91bc-452a-88eb-f4eecaabadc2", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:12:46.823114"}
+{"uuid": "9fbd01c4-4930-4794-8052-02a734d76fd9", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:12:50.915855"}
+{"uuid": "e928335d-e6a1-4e4b-b034-d4fe659248e4", "parentUuid": null, "sessionId": "18daf718", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:12:50.915855"}
+{"uuid": "e137a176-3d11-4b18-9e23-27a6b02b16ab", "parentUuid": null, "sessionId": "18daf718", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:12:50.915855"}
+{"uuid": "f37aaada-5373-4c78-90be-d50e7e9dc7c3", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:12:50.930722"}
+{"uuid": "8a7c114e-60ca-4ef2-a0c4-9897b9945334", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:15.540258"}
+{"uuid": "22efe6fb-427b-4150-b5be-e28a73333471", "parentUuid": null, "sessionId": "18daf718", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:13:15.540258"}
+{"uuid": "a44bcd9c-1cce-4b19-8c23-959a7be5e661", "parentUuid": null, "sessionId": "18daf718", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:13:15.540258"}
+{"uuid": "ea72e0c2-d93e-41e8-aa11-ce4cdf818d75", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:15.553968"}
+{"uuid": "d9bafe69-da9c-45c3-84cf-44ebfac20abf", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.031250"}
+{"uuid": "21b7d9c4-1c47-4e1f-a17b-a4748731dc11", "parentUuid": null, "sessionId": "18daf718", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:13:29.031250"}
+{"uuid": "bd89ca8e-65ea-415c-a390-8a1a6d7217dc", "parentUuid": null, "sessionId": "18daf718", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:13:29.031250"}
+{"uuid": "cbffaca7-6f29-46d3-8715-3b751b4c1edd", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.033728"}
+{"uuid": "a8c3903d-f277-4f00-a27e-d5ed7aac3014", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.054518"}
+{"uuid": "c1ce6636-8412-4c13-83f7-9b7ed4eea15b", "parentUuid": null, "sessionId": "18daf718", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:13:29.054518"}
+{"uuid": "721578b3-abda-47db-9d8e-1a298fb42b9d", "parentUuid": null, "sessionId": "18daf718", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:13:29.054518"}
+{"uuid": "891b431c-70fb-48ae-ba53-3abfbc076a05", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.061398"}
+{"uuid": "c5389dfc-8036-46ce-a765-ab2b04adf2bb", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.065397"}
+{"uuid": "567d8f2c-a00a-4e29-8496-6ed8b0712a9e", "parentUuid": null, "sessionId": "18daf718", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:13:29.065397"}
+{"uuid": "365466a7-1f5f-427a-8fd4-2d9795316ba4", "parentUuid": null, "sessionId": "18daf718", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:13:29.065397"}
+{"uuid": "7870f86e-5ad5-493a-be93-57db22a5b3a9", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.069278"}
+{"uuid": "60531154-21f7-4f46-a23f-2c448cbde441", "parentUuid": null, "sessionId": "18daf718", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:13:29.069278"}
+{"uuid": "885c522f-095a-4f64-b275-93e6223a6818", "parentUuid": null, "sessionId": "18daf718", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:13:29.069278"}
+{"uuid": "104440c4-7de0-4c7c-bcfb-33b9ba595dbc", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.071346"}
+{"uuid": "8f7bf99c-5365-4b25-99c4-172d43a64077", "parentUuid": null, "sessionId": "18daf718", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:13:29.071346"}
+{"uuid": "8519dae2-32ca-4003-96d0-999f3f1efb9c", "parentUuid": null, "sessionId": "18daf718", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:13:29.071346"}
+{"uuid": "7ad66ba1-a38f-4c22-a1bf-61c6cb9dec3d", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.074293"}
+{"uuid": "15c5fe93-a7d7-4ff9-b714-af2e5f6c09d6", "parentUuid": null, "sessionId": "18daf718", "type": "last-prompt", "lastPrompt": "我是小明", "timestamp": "2026-06-13T23:13:29.097589"}

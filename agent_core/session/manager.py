@@ -182,13 +182,6 @@ n        agent-dev 对应：
             self.storage.flush()
             logger.info(f"last-prompt flushed on close: {self.session_id}")
 
-    def __del__(self):
-        """析构时兜底写入（防止调用方忘记 close()）"""
-        try:
-            self.close()
-        except Exception:
-            pass  # __del__ 不能抛异常
-
     def switch(self, session_id: str):
         """
         切换到指定会话（当前 SessionManager 实例切换会话）
