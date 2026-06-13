@@ -35,7 +35,7 @@ from .state import SessionState, SessionStatus, RequiresActionDetails
 from .progress import ProgressTracker, ProgressSnapshot, FileChange, TodoItem, TurnStats
 from .cleanup import SessionCleanup
 from .restore import resume_session, continue_session, fork_session, list_sessions, delete_session, compact_session
-from .manager import SessionManager
+from .manager import SessionManager, TitleState
 
 __all__ = [
     # 核心存储
@@ -63,4 +63,6 @@ __all__ = [
     "compact_session",
     # Facade
     "SessionManager",
+    # 标题状态机
+    "TitleState",
 ]

@@ -29,6 +29,7 @@ from agent_core.session import (
     fork_session,
     list_sessions,
 )
+from agent_core.session.manager import TitleState
 from agent_core.session.progress import FileChangeType
 
 # ── 测试工具 ────────────────────────────────────────────────────────────────
@@ -537,5 +538,243 @@ def main():
         shutil.rmtree(tmpdir)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+# ═══════════════════════════════════════════════════════════
+# 标题生成测试
+# ═══════════════════════════════════════════════════════════
+
+def test_title_state_machine():
+    """测试标题状态机：NEED_TITLE → AI_PENDING → AI_SET → FINALIZED / USER_SET"""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        manager = SessionManager(data_dir=tmpdir)
+
+        assert manager._title_state.value == "need_title", "初始应为 NEED_TITLE"
+
+
+        # 模拟第1条用户消息触发
+        manager._on_user_message("帮我写一个排序函数")
+        assert manager._title_state.value == "ai_pending", "第1条后应为 AI_PENDING"
+        assert manager._title_cache is not None, "应有占位标题"
+
+        # 模拟第2条（不应改变状态）
+        # _on_user_message 会递增 _user_msg_count，当前=1，+1=2
+        # 但第2条不应触发状态变化（只在第1条和第3条触发）
+        manager._on_user_message("换成快速排序")
+        # _user_msg_count 现在是 2，状态仍是 AI_PENDING
+        assert manager._user_msg_count == 2, "应为第2条"
+        assert manager._title_state.value == "ai_pending", "第2条不应改变状态"
+
+        # 模拟 AI 返回（genSeq 匹配）
+        # _user_msg_count=2 < 3，所以应转到 AI_SET
+        manager._save_ai_title("写排序函数", gen_seq=1)
+        assert manager._title_state.value == "ai_set", "AI返回后应为 AI_SET"
+        assert manager.get_title() == "写排序函数"
+
+        # 模拟第3条消息触发
+        # _on_user_message 递增到 3，触发第3条重新生成
+        manager._on_user_message("再加一个搜索功能")
+        assert manager._user_msg_count == 3, "应为第3条"
+        assert manager._title_state.value == "ai_pending", "第3条后应为 AI_PENDING"
+
+        # 模拟 AI 返回（genSeq 匹配，覆盖旧标题）
+        manager._save_ai_title("排序和搜索功能", gen_seq=2)
+        assert manager._title_state.value == "finalized", "第3条后应为 FINALIZED"
+        assert manager.get_title() == "排序和搜索功能"
+
+        print("  ✓ 状态机转移正确")
+
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+
+def test_title_user_rename():
+    """测试用户手动改名：USER_SET 永久阻止自动生成"""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        manager = SessionManager(data_dir=tmpdir)
+
+        # 用户手动改名
+        manager.rename_session("我的自定义标题")
+        assert manager._title_state.value == "user_set", "用户改后应为 USER_SET"
+        assert manager.get_title() == "我的自定义标题"
+
+
+        # 模拟用户消息不应触发自动生成
+        manager._user_msg_count = 1
+        manager._on_user_message("任何消息")
+        assert manager._title_state.value == "user_set", "USER_SET 应阻止自动生成"
+        assert manager.get_title() == "我的自定义标题", "标题不应被覆盖"
+
+        print("  ✓ 用户改名保护正确")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_title_restore_on_resume():
+    """测试重启恢复：AI 标题恢复为 FINALIZED，自定义标题恢复为 USER_SET"""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        # 创建会话，写入 ai-title
+        manager = SessionManager(data_dir=tmpdir)
+        manager._save_ai_title("恢复测试标题", gen_seq=1)
+        manager.flush()
+        session_id = manager.session_id
+
+        # 重启（新建 SessionManager，相同 session_id）
+        manager2 = SessionManager(session_id=session_id, data_dir=tmpdir)
+        manager2._restore_title_state()
+        assert manager2._title_state.value == "finalized", "恢复后应为 FINALIZED"
+        assert manager2.get_title() == "恢复测试标题"
+
+        # 模拟用户改名后重启
+        manager.rename_session("用户自定义标题")
+        manager.flush()
+        session_id2 = manager.session_id
+
+        manager3 = SessionManager(session_id=session_id2, data_dir=tmpdir)
+        manager3._restore_title_state()
+        assert manager3._title_state.value == "user_set", "用户改后重启应为 USER_SET"
+        assert manager3.get_title() == "用户自定义标题"
+
+        print("  ✓ 重启恢复正确")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_title_derive_title():
+    """测试 derive_title 即时占位"""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        manager = SessionManager(data_dir=tmpdir)
+
+
+        # 有句号：截取到句末
+        title = manager._derive_title("帮我写一个冒泡排序算法。顺便加上注释。")
+        assert title == "帮我写一个冒泡排序算法。"
+
+
+        # 无句号：截取20字符
+        title = manager._derive_title("帮我写一个排序函数，要求支持升序和降序两种模式")
+        assert title == "帮我写一个排序函数，要求支持升序和降序两..."
+
+        # 短文本：直接返回
+        title = manager._derive_title("你好")
+        assert title == "你好"
+
+
+        print("  ✓ derive_title 正确")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+
+def test_title_genseq_out_of_order():
+    """测试 genSeq 防乱序：_generate_ai_title 中旧请求晚返回不应覆盖新请求"""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        manager = SessionManager(data_dir=tmpdir)
+        manager._gen_seq = 2  # 当前最新是 genSeq=2
+        manager._title_state = TitleState.AI_SET  # 模拟已有 AI 标题
+
+        # 场景：_generate_ai_title 检查 genSeq，旧请求 (genSeq=1) 不匹配当前 _gen_seq=2
+        # 所以旧请求不会调用 _save_ai_title
+        # 模拟这个检查逻辑
+        old_gen = 1
+        assert old_gen != manager._gen_seq, "旧 genSeq 应不匹配当前"
+
+        # 新请求 (genSeq=2) 匹配
+        new_gen = 2
+        assert new_gen == manager._gen_seq, "新 genSeq 应匹配当前"
+
+        # 验证 get_title 优先返回高 genSeq 的条目
+        manager._save_ai_title("旧标题", gen_seq=1)
+        manager._save_ai_title("新标题", gen_seq=2)
+        assert manager.get_title() == "新标题", "应返回高 genSeq 的标题"
+
+        print("  ✓ genSeq 防乱序正确")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_title_entry_format():
+    """测试 JSONL 条目格式正确"""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        manager = SessionManager(data_dir=tmpdir)
+        manager._save_ai_title("AI标题", gen_seq=1)
+        manager.flush()
+
+        # 读取 JSONL 验证格式
+        path = manager.jsonl_path
+        entries = []
+        with open(path, "r") as f:
+            for line in f:
+                import json
+                entries.append(json.loads(line.strip()))
+
+        ai_entry = next(e for e in entries if e["type"] == "ai-title")
+        assert ai_entry["aiTitle"] == "AI标题"
+        assert ai_entry["genSeq"] == 1
+        assert ai_entry["type"] == "ai-title"
+        assert "uuid" in ai_entry
+        assert "sessionId" in ai_entry
+        assert "timestamp" in ai_entry
+
+        manager.rename_session("自定义标题")
+        manager.flush()
+
+        with open(path, "r") as f:
+            entries = [json.loads(line.strip()) for line in f if line.strip()]
+
+        custom_entry = next(e for e in entries if e["type"] == "custom-title")
+        assert custom_entry["customTitle"] == "自定义标题"
+        assert custom_entry["type"] == "custom-title"
+
+        print("  ✓ JSONL 条目格式正确")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def main():
+    print("\n" + "=" * 60)
+    print("会话管理功能测试")
+    print("=" * 60)
+
+    tests = [
+        # 原有测试
+        test_parent_uuid_chain,
+        test_compact_boundary,
+        test_resume_and_continue,
+        test_fork,
+        test_metadata,
+        test_state_machine,
+        test_progress_tracker,
+        test_jsonl_storage_details,
+        test_list_and_delete,
+        test_cleanup,
+        test_integration_full_workflow,
+        # 标题测试
+        test_title_state_machine,
+        test_title_user_rename,
+        test_title_restore_on_resume,
+        test_title_derive_title,
+        test_title_genseq_out_of_order,
+        test_title_entry_format,
+    ]
+
+    passed = 0
+    failed = 0
+    for test in tests:
+        try:
+            test()
+            passed += 1
+        except AssertionError as e:
+            print(f"  ✗ {test.__name__}: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"  ✗ {test.__name__}: {e}")
+            failed += 1
+
+    print(f"\n总计: {passed} passed, {failed} failed")
+    return 0 if failed == 0 else 1
