@@ -301,6 +301,17 @@ class ReactAgent:
         
         Day 4: 如果启用了 session，run 结束后自动保存到 session。
         """
+        # Day 4: 如果有 system_prompt 且首次写入 session
+        if self._session_manager and self.system_prompt:
+            try:
+                # 检查 session 中是否已有 system entry（避免重复写入）
+                existing = self._session_manager.get_messages()
+                has_system = any(e.get("type") == "system" for e in existing)
+                if not has_system:
+                    self._session_manager.add_system(self.system_prompt)
+            except Exception as e:
+                _logger.warning(f"Failed to save system prompt to session: {e}")
+
         # 追加用户消息（内存）
         self.history.append({"role": "user", "content": user_message})
         
@@ -541,14 +552,21 @@ class ReactAgent:
                             except Exception:
                                 pass
 
-            # Day 4: 保存中间轮次的 assistant message（不带 tool_logs，工具调用链由最终回答统一保存）
+            # Day 4: 保存中间轮次（assistant 文本 + tool_use 独立 Entry + tool_result）
             if self._session_manager:
                 try:
-                    self._session_manager.add_assistant_message(
-                        json.dumps(assistant_content, ensure_ascii=False),
-                    )
-                except Exception:
-                    pass
+                    # 1. assistant 只保存文本部分（不含 tool_use）
+                    if full_text:
+                        self._session_manager.add_assistant_message(full_text)
+                    # 2. 每个 tool_use 写入独立 Entry
+                    for tc in tool_calls:
+                        self._session_manager.add_tool_use(
+                            name=tc.tool_name,
+                            tool_input=tc.tool_input,
+                            tool_use_id=tc.tool_use_id,
+                        )
+                except Exception as e:
+                    _logger.warning(f"Failed to save intermediate turn to session: {e}")
             # 继续下一轮循环（让 LLM 看到 tool_result）
 
         else:

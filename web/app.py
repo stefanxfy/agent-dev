@@ -357,42 +357,38 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
         history = mgr.get_messages()
         for msg in history:
-            # Entry 结构：{"type": "user/assistant", "content": {"role": ..., "content": ...}, "thinking": ..., "tool_logs": ...}
-            # thinking/tool_logs 存在 entry 顶层（通过 **extra 传入）
+            etype = msg.get("type", "")
             inner = msg.get("content", {})
+
+            # system / tool_use / tool_result / 元数据类型不显示在 UI
+            if etype in ("system", "tool_use", "tool_result",
+                         "custom-title", "ai-title", "agent-name", "mode", "tag",
+                         "compact_boundary", "summary"):
+                continue
+
             if isinstance(inner, dict):
                 role = inner.get("role", "")
                 content = inner.get("content", "")
             else:
-                role = msg.get("type", "")
+                role = msg.get("role", "") or etype
                 content = inner
 
-            # 从 entry 顶层取 thinking 和 tool_logs（由 agent_core 存储）
+            # 从 entry 顶层取 thinking 和 tool_logs
             thinking = msg.get("thinking", "") or ""
             tool_logs = msg.get("tool_logs", []) or []
 
             if role == "user" and content:
                 st.session_state.messages.append({"role": "user", "content": content})
-            elif role == "assistant":
-                # content 可能是 str 或 list（包含 tool_use 的数组）
+            elif role == "assistant" and content:
+                # content 现在是纯文本（tool_use 已独立 Entry）
                 display_content = ""
-                if isinstance(content, list):
-                    # 直接是 list
+                if isinstance(content, str):
+                    display_content = content
+                elif isinstance(content, list):
+                    # 兼容旧格式：嵌套 text/tool_use 数组
                     texts = [item["text"] for item in content
                              if isinstance(item, dict) and item.get("type") == "text"]
                     display_content = "".join(texts) if texts else str(content)
-                elif isinstance(content, str):
-                    # 尝试解析为 JSON（可能是 tool_use 数组的字符串形式）
-                    try:
-                        parsed = json.loads(content)
-                        if isinstance(parsed, list):
-                            texts = [item["text"] for item in parsed
-                                     if isinstance(item, dict) and item.get("type") == "text"]
-                            display_content = "".join(texts) if texts else ""
-                        else:
-                            display_content = content
-                    except (json.JSONDecodeError, TypeError):
-                        display_content = content
 
                 if display_content:
                     st.session_state.messages.append({

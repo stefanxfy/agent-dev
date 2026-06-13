@@ -276,6 +276,17 @@ class SessionManager:
         })
         return uuid_
 
+    def add_system(self, content: str, **extra) -> str:
+        """添加 system prompt"""
+        uuid_ = self.storage.add_system(content, parent_uuid=self._last_uuid)
+        self._last_uuid = uuid_
+        self._message_cache.append({
+            "type": "system",
+            "content": content,
+            "uuid": uuid_,
+        })
+        return uuid_
+
     def add_summary(
         self,
         summary: str,
