@@ -193,18 +193,16 @@ with st.sidebar:
     # DATA_DIR 已移到文件顶部定义
     
     # 新建会话
-    if st.button("➕ 新建会话", key="new_session"):
+    def create_session():
+        """新建会话"""
         import uuid
-        from datetime import datetime
         new_id = str(uuid.uuid4())[:8]
-        # 先创建 session 并设置 title
         try:
             mgr = SessionManager(session_id=new_id, data_dir=DATA_DIR)
-            # 标题由 _on_user_message 自动生成，新建时不再预设
             mgr.flush()
         except Exception:
             pass
-        # 关闭旧 Agent 的 session
+        # 关闭旧 Agent
         if st.session_state.agent is not None:
             try:
                 st.session_state.agent.close()
@@ -212,10 +210,22 @@ with st.sidebar:
                 pass
         st.session_state.chat_session_id = new_id
         st.session_state.agent = None
-        st.session_state.messages = []
-        st.query_params["session"] = new_id
-        st.rerun()
-    
+
+    def switch_session(sid: str):
+        """切换到指定会话"""
+        if sid == st.session_state.get("chat_session_id"):
+            return
+        if st.session_state.agent is not None:
+            try:
+                st.session_state.agent.close()
+            except Exception:
+                pass
+        st.session_state.chat_session_id = sid
+        st.session_state.agent = None
+
+    if st.button("➕ 新建会话", key="new_session", on_click=create_session):
+        pass  # 回调在 on_click 中处理
+
     # 加载已有会话
     from agent_core.session.manager import SessionManager
     try:
@@ -241,20 +251,9 @@ with st.sidebar:
                     with cols[0]:
                         label = f"📄 {title} ({msg_count}条)"
                         help_text = f"{sid}\n最近: {preview}" if preview else sid
-                        if st.button(label, key=f"load_{sid}", help=help_text):
-                            # 点击当前会话：不走切换流程
-                            if sid == st.session_state.get("chat_session_id"):
-                                continue
-                            # 关闭旧 Agent 的 session
-                            if st.session_state.agent is not None:
-                                try:
-                                    st.session_state.agent.close()
-                                except Exception:
-                                    pass
-                            st.session_state.chat_session_id = sid
-                            st.session_state.agent = None
-                            st.query_params["session"] = sid
-                            st.rerun()
+                        # 使用 on_click 回调避免双 rerun
+                        st.button(label, key=f"load_{sid}", help=help_text,
+                                  on_click=switch_session, args=(sid,))
                     with cols[1]:
                         # 重命名按钮
                         if st.button("✏️", key=f"rename_{sid}", help="修改标题"):
@@ -459,6 +458,7 @@ st.caption(f"🐛 DEBUG: session={_debug_sid}, messages={_debug_msgs}, agent={_d
 # ── 主聊天界面 ────────────────────────────────────────────────
 
 # 渲染历史消息
+logging.warning(f"[DEBUG-RENDER] rendering {len(st.session_state.messages)} messages")
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg.get("thinking"):
