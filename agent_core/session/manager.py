@@ -164,14 +164,12 @@ class SessionManager:
         if not self.metadata.last_prompt:
             return
 
-        # 检查磁盘最后一条是否已经是相同的 last-prompt（避免重复追加）
+        # 检查磁盘最后一行是否已经是相同的 last-prompt（避免重复追加）
         try:
-            entries = self.storage.read_tail(lines=5)
-            for entry in reversed(entries):
-                if entry.get("type") == "last-prompt":
-                    if entry.get("lastPrompt") == self.metadata.last_prompt:
-                        return  # 已存在，不重复写
-                    break  # 最后一条 last-prompt 内容不同，继续写
+            entries = self.storage.read_tail(lines=1)
+            if entries and entries[-1].get("type") == "last-prompt" \
+                    and entries[-1].get("lastPrompt") == self.metadata.last_prompt:
+                return  # 已存在，不重复写
         except Exception:
             pass  # 读失败则继续写
 
