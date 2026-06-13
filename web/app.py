@@ -356,9 +356,9 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
     try:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
         history = mgr.get_messages()
-        for msg in history:
-            etype = msg.get("type", "")
-            inner = msg.get("content", {})
+        for entry in history:
+            etype = entry.get("type", "")
+            msg = entry.get("message")
 
             # system / tool_use / tool_result / 元数据类型不显示在 UI
             if etype in ("system", "tool_use", "tool_result",
@@ -366,48 +366,26 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                          "compact_boundary", "summary"):
                 continue
 
-            if isinstance(inner, dict):
-                role = inner.get("role", "")
-                content = inner.get("content", "")
-            elif isinstance(inner, list):
-                # 新格式：content 是 [{type:text, text:...}, {type:tool_use, ...}] 数组
-                role = msg.get("role", "") or etype
-                content = inner
-            elif isinstance(inner, str):
-                # 旧格式兼容：content 是 JSON 字符串
-                role = msg.get("role", "") or etype
-                try:
-                    content = json.loads(inner)
-                except (json.JSONDecodeError, TypeError):
-                    content = inner  # 普通字符串，原样使用
-            else:
-                role = msg.get("role", "") or etype
-                content = inner
+            # 从 message 字段取 API 原始消息（信封套信纸）
+            if not msg:
+                continue
+
+            role = msg.get("role", "")
+            content = msg.get("content", "")
 
             # 从 entry 顶层取 thinking 和 tool_logs
-            thinking = msg.get("thinking", "") or ""
-            tool_logs = msg.get("tool_logs", []) or []
+            thinking = entry.get("thinking", "") or ""
+            tool_logs = entry.get("tool_logs", []) or []
 
             if role == "user" and content:
                 st.session_state.messages.append({"role": "user", "content": content})
             elif role == "assistant" and content:
-                # content 现在是纯文本（tool_use 已独立 Entry）
-                display_content = ""
-                if isinstance(content, str):
-                    display_content = content
-                elif isinstance(content, list):
-                    # 兼容旧格式：嵌套 text/tool_use 数组
-                    texts = [item["text"] for item in content
-                             if isinstance(item, dict) and item.get("type") == "text"]
-                    display_content = "".join(texts) if texts else str(content)
-
-                if display_content:
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": display_content,
-                        "thinking": thinking,
-                        "tool_logs": tool_logs,
-                    })
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": content,
+                    "thinking": thinking,
+                    "tool_logs": tool_logs,
+                })
     except Exception as e:
         logging.warning(f"加载会话历史失败: {e}")
 

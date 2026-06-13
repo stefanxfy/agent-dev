@@ -107,23 +107,40 @@ class SessionStorage:
     def _make_entry(
         self,
         entry_type: str,
-        content: Optional[dict] = None,
+        message: Optional[dict] = None,
         parent_uuid: Optional[str] = None,
         **extra,
     ) -> dict:
-        """构造标准 Entry，带 UUID + parentUuid 链 + sessionId"""
+        """构造标准 Entry（信封套信纸结构）
+
+        Entry 结构（参考 Claude Code）:
+        {
+            "uuid": "...",
+            "parentUuid": "...",
+            "sessionId": "...",
+            "type": "user" | "assistant" | "tool_use" | "tool_result" | ...,
+            "timestamp": "...",
+            "message": { ... }    ← API 原始消息，原样存储
+            **extra               ← 顶层扩展字段（thinking, tool_logs 等）
+        }
+        """
         entry_uuid = str(uuid.uuid4())
 
         entry = {
             "uuid": entry_uuid,
-            "parentUuid": parent_uuid,  # None 表示新链起点
+            "parentUuid": parent_uuid,
             "sessionId": self.session_id,
             "type": entry_type,
             "timestamp": datetime.now().isoformat(),
-            **extra,
         }
-        if content:
-            entry.update(content)
+
+        # message 字段：存 API 原始消息对象（零转换）
+        if message:
+            entry["message"] = message
+
+        # 额外字段挂顶层（thinking, tool_logs, tool_use_id 等）
+        if extra:
+            entry.update(extra)
 
         # 注册到内存索引
         self._entry_cache[entry_uuid] = entry
@@ -136,7 +153,7 @@ class SessionStorage:
     def append_entry(
         self,
         entry_type: str,
-        content: Optional[dict] = None,
+        message: Optional[dict] = None,
         parent_uuid: Optional[str] = None,
         **extra,
     ) -> str:
@@ -145,9 +162,9 @@ class SessionStorage:
 
         Args:
             entry_type: Entry 类型（如 user / assistant / tool_result / summary）
-            content: Entry 内容（role / content 等）
+            message: API 原始消息对象（原样存入 message 字段）
             parent_uuid: 父消息 UUID（None 表示新链起点）
-            **extra: 额外字段
+            **extra: 额外字段（挂 Entry 顶层，如 thinking, tool_logs）
 
         Returns:
             新 Entry 的 UUID
@@ -160,7 +177,7 @@ class SessionStorage:
             # 有历史消息，自动链到最新
             parent_uuid = self._get_last_uuid()
 
-        entry = self._make_entry(entry_type, content, parent_uuid, **extra)
+        entry = self._make_entry(entry_type, message, parent_uuid, **extra)
         self._pending.append(entry)
 
         logger.debug(
@@ -198,22 +215,15 @@ class SessionStorage:
         entry_type: Optional[str] = None,
         **extra,
     ) -> str:
-        """
-        添加一条消息 Entry（快捷方法）
+        """添加一条消息 Entry（快捷方法）
 
-        Args:
-            role: 角色（user / assistant / system）
-            content: 消息内容
-            entry_type: 类型，默认从 role 推断
-
-        Returns:
-            Entry UUID
+        存储格式：message = {"role": role, "content": content}
         """
         if entry_type is None:
             entry_type = role
         return self.append_entry(
             entry_type=entry_type,
-            content={"role": role, "content": content},
+            message={"role": role, "content": content},
             **extra,
         )
 
@@ -224,10 +234,13 @@ class SessionStorage:
         tool_use_id: str,
         **extra,
     ) -> str:
-        """添加 tool_use Entry"""
+        """添加 tool_use Entry
+
+        存储格式：message = {"type": "tool_use", "id": ..., "name": ..., "input": ...}
+        """
         return self.append_entry(
             entry_type="tool_use",
-            content={
+            message={
                 "type": "tool_use",
                 "id": tool_use_id,
                 "name": tool_name,
@@ -242,10 +255,13 @@ class SessionStorage:
         content: str,
         **extra,
     ) -> str:
-        """添加 tool_result Entry"""
+        """添加 tool_result Entry
+
+        存储格式：message = {"type": "tool_result", "tool_use_id": ..., "content": ...}
+        """
         return self.append_entry(
             entry_type="tool_result",
-            content={
+            message={
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
                 "content": content,
@@ -260,16 +276,37 @@ class SessionStorage:
         format: str = "BASE",
         **extra,
     ) -> str:
-        """添加 summary Entry（压缩产物）"""
+        """添加 summary Entry（压缩产物）
+
+        存储格式：message = {"summary": ..., "tokens_saved": ..., "format": ...}
+        """
         return self.append_entry(
             entry_type="summary",
-            content={
+            message={
                 "summary": summary,
                 "tokens_saved": tokens_saved,
                 "format": format,
             },
             **extra,
         )
+
+    def append_raw_entry(self, entry: dict) -> str:
+        """直接追加已构造好的 Entry（不走 message 包装，用于 metadata entries）
+
+        Args:
+            entry: 完整的 Entry dict（必须包含 uuid, type, sessionId）
+
+        Returns:
+            Entry UUID
+        """
+        self._entry_cache[entry.get("uuid", "")] = entry
+        self._uuid_set.add(entry.get("uuid", ""))
+        self._pending.append(entry)
+
+        if not self._auto_flush:
+            self.flush()
+
+        return entry.get("uuid", "")
 
     def add_compact_boundary(self, **extra) -> str:
         """添加压缩边界 Entry（parentUuid = None，断链标记）"""

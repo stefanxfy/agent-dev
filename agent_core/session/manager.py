@@ -327,7 +327,7 @@ class SessionManager:
         """重新追加元数据到 JSONL 尾部（保证最新）"""
         entries = self.metadata.to_entries()
         for entry in entries:
-            self.storage.append_entry(entry_type=entry["type"], content=entry)
+            self.storage.append_raw_entry(entry)
         self.storage.flush()
 
     # ── 读取 ───────────────────────────────────────────────────
@@ -362,12 +362,16 @@ class SessionManager:
         return disk_messages
 
     def get_history(self) -> list[dict]:
-        """Get conversation history for agent_core compatibility."""
-        return [
-            {"role": m.get("role") or m.get("type"), "content": m.get("content", "")}
-            for m in self.get_messages(stop_at_boundary=False)
-            if (m.get("role") or m.get("type")) in ("user", "assistant")
-        ]
+        """Get conversation history for agent_core compatibility.
+
+        从 message 字段直接提取 role + content，零转换。
+        """
+        result = []
+        for m in self.get_messages(stop_at_boundary=False):
+            msg = m.get("message")
+            if msg and msg.get("role") in ("user", "assistant"):
+                result.append({"role": msg["role"], "content": msg.get("content", "")})
+        return result
 
 
     def get_metadata(self) -> SessionMetadata:
@@ -403,23 +407,14 @@ class SessionManager:
         stop_at_boundary: bool = True,
     ) -> list[dict]:
         """
-        获取适合传给 LLM 的消息格式
-
-        格式：
-        - role: user / assistant / system
-        - content: 消息内容
-        - tool_calls: [可选] 工具调用
+        获取适合传给 LLM 的消息格式（直接取 message 字段，零转换）
         """
         messages = self.get_messages(stop_at_boundary=stop_at_boundary)
         result = []
         for m in messages:
-            role = m.get("role") or m.get("type")
-            if role in ("user", "assistant", "system"):
-                result.append({
-                    "role": role,
-                    "content": m.get("content", ""),
-                    **({"tool_calls": m.get("tool_calls", [])} if m.get("tool_calls") else {}),
-                })
+            msg = m.get("message")
+            if msg and msg.get("role") in ("user", "assistant", "system"):
+                result.append(msg)
         return result
 
     # ── 诊断 ───────────────────────────────────────────────────

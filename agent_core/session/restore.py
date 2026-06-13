@@ -46,9 +46,13 @@ def _is_compact_boundary(entry: dict) -> bool:
 
 def _is_message_entry(entry: dict) -> bool:
     """判断 entry 是否为实际消息（而非元数据/summary/边界）"""
-    # agent_core storage: role = "user" / "assistant" / "system"
-    # tool entry: type = "tool_use" / "tool_result"
-    role = entry.get("role") or entry.get("type")
+    # 新格式：role 在 message 字段内
+    msg = entry.get("message")
+    if msg:
+        role = msg.get("role") or msg.get("type")
+    else:
+        # 兼容旧格式：role 在 entry 顶层
+        role = entry.get("role") or entry.get("type")
     return role in ("user", "assistant", "system", "tool_use", "tool_result")
 
 
