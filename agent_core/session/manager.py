@@ -217,67 +217,89 @@ class SessionManager:
 
     def add_assistant_message(
         self,
-        content: str,
-        tool_calls: Optional[list[dict]] = None,
+        content=None,
+        message: Optional[dict] = None,
         **extra,
     ) -> str:
-        """添加助手消息"""
+        """添加助手消息
+
+        两种用法（Claude Code 风格）:
+        1. add_assistant_message("纯文本") → message = {role: assistant, content: "纯文本"}
+        2. add_assistant_message(message={role: assistant, content: [{type:text,...}, {type:tool_use,...}]})
+           → 直接存 API 原始格式，零转换
+        """
         entry_type = extra.pop("entry_type", "assistant")
-        extra_kwargs = {}
-        if tool_calls:  # 只在有 tool_calls 时才存
-            extra_kwargs["tool_calls"] = tool_calls
+        if message is None:
+            message = {"role": "assistant", "content": content}
         uuid_ = self.storage.add_message(
             "assistant",
-            content,
             entry_type=entry_type,
+            message=message,
             parent_uuid=self._last_uuid,
-            **extra_kwargs,
             **extra,
         )
         self._last_uuid = uuid_
-        self._message_cache.append({
-            "role": "assistant",
-            "content": content,
-            "uuid": uuid_,
-            "tool_calls": tool_calls or [],
-        })
+        self._message_cache.append({"role": "assistant", "content": message.get("content", ""), "uuid": uuid_})
         self.state.set_idle()
         return uuid_
 
-    def add_tool_use(
+    def add_assistant_with_tools(
         self,
-        name: str,
-        tool_input: dict,
-        tool_use_id: str,
+        text: str,
+        tool_calls: list,
         **extra,
     ) -> str:
-        """添加 tool_use"""
-        self.progress.record_tool_call(name)
-        uuid_ = self.storage.add_tool_use(name, tool_input, tool_use_id, parent_uuid=self._last_uuid)
-        self._last_uuid = uuid_
-        self._message_cache.append({
-            "type": "tool_use",
-            "name": name,
-            "input": tool_input,
-            "uuid": uuid_,
-        })
-        return uuid_
+        """添加包含 tool_use 的 assistant 消息（Claude Code 风格：一条 Entry）
 
-    def add_tool_result(
+        存储格式：message = {role: assistant, content: [{type:text}, {type:tool_use}, ...]}
+        和 LLM API 返回的格式完全一致，零转换。
+        """
+        content_blocks = []
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+        for tc in tool_calls:
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc["id"],
+                "name": tc["name"],
+                "input": tc["input"],
+            })
+            self.progress.record_tool_call(tc["name"])
+
+        return self.add_assistant_message(
+            message={"role": "assistant", "content": content_blocks},
+            **extra,
+        )
+
+    def add_tool_results(
         self,
-        tool_use_id: str,
-        content: str,
+        results: list[dict],
         **extra,
     ) -> str:
-        """添加 tool_result"""
-        uuid_ = self.storage.add_tool_result(tool_use_id, content, parent_uuid=self._last_uuid)
+        """添加 tool_results（Claude Code 风格：一条 user Entry 包含所有 tool_result）
+
+        存储格式：message = {role: user, content: [{type:tool_result, ...}, ...]}
+        和 LLM API 格式完全一致，零转换。
+
+        Args:
+            results: [{"tool_use_id": "...", "content": "..."}, ...]
+        """
+        content_blocks = []
+        for r in results:
+            content_blocks.append({
+                "type": "tool_result",
+                "tool_use_id": r["tool_use_id"],
+                "content": r["content"],
+            })
+
+        uuid_ = self.storage.add_message(
+            "user",
+            entry_type="user",
+            message={"role": "user", "content": content_blocks},
+            parent_uuid=self._last_uuid,
+            **extra,
+        )
         self._last_uuid = uuid_
-        self._message_cache.append({
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": content,
-            "uuid": uuid_,
-        })
         return uuid_
 
     def add_summary(
@@ -410,40 +432,17 @@ class SessionManager:
         self,
         stop_at_boundary: bool = True,
     ) -> list[dict]:
-        """
-        获取适合传给 LLM 的消息格式（直接取 message 字段，零转换）
-        包含 user/assistant/system + tool_use/tool_result 完整链。
+        """获取适合传给 LLM 的消息格式（直接取 message 字段，零转换）
+
+        Claude Code 风格：tool_use 包在 assistant content 数组里，
+        tool_result 包在 user content 数组里，存储即 API 格式。
         """
         messages = self.get_messages(stop_at_boundary=stop_at_boundary)
         result = []
         for m in messages:
             msg = m.get("message")
-            if not msg:
-                continue
-            # 标准 role 消息
-            if msg.get("role") in ("user", "assistant", "system"):
+            if msg and msg.get("role") in ("user", "assistant", "system"):
                 result.append(msg)
-            # tool_use: 转为 LLM API 格式（包含在 assistant message 里）
-            elif msg.get("type") == "tool_use":
-                result.append({
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": msg["id"],
-                        "type": "function",
-                        "function": {
-                            "name": msg["name"],
-                            "arguments": json.dumps(msg.get("input", {}), ensure_ascii=False),
-                        },
-                    }],
-                })
-            # tool_result: 转为 LLM API 格式（role=tool）
-            elif msg.get("type") == "tool_result":
-                result.append({
-                    "role": "tool",
-                    "tool_call_id": msg["tool_use_id"],
-                    "content": msg.get("content", ""),
-                })
         return result
 
     # ── 诊断 ───────────────────────────────────────────────────

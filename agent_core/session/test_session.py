@@ -92,7 +92,10 @@ def test_parent_uuid_chain(tmpdir: str):
     u2 = manager.add_assistant_message("你好！有什么可以帮你的？")
     u3 = manager.add_user_message("帮我写排序函数")
     u4 = manager.add_assistant_message("好的")
-    u5 = manager.add_tool_use("write_file", {"path": "sort.py"}, tool_use_id="tc1")
+    u5 = manager.add_assistant_with_tools(
+        None,
+        tool_calls=[{"id": "tc1", "name": "write_file", "input": {"path": "sort.py"}}],
+    )
 
     manager.flush()
 
@@ -443,22 +446,22 @@ def test_integration_full_workflow(tmpdir: str):
 
     manager.state.set_running("用户输入")
     u1 = manager.add_user_message("帮我写一个 quicksort")
-    a1 = manager.add_assistant_message("好的，我写 quicksort")
-    tc1 = manager.add_tool_use("write_file",
-                                {"path": "quicksort.py", "content": "def quicksort():\n    pass"},
-                                tool_use_id="tc1")
-    tr1 = manager.add_tool_result("tc1", "文件已创建: quicksort.py")
+    a1 = manager.add_assistant_with_tools(
+        "好的，我写 quicksort",
+        tool_calls=[{"id": "tc1", "name": "write_file", "input": {"path": "quicksort.py", "content": "def quicksort():\n    pass"}}],
+    )
+    tr1 = manager.add_tool_results([{"tool_use_id": "tc1", "content": "文件已创建: quicksort.py"}])
     manager.state.set_idle()
     manager.flush()
 
     # Turn 2
     manager.state.set_running("用户输入")
     u2 = manager.add_user_message("改成降序")
-    a2 = manager.add_assistant_message("好的")
-    tc2 = manager.add_tool_use("edit_file",
-                                {"path": "quicksort.py", "old": "pass", "new": "reverse=True"},
-                                tool_use_id="tc2")
-    tr2 = manager.add_tool_result("tc2", "已修改")
+    a2 = manager.add_assistant_with_tools(
+        "好的",
+        tool_calls=[{"id": "tc2", "name": "edit_file", "input": {"path": "quicksort.py", "old": "pass", "new": "reverse=True"}}],
+    )
+    tr2 = manager.add_tool_results([{"tool_use_id": "tc2", "content": "已修改"}])
     manager.state.set_idle()
     manager.flush()
 

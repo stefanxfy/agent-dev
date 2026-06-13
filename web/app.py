@@ -362,9 +362,8 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
             etype = entry.get("type", "")
             msg = entry.get("message")
 
-            # system / tool_use / tool_result / 元数据类型不显示在 UI
-            if etype in ("system", "tool_use", "tool_result",
-                         "custom-title", "ai-title", "agent-name", "mode", "tag",
+            # 元数据类型不显示在 UI
+            if etype in ("custom-title", "ai-title", "agent-name", "mode", "tag",
                          "compact_boundary", "summary"):
                 continue
 
@@ -379,13 +378,29 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
             thinking = entry.get("thinking", "") or ""
             tool_logs = entry.get("tool_logs", []) or []
 
-            if role == "user" and content:
-                st.session_state.messages.append({"role": "user", "content": content})
+            # 提取文本内容（content 可能是 str 或 list）
+            def extract_text(c):
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    # 从 content blocks 中提取 text
+                    texts = []
+                    for block in c:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            texts.append(block.get("text", ""))
+                    return " ".join(texts)
+                return str(c) if c else ""
+
+            text_content = extract_text(content)
+
+            # 只显示有文本内容的 user 和 assistant
+            if role == "user" and text_content:
+                st.session_state.messages.append({"role": "user", "content": text_content})
                 loaded_count += 1
-            elif role == "assistant" and content:
+            elif role == "assistant" and text_content:
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": content,
+                    "content": text_content,
                     "thinking": thinking,
                     "tool_logs": tool_logs,
                 })

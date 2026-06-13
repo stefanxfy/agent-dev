@@ -211,61 +211,25 @@ class SessionStorage:
     def add_message(
         self,
         role: str,
-        content: str,
+        content=None,
         entry_type: Optional[str] = None,
+        message: Optional[dict] = None,
         **extra,
     ) -> str:
         """添加一条消息 Entry（快捷方法）
 
-        存储格式：message = {"role": role, "content": content}
+        两种用法：
+        1. add_message("user", "hello") → message = {"role": "user", "content": "hello"}
+        2. add_message("assistant", message={"role": "assistant", "content": [...]})
+           → 直接存传入的 message dict（零转换）
         """
         if entry_type is None:
             entry_type = role
+        if message is None:
+            message = {"role": role, "content": content}
         return self.append_entry(
             entry_type=entry_type,
-            message={"role": role, "content": content},
-            **extra,
-        )
-
-    def add_tool_use(
-        self,
-        tool_name: str,
-        tool_input: dict,
-        tool_use_id: str,
-        **extra,
-    ) -> str:
-        """添加 tool_use Entry
-
-        存储格式：message = {"type": "tool_use", "id": ..., "name": ..., "input": ...}
-        """
-        return self.append_entry(
-            entry_type="tool_use",
-            message={
-                "type": "tool_use",
-                "id": tool_use_id,
-                "name": tool_name,
-                "input": tool_input,
-            },
-            **extra,
-        )
-
-    def add_tool_result(
-        self,
-        tool_use_id: str,
-        content: str,
-        **extra,
-    ) -> str:
-        """添加 tool_result Entry
-
-        存储格式：message = {"type": "tool_result", "tool_use_id": ..., "content": ...}
-        """
-        return self.append_entry(
-            entry_type="tool_result",
-            message={
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": content,
-            },
+            message=message,
             **extra,
         )
 

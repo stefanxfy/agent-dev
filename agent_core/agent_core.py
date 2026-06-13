@@ -277,18 +277,30 @@ class ReactAgent:
             # 追加所有未保存的消息到 session
             for msg in self.history:
                 role = msg.get("role", "")
-                content = msg.get("content", "")
                 if role == "user":
-                    self._session_manager.add_user_message(content)
-                elif role == "assistant":
-                    # assistant 可能是 str 或 list
+                    content = msg.get("content", "")
                     if isinstance(content, str):
-                        self._session_manager.add_assistant_message(content)
+                        self._session_manager.add_user_message(content)
                     else:
-                        # 多模态 content（包含 tool_use），存储为 JSON
-                        self._session_manager.add_assistant_message(
-                            json.dumps(content, ensure_ascii=False)
+                        # tool_results 包在 user 的 content 数组里
+                        self._session_manager.storage.add_message(
+                            "user", entry_type="user",
+                            message=msg,
+                            parent_uuid=self._session_manager._last_uuid,
                         )
+                elif role == "assistant":
+                    self._session_manager.add_assistant_message(message=msg)
+                elif role == "tool":
+                    # tool 角色转为 Claude Code 风格 user Entry
+                    self._session_manager.storage.add_message(
+                        "user", entry_type="user",
+                        message={"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": msg.get("tool_call_id", ""),
+                            "content": msg.get("content", ""),
+                        }]},
+                        parent_uuid=self._session_manager._last_uuid,
+                    )
             self._session_manager.flush()
         except Exception as e:
             _logger.warning(f"Failed to save to session: {e}")
@@ -536,23 +548,21 @@ class ReactAgent:
                         self._pending_tool_results.append((tc.tool_use_id, tool_output))
             if self._session_manager:
                 try:
-                    # 1. assistant 只保存文本部分（不含 tool_use）
-                    if full_text:
-                        self._session_manager.add_assistant_message(full_text)
-                    # 2. 每个 tool_use 写入独立 Entry
+                    # Claude Code 风格：assistant+tool_use 一条 Entry，tool_results 一条 Entry
+                    # 1. assistant 消息（包含 text + tool_use blocks）
+                    tc_list = [{"id": tc.tool_use_id, "name": tc.tool_name, "input": tc.tool_input} for tc in tool_calls]
+                    self._session_manager.add_assistant_with_tools(
+                        text=full_text,
+                        tool_calls=tc_list,
+                    )
+                    # 2. tool_results（一条 user Entry 包含所有 tool_result）
+                    results = []
                     for tc in tool_calls:
-                        self._session_manager.add_tool_use(
-                            name=tc.tool_name,
-                            tool_input=tc.tool_input,
-                            tool_use_id=tc.tool_use_id,
-                        )
-                    # 3. tool_result（按 tool_use 顺序写入，保证链路正确）
-                    for tc in tool_calls:
-                        # 从本轮收集的 _pending_tool_results 中查找
                         for tid, output in self._pending_tool_results:
                             if tid == tc.tool_use_id:
-                                self._session_manager.add_tool_result(tid, output)
+                                results.append({"tool_use_id": tc.tool_use_id, "content": output})
                                 break
+                    self._session_manager.add_tool_results(results)
                     # 清空本轮结果
                     self._pending_tool_results = []
                 except Exception as e:
