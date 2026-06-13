@@ -242,6 +242,9 @@ with st.sidebar:
                         label = f"📄 {title} ({msg_count}条)"
                         help_text = f"{sid}\n最近: {last_prompt}" if last_prompt else sid
                         if st.button(label, key=f"load_{sid}", help=help_text):
+                            # 点击当前会话：不走切换流程
+                            if sid == st.session_state.get("chat_session_id"):
+                                continue
                             # 关闭旧 Agent 的 session（写入 last-prompt）
                             if st.session_state.agent is not None:
                                 try:
