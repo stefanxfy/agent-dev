@@ -73,6 +73,7 @@ if "system_prompt" not in st.session_state:
 if "chat_session_id" not in st.session_state:
     # 优先从 URL query param 获取
     url_sid = st.query_params.get("session", None)
+    logging.warning(f"[DEBUG-INIT] url_sid={url_sid}, query_params={dict(st.query_params)}")
     if url_sid:
         st.session_state.chat_session_id = url_sid
     else:
@@ -213,6 +214,7 @@ with st.sidebar:
     from agent_core.session.manager import SessionManager
     try:
         sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
+        logging.warning(f"[DEBUG-SIDEBAR] DATA_DIR={DATA_DIR}, sessions={len(sessions)}")
         if sessions:
             st.write(f"**会话列表** ({len(sessions)}个)")
             # 使用容器实现滚动
@@ -332,6 +334,7 @@ if (st.session_state.agent is None or
         st.session_state.get("last_session_id") != st.session_state.chat_session_id):
     # 如果没有 session_id，尝试加载最近的会话
     sid = st.session_state.chat_session_id
+    logging.warning(f"[DEBUG-AGENT-INIT] sid={sid}, agent is None={st.session_state.agent is None}")
     if not sid:
         try:
             sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
@@ -348,6 +351,7 @@ if (st.session_state.agent is None or
 agent = st.session_state.agent
 
 # 从 session 加载聊天历史（仅首次加载）
+logging.warning(f"[DEBUG-LOAD] messages={len(st.session_state.messages)}, chat_session_id={st.session_state.chat_session_id}")
 if st.session_state.messages == [] and st.session_state.chat_session_id:
     try:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
@@ -412,6 +416,12 @@ def run_agent(user_input: str):
     for msg_type, content in agent.run(user_input):
         yield (msg_type, content)
 
+
+# ── 调试信息（临时）─────────────────────────────────────────────
+_debug_sid = st.session_state.chat_session_id
+_debug_msgs = len(st.session_state.messages)
+_debug_agent = st.session_state.agent is not None
+st.caption(f"🐛 DEBUG: session={_debug_sid}, messages={_debug_msgs}, agent={_debug_agent}, query_params={dict(st.query_params)}")
 
 # ── 主聊天界面 ────────────────────────────────────────────────
 

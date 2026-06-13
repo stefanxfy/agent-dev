@@ -478,7 +478,7 @@ class ReactAgent:
                 # Day 4: 保存 tool_result 到 session
                 if self._session_manager:
                     try:
-                        self._session_manager.add_tool_result(tool_output)
+                        self._session_manager.add_tool_result(tc.tool_use_id, tool_output)
                     except Exception:
                         pass
             else:
@@ -537,7 +537,7 @@ class ReactAgent:
                         # Day 4: 保存 tool_result 到 session
                         if self._session_manager:
                             try:
-                                self._session_manager.add_tool_result(tool_output)
+                                self._session_manager.add_tool_result(tc.tool_use_id, tool_output)
                             except Exception:
                                 pass
 
