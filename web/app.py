@@ -222,6 +222,7 @@ with st.sidebar:
                 for sess in sessions:
                     sid = sess["session_id"]
                     title = sess.get("title") or "未命名"
+                    last_prompt = sess.get("last_prompt") or ""
                     # 实时读取消息数
                     try:
                         m_mgr = SessionManager(session_id=sid, data_dir=DATA_DIR)
@@ -233,7 +234,8 @@ with st.sidebar:
                     cols = st.columns([4, 1, 1])
                     with cols[0]:
                         label = f"📄 {title} ({msg_count}条)"
-                        if st.button(label, key=f"load_{sid}", help=sid):
+                        help_text = f"{sid}\n最近: {last_prompt}" if last_prompt else sid
+                        if st.button(label, key=f"load_{sid}", help=help_text):
                             st.session_state.chat_session_id = sid
                             st.session_state.agent = None
                             st.session_state.messages = []
