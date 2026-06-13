@@ -1,3 +1,29 @@
 {"uuid": "9256bbd5-6b0d-4fd4-890e-4b62c1e2f674", "parentUuid": null, "sessionId": "5cdb12a6", "type": "user", "timestamp": "2026-06-13T23:55:22.889976", "message": {"role": "user", "content": "你是谁"}}
 {"uuid": "24c93a80-d308-4b52-95c1-f7ec2db7f12f", "parentUuid": null, "sessionId": "5cdb12a6", "type": "ai-title", "aiTitle": "我是谁", "genSeq": 1, "timestamp": "2026-06-13T23:55:23.635135"}
 {"uuid": "fc4825c4-02ab-41bd-85d1-bc5dc8ff20de", "parentUuid": "9256bbd5-6b0d-4fd4-890e-4b62c1e2f674", "sessionId": "5cdb12a6", "type": "assistant", "timestamp": "2026-06-13T23:55:27.879765", "message": {"role": "assistant", "content": "你好！我是一个AI智能助手，可以帮助你回答问题、查找信息、进行计算等。你可以随时向我提问，我会尽力为你提供帮助！😊\n\n有什么我可以帮你的吗？"}, "thinking": "", "tool_logs": []}
+{"uuid": "c01d356e-7402-4bad-8cb8-6096c5b4b65f", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:38.693968"}
+{"uuid": "4bd9a3dd-766c-4b71-8681-0a455979717c", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:38.717046"}
+{"uuid": "4cf048dd-4983-476e-a9be-4e7852aa4591", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:38.717046"}
+{"uuid": "752fc35a-75e2-461c-953a-7c11d253a707", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:38.717046"}
+{"uuid": "5b950296-3f00-4e0f-9ecf-94dfda69f170", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:41.049347"}
+{"uuid": "5047b665-28c6-445c-9a15-5c139186ed7f", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:41.049347"}
+{"uuid": "17b97b8e-5910-4be9-814d-42d09e2509ce", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:41.049347"}
+{"uuid": "77442875-8ee6-44b3-8476-79563e9c313c", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:41.080196"}
+{"uuid": "83d998ca-7964-428b-a8e4-43f5907f9b4b", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:41.080196"}
+{"uuid": "cd56758c-38a2-4401-8b7b-6f26dacdf342", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:41.080196"}
+{"uuid": "3d4a5c86-2293-4b14-b07b-d5e24a906e84", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:43.403437"}
+{"uuid": "39ebfd18-b79c-4c53-b4eb-dc6af2ef4c36", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:43.403437"}
+{"uuid": "22dca685-080e-41b0-bd72-779ce7838d31", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:43.403437"}
+{"uuid": "e1c89be1-8214-4f04-93b0-5ef703dfe252", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:45.104805"}
+{"uuid": "ad509e8e-5601-487c-a66a-49d805375c5b", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:45.104805"}
+{"uuid": "a0dfe76c-5ea5-4114-be97-b1e3f9518a6d", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:45.104805"}
+{"uuid": "d0602c87-5e5d-435c-97b9-992f07e69ce0", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:45.107337"}
+{"uuid": "2f757a50-bbbe-46ec-91f8-6ec080718f81", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:45.107337"}
+{"uuid": "1e9209e9-b76a-4c59-a750-3c5c8b49152d", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:45.107337"}
+{"uuid": "24365b09-5a70-4422-8e88-46db2c54a909", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:45.108165"}
+{"uuid": "fd228f7f-7a1b-422b-85aa-0ee6e5e5a725", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:45.128014"}
+{"uuid": "e5f4c5ec-b4b3-4420-a130-81121e643f8e", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:45.128014"}
+{"uuid": "05598852-3c0b-4972-8843-9eea62135a85", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:45.128014"}
+{"uuid": "68a9dba2-2274-48fa-9063-63777f1a0004", "parentUuid": null, "sessionId": "5cdb12a6", "type": "custom-title", "customTitle": "我是谁", "timestamp": "2026-06-14T00:01:48.339811"}
+{"uuid": "9f04005a-23e8-4118-b954-e7388eb1f43d", "parentUuid": null, "sessionId": "5cdb12a6", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-14T00:01:48.339811"}
+{"uuid": "d180c651-4659-4986-89f7-17b513b242d1", "parentUuid": null, "sessionId": "5cdb12a6", "type": "mode", "mode": "write", "timestamp": "2026-06-14T00:01:48.339811"}

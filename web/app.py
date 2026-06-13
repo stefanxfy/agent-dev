@@ -253,7 +253,6 @@ with st.sidebar:
                                     pass
                             st.session_state.chat_session_id = sid
                             st.session_state.agent = None
-                            st.session_state.messages = []
                             st.query_params["session"] = sid
                             st.rerun()
                     with cols[1]:
@@ -374,9 +373,13 @@ if (st.session_state.agent is None or
 
 agent = st.session_state.agent
 
-# 从 session 加载聊天历史（仅首次加载）
-logging.warning(f"[DEBUG-LOAD] messages={len(st.session_state.messages)}, chat_session_id={st.session_state.chat_session_id}")
-if st.session_state.messages == [] and st.session_state.chat_session_id:
+# 从 session 加载聊天历史（session_id 变化时重新加载）
+_loaded_sid = st.session_state.get("_loaded_session_id")
+_current_sid = st.session_state.chat_session_id
+logging.warning(f"[DEBUG-LOAD] loaded_sid={_loaded_sid}, current_sid={_current_sid}, messages={len(st.session_state.messages)}")
+if _loaded_sid != _current_sid and _current_sid:
+    # session 切换了，先清空旧消息
+    st.session_state.messages = []
     try:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
         history = mgr.get_messages()
@@ -430,6 +433,7 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                 })
                 loaded_count += 1
         logging.warning(f"[DEBUG-LOAD] loaded {loaded_count} messages to session_state")
+        st.session_state._loaded_session_id = _current_sid
     except Exception as e:
         logging.warning(f"加载会话历史失败: {e}")
 
