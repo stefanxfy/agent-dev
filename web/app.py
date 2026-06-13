@@ -204,6 +204,12 @@ with st.sidebar:
             mgr.flush()
         except Exception:
             pass
+        # 关闭旧 Agent 的 session（写入 last-prompt）
+        if st.session_state.agent is not None:
+            try:
+                st.session_state.agent.close()
+            except Exception:
+                pass
         st.session_state.chat_session_id = new_id
         st.session_state.agent = None
         st.session_state.messages = []
@@ -236,6 +242,12 @@ with st.sidebar:
                         label = f"📄 {title} ({msg_count}条)"
                         help_text = f"{sid}\n最近: {last_prompt}" if last_prompt else sid
                         if st.button(label, key=f"load_{sid}", help=help_text):
+                            # 关闭旧 Agent 的 session（写入 last-prompt）
+                            if st.session_state.agent is not None:
+                                try:
+                                    st.session_state.agent.close()
+                                except Exception:
+                                    pass
                             st.session_state.chat_session_id = sid
                             st.session_state.agent = None
                             st.session_state.messages = []

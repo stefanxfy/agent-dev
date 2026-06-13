@@ -1,0 +1,3 @@
+{"uuid": "ee669b5f-d1bf-48f6-adcf-e0d542ac2d63", "parentUuid": null, "sessionId": "a3693946", "type": "user", "timestamp": "2026-06-13T23:09:40.040621", "message": {"role": "user", "content": "你好"}}
+{"uuid": "afe4082b-f3d7-4501-9466-b56399e394e1", "parentUuid": null, "sessionId": "a3693946", "type": "ai-title", "aiTitle": "用户问候", "genSeq": 1, "timestamp": "2026-06-13T23:09:41.580968"}
+{"uuid": "262ff581-2140-47e5-8aee-13ecf75cde7c", "parentUuid": "ee669b5f-d1bf-48f6-adcf-e0d542ac2d63", "sessionId": "a3693946", "type": "assistant", "timestamp": "2026-06-13T23:09:47.979096", "message": {"role": "assistant", "content": "你好！😊 有什么我可以帮你的吗？无论是数学计算、信息搜索，还是其他问题，随时都可以问我！"}, "thinking": "", "tool_logs": []}
