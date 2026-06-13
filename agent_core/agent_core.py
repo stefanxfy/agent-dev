@@ -183,7 +183,7 @@ class ReactAgent:
                 data_dir=session_data_dir,
             )
             # 从 session 加载历史（Resume 语义：只加载断链后的消息）
-            self.history = self._session_manager.get_messages()
+            self.history = self._session_manager.get_messages_for_llm()
             _logger.info(f"Session loaded: {session_id}, {len(self.history)} messages")
 
         # ── 流式过程中记录 thinking/tool_logs，用于 session 持久化 ───

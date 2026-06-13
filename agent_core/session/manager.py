@@ -20,6 +20,7 @@ SessionManager
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -411,13 +412,38 @@ class SessionManager:
     ) -> list[dict]:
         """
         获取适合传给 LLM 的消息格式（直接取 message 字段，零转换）
+        包含 user/assistant/system + tool_use/tool_result 完整链。
         """
         messages = self.get_messages(stop_at_boundary=stop_at_boundary)
         result = []
         for m in messages:
             msg = m.get("message")
-            if msg and msg.get("role") in ("user", "assistant", "system"):
+            if not msg:
+                continue
+            # 标准 role 消息
+            if msg.get("role") in ("user", "assistant", "system"):
                 result.append(msg)
+            # tool_use: 转为 LLM API 格式（包含在 assistant message 里）
+            elif msg.get("type") == "tool_use":
+                result.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": msg["id"],
+                        "type": "function",
+                        "function": {
+                            "name": msg["name"],
+                            "arguments": json.dumps(msg.get("input", {}), ensure_ascii=False),
+                        },
+                    }],
+                })
+            # tool_result: 转为 LLM API 格式（role=tool）
+            elif msg.get("type") == "tool_result":
+                result.append({
+                    "role": "tool",
+                    "tool_call_id": msg["tool_use_id"],
+                    "content": msg.get("content", ""),
+                })
         return result
 
     # ── 诊断 ───────────────────────────────────────────────────
