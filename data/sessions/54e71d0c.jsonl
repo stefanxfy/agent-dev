@@ -1,0 +1,6 @@
+{"uuid": "2e1114c7-8a33-4e82-95b5-8760d8de66d2", "parentUuid": null, "sessionId": "54e71d0c", "type": "user", "timestamp": "2026-06-13T23:15:11.232870", "message": {"role": "user", "content": "你好"}}
+{"uuid": "89843a48-47fe-409e-835f-c577f0b7cf2a", "parentUuid": null, "sessionId": "54e71d0c", "type": "ai-title", "aiTitle": "问候与交流", "genSeq": 1, "timestamp": "2026-06-13T23:15:14.507965"}
+{"uuid": "5f7db277-b2d8-4ea4-acb9-8a72ea03158f", "parentUuid": "2e1114c7-8a33-4e82-95b5-8760d8de66d2", "sessionId": "54e71d0c", "type": "assistant", "timestamp": "2026-06-13T23:15:18.144282", "message": {"role": "assistant", "content": "你好！👋 很高兴见到你！我是你的AI助手，可以帮你：\n\n- 🔍 **搜索信息** — 查找网络上的最新资讯\n- 🧮 **数学计算** — 帮你进行数学运算\n\n请问有什么可以帮到你的吗？😊"}, "thinking": "", "tool_logs": []}
+{"uuid": "0662e3f4-7448-4eab-acbf-c50f0f811238", "parentUuid": null, "sessionId": "54e71d0c", "type": "agent-name", "agentName": "default", "timestamp": "2026-06-13T23:15:26.859045"}
+{"uuid": "89c348c6-f1e0-4826-bb7b-444d649fd8b4", "parentUuid": null, "sessionId": "54e71d0c", "type": "mode", "mode": "write", "timestamp": "2026-06-13T23:15:26.859045"}
+{"uuid": "6ca15fdd-8784-47f8-b48a-c71fe388a223", "parentUuid": null, "sessionId": "54e71d0c", "type": "last-prompt", "lastPrompt": "你好", "timestamp": "2026-06-13T23:15:26.887134"}

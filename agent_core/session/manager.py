@@ -500,9 +500,8 @@ n        agent-dev 对应：
             self._reappend_metadata()
             return
 
-        # ai-title 场景: 如果有 last_prompt 也 re-append
-        if last_prompt_entry:
-            self._reappend_metadata()
+        # ai-title 场景不需要 re-append last_prompt
+        # last_prompt 只在 close() 时写一次
 
         if ai_title:
             self._title_cache = ai_title.get("aiTitle") or ai_title.get("title")
@@ -802,25 +801,16 @@ n        agent-dev 对应：
 
         学 Claude Code reAppendSessionMetadata:
         只 re-append 需要保活在 tail 窗口的字段:
-        1. last-prompt (先写，最不重要)
-        2. custom-title (后写，更重要)
-        3. tag
-        4. agent-name
-        5. mode
-        写入顺序: 越重要的越靠尾部。
+        1. custom-title
+        2. tag
+        3. agent-name
+        4. mode
+
+        注意：last-prompt 不在这里 re-append！
+        last-prompt 只在 close() 时写一次，避免每次创建 SessionManager 都追加。
         """
         timestamp = datetime.now().isoformat()
         reappend_order = []  # 按写入顺序收集
-
-        if self.metadata.last_prompt:
-            reappend_order.append({
-                "uuid": str(uuid.uuid4()),
-                "parentUuid": None,
-                "sessionId": self.session_id,
-                "type": "last-prompt",
-                "lastPrompt": self.metadata.last_prompt,
-                "timestamp": timestamp,
-            })
 
         if self.metadata.title:
             reappend_order.append({
