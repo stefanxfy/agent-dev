@@ -232,6 +232,12 @@ with st.sidebar:
         sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
         logging.warning(f"[DEBUG-SIDEBAR] DATA_DIR={DATA_DIR}, sessions={len(sessions)}")
         if sessions:
+            # 当前会话排第一，其余按 mtime 倒序
+            current_sid = st.session_state.get("chat_session_id")
+            sessions.sort(key=lambda s: (
+                0 if s["session_id"] == current_sid else 1,
+                -s["updated_at"].timestamp() if hasattr(s["updated_at"], "timestamp") else 0
+            ))
             st.write(f"**会话列表** ({len(sessions)}个)")
             # 使用容器实现滚动
             with st.container(height=300):
