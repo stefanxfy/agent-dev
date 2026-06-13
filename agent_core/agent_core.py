@@ -189,6 +189,7 @@ class ReactAgent:
         # ── 流式过程中记录 thinking/tool_logs，用于 session 持久化 ───
         self._pending_thinking: str = ""
         self._pending_tool_logs: list = []
+        self._pending_tool_results: list = []  # [(tool_use_id, output), ...]
 
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
@@ -316,6 +317,7 @@ class ReactAgent:
         # 重置 pending 状态（每次 run 独立）
         self._pending_thinking = ""
         self._pending_tool_logs = []
+        self._pending_tool_results = []
 
         # Day 3：检查 Token 预算，必要时截断 history
         self._trim_history()
@@ -477,12 +479,7 @@ class ReactAgent:
                         return
 
                 self.history.append(_make_tool_result_block(tc.tool_use_id, tool_output))
-                # Day 4: 保存 tool_result 到 session
-                if self._session_manager:
-                    try:
-                        self._session_manager.add_tool_result(tc.tool_use_id, tool_output)
-                    except Exception:
-                        pass
+                self._pending_tool_results.append((tc.tool_use_id, tool_output))
             else:
                 # Day 3：多工具并行执行
                 tool_names = [tc.tool_name for tc in tool_calls]
@@ -536,14 +533,7 @@ class ReactAgent:
                             self._pending_tool_logs.append({"type": "result", "name": tc.tool_name, "output": tool_output, "success": False})
 
                         self.history.append(_make_tool_result_block(tc.tool_use_id, tool_output))
-                        # Day 4: 保存 tool_result 到 session
-                        if self._session_manager:
-                            try:
-                                self._session_manager.add_tool_result(tc.tool_use_id, tool_output)
-                            except Exception:
-                                pass
-
-            # Day 4: 保存中间轮次（assistant 文本 + tool_use 独立 Entry + tool_result）
+                        self._pending_tool_results.append((tc.tool_use_id, tool_output))
             if self._session_manager:
                 try:
                     # 1. assistant 只保存文本部分（不含 tool_use）
@@ -556,6 +546,15 @@ class ReactAgent:
                             tool_input=tc.tool_input,
                             tool_use_id=tc.tool_use_id,
                         )
+                    # 3. tool_result（按 tool_use 顺序写入，保证链路正确）
+                    for tc in tool_calls:
+                        # 从本轮收集的 _pending_tool_results 中查找
+                        for tid, output in self._pending_tool_results:
+                            if tid == tc.tool_use_id:
+                                self._session_manager.add_tool_result(tid, output)
+                                break
+                    # 清空本轮结果
+                    self._pending_tool_results = []
                 except Exception as e:
                     _logger.warning(f"Failed to save intermediate turn to session: {e}")
             # 继续下一轮循环（让 LLM 看到 tool_result）
