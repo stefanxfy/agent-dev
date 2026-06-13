@@ -249,12 +249,25 @@ class SessionManager:
     # ── 消息写入 ────────────────────────────────────────────────
 
     def add_user_message(self, content: str, **extra) -> str:
-        """添加用户消息（同时触发标题生成逻辑）"""
+        """添加用户消息（同时触发标题生成逻辑 + 更新 last-prompt）"""
         self.state.set_running("user input")
         self.metadata.update_last_prompt(content)
         uuid_ = self.storage.add_message("user", content, parent_uuid=self._last_uuid)
         self._last_uuid = uuid_
         self._message_cache.append({"role": "user", "content": content, "uuid": uuid_})
+
+        # 追加 last-prompt Entry 到磁盘（每轮覆盖式追加，靠 reverse scan 取最新）
+        # 学 Claude Code: 进程退出时 re-append，但 agent-dev 没有退出钩子，
+        # 所以在每条用户消息时直接写入更简单可靠
+        self.storage.append_raw_entry({
+            "uuid": str(uuid.uuid4()),
+            "parentUuid": None,
+            "sessionId": self.session_id,
+            "type": "last-prompt",
+            "lastPrompt": self.metadata.last_prompt,
+            "timestamp": datetime.now().isoformat(),
+        })
+        self.storage.flush()
 
         # 触发标题生成（fire-and-forget，不阻塞主流程）
         self._on_user_message(content)
@@ -397,6 +410,7 @@ class SessionManager:
         custom_title = None
         ai_title = None
         ai_title_entries = []
+        last_prompt_entry = None
         user_msg_count = 0
 
         for entry in reversed(entries):
@@ -407,6 +421,8 @@ class SessionManager:
                 ai_title_entries.append(entry)
                 if ai_title is None:
                     ai_title = entry
+            elif etype == "last-prompt" and last_prompt_entry is None:
+                last_prompt_entry = entry
             elif etype == "user":
                 msg = entry.get("message", {})
                 content = msg.get("content", "")
@@ -424,6 +440,17 @@ class SessionManager:
             except Exception:
                 pass
 
+        # tail 没找到 last-prompt，也回退到 head
+        if not last_prompt_entry:
+            try:
+                head_entries = self.storage.read_head(kb=64)
+                for entry in reversed(head_entries):
+                    if entry.get("type") == "last-prompt":
+                        last_prompt_entry = entry
+                        break
+            except Exception:
+                pass
+
         # 恢复计数器
         self._user_msg_count = user_msg_count
 
@@ -435,23 +462,25 @@ class SessionManager:
                 max_gen_seq = gs
         self._gen_seq = max_gen_seq
 
+        # 恢复 last_prompt 到内存
+        if last_prompt_entry:
+            self.metadata.last_prompt = last_prompt_entry.get("lastPrompt", "")
+
         # 决策：custom-title > ai-title > NEED_TITLE
         if custom_title:
             self._title_state = TitleState.USER_SET
             self._title_cache = custom_title.get("customTitle") or custom_title.get("title")
-            # re-append custom-title 到文件尾部（学 Claude Code reAppendSessionMetadata）
-            # 保证 tail 窗口始终能读到，即使会话很长标题已被挤出窗口
-            reappend = {
-                "uuid": str(uuid.uuid4()),
-                "parentUuid": None,
-                "sessionId": self.session_id,
-                "type": "custom-title",
-                "customTitle": self._title_cache,
-                "timestamp": datetime.now().isoformat(),
-            }
-            self.storage.append_raw_entry(reappend)
-            self.storage.flush()
+            # 同步到 metadata（_reappend_metadata 会读 metadata.title 写 custom-title Entry）
+            self.metadata.title = self._title_cache
+            # re-append custom-title + last-prompt 到文件尾部
+            # 学 Claude Code reAppendSessionMetadata: 保证 tail 窗口能读到
+            # 写入顺序: last-prompt 先写, custom-title 后写 (更重要的靠尾部)
+            self._reappend_metadata()
             return
+
+        # ai-title 场景: 如果有 last_prompt 也 re-append
+        if last_prompt_entry:
+            self._reappend_metadata()
 
         if ai_title:
             self._title_cache = ai_title.get("aiTitle") or ai_title.get("title")
@@ -747,9 +776,69 @@ class SessionManager:
         self._reappend_metadata()
 
     def _reappend_metadata(self):
-        """重新追加元数据到 JSONL 尾部（保证最新）"""
-        entries = self.metadata.to_entries()
-        for entry in entries:
+        """重新追加元数据到 JSONL 尾部（保证最新）
+
+        学 Claude Code reAppendSessionMetadata:
+        只 re-append 需要保活在 tail 窗口的字段:
+        1. last-prompt (先写，最不重要)
+        2. custom-title (后写，更重要)
+        3. tag
+        4. agent-name
+        5. mode
+        写入顺序: 越重要的越靠尾部。
+        """
+        timestamp = datetime.now().isoformat()
+        reappend_order = []  # 按写入顺序收集
+
+        if self.metadata.last_prompt:
+            reappend_order.append({
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": None,
+                "sessionId": self.session_id,
+                "type": "last-prompt",
+                "lastPrompt": self.metadata.last_prompt,
+                "timestamp": timestamp,
+            })
+
+        if self.metadata.title:
+            reappend_order.append({
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": None,
+                "sessionId": self.session_id,
+                "type": "custom-title",
+                "customTitle": self.metadata.title,
+                "timestamp": timestamp,
+            })
+
+        for tag in self.metadata.tags:
+            reappend_order.append({
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": None,
+                "sessionId": self.session_id,
+                "type": "tag",
+                "tag": tag,
+                "timestamp": timestamp,
+            })
+
+        reappend_order.append({
+            "uuid": str(uuid.uuid4()),
+            "parentUuid": None,
+            "sessionId": self.session_id,
+            "type": "agent-name",
+            "agentName": self.metadata.agent_name,
+            "timestamp": timestamp,
+        })
+
+        reappend_order.append({
+            "uuid": str(uuid.uuid4()),
+            "parentUuid": None,
+            "sessionId": self.session_id,
+            "type": "mode",
+            "mode": self.metadata.mode,
+            "timestamp": timestamp,
+        })
+
+        for entry in reappend_order:
             self.storage.append_raw_entry(entry)
         self.storage.flush()
 

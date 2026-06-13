@@ -911,3 +911,52 @@ def test_custom_title_reappend_on_restore():
         tail_titles = [e for e in tail if e.get("type") == "custom-title"]
         assert len(tail_titles) >= 1, "re-append 后 tail 应包含 custom-title"
         assert tail_titles[-1]["customTitle"] == "用户自定义标题"
+
+
+def test_last_prompt_truncate():
+    """last_prompt 超过 200 字符时截断 + 换行转空格"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = SessionManager("trunc-test", data_dir=tmpdir)
+        mgr.create()
+
+        long_prompt = "第一行\n第二行\n" + "测试" * 200
+        mgr.add_user_message(long_prompt)
+
+        # 验证：换行被替换为空格，截断到 200 字符 + 省略号
+        assert "\n" not in mgr.metadata.last_prompt
+        assert len(mgr.metadata.last_prompt) <= 201  # 200 + …
+        assert mgr.metadata.last_prompt.endswith("…")
+
+
+def test_last_prompt_restore_on_resume():
+    """重启后从 JSONL 恢复 last_prompt 并 re-append 到尾部"""
+    import tempfile, json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. 创建会话并发消息
+        mgr1 = SessionManager("lp-restore", data_dir=tmpdir)
+        mgr1.create()
+        mgr1.add_user_message("帮我修复登录Bug")
+
+        # 2. 用户改名触发 re-append（此时 last_prompt 也被写入）
+        mgr1.rename_session("登录Bug修复")
+
+        # 3. 重启
+        mgr2 = SessionManager("lp-restore", data_dir=tmpdir)
+
+        # 4. 验证 last_prompt 恢复
+        assert mgr2.metadata.last_prompt == "帮我修复登录Bug"
+
+        # 5. 验证 tail 窗口能读到 last-prompt
+        tail = mgr2.storage.read_tail(kb=64)
+        lp_entries = [e for e in tail if e.get("type") == "last-prompt"]
+        assert len(lp_entries) >= 1
+        assert lp_entries[-1]["lastPrompt"] == "帮我修复登录Bug"
+
+        # 6. 验证写入顺序：last-prompt 在 custom-title 之前（更重要的靠尾部）
+        tail_types = [e.get("type") for e in tail]
+        if "last-prompt" in tail_types and "custom-title" in tail_types:
+            # 找最后一次出现的位置
+            last_lp_idx = max(i for i, t in enumerate(tail_types) if t == "last-prompt")
+            last_ct_idx = max(i for i, t in enumerate(tail_types) if t == "custom-title")
+            assert last_lp_idx < last_ct_idx, "last-prompt 应在 custom-title 之前写入"

@@ -101,8 +101,12 @@ class SessionMetadata:
             self._updated_at = time.time()
 
     def update_last_prompt(self, prompt: str):
-        """更新最后一条用户消息"""
-        self.last_prompt = prompt[:1000]  # 截断到 1000 字符
+        """更新最后一条用户消息（每轮覆盖）
+
+        学 Claude Code: 换行替换为空格, 截断到 200 字符, 超长加省略号
+        """
+        flat = prompt.replace("\n", " ").strip()
+        self.last_prompt = flat[:200] + "…" if len(flat) > 200 else flat
         self._updated_at = time.time()
 
     def update_worktree_state(self, state: dict):
