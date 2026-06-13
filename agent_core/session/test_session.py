@@ -802,3 +802,112 @@ def main():
 
     print(f"\n总计: {passed} passed, {failed} failed")
     return 0 if failed == 0 else 1
+
+
+def test_read_tail_basic():
+    """read_tail 返回尾部 Entry（时间正序）"""
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = SessionStorage("test-tail", data_dir=tmpdir)
+
+        # 写 5 条消息
+        for i in range(5):
+            storage.add_message("user", f"消息 {i}")
+        storage.flush()
+
+        entries = storage.read_tail(kb=64)
+        assert len(entries) == 5
+        assert entries[0]["message"]["content"] == "消息 0"
+        assert entries[-1]["message"]["content"] == "消息 4"
+
+
+def test_read_head_basic():
+    """read_head 返回头部 Entry（时间正序）"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = SessionStorage("test-head", data_dir=tmpdir)
+
+        for i in range(5):
+            storage.add_message("user", f"head {i}")
+        storage.flush()
+
+        entries = storage.read_head(kb=64)
+        assert len(entries) == 5
+        assert entries[0]["message"]["content"] == "head 0"
+
+
+def test_custom_title_head_fallback():
+    """长会话 tail 读不到 custom-title 时，head 回退读取"""
+    import tempfile, json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage = SessionStorage("test-fallback", data_dir=tmpdir)
+
+        # 1. 开头写 custom-title
+        storage.append_raw_entry({
+            "uuid": "title-uuid",
+            "parentUuid": None,
+            "sessionId": "test-fallback",
+            "type": "custom-title",
+            "customTitle": "我的测试会话",
+            "timestamp": "2026-06-13T10:00:00",
+        })
+
+        # 2. 写大量消息把 custom-title 挤出 tail 窗口
+        for i in range(500):
+            storage.add_message("user", f"这是一条比较长的测试消息编号 {i}，用于撑大文件体积 " * 5)
+        storage.flush()
+
+        # 确认文件确实 > 64KB
+        import os
+        file_size = os.path.getsize(storage.jsonl_path)
+        assert file_size > 65536, f"文件应 > 64KB, 实际 {file_size}"
+
+        # tail 读不到 custom-title
+        tail_entries = storage.read_tail(kb=64)
+        tail_types = {e.get("type") for e in tail_entries}
+        assert "custom-title" not in tail_types, "tail 不应该包含 custom-title"
+
+        # head 能读到
+        head_entries = storage.read_head(kb=64)
+        head_titles = [e for e in head_entries if e.get("type") == "custom-title"]
+        assert len(head_titles) == 1
+        assert head_titles[0]["customTitle"] == "我的测试会话"
+
+
+def test_custom_title_reappend_on_restore():
+    """恢复时 custom-title 被 re-append 到文件尾部"""
+    import tempfile, json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. 创建会话，用户改名
+        mgr1 = SessionManager("reappend-test", data_dir=tmpdir)
+        mgr1.create()
+        mgr1.add_user_message("hello")
+        mgr1.rename_session("用户自定义标题")
+
+        # 2. 记录文件行数
+        with open(mgr1.jsonl_path) as f:
+            lines_before = sum(1 for _ in f)
+
+        # 3. 写大量消息撑大文件
+        for i in range(500):
+            mgr1.add_user_message(f"填充消息 {i} " * 10)
+            mgr1.add_assistant_message(f"回复 {i} " * 10)
+        mgr1.storage.flush()
+
+        # 确认文件 > 64KB
+        import os
+        file_size = os.path.getsize(mgr1.jsonl_path)
+        assert file_size > 65536
+
+        # 4. 新建 SessionManager 模拟重启
+        mgr2 = SessionManager("reappend-test", data_dir=tmpdir)
+
+        # 5. 验证标题正确恢复
+        assert mgr2.get_title() == "用户自定义标题"
+        assert mgr2._title_state == TitleState.USER_SET
+
+        # 6. 验证 re-append 后 tail 窗口能读到 custom-title
+        tail = mgr2.storage.read_tail(kb=64)
+        tail_titles = [e for e in tail if e.get("type") == "custom-title"]
+        assert len(tail_titles) >= 1, "re-append 后 tail 应包含 custom-title"
+        assert tail_titles[-1]["customTitle"] == "用户自定义标题"

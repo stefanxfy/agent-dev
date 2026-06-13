@@ -371,54 +371,86 @@ class SessionManager:
     # ── 标题生成系统 ─────────────────────────────────────────────
 
     def _restore_title_state(self):
-        """从 JSONL tail 扫描，重建标题状态和用户消息计数（重启恢复）
+        """从 JSONL 恢复标题状态和用户消息计数（重启恢复）
+
+        读取策略（学 Claude Code）：
+        1. 先读 tail 64KB（快速，覆盖绝大多数场景）
+        2. tail 没找到 custom-title 且文件 > 64KB → 回退读 head 64KB
+        3. 仍找不到 → NEED_TITLE
+
+        恢复后，如果有 custom-title，重新追加到文件尾部（re-append）。
+        这保证 tail 窗口始终能读到最新标题（学 Claude Code 的 reAppendSessionMetadata）。
+        ai-title 不 re-append——它是临时的，允许被挤出 tail 窗口。
 
         规则（优先级从高到低）：
         - 有 custom-title → USER_SET（用户改过，永久锁定）
         - 有 ai-title 且 genSeq>=2（已重新生成过）→ FINALIZED
         - 有 ai-title 且 genSeq==1（仅首轮生成）→ AI_SET（允许第3条消息重新生成）
         - 都没有 → NEED_TITLE（需要生成）
-
-        同时恢复 _user_msg_count：统计纯用户消息（非 tool_result）的数量，
-        确保第3条消息的重新生成不会因重启而丢失。
         """
         try:
             entries = self.storage.read_tail(kb=64)
         except Exception:
             return
 
+        # tail 扫描
         custom_title = None
         ai_title = None
+        ai_title_entries = []
         user_msg_count = 0
+
         for entry in reversed(entries):
             etype = entry.get("type")
             if etype == "custom-title" and custom_title is None:
                 custom_title = entry
-            elif etype == "ai-title" and ai_title is None:
-                ai_title = entry
+            elif etype == "ai-title":
+                ai_title_entries.append(entry)
+                if ai_title is None:
+                    ai_title = entry
             elif etype == "user":
-                # 统计纯用户消息（content 是字符串，不是 tool_result 数组）
                 msg = entry.get("message", {})
                 content = msg.get("content", "")
                 if isinstance(content, str) and content:
                     user_msg_count += 1
 
-        # 恢复用户消息计数
+        # tail 没找到 custom-title，回退到 head 读取
+        if not custom_title:
+            try:
+                head_entries = self.storage.read_head(kb=64)
+                for entry in head_entries:
+                    if entry.get("type") == "custom-title":
+                        custom_title = entry
+                        break
+            except Exception:
+                pass
+
+        # 恢复计数器
         self._user_msg_count = user_msg_count
 
         # 恢复 gen_seq：取所有 ai-title 条目中最大的 genSeq
         max_gen_seq = 0
-        for entry in entries:
-            if entry.get("type") == "ai-title":
-                gs = entry.get("genSeq", 1)
-                if gs > max_gen_seq:
-                    max_gen_seq = gs
+        for entry in ai_title_entries:
+            gs = entry.get("genSeq", 1)
+            if gs > max_gen_seq:
+                max_gen_seq = gs
         self._gen_seq = max_gen_seq
 
         # 决策：custom-title > ai-title > NEED_TITLE
         if custom_title:
             self._title_state = TitleState.USER_SET
             self._title_cache = custom_title.get("customTitle") or custom_title.get("title")
+            # re-append custom-title 到文件尾部（学 Claude Code reAppendSessionMetadata）
+            # 保证 tail 窗口始终能读到，即使会话很长标题已被挤出窗口
+            reappend = {
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": None,
+                "sessionId": self.session_id,
+                "type": "custom-title",
+                "customTitle": self._title_cache,
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.storage.append_raw_entry(reappend)
+            self.storage.flush()
             return
 
         if ai_title:

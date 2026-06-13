@@ -328,42 +328,81 @@ class SessionStorage:
         return entries
 
     def read_tail(self, kb: int = 64) -> list[dict]:
-        """
-        读取尾部 64KB（轻量读取，用于元数据恢复）
+        """读取文件尾部 kb KB 的 Entry（时间顺序）
+
+        用于元数据恢复等轻量读取场景。如果文件 <= kb KB，返回全部 Entry。
 
         Args:
-            kb: 读取的 KB 数
+            kb: 读取的 KB 数（默认 64）
 
         Returns:
-            尾部 Entry 列表（倒序）
+            Entry 列表（时间正序，非倒序）
         """
         path = self._ensure_path()
         if not path.exists():
             return []
 
-        # 从文件末尾读取 kb
+        file_size = path.stat().st_size
         byte_limit = kb * 1024
+
         with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            file_size = f.tell()
             if file_size <= byte_limit:
+                # 文件比窗口小，从头读
                 f.seek(0)
             else:
+                # 跳到尾部窗口起点
                 f.seek(-byte_limit, os.SEEK_END)
-            # 跳过可能截断的行
-            f.readline()
+                # 第一行可能被截断（不从行首开始），丢弃
+                f.readline()
+
+            # 读取剩余内容
+            raw = f.read()
 
         entries = []
-        with open(path, "r", encoding="utf-8") as f:
-            f.seek(-byte_limit, os.SEEK_END) if file_size > byte_limit else None
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        return entries
+
+
+    def read_head(self, kb: int = 64) -> list[dict]:
+        """读取文件头部 kb KB 的 Entry（时间顺序）
+
+        用于 tail 窗口读不到元数据时的回退读取。
+        Claude Code 的 head buffer 也是 64KB。
+
+        Args:
+            kb: 读取的 KB 数（默认 64）
+
+        Returns:
+            Entry 列表（时间正序）
+        """
+        path = self._ensure_path()
+        if not path.exists():
+            return []
+
+        file_size = path.stat().st_size
+        byte_limit = kb * 1024
+        read_size = min(file_size, byte_limit)
+
+        with open(path, "rb") as f:
+            raw = f.read(read_size)
+
+        entries = []
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
         return entries
 
@@ -444,22 +483,52 @@ class SessionStorage:
             mtime = datetime.fromtimestamp(stat.st_mtime)
             size = stat.st_size
 
-            # 读取元数据（metadata 在文件头部，所以从头扫描）
+            # 读取元数据：先 tail（快），tail 读不到 custom-title 再 head 回退
             meta = {}
             try:
-                with open(f, "r", encoding="utf-8") as fp:
-                    for line in fp:
+                # tail 读取（默认 64KB）
+                with open(f, "rb") as fp:
+                    fp.seek(0, os.SEEK_END)
+                    fsize = fp.tell()
+                    tail_bytes = min(fsize, 64 * 1024)
+                    fp.seek(-tail_bytes, os.SEEK_END) if fsize > tail_bytes else fp.seek(0)
+                    if fsize > tail_bytes:
+                        fp.readline()  # 丢弃可能截断的首行
+                    raw_tail = fp.read()
+
+                tail_has_custom = False
+                for line in raw_tail.decode("utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                        if e.get("type") == "custom-title":
+                            meta["title"] = e.get("customTitle")
+                            tail_has_custom = True
+                        elif e.get("type") == "ai-title":
+                            meta["ai_title"] = e.get("aiTitle")
+                        elif e.get("type") == "tag":
+                            meta["tags"] = meta.get("tags", [])
+                            meta["tags"].append(e.get("tag"))
+                        elif e.get("type") == "last-prompt":
+                            meta["last_prompt"] = e.get("lastPrompt")
+                    except json.JSONDecodeError:
+                        continue
+
+                # tail 没找到 custom-title，回退到 head 读取
+                if not tail_has_custom and fsize > tail_bytes:
+                    with open(f, "rb") as fp:
+                        raw_head = fp.read(64 * 1024)
+                    for line in raw_head.decode("utf-8", errors="replace").splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
                         try:
-                            e = json.loads(line.strip())
+                            e = json.loads(line)
                             if e.get("type") == "custom-title":
                                 meta["title"] = e.get("customTitle")
-                            elif e.get("type") == "ai-title":
-                                meta["ai_title"] = e.get("aiTitle")
-                            elif e.get("type") == "tag":
-                                meta["tags"] = meta.get("tags", [])
-                                meta["tags"].append(e.get("tag"))
-                            elif e.get("type") == "last-prompt":
-                                meta["last_prompt"] = e.get("lastPrompt")
+                                break  # 找到就够了
                         except json.JSONDecodeError:
                             continue
             except Exception:
