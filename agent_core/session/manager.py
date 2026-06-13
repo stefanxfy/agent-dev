@@ -153,40 +153,11 @@ class SessionManager:
         return new_id
 
     def close(self):
-        """关闭会话，写入 last-prompt 到磁盘
-
-        幂等：如果磁盘最后一条已经是相同的 last-prompt，不重复写。
-        """
+        """关闭会话，刷新待写缓冲到磁盘"""
         if self._closed:
-            logger.warning(f"[CLOSE] already closed: {self.session_id}")
             return
         self._closed = True
-
-        logger.warning(f"[CLOSE] sid={self.session_id}, last_prompt={self.metadata.last_prompt!r}")
-
-        if not self.metadata.last_prompt:
-            logger.warning(f"[CLOSE] no last_prompt, skip: {self.session_id}")
-            return
-
-        # 检查磁盘最后一行是否已经是相同的 last-prompt（避免重复追加）
-        try:
-            entries = self.storage.read_tail(lines=1)
-            if entries and entries[-1].get("type") == "last-prompt" \
-                    and entries[-1].get("lastPrompt") == self.metadata.last_prompt:
-                return  # 已存在，不重复写
-        except Exception:
-            pass  # 读失败则继续写
-
-        self.storage.append_raw_entry({
-            "uuid": str(uuid.uuid4()),
-            "parentUuid": None,
-            "sessionId": self.session_id,
-            "type": "last-prompt",
-            "lastPrompt": self.metadata.last_prompt,
-            "timestamp": datetime.now().isoformat(),
-        })
         self.storage.flush()
-        logger.info(f"last-prompt flushed on close: {self.session_id}")
 
     def switch(self, session_id: str):
         """
@@ -195,7 +166,7 @@ class SessionManager:
         Args:
             session_id: 目标会话 ID
         """
-        # 关闭当前会话（写入 last-prompt）
+        # 关闭当前会话（刷新缓冲）
         self.close()
 
         # 切换到新会话
@@ -287,15 +258,11 @@ class SessionManager:
     # ── 消息写入 ────────────────────────────────────────────────
 
     def add_user_message(self, content: str, **extra) -> str:
-        """添加用户消息（同时触发标题生成逻辑 + 更新 last-prompt 内存）"""
+        """添加用户消息（同时触发标题生成逻辑）"""
         self.state.set_running("user input")
-        self.metadata.update_last_prompt(content)
         uuid_ = self.storage.add_message("user", content, parent_uuid=self._last_uuid)
         self._last_uuid = uuid_
         self._message_cache.append({"role": "user", "content": content, "uuid": uuid_})
-
-        # last-prompt 只更新内存，不每轮写磁盘（避免 Entry 膨胀）
-        # 磁盘写入由 close() / switch() 触发，__del__ 仅兜底
 
         # 触发标题生成（fire-and-forget，不阻塞主流程）
         self._on_user_message(content)
@@ -438,8 +405,6 @@ class SessionManager:
         custom_title = None
         ai_title = None
         ai_title_entries = []
-        last_prompt_entry = None
-        last_user_content = None
         user_msg_count = 0
 
         for entry in reversed(entries):
@@ -450,15 +415,11 @@ class SessionManager:
                 ai_title_entries.append(entry)
                 if ai_title is None:
                     ai_title = entry
-            elif etype == "last-prompt" and last_prompt_entry is None:
-                last_prompt_entry = entry
             elif etype == "user":
                 msg = entry.get("message", {})
                 content = msg.get("content", "")
                 if isinstance(content, str) and content:
                     user_msg_count += 1
-                    if last_user_content is None:
-                        last_user_content = content
 
         # tail 没找到 custom-title，回退到 head 读取
         if not custom_title:
@@ -467,17 +428,6 @@ class SessionManager:
                 for entry in head_entries:
                     if entry.get("type") == "custom-title":
                         custom_title = entry
-                        break
-            except Exception:
-                pass
-
-        # tail 没找到 last-prompt，也回退到 head
-        if not last_prompt_entry:
-            try:
-                head_entries = self.storage.read_head(kb=64)
-                for entry in reversed(head_entries):
-                    if entry.get("type") == "last-prompt":
-                        last_prompt_entry = entry
                         break
             except Exception:
                 pass
@@ -493,27 +443,17 @@ class SessionManager:
                 max_gen_seq = gs
         self._gen_seq = max_gen_seq
 
-        # 恢复 last_prompt 到内存
-        # 优先从 last-prompt Entry 恢复，fallback 到最后一条 user 消息
-        if last_prompt_entry:
-            self.metadata.last_prompt = last_prompt_entry.get("lastPrompt", "")
-        elif last_user_content:
-            self.metadata.update_last_prompt(last_user_content)
-
         # 决策：custom-title > ai-title > NEED_TITLE
         if custom_title:
             self._title_state = TitleState.USER_SET
             self._title_cache = custom_title.get("customTitle") or custom_title.get("title")
             # 同步到 metadata（_reappend_metadata 会读 metadata.title 写 custom-title Entry）
             self.metadata.title = self._title_cache
-            # re-append custom-title + last-prompt 到文件尾部
-            # 学 Claude Code reAppendSessionMetadata: 保证 tail 窗口能读到
-            # 写入顺序: last-prompt 先写, custom-title 后写 (更重要的靠尾部)
+            # re-append custom-title 到文件尾部（保证 tail 窗口能读到）
             self._reappend_metadata()
             return
 
-        # ai-title 场景不需要 re-append last_prompt
-        # last_prompt 只在 close() 时写一次
+        # ai-title 场景不需要 re-append
 
         if ai_title:
             self._title_cache = ai_title.get("aiTitle") or ai_title.get("title")
@@ -798,11 +738,6 @@ class SessionManager:
         self.metadata.add_tag(tag)
         self._reappend_metadata()
 
-    def update_last_prompt(self, prompt: str):
-        """更新最后一条用户消息"""
-        self.metadata.update_last_prompt(prompt)
-        self._reappend_metadata()
-
     def update_mode(self, mode: Literal["plan", "read", "write"]):
         """更新模式"""
         self.metadata.update_mode(mode)
@@ -818,8 +753,7 @@ class SessionManager:
         3. agent-name
         4. mode
 
-        注意：last-prompt 不在这里 re-append！
-        last-prompt 只在 close() 时写一次，避免每次创建 SessionManager 都追加。
+        只 re-append: custom-title, tag, agent-name, mode
         """
         timestamp = datetime.now().isoformat()
         reappend_order = []  # 按写入顺序收集

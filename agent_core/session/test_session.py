@@ -246,7 +246,6 @@ def test_metadata(tmpdir: str):
     manager.add_tag("tag1")
     manager.add_tag("tag2")
     manager.update_mode("write")
-    manager.update_last_prompt("最后一条用户消息")
     manager.flush()
 
     # 从磁盘恢复元数据（直接读取完整 JSONL 尾部）
@@ -258,7 +257,6 @@ def test_metadata(tmpdir: str):
     Test.assert_equal("AI标题恢复", restored.ai_title, "AI生成的标题")
     Test.assert_equal("标签恢复", restored.tags, ["tag1", "tag2"])
     Test.assert_equal("模式恢复", restored.mode, "write")
-    Test.assert_equal("最后提示恢复", restored.last_prompt, "最后一条用户消息")
     Test.assert_equal("display_title 优先用户标题", restored.display_title, "自定义标题")
 
     # 清理
@@ -913,104 +911,3 @@ def test_custom_title_reappend_on_restore():
         assert len(tail_titles) >= 1, "re-append 后 tail 应包含 custom-title"
         assert tail_titles[-1]["customTitle"] == "用户自定义标题"
 
-
-def test_last_prompt_truncate():
-    """last_prompt 超过 200 字符时截断 + 换行转空格"""
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = SessionManager("trunc-test", data_dir=tmpdir)
-        mgr.create()
-
-        long_prompt = "第一行\n第二行\n" + "测试" * 200
-        mgr.add_user_message(long_prompt)
-
-        # 验证：换行被替换为空格，截断到 200 字符 + 省略号
-        assert "\n" not in mgr.metadata.last_prompt
-        assert len(mgr.metadata.last_prompt) <= 201  # 200 + …
-        assert mgr.metadata.last_prompt.endswith("…")
-
-
-def test_last_prompt_restore_on_resume():
-    """重启后从 JSONL 恢复 last_prompt 并 re-append 到尾部
-
-    last-prompt 在 close() 时写入磁盘，resume 时从 tail 读取。
-    """
-    import tempfile, json
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # 1. 创建会话并发消息
-        mgr1 = SessionManager("lp-restore", data_dir=tmpdir)
-        mgr1.create()
-        mgr1.add_user_message("帮我修复登录Bug")
-
-        # 2. close() 触发 last-prompt 落盘
-        mgr1.close()
-
-        # 3. 重启
-        mgr2 = SessionManager("lp-restore", data_dir=tmpdir)
-
-        # 4. 验证 last_prompt 恢复
-        assert mgr2.metadata.last_prompt == "帮我修复登录Bug"
-
-        # 5. 验证 tail 窗口能读到 last-prompt
-        tail = mgr2.storage.read_tail(kb=64)
-        lp_entries = [e for e in tail if e.get("type") == "last-prompt"]
-        assert len(lp_entries) >= 1
-        assert lp_entries[-1]["lastPrompt"] == "帮我修复登录Bug"
-
-
-def test_last_prompt_no_entry_without_close():
-    """未 close 时磁盘上没有 last-prompt Entry（不每轮写）"""
-    import tempfile, json
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = SessionManager("no-close-test", data_dir=tmpdir)
-        mgr.create()
-        mgr.add_user_message("第一条消息")
-        mgr.add_user_message("第二条消息")
-        mgr.storage.flush()
-
-        # 磁盘上应该没有 last-prompt
-        with open(mgr.jsonl_path) as f:
-            lines = f.readlines()
-        types = [json.loads(l)["type"] for l in lines]
-        assert "last-prompt" not in types, f"未 close 不应有 last-prompt Entry: {types}"
-
-
-def test_switch_writes_last_prompt():
-    """switch() 时自动 close 旧会话，写入 last-prompt"""
-    import tempfile, json
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = SessionManager("switch-from", data_dir=tmpdir)
-        mgr.create()
-        mgr.add_user_message("切换前的消息")
-        mgr.storage.flush()
-
-        # 确认 close 前没有 last-prompt
-        with open(mgr.jsonl_path) as f:
-            types_before = [json.loads(l)["type"] for l in f]
-        assert "last-prompt" not in types_before
-
-        # switch 触发 close
-        mgr.switch("switch-to")
-
-        # 现在旧会话文件应该有 last-prompt
-        old_path = Path(tmpdir) / "switch-from.jsonl"
-        with open(old_path) as f:
-            types_after = [json.loads(l)["type"] for l in f]
-        assert "last-prompt" in types_after
-
-
-def test_close_idempotent():
-    """close() 幂等，多次调用只写一次"""
-    import tempfile, json
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mgr = SessionManager("idempotent-test", data_dir=tmpdir)
-        mgr.create()
-        mgr.add_user_message("测试幂等")
-        mgr.close()
-        mgr.close()  # 第二次应该是 no-op
-        mgr.close()  # 第三次也是
-
-        with open(mgr.jsonl_path) as f:
-            lines = f.readlines()
-        lp_count = sum(1 for l in lines if json.loads(l)["type"] == "last-prompt")
-        assert lp_count == 1, f"close 应该只写一条 last-prompt: got {lp_count}"

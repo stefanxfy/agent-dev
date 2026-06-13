@@ -40,7 +40,6 @@ class SessionMetadata:
         agent_setting: Agent 配置（JSON 字符串）
         mode: 当前模式（plan / read / write）
         worktree_state: Git worktree 状态
-        last_prompt: 最后一条用户消息
         project_slug: 项目标识
         session_id: 所属会话 ID
     """
@@ -55,7 +54,6 @@ class SessionMetadata:
         agent_setting: Optional[str] = None,
         mode: str = "write",
         worktree_state: Optional[dict] = None,
-        last_prompt: Optional[str] = None,
         project_slug: Optional[str] = None,
     ):
         self.session_id = session_id
@@ -66,7 +64,6 @@ class SessionMetadata:
         self.agent_setting = agent_setting
         self.mode = mode
         self.worktree_state = worktree_state or {}
-        self.last_prompt = last_prompt
         self.project_slug = project_slug or "default"
         self._updated_at = time.time()
 
@@ -99,15 +96,6 @@ class SessionMetadata:
         if mode in ("plan", "read", "write"):
             self.mode = mode
             self._updated_at = time.time()
-
-    def update_last_prompt(self, prompt: str):
-        """更新最后一条用户消息（每轮覆盖）
-
-        学 Claude Code: 换行替换为空格, 截断到 200 字符, 超长加省略号
-        """
-        flat = prompt.replace("\n", " ").strip()
-        self.last_prompt = flat[:200] + "…" if len(flat) > 200 else flat
-        self._updated_at = time.time()
 
     def update_worktree_state(self, state: dict):
         """更新 Git worktree 状态"""
@@ -199,16 +187,6 @@ class SessionMetadata:
                 "timestamp": timestamp,
             })
 
-        if self.last_prompt:
-            entries.append({
-                "uuid": str(uuid.uuid4()),
-                "parentUuid": None,
-                "sessionId": self.session_id,
-                "type": "last-prompt",
-                "lastPrompt": self.last_prompt,
-                "timestamp": timestamp,
-            })
-
         return entries
 
     def to_dict(self) -> dict:
@@ -221,7 +199,6 @@ class SessionMetadata:
             "agent_setting": self.agent_setting,
             "mode": self.mode,
             "worktree_state": self.worktree_state,
-            "last_prompt": self.last_prompt,
             "project_slug": self.project_slug,
             "updated_at": self._updated_at,
         }
@@ -277,10 +254,6 @@ class SessionMetadata:
                 meta.worktree_state = entry.get("worktreeSession", {})
                 seen_types.add("worktree-state")
 
-            elif etype == "last-prompt":
-                meta.last_prompt = entry.get("lastPrompt")
-                seen_types.add("last-prompt")
-
         return meta
 
     @classmethod
@@ -295,7 +268,6 @@ class SessionMetadata:
             agent_setting=data.get("agent_setting"),
             mode=data.get("mode", "write"),
             worktree_state=data.get("worktree_state") or {},
-            last_prompt=data.get("last_prompt"),
             project_slug=data.get("project_slug"),
         )
 

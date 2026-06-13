@@ -514,8 +514,12 @@ class SessionStorage:
                         elif e.get("type") == "tag":
                             meta["tags"] = meta.get("tags", [])
                             meta["tags"].append(e.get("tag"))
-                        elif e.get("type") == "last-prompt":
-                            meta["last_prompt"] = e.get("lastPrompt")
+                        elif e.get("type") == "user":
+                            # 从 user Entry 提取 preview
+                            msg = e.get("message", {})
+                            content = msg.get("content", "")
+                            if isinstance(content, str) and content:
+                                meta["last_prompt"] = content[:50]
                     except json.JSONDecodeError:
                         continue
 
@@ -544,7 +548,7 @@ class SessionStorage:
                 "size": size,
                 "title": meta.get("title") or meta.get("ai_title") or "新会话",
                 "tags": meta.get("tags", []),
-                "last_prompt": meta.get("last_prompt"),
+                "last_prompt": meta.get("last_prompt", ""),
             })
 
         # 按更新时间倒序

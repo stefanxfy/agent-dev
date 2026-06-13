@@ -204,7 +204,7 @@ with st.sidebar:
             mgr.flush()
         except Exception:
             pass
-        # 关闭旧 Agent 的 session（写入 last-prompt）
+        # 关闭旧 Agent 的 session
         if st.session_state.agent is not None:
             try:
                 st.session_state.agent.close()
@@ -245,7 +245,7 @@ with st.sidebar:
                             # 点击当前会话：不走切换流程
                             if sid == st.session_state.get("chat_session_id"):
                                 continue
-                            # 关闭旧 Agent 的 session（写入 last-prompt）
+                            # 关闭旧 Agent 的 session
                             if st.session_state.agent is not None:
                                 try:
                                     st.session_state.agent.close()
@@ -361,7 +361,7 @@ if (st.session_state.agent is None or
                 st.query_params["session"] = sid
         except Exception:
             pass
-    # 关闭旧 Agent 的 session（写入 last-prompt）
+    # 关闭旧 Agent 的 session
     if st.session_state.agent is not None:
         try:
             st.session_state.agent.close()
