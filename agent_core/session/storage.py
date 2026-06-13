@@ -480,14 +480,10 @@ class SessionStorage:
             mtime = datetime.fromtimestamp(stat.st_mtime)
             size = stat.st_size
 
-            # 读取尾部获取元数据
+            # 读取元数据（metadata 在文件头部，所以从头扫描）
             meta = {}
             try:
-                with open(f, "rb") as fp:
-                    fp.seek(max(0, stat.st_size - 4096), os.SEEK_SET)
-                    fp.readline()  # 跳过不完整行
                 with open(f, "r", encoding="utf-8") as fp:
-                    fp.seek(max(0, stat.st_size - 4096), os.SEEK_SET)
                     for line in fp:
                         try:
                             e = json.loads(line.strip())

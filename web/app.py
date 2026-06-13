@@ -356,6 +356,8 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
     try:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
         history = mgr.get_messages()
+        logging.warning(f"[DEBUG-LOAD] session={st.session_state.chat_session_id}, history={len(history)} entries")
+        loaded_count = 0
         for entry in history:
             etype = entry.get("type", "")
             msg = entry.get("message")
@@ -379,6 +381,7 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
 
             if role == "user" and content:
                 st.session_state.messages.append({"role": "user", "content": content})
+                loaded_count += 1
             elif role == "assistant" and content:
                 st.session_state.messages.append({
                     "role": "assistant",
@@ -386,6 +389,8 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
                     "thinking": thinking,
                     "tool_logs": tool_logs,
                 })
+                loaded_count += 1
+        logging.warning(f"[DEBUG-LOAD] loaded {loaded_count} messages to session_state")
     except Exception as e:
         logging.warning(f"加载会话历史失败: {e}")
 
