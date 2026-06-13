@@ -508,8 +508,8 @@ if "session" in st.query_params:
 | **标题存储** | ai-title / custom-title 双 Entry 类型 | ✅ 一致 |
 | **genSeq 防乱序** | ✅ 闭包变量 | ✅ 实例变量 + JSONL 恢复 |
 | **deriveTitle 存 JSONL** | ❌ 不存（发远程 API） | ❌ 不存（只在内存缓存） |
-| **64KB Tail 窗口** | ✅ read_tail(kb=64) | ✅ 一致 |
-| **reAppendSessionMetadata** | ✅ resume 时 custom-title 重写到尾部 | ⚠️ 变更时追加（非 resume 时） |
+| **64KB Tail + Head 双窗口** | ✅ tail 优先，head 回退 | ✅ 一致（commit `114043f`） |
+| **reAppendSessionMetadata** | ✅ resume 时 custom-title 重写到尾部 | ✅ 一致（commit `114043f`） |
 | **sessions-index.json** | ✅ 缓存加速层 | ❌ 未实现（直接扫描目录） |
 | **last-prompt Entry** | ✅ 每轮覆盖，200字截断 | ❌ 未实现 |
 | **task-summary Entry** | ✅ `claude ps` 命令用 | ❌ 未实现 |
@@ -533,7 +533,6 @@ if "session" in st.query_params:
 |--------|------|------|
 | P0 | F5 刷新后历史消息显示 | 修复 web/app.py 的消息加载逻辑 |
 | P1 | `last-prompt` Entry | 最近用户输入（200字截断），用于会话列表预览 |
-| P1 | Resume 时 re-append metadata | Claude Code 在 resume 时把 custom-title 重写到尾部，保证 tail 窗口可见；agent-dev 当前只在变更时追加，resume 时不重写 |
 | P2 | 上下文管理模块 | Token 预算 + 动态压缩 + summary Entry |
 | P2 | `task-summary` Entry | 周期性任务摘要，用于会话列表展示 |
 | P3 | `tag` / `agent-name` | 会话标签和 Agent 类型标记 |
