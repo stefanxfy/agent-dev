@@ -27,7 +27,6 @@ import concurrent.futures
 import logging
 import re
 import threading
-import atexit
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -122,9 +121,6 @@ class SessionManager:
         self._title_cache: Optional[str] = None
         self._restore_title_state()
 
-        # 注册 atexit 兜底（进程退出时保证 last-prompt 落盘）
-        atexit.register(self.close)
-
         logger.info(f"SessionManager created: {self.session_id}")
 
     # ── 路径 ───────────────────────────────────────────────────
@@ -166,7 +162,7 @@ n        学 Claude Code 的三个 re-append 时机：
 
 n        agent-dev 对应：
         - close() — 会话切换/显式关闭时（主力）
-        - atexit — 进程退出时（兜底）
+
         - _restore_title_state — resume 后 re-append
         """
         if self._closed:
@@ -300,7 +296,7 @@ n        agent-dev 对应：
         self._message_cache.append({"role": "user", "content": content, "uuid": uuid_})
 
         # last-prompt 只更新内存，不每轮写磁盘（避免 Entry 膨胀）
-        # 磁盘写入由 close() / switch() / atexit 触发
+        # 磁盘写入由 close() / switch() 触发，__del__ 兜底
 
         # 触发标题生成（fire-and-forget，不阻塞主流程）
         self._on_user_message(content)
