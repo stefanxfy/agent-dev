@@ -327,13 +327,14 @@ class SessionStorage:
 
         return entries
 
-    def read_tail(self, kb: int = 64) -> list[dict]:
+    def read_tail(self, kb: int = 64, lines: Optional[int] = None) -> list[dict]:
         """读取文件尾部 kb KB 的 Entry（时间顺序）
 
         用于元数据恢复等轻量读取场景。如果文件 <= kb KB，返回全部 Entry。
 
         Args:
             kb: 读取的 KB 数（默认 64）
+            lines: 如果指定，只返回最后 N 条 Entry
 
         Returns:
             Entry 列表（时间正序，非倒序）
@@ -368,6 +369,8 @@ class SessionStorage:
             except json.JSONDecodeError:
                 continue
 
+        if lines is not None and len(entries) > lines:
+            entries = entries[-lines:]
         return entries
 
 

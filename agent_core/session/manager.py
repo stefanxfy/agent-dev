@@ -155,32 +155,36 @@ class SessionManager:
     def close(self):
         """关闭会话，写入 last-prompt 到磁盘
 
-n        学 Claude Code 的三个 re-append 时机：
-        1. materializeSessionFile — 文件首创建时
-        2. adoptResumedSessionFile — resume 加载完后
-        3. exit cleanup — 进程退出前
-
-n        agent-dev 对应：
-        - close() — 会话切换/显式关闭时（主力）
-
-        - _restore_title_state — resume 后 re-append
+        幂等：如果磁盘最后一条已经是相同的 last-prompt，不重复写。
         """
         if self._closed:
             return
         self._closed = True
 
-        # 写入 last-prompt（只写一次）
-        if self.metadata.last_prompt:
-            self.storage.append_raw_entry({
-                "uuid": str(uuid.uuid4()),
-                "parentUuid": None,
-                "sessionId": self.session_id,
-                "type": "last-prompt",
-                "lastPrompt": self.metadata.last_prompt,
-                "timestamp": datetime.now().isoformat(),
-            })
-            self.storage.flush()
-            logger.info(f"last-prompt flushed on close: {self.session_id}")
+        if not self.metadata.last_prompt:
+            return
+
+        # 检查磁盘最后一条是否已经是相同的 last-prompt（避免重复追加）
+        try:
+            entries = self.storage.read_tail(lines=5)
+            for entry in reversed(entries):
+                if entry.get("type") == "last-prompt":
+                    if entry.get("lastPrompt") == self.metadata.last_prompt:
+                        return  # 已存在，不重复写
+                    break  # 最后一条 last-prompt 内容不同，继续写
+        except Exception:
+            pass  # 读失败则继续写
+
+        self.storage.append_raw_entry({
+            "uuid": str(uuid.uuid4()),
+            "parentUuid": None,
+            "sessionId": self.session_id,
+            "type": "last-prompt",
+            "lastPrompt": self.metadata.last_prompt,
+            "timestamp": datetime.now().isoformat(),
+        })
+        self.storage.flush()
+        logger.info(f"last-prompt flushed on close: {self.session_id}")
 
     def switch(self, session_id: str):
         """
