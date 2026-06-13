@@ -406,6 +406,15 @@ class SessionManager:
         # 恢复用户消息计数
         self._user_msg_count = user_msg_count
 
+        # 恢复 gen_seq：取所有 ai-title 条目中最大的 genSeq
+        max_gen_seq = 0
+        for entry in entries:
+            if entry.get("type") == "ai-title":
+                gs = entry.get("genSeq", 1)
+                if gs > max_gen_seq:
+                    max_gen_seq = gs
+        self._gen_seq = max_gen_seq
+
         # 决策：custom-title > ai-title > NEED_TITLE
         if custom_title:
             self._title_state = TitleState.USER_SET
@@ -509,10 +518,33 @@ class SessionManager:
             if self._title_state == TitleState.AI_PENDING:
                 self._title_state = TitleState.NEED_TITLE
 
+    # 标题生成 prompt（学 Claude Code 的 sessionTitle.ts）
+    TITLE_SYSTEM_PROMPT = (
+        "生成一个简洁的会话标题（3-7个词），要求：\n"
+        "1. 准确概括对话的主题或目标\n"
+        "2. 只返回标题文本，不要引号、不要解释、不要多余内容\n"
+        "3. 使用自然的中文表达\n"
+        "\n"
+        "好的示例：\n"
+        "- 用户问候和自我介绍\n"
+        "- 并行执行三个计算和搜索任务\n"
+        "- 调试登录按钮无响应问题\n"
+        "- 重构API客户端错误处理\n"
+        "\n"
+        "差的示例：\n"
+        "- 问候时刻（太模糊，没有信息量）\n"
+        "- 三个任务执行（太简略，缺少具体内容）\n"
+        "- 代码修改（太泛，无法区分会话）\n"
+        "- 调查并修复移动设备上登录按钮无响应的问题（太长）"
+    )
+
     async def _call_llm_for_title(self, input_text: str) -> Optional[str]:
         """调用轻量模型（GLM-4-flash）生成 3-7 词标题
 
-        使用同步 LLMRouter.chat（项目现有接口），在 ThreadPoolExecutor 中运行避免 async 冲突。
+        Prompt 参考自 Claude Code 的 sessionTitle.ts:
+        - 强调"概括主题或目标"，而非"提取关键词"
+        - 提供好坏示例做 few-shot 引导
+        - 输入是完整对话文本（最多1000字符），而非单条消息
         """
         def _sync_call():
             try:
@@ -529,14 +561,8 @@ class SessionManager:
                 full_text = ""
                 for chunk in router.chat(
                     messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "生成一个简洁的会话标题（3-7个词），只返回标题文本，"
-                                "不要引号、不要解释、不要多余内容。"
-                            ),
-                        },
-                        {"role": "user", "content": input_text[:500]},
+                        {"role": "system", "content": self.TITLE_SYSTEM_PROMPT},
+                        {"role": "user", "content": input_text[:1000]},
                     ],
                 ):
                     if chunk.text_delta:
