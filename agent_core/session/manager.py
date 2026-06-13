@@ -27,6 +27,7 @@ import concurrent.futures
 import logging
 import re
 import threading
+import atexit
 import uuid
 from datetime import datetime
 from enum import Enum
@@ -112,6 +113,7 @@ class SessionManager:
         # ── 内部缓存 ──
         self._message_cache: list[dict] = []
         self._last_uuid: Optional[str] = None
+        self._closed = False
 
         # ── 标题生成状态 ──
         self._title_state = TitleState.NEED_TITLE
@@ -119,6 +121,9 @@ class SessionManager:
         self._gen_seq: int = 0
         self._title_cache: Optional[str] = None
         self._restore_title_state()
+
+        # 注册 atexit 兜底（进程退出时保证 last-prompt 落盘）
+        atexit.register(self.close)
 
         logger.info(f"SessionManager created: {self.session_id}")
 
@@ -151,6 +156,43 @@ class SessionManager:
         logger.info(f"Creating new session: {new_id}")
         return new_id
 
+    def close(self):
+        """关闭会话，写入 last-prompt 到磁盘
+
+n        学 Claude Code 的三个 re-append 时机：
+        1. materializeSessionFile — 文件首创建时
+        2. adoptResumedSessionFile — resume 加载完后
+        3. exit cleanup — 进程退出前
+
+n        agent-dev 对应：
+        - close() — 会话切换/显式关闭时（主力）
+        - atexit — 进程退出时（兜底）
+        - _restore_title_state — resume 后 re-append
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        # 写入 last-prompt（只写一次）
+        if self.metadata.last_prompt:
+            self.storage.append_raw_entry({
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": None,
+                "sessionId": self.session_id,
+                "type": "last-prompt",
+                "lastPrompt": self.metadata.last_prompt,
+                "timestamp": datetime.now().isoformat(),
+            })
+            self.storage.flush()
+            logger.info(f"last-prompt flushed on close: {self.session_id}")
+
+    def __del__(self):
+        """析构时兜底写入（防止调用方忘记 close()）"""
+        try:
+            self.close()
+        except Exception:
+            pass  # __del__ 不能抛异常
+
     def switch(self, session_id: str):
         """
         切换到指定会话（当前 SessionManager 实例切换会话）
@@ -158,8 +200,8 @@ class SessionManager:
         Args:
             session_id: 目标会话 ID
         """
-        # 刷新当前会话
-        self.flush()
+        # 关闭当前会话（写入 last-prompt）
+        self.close()
 
         # 切换到新会话
         self.session_id = session_id
@@ -184,6 +226,7 @@ class SessionManager:
         self._user_msg_count = 0
         self._gen_seq = 0
         self._title_cache = None
+        self._closed = False  # 重置 close 标志
         self._restore_title_state()
 
         logger.info(f"Switched to session: {session_id}")
@@ -249,25 +292,15 @@ class SessionManager:
     # ── 消息写入 ────────────────────────────────────────────────
 
     def add_user_message(self, content: str, **extra) -> str:
-        """添加用户消息（同时触发标题生成逻辑 + 更新 last-prompt）"""
+        """添加用户消息（同时触发标题生成逻辑 + 更新 last-prompt 内存）"""
         self.state.set_running("user input")
         self.metadata.update_last_prompt(content)
         uuid_ = self.storage.add_message("user", content, parent_uuid=self._last_uuid)
         self._last_uuid = uuid_
         self._message_cache.append({"role": "user", "content": content, "uuid": uuid_})
 
-        # 追加 last-prompt Entry 到磁盘（每轮覆盖式追加，靠 reverse scan 取最新）
-        # 学 Claude Code: 进程退出时 re-append，但 agent-dev 没有退出钩子，
-        # 所以在每条用户消息时直接写入更简单可靠
-        self.storage.append_raw_entry({
-            "uuid": str(uuid.uuid4()),
-            "parentUuid": None,
-            "sessionId": self.session_id,
-            "type": "last-prompt",
-            "lastPrompt": self.metadata.last_prompt,
-            "timestamp": datetime.now().isoformat(),
-        })
-        self.storage.flush()
+        # last-prompt 只更新内存，不每轮写磁盘（避免 Entry 膨胀）
+        # 磁盘写入由 close() / switch() / atexit 触发
 
         # 触发标题生成（fire-and-forget，不阻塞主流程）
         self._on_user_message(content)

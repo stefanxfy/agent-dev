@@ -13,6 +13,7 @@ import sys
 import os
 import tempfile
 import shutil
+from pathlib import Path
 
 # 确保可以 import
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -930,7 +931,10 @@ def test_last_prompt_truncate():
 
 
 def test_last_prompt_restore_on_resume():
-    """重启后从 JSONL 恢复 last_prompt 并 re-append 到尾部"""
+    """重启后从 JSONL 恢复 last_prompt 并 re-append 到尾部
+
+    last-prompt 在 close() 时写入磁盘，resume 时从 tail 读取。
+    """
     import tempfile, json
     with tempfile.TemporaryDirectory() as tmpdir:
         # 1. 创建会话并发消息
@@ -938,8 +942,8 @@ def test_last_prompt_restore_on_resume():
         mgr1.create()
         mgr1.add_user_message("帮我修复登录Bug")
 
-        # 2. 用户改名触发 re-append（此时 last_prompt 也被写入）
-        mgr1.rename_session("登录Bug修复")
+        # 2. close() 触发 last-prompt 落盘
+        mgr1.close()
 
         # 3. 重启
         mgr2 = SessionManager("lp-restore", data_dir=tmpdir)
@@ -953,10 +957,60 @@ def test_last_prompt_restore_on_resume():
         assert len(lp_entries) >= 1
         assert lp_entries[-1]["lastPrompt"] == "帮我修复登录Bug"
 
-        # 6. 验证写入顺序：last-prompt 在 custom-title 之前（更重要的靠尾部）
-        tail_types = [e.get("type") for e in tail]
-        if "last-prompt" in tail_types and "custom-title" in tail_types:
-            # 找最后一次出现的位置
-            last_lp_idx = max(i for i, t in enumerate(tail_types) if t == "last-prompt")
-            last_ct_idx = max(i for i, t in enumerate(tail_types) if t == "custom-title")
-            assert last_lp_idx < last_ct_idx, "last-prompt 应在 custom-title 之前写入"
+
+def test_last_prompt_no_entry_without_close():
+    """未 close 时磁盘上没有 last-prompt Entry（不每轮写）"""
+    import tempfile, json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = SessionManager("no-close-test", data_dir=tmpdir)
+        mgr.create()
+        mgr.add_user_message("第一条消息")
+        mgr.add_user_message("第二条消息")
+        mgr.storage.flush()
+
+        # 磁盘上应该没有 last-prompt
+        with open(mgr.jsonl_path) as f:
+            lines = f.readlines()
+        types = [json.loads(l)["type"] for l in lines]
+        assert "last-prompt" not in types, f"未 close 不应有 last-prompt Entry: {types}"
+
+
+def test_switch_writes_last_prompt():
+    """switch() 时自动 close 旧会话，写入 last-prompt"""
+    import tempfile, json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = SessionManager("switch-from", data_dir=tmpdir)
+        mgr.create()
+        mgr.add_user_message("切换前的消息")
+        mgr.storage.flush()
+
+        # 确认 close 前没有 last-prompt
+        with open(mgr.jsonl_path) as f:
+            types_before = [json.loads(l)["type"] for l in f]
+        assert "last-prompt" not in types_before
+
+        # switch 触发 close
+        mgr.switch("switch-to")
+
+        # 现在旧会话文件应该有 last-prompt
+        old_path = Path(tmpdir) / "switch-from.jsonl"
+        with open(old_path) as f:
+            types_after = [json.loads(l)["type"] for l in f]
+        assert "last-prompt" in types_after
+
+
+def test_close_idempotent():
+    """close() 幂等，多次调用只写一次"""
+    import tempfile, json
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = SessionManager("idempotent-test", data_dir=tmpdir)
+        mgr.create()
+        mgr.add_user_message("测试幂等")
+        mgr.close()
+        mgr.close()  # 第二次应该是 no-op
+        mgr.close()  # 第三次也是
+
+        with open(mgr.jsonl_path) as f:
+            lines = f.readlines()
+        lp_count = sum(1 for l in lines if json.loads(l)["type"] == "last-prompt")
+        assert lp_count == 1, f"close 应该只写一条 last-prompt: got {lp_count}"
