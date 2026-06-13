@@ -344,6 +344,13 @@ if (st.session_state.agent is None or
                 st.query_params["session"] = sid
         except Exception:
             pass
+    # 关闭旧 Agent 的 session（写入 last-prompt）
+    if st.session_state.agent is not None:
+        try:
+            st.session_state.agent.close()
+        except Exception:
+            pass
+
     st.session_state.agent = get_agent(sid)
     st.session_state.last_agent_config = current_config
     st.session_state.last_session_id = sid

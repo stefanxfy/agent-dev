@@ -296,7 +296,7 @@ n        agent-dev 对应：
         self._message_cache.append({"role": "user", "content": content, "uuid": uuid_})
 
         # last-prompt 只更新内存，不每轮写磁盘（避免 Entry 膨胀）
-        # 磁盘写入由 close() / switch() 触发，__del__ 兜底
+        # 磁盘写入由 close() / switch() 触发，__del__ 仅兜底
 
         # 触发标题生成（fire-and-forget，不阻塞主流程）
         self._on_user_message(content)

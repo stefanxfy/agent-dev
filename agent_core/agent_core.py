@@ -593,6 +593,17 @@ class ReactAgent:
 
     # ── history 管理 ──────────────────────────────────────────────────
 
+    def close(self):
+        """关闭当前会话，写入 last-prompt 到磁盘
+
+n        在切换会话或销毁 Agent 前显式调用，不依赖 __del__。
+        """
+        if self._session_manager:
+            try:
+                self._session_manager.close()
+            except Exception:
+                pass
+
     def reset(self):
         """重置会话历史"""
         self.history.clear()
