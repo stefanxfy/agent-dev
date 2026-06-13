@@ -371,27 +371,57 @@ class SessionManager:
     # ── 标题生成系统 ─────────────────────────────────────────────
 
     def _restore_title_state(self):
-        """从 JSONL tail 扫描，重建标题状态（重启恢复）
+        """从 JSONL tail 扫描，重建标题状态和用户消息计数（重启恢复）
 
-        规则：
+        规则（优先级从高到低）：
         - 有 custom-title → USER_SET（用户改过，永久锁定）
-        - 有 ai-title → FINALIZED（AI 生成过，不再自动生成）
+        - 有 ai-title 且 genSeq>=2（已重新生成过）→ FINALIZED
+        - 有 ai-title 且 genSeq==1（仅首轮生成）→ AI_SET（允许第3条消息重新生成）
         - 都没有 → NEED_TITLE（需要生成）
+
+        同时恢复 _user_msg_count：统计纯用户消息（非 tool_result）的数量，
+        确保第3条消息的重新生成不会因重启而丢失。
         """
         try:
             entries = self.storage.read_tail(kb=64)
         except Exception:
             return
 
+        custom_title = None
+        ai_title = None
+        user_msg_count = 0
         for entry in reversed(entries):
-            if entry.get("type") == "custom-title":
-                self._title_state = TitleState.USER_SET
-                self._title_cache = entry.get("customTitle") or entry.get("title")
-                return
-            if entry.get("type") == "ai-title":
+            etype = entry.get("type")
+            if etype == "custom-title" and custom_title is None:
+                custom_title = entry
+            elif etype == "ai-title" and ai_title is None:
+                ai_title = entry
+            elif etype == "user":
+                # 统计纯用户消息（content 是字符串，不是 tool_result 数组）
+                msg = entry.get("message", {})
+                content = msg.get("content", "")
+                if isinstance(content, str) and content:
+                    user_msg_count += 1
+
+        # 恢复用户消息计数
+        self._user_msg_count = user_msg_count
+
+        # 决策：custom-title > ai-title > NEED_TITLE
+        if custom_title:
+            self._title_state = TitleState.USER_SET
+            self._title_cache = custom_title.get("customTitle") or custom_title.get("title")
+            return
+
+        if ai_title:
+            self._title_cache = ai_title.get("aiTitle") or ai_title.get("title")
+            gen_seq = ai_title.get("genSeq", 1)
+            if gen_seq >= 2:
                 self._title_state = TitleState.FINALIZED
-                self._title_cache = entry.get("aiTitle") or entry.get("title")
-                return
+            else:
+                self._title_state = TitleState.AI_SET
+            return
+
+        self._title_state = TitleState.NEED_TITLE
 
     def _on_user_message(self, text: str) -> None:
         """每条用户消息调用，决定是否触发标题生成

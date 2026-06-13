@@ -612,32 +612,56 @@ def test_title_user_rename():
 
 
 def test_title_restore_on_resume():
-    """测试重启恢复：AI 标题恢复为 FINALIZED，自定义标题恢复为 USER_SET"""
+    """测试重启恢复：genSeq=1 → AI_SET，genSeq>=2 → FINALIZED，custom-title → USER_SET"""
     tmpdir = tempfile.mkdtemp()
     try:
-        # 创建会话，写入 ai-title
+        # 场景1：genSeq=1 的 ai-title → 恢复为 AI_SET（允许第3条重新生成）
         manager = SessionManager(data_dir=tmpdir)
-        manager._save_ai_title("恢复测试标题", gen_seq=1)
+        manager._save_ai_title("首轮标题", gen_seq=1)
         manager.flush()
         session_id = manager.session_id
 
-        # 重启（新建 SessionManager，相同 session_id）
         manager2 = SessionManager(session_id=session_id, data_dir=tmpdir)
-        manager2._restore_title_state()
-        assert manager2._title_state.value == "finalized", "恢复后应为 FINALIZED"
-        assert manager2.get_title() == "恢复测试标题"
+        assert manager2._title_state.value == "ai_set", "genSeq=1 恢复后应为 AI_SET"
+        assert manager2.get_title() == "首轮标题"
 
-        # 模拟用户改名后重启
+        # 场景2：genSeq>=2 的 ai-title → 恢复为 FINALIZED（已重新生成过，锁定）
+        manager._save_ai_title("重新生成标题", gen_seq=2)
+        manager.flush()
+
+        manager3 = SessionManager(session_id=session_id, data_dir=tmpdir)
+        assert manager3._title_state.value == "finalized", "genSeq>=2 恢复后应为 FINALIZED"
+        assert manager3.get_title() == "重新生成标题"
+
+        # 场景3：custom-title → USER_SET（用户改过，永久锁定）
         manager.rename_session("用户自定义标题")
         manager.flush()
-        session_id2 = manager.session_id
 
-        manager3 = SessionManager(session_id=session_id2, data_dir=tmpdir)
-        manager3._restore_title_state()
-        assert manager3._title_state.value == "user_set", "用户改后重启应为 USER_SET"
-        assert manager3.get_title() == "用户自定义标题"
+        manager4 = SessionManager(session_id=session_id, data_dir=tmpdir)
+        assert manager4._title_state.value == "user_set", "custom-title 恢复后应为 USER_SET"
+        assert manager4.get_title() == "用户自定义标题"
 
-        print("  ✓ 重启恢复正确")
+        print("  ✓ 重启恢复正确（AI_SET / FINALIZED / USER_SET）")
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_title_user_msg_count_restore():
+    """测试重启恢复时 _user_msg_count 也被恢复"""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        # 创建会话，发3条用户消息
+        manager = SessionManager(data_dir=tmpdir)
+        session_id = manager.session_id
+        manager.add_user_message("第1条消息")
+        manager.add_user_message("第2条消息")
+        manager.add_user_message("第3条消息")
+        manager.flush()
+
+        # 重启后恢复
+        manager2 = SessionManager(session_id=session_id, data_dir=tmpdir)
+        assert manager2._user_msg_count == 3, f"恢复后 _user_msg_count 应为3，实际为 {manager2._user_msg_count}"
+        print("  ✓ _user_msg_count 恢复正确")
     finally:
         shutil.rmtree(tmpdir)
 
