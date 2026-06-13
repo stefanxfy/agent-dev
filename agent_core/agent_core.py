@@ -301,16 +301,7 @@ class ReactAgent:
         
         Day 4: 如果启用了 session，run 结束后自动保存到 session。
         """
-        # Day 4: 如果有 system_prompt 且首次写入 session
-        if self._session_manager and self.system_prompt:
-            try:
-                # 检查 session 中是否已有 system entry（避免重复写入）
-                existing = self._session_manager.get_messages()
-                has_system = any(e.get("type") == "system" for e in existing)
-                if not has_system:
-                    self._session_manager.add_system(self.system_prompt)
-            except Exception as e:
-                _logger.warning(f"Failed to save system prompt to session: {e}")
+        # system prompt 不持久化到 JSONL（与 Claude Code 一致：每次 run 动态注入）
 
         # 追加用户消息（内存）
         self.history.append({"role": "user", "content": user_message})
