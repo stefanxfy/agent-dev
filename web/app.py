@@ -222,6 +222,12 @@ with st.sidebar:
                 pass
         st.session_state.chat_session_id = sid
         st.session_state.agent = None
+        # 更新文件 mtime 让 list_sessions 排序正确
+        from pathlib import Path
+        p = Path(DATA_DIR) / f"{sid}.jsonl"
+        if p.exists():
+            import os, time
+            os.utime(p, (time.time(), time.time()))
 
     if st.button("➕ 新建会话", key="new_session", on_click=create_session):
         pass  # 回调在 on_click 中处理
