@@ -439,6 +439,7 @@ class SessionManager:
         ai_title = None
         ai_title_entries = []
         last_prompt_entry = None
+        last_user_content = None
         user_msg_count = 0
 
         for entry in reversed(entries):
@@ -456,6 +457,8 @@ class SessionManager:
                 content = msg.get("content", "")
                 if isinstance(content, str) and content:
                     user_msg_count += 1
+                    if last_user_content is None:
+                        last_user_content = content
 
         # tail 没找到 custom-title，回退到 head 读取
         if not custom_title:
@@ -491,8 +494,11 @@ class SessionManager:
         self._gen_seq = max_gen_seq
 
         # 恢复 last_prompt 到内存
+        # 优先从 last-prompt Entry 恢复，fallback 到最后一条 user 消息
         if last_prompt_entry:
             self.metadata.last_prompt = last_prompt_entry.get("lastPrompt", "")
+        elif last_user_content:
+            self.metadata.update_last_prompt(last_user_content)
 
         # 决策：custom-title > ai-title > NEED_TITLE
         if custom_title:
