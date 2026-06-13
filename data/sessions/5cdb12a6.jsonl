@@ -1,0 +1,3 @@
+{"uuid": "9256bbd5-6b0d-4fd4-890e-4b62c1e2f674", "parentUuid": null, "sessionId": "5cdb12a6", "type": "user", "timestamp": "2026-06-13T23:55:22.889976", "message": {"role": "user", "content": "你是谁"}}
+{"uuid": "24c93a80-d308-4b52-95c1-f7ec2db7f12f", "parentUuid": null, "sessionId": "5cdb12a6", "type": "ai-title", "aiTitle": "我是谁", "genSeq": 1, "timestamp": "2026-06-13T23:55:23.635135"}
+{"uuid": "fc4825c4-02ab-41bd-85d1-bc5dc8ff20de", "parentUuid": "9256bbd5-6b0d-4fd4-890e-4b62c1e2f674", "sessionId": "5cdb12a6", "type": "assistant", "timestamp": "2026-06-13T23:55:27.879765", "message": {"role": "assistant", "content": "你好！我是一个AI智能助手，可以帮助你回答问题、查找信息、进行计算等。你可以随时向我提问，我会尽力为你提供帮助！😊\n\n有什么我可以帮你的吗？"}, "thinking": "", "tool_logs": []}

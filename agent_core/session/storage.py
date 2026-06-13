@@ -519,7 +519,7 @@ class SessionStorage:
                             msg = e.get("message", {})
                             content = msg.get("content", "")
                             if isinstance(content, str) and content:
-                                meta["last_prompt"] = content[:50]
+                                meta["preview"] = content[:50]
                     except json.JSONDecodeError:
                         continue
 
@@ -548,7 +548,7 @@ class SessionStorage:
                 "size": size,
                 "title": meta.get("title") or meta.get("ai_title") or "新会话",
                 "tags": meta.get("tags", []),
-                "last_prompt": meta.get("last_prompt", ""),
+                "preview": meta.get("preview", ""),
             })
 
         # 按更新时间倒序

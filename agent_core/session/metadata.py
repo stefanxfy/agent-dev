@@ -10,7 +10,6 @@ SessionMetadata - 会话元数据管理
 - agent-setting: Agent 配置
 - mode: 当前模式（plan/read/write）
 - worktree-state: Git worktree 状态
-- last-prompt: 最后一条用户消息
 - pr-link: PR 链接信息
 
 元数据存储策略：
