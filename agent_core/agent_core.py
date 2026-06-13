@@ -596,13 +596,15 @@ class ReactAgent:
     def close(self):
         """关闭当前会话，写入 last-prompt 到磁盘
 
-n        在切换会话或销毁 Agent 前显式调用，不依赖 __del__。
+        在切换会话或销毁 Agent 前显式调用，不依赖 __del__。
         """
         if self._session_manager:
+            lp = self._session_manager.metadata.last_prompt
+            _logger.warning(f"[DEBUG-CLOSE] sid={self._session_manager.session_id}, last_prompt={lp!r}")
             try:
                 self._session_manager.close()
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.warning(f"Agent.close() failed: {e}")
 
     def reset(self):
         """重置会话历史"""

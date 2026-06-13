@@ -158,10 +158,14 @@ class SessionManager:
         幂等：如果磁盘最后一条已经是相同的 last-prompt，不重复写。
         """
         if self._closed:
+            logger.warning(f"[CLOSE] already closed: {self.session_id}")
             return
         self._closed = True
 
+        logger.warning(f"[CLOSE] sid={self.session_id}, last_prompt={self.metadata.last_prompt!r}")
+
         if not self.metadata.last_prompt:
+            logger.warning(f"[CLOSE] no last_prompt, skip: {self.session_id}")
             return
 
         # 检查磁盘最后一行是否已经是相同的 last-prompt（避免重复追加）
