@@ -1,0 +1,4 @@
+{"uuid": "9d55323f-3e21-4b66-88ee-640dfed63055", "parentUuid": null, "sessionId": "628f1af2", "type": "custom-title", "customTitle": "你好", "timestamp": "2026-06-13T16:51:29.647125"}
+{"uuid": "5ac304f7-04c7-457c-80a0-2a087e5a4b4b", "parentUuid": null, "sessionId": "628f1af2", "type": "user", "timestamp": "2026-06-13T16:51:29.704753", "message": {"role": "user", "content": "你好"}}
+{"uuid": "f1355974-73e1-4b6a-91cb-be56c301ff7c", "parentUuid": null, "sessionId": "628f1af2", "type": "ai-title", "aiTitle": "问候时刻", "genSeq": 1, "timestamp": "2026-06-13T16:51:30.884922"}
+{"uuid": "9fa55ae1-3499-41d0-acc0-ac9483420974", "parentUuid": "5ac304f7-04c7-457c-80a0-2a087e5a4b4b", "sessionId": "628f1af2", "type": "assistant", "timestamp": "2026-06-13T16:51:42.846129", "message": {"role": "assistant", "content": "你好！👋 很高兴见到你！我是你的智能助手，可以帮你：\n\n- 🔍 **搜索信息** — 查询各种资讯、知识等\n- 🧮 **数学计算** — 帮你进行数学运算\n\n请问有什么可以帮到你的吗？😊"}, "thinking": "", "tool_logs": []}

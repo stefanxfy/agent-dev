@@ -200,7 +200,7 @@ with st.sidebar:
         # 先创建 session 并设置 title
         try:
             mgr = SessionManager(session_id=new_id, data_dir=DATA_DIR)
-            mgr.update_title(f"会话 {datetime.now().strftime('%H:%M')}")
+            # 标题由 _on_user_message 自动生成，新建时不再预设
             mgr.flush()
         except Exception:
             pass
@@ -480,15 +480,8 @@ if prompt := st.chat_input("输入消息..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
 
     # 自动生成标题（第一条用户消息）
-    if st.session_state.chat_session_id and len(st.session_state.messages) == 1:
-        try:
-            # 取前 20 个字符作为标题
-            title = prompt[:20] + ("..." if len(prompt) > 20 else "")
-            mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
-            mgr.update_title(title)
-            mgr.flush()
-        except Exception:
-            pass  # 标题生成失败不影响主流程
+    # 标题生成已由 SessionManager._on_user_message 自动处理
+    # （即时占位 + 异步 AI 生成），不再在 app.py 手动调用 update_title
 
     # 调用 Agent（流式）
     with st.chat_message("assistant"):
