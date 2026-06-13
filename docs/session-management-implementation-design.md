@@ -471,33 +471,9 @@ def _restore_title_state(self):
 
 ---
 
-## 六、Streamlit 集成的特殊考量
+## 六、与 Claude Code 的对照分析
 
-### 6.1 脚本重跑模型
-
-Streamlit 每次用户交互（点按钮、输入文本）都会**重跑整个脚本**。这意味着：
-
-- `get_agent()` 可能在每次交互时被重新调用
-- 新 `ReactAgent` → 新 `SessionManager` → `_restore_title_state()` 被触发
-- 任何不持久化的内存状态（`_user_msg_count`、`_gen_seq`、`_title_state`）都会丢失
-
-**解决方案**：所有标题相关状态都从 JSONL 恢复（见上文 `_restore_title_state`）。
-
-### 6.2 Session ID 持久化
-
-Streamlit 的 `st.session_state` 在 F5 刷新后丢失。使用 URL query param 持久化：
-
-```python
-# 从 URL 恢复 session_id
-if "session" in st.query_params:
-    st.session_state.chat_session_id = st.query_params["session"]
-```
-
----
-
-## 七、与 Claude Code 的对照分析
-
-### 7.1 设计差异
+### 6.1 设计差异
 
 | 维度 | Claude Code | agent-dev |
 |------|-------------|-----------|
@@ -514,7 +490,7 @@ if "session" in st.query_params:
 | **last-prompt Entry** | ✅ 每轮覆盖，200字截断 | ❌ 未实现 |
 | **task-summary Entry** | ✅ `claude ps` 命令用 | ❌ 未实现 |
 
-### 7.2 Claude Code 设计精髓总结
+### 6.2 Claude Code 设计精髓总结
 
 1. **Append-Only 是基石**：所有操作都是追加，永不修改已有数据。崩溃安全、可回溯、无锁
 2. **类型即元数据**：用 Entry type 区分数据种类，避免一个字段存多种语义
@@ -527,7 +503,7 @@ if "session" in st.query_params:
 
 ---
 
-## 八、待补齐功能（按优先级）
+## 七、待补齐功能（按优先级）
 
 | 优先级 | 功能 | 说明 |
 |--------|------|------|
@@ -541,7 +517,7 @@ if "session" in st.query_params:
 
 ---
 
-## 九、测试覆盖
+## 八、测试覆盖
 
 当前 18 个测试覆盖：
 
