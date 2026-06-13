@@ -213,6 +213,7 @@ with st.sidebar:
 
     def switch_session(sid: str):
         """切换到指定会话"""
+        logging.warning(f"[DEBUG-SWITCH] click sid={sid}, current_sid={st.session_state.get('chat_session_id')}")
         if sid == st.session_state.get("chat_session_id"):
             return
         if st.session_state.agent is not None:
