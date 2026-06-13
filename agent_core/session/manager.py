@@ -222,12 +222,15 @@ class SessionManager:
     ) -> str:
         """添加助手消息"""
         entry_type = extra.pop("entry_type", "assistant")
+        extra_kwargs = {}
+        if tool_calls:  # 只在有 tool_calls 时才存
+            extra_kwargs["tool_calls"] = tool_calls
         uuid_ = self.storage.add_message(
             "assistant",
             content,
             entry_type=entry_type,
             parent_uuid=self._last_uuid,
-            tool_calls=tool_calls or [],
+            **extra_kwargs,
             **extra,
         )
         self._last_uuid = uuid_
