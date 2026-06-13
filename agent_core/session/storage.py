@@ -253,18 +253,6 @@ class SessionStorage:
             **extra,
         )
 
-    def add_system(
-        self,
-        content: str,
-        **extra,
-    ) -> str:
-        """添加 system prompt Entry"""
-        return self.append_entry(
-            entry_type="system",
-            content={"role": "system", "content": content},
-            **extra,
-        )
-
     def add_summary(
         self,
         summary: str,
