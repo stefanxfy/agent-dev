@@ -369,6 +369,17 @@ if st.session_state.messages == [] and st.session_state.chat_session_id:
             if isinstance(inner, dict):
                 role = inner.get("role", "")
                 content = inner.get("content", "")
+            elif isinstance(inner, list):
+                # 新格式：content 是 [{type:text, text:...}, {type:tool_use, ...}] 数组
+                role = msg.get("role", "") or etype
+                content = inner
+            elif isinstance(inner, str):
+                # 旧格式兼容：content 是 JSON 字符串
+                role = msg.get("role", "") or etype
+                try:
+                    content = json.loads(inner)
+                except (json.JSONDecodeError, TypeError):
+                    content = inner  # 普通字符串，原样使用
             else:
                 role = msg.get("role", "") or etype
                 content = inner
