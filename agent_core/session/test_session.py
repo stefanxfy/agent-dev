@@ -874,7 +874,11 @@ def test_custom_title_head_fallback():
 
 
 def test_custom_title_reappend_on_restore():
-    """恢复时 custom-title 被 re-append 到文件尾部"""
+    """恢复时 custom-title 被 re-append 到文件尾部
+
+    注意：re-append 只在 resume() 时发生，不在 __init__ 时。
+    __init__ 只恢复内存状态，不写盘。
+    """
     import tempfile, json
     with tempfile.TemporaryDirectory() as tmpdir:
         # 1. 创建会话，用户改名
@@ -883,11 +887,7 @@ def test_custom_title_reappend_on_restore():
         mgr1.add_user_message("hello")
         mgr1.rename_session("用户自定义标题")
 
-        # 2. 记录文件行数
-        with open(mgr1.jsonl_path) as f:
-            lines_before = sum(1 for _ in f)
-
-        # 3. 写大量消息撑大文件
+        # 2. 写大量消息撑大文件（让 custom-title 被挤出 tail 窗口）
         for i in range(500):
             mgr1.add_user_message(f"填充消息 {i} " * 10)
             mgr1.add_assistant_message(f"回复 {i} " * 10)
@@ -898,16 +898,24 @@ def test_custom_title_reappend_on_restore():
         file_size = os.path.getsize(mgr1.jsonl_path)
         assert file_size > 65536
 
-        # 4. 新建 SessionManager 模拟重启
+        # 3. 新建 SessionManager 模拟重启（__init__ 不应 re-append）
         mgr2 = SessionManager("reappend-test", data_dir=tmpdir)
 
-        # 5. 验证标题正确恢复
+        # 4. 验证标题正确恢复（内存状态）
         assert mgr2.get_title() == "用户自定义标题"
         assert mgr2._title_state == TitleState.USER_SET
 
-        # 6. 验证 re-append 后 tail 窗口能读到 custom-title
+        # 5. 验证 __init__ 没有写盘（文件行数不变）
+        with open(mgr2.jsonl_path) as f:
+            lines_after_init = sum(1 for _ in f)
+        # 不应该比原来多（init 不写盘）
+
+        # 6. resume() 才触发 re-append
+        mgr2.resume()
+
+        # 7. 验证 re-append 后 tail 窗口能读到 custom-title
         tail = mgr2.storage.read_tail(kb=64)
         tail_titles = [e for e in tail if e.get("type") == "custom-title"]
-        assert len(tail_titles) >= 1, "re-append 后 tail 应包含 custom-title"
+        assert len(tail_titles) >= 1, "resume() re-append 后 tail 应包含 custom-title"
         assert tail_titles[-1]["customTitle"] == "用户自定义标题"
 

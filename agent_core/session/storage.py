@@ -557,6 +557,56 @@ class SessionStorage:
 
     # ── 删除会话 ─────────────────────────────────────────────────
 
+    @staticmethod
+    def count_messages(jsonl_path: Path) -> int:
+        """快速统计消息数（不创建实例，只数 user/assistant 行）
+
+        用于 UI 侧边栏列表等只需要数字的场景，避免 SessionManager.__init__
+        触发 _restore_title_state 带来的副作用。
+        """
+        count = 0
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                        if e.get("type") in ("user", "assistant"):
+                            count += 1
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            pass
+        return count
+
+    @staticmethod
+    def read_messages_lightweight(jsonl_path: Path, limit: int = 5) -> list[dict]:
+        """轻量读取最近 N 条消息（不创建实例，不触发 __init__ 副作用）
+
+        用于 UI 历史查看器等只需要最近几条消息的场景。
+        """
+        entries = []
+        try:
+            # 先读全部行（JSONL 文件通常不大），取最后 limit 条消息
+            all_msgs = []
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                        if e.get("type") in ("user", "assistant"):
+                            all_msgs.append(e)
+                    except json.JSONDecodeError:
+                        continue
+            entries = all_msgs[-limit:] if len(all_msgs) > limit else all_msgs
+        except Exception:
+            pass
+        return entries
+
     def delete(self):
         """删除当前会话文件"""
         self.flush()

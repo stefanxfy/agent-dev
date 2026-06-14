@@ -54,6 +54,7 @@ from agent_core.llm.router import (
 )
 from agent_core.agent_core import ReactAgent
 from agent_core.session.manager import SessionManager
+from agent_core.session.storage import SessionStorage
 from agent_core.tools.base import ToolRegistry
 from agent_core.tools.builtin import register_builtin_tools
 
@@ -170,17 +171,16 @@ with st.sidebar:
             last_role = agent.history[-1].get("role", "unknown")
             st.caption(f"最后消息: {last_role}")
 
-    # 历史记录查看器（直接从磁盘加载，不受执行顺序影响）
+    # 历史记录查看器（直接从磁盘读取，不创建 SessionManager 实例）
     _view_sid = st.session_state.get("chat_session_id")
     if _view_sid:
         try:
-            _view_mgr = SessionManager(session_id=_view_sid, data_dir=DATA_DIR)
-            _view_msgs = _view_mgr.get_messages()
+            _jsonl_path = Path(DATA_DIR) / f"{_view_sid}.jsonl"
+            _view_msgs = SessionStorage.read_messages_lightweight(_jsonl_path, limit=5)
             if _view_msgs:
                 st.divider()
                 st.subheader("📜 历史记录")
-                recent = _view_msgs[-5:] if len(_view_msgs) > 5 else _view_msgs
-                for i, entry in enumerate(recent):
+                for i, entry in enumerate(_view_msgs):
                     role = entry.get("message", {}).get("role", "unknown")
                     content = entry.get("message", {}).get("content", "")
                     if isinstance(content, str):
@@ -232,10 +232,10 @@ with st.sidebar:
                     sid = sess["session_id"]
                     title = sess.get("title") or "未命名"
                     preview = sess.get("preview") or ""
-                    # 实时读取消息数
+                    # 实时读取消息数（轻量静态方法，不创建 SessionManager）
                     try:
-                        m_mgr = SessionManager(session_id=sid, data_dir=DATA_DIR)
-                        msg_count = len(m_mgr.get_messages())
+                        _path = Path(DATA_DIR) / f"{sid}.jsonl"
+                        msg_count = SessionStorage.count_messages(_path)
                     except Exception as e:
                         logging.warning(f"会话消息数读取失败 (sid={sid}): {e}")
                         msg_count = 0
@@ -297,9 +297,9 @@ with st.sidebar:
         st.divider()
         st.caption(f"**当前会话**: `{st.session_state.chat_session_id}`")
         try:
-            mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
-            msgs = mgr.get_messages()
-            st.caption(f"消息数: {len(msgs)}")
+            _path = Path(DATA_DIR) / f"{st.session_state.chat_session_id}.jsonl"
+            msg_count = SessionStorage.count_messages(_path)
+            st.caption(f"消息数: {msg_count}")
         except Exception as e:
             logging.warning(f"当前会话消息数读取失败: {e}")
     
@@ -394,8 +394,9 @@ if _loaded_sid != _current_sid and _current_sid:
     # session 切换了，先清空旧消息
     st.session_state.messages = []
     try:
-        mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
-        history = mgr.get_messages()
+        # 直接用 SessionStorage 读取，不创建 SessionManager（避免 _restore_title_state 副作用）
+        _storage = SessionStorage(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
+        history = _storage.get_messages()
 
         loaded_count = 0
         for entry in history:

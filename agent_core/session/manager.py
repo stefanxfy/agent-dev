@@ -241,6 +241,11 @@ class SessionManager:
         # 恢复标题状态
         self._restore_title_state()
 
+        # Resume 时显式 re-append 元数据（保证 tail 窗口可见）
+        # 这是唯一应该 re-append 的地方
+        if self.metadata.title:
+            self._reappend_metadata()
+
         logger.info(f"Resumed session: {self.session_id}, got {len(messages)} messages")
         return messages
 
@@ -447,10 +452,10 @@ class SessionManager:
         if custom_title:
             self._title_state = TitleState.USER_SET
             self._title_cache = custom_title.get("customTitle") or custom_title.get("title")
-            # 同步到 metadata（_reappend_metadata 会读 metadata.title 写 custom-title Entry）
+            # 同步到 metadata（仅内存，不写盘）
             self.metadata.title = self._title_cache
-            # re-append custom-title 到文件尾部（保证 tail 窗口能读到）
-            self._reappend_metadata()
+            # 注意：不在 __init__ 路径调用 _reappend_metadata()
+            # re-append 只应在 resume() 中显式调用，避免每次创建实例都写盘
             return
 
         # ai-title 场景不需要 re-append
