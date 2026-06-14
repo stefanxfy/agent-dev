@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 # ── 配置日志（在加载任何模块之前）──────────────────────────────
@@ -52,6 +53,7 @@ from agent_core.llm.router import (
     UsageStats,
 )
 from agent_core.agent_core import ReactAgent
+from agent_core.session.manager import SessionManager
 from agent_core.tools.base import ToolRegistry
 from agent_core.tools.builtin import register_builtin_tools
 
@@ -73,7 +75,6 @@ if "system_prompt" not in st.session_state:
 if "chat_session_id" not in st.session_state:
     # 优先从 URL query param 获取
     url_sid = st.query_params.get("session", None)
-    logging.warning(f"[DEBUG-INIT] url_sid={url_sid}, query_params={dict(st.query_params)}")
     if url_sid:
         st.session_state.chat_session_id = url_sid
     else:
@@ -169,22 +170,27 @@ with st.sidebar:
             last_role = agent.history[-1].get("role", "unknown")
             st.caption(f"最后消息: {last_role}")
 
-    # 历史记录查看器
-    if st.session_state.agent and st.session_state.agent.history:
-        st.divider()
-        st.subheader("📜 历史记录")
-        history = st.session_state.agent.history
-        # 显示最近 5 条
-        recent = history[-5:] if len(history) > 5 else history
-        for i, msg in enumerate(recent):
-            role = msg.get("role", "unknown")
-            content_preview = ""
-            if isinstance(msg.get("content"), str):
-                content_preview = msg["content"][:50]
-            else:
-                content_preview = f"[{len(msg.get('content', []))} blocks]"
-            with st.expander(f"{i+1}. {role}: {content_preview}..."):
-                st.json(msg)
+    # 历史记录查看器（直接从磁盘加载，不受执行顺序影响）
+    _view_sid = st.session_state.get("chat_session_id")
+    if _view_sid:
+        try:
+            _view_mgr = SessionManager(session_id=_view_sid, data_dir=DATA_DIR)
+            _view_msgs = _view_mgr.get_messages()
+            if _view_msgs:
+                st.divider()
+                st.subheader("📜 历史记录")
+                recent = _view_msgs[-5:] if len(_view_msgs) > 5 else _view_msgs
+                for i, entry in enumerate(recent):
+                    role = entry.get("message", {}).get("role", "unknown")
+                    content = entry.get("message", {}).get("content", "")
+                    if isinstance(content, str):
+                        content_preview = content[:50]
+                    else:
+                        content_preview = f"[{len(content)} blocks]"
+                    with st.expander(f"{i+1}. {role}: {content_preview}..."):
+                        st.json(entry.get("message", {}))
+        except Exception as e:
+            logging.warning(f"侧边栏历史记录加载失败: {e}")
 
     # ── 会话管理 ────────────────────────────────────────────────
     st.divider()
@@ -193,45 +199,25 @@ with st.sidebar:
     # DATA_DIR 已移到文件顶部定义
     
     # 新建会话
-    def create_session():
-        """新建会话"""
-        import uuid
+    if st.button("➕ 新建会话", key="new_session"):
         new_id = str(uuid.uuid4())[:8]
         try:
             mgr = SessionManager(session_id=new_id, data_dir=DATA_DIR)
             mgr.flush()
-        except Exception:
-            pass
-        # 关闭旧 Agent
+        except Exception as e:
+            logging.warning(f"新建会话写入失败: {e}")
         if st.session_state.agent is not None:
             try:
                 st.session_state.agent.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"关闭旧 Agent 失败: {e}")
         st.session_state.chat_session_id = new_id
         st.session_state.agent = None
-
-    def switch_session(sid: str):
-        """切换到指定会话"""
-        logging.warning(f"[DEBUG-SWITCH] click sid={sid}, current_sid={st.session_state.get('chat_session_id')}")
-        if sid == st.session_state.get("chat_session_id"):
-            return
-        if st.session_state.agent is not None:
-            try:
-                st.session_state.agent.close()
-            except Exception:
-                pass
-        st.session_state.chat_session_id = sid
-        st.session_state.agent = None
-
-    if st.button("➕ 新建会话", key="new_session", on_click=create_session):
-        pass  # 回调在 on_click 中处理
+        st.rerun()
 
     # 加载已有会话
-    from agent_core.session.manager import SessionManager
     try:
         sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
-        logging.warning(f"[DEBUG-SIDEBAR] DATA_DIR={DATA_DIR}, sessions={len(sessions)}")
         if sessions:
             # 当前会话排第一，其余按 mtime 倒序
             current_sid = st.session_state.get("chat_session_id")
@@ -250,7 +236,8 @@ with st.sidebar:
                     try:
                         m_mgr = SessionManager(session_id=sid, data_dir=DATA_DIR)
                         msg_count = len(m_mgr.get_messages())
-                    except Exception:
+                    except Exception as e:
+                        logging.warning(f"会话消息数读取失败 (sid={sid}): {e}")
                         msg_count = 0
                     
                     # 一行：加载按钮 + 操作按钮
@@ -258,9 +245,16 @@ with st.sidebar:
                     with cols[0]:
                         label = f"📄 {title} ({msg_count}条)"
                         help_text = f"{sid}\n最近: {preview}" if preview else sid
-                        # 使用 on_click 回调避免双 rerun
-                        st.button(label, key=f"load_{sid}", help=help_text,
-                                  on_click=switch_session, args=(sid,))
+                        if st.button(label, key=f"load_{sid}", help=help_text):
+                            if sid != st.session_state.get("chat_session_id"):
+                                if st.session_state.agent is not None:
+                                    try:
+                                        st.session_state.agent.close()
+                                    except Exception as e:
+                                        logging.warning(f"切换会话时关闭旧 Agent 失败: {e}")
+                                st.session_state.chat_session_id = sid
+                                st.session_state.agent = None
+                                st.rerun()
                     with cols[1]:
                         # 重命名按钮
                         if st.button("✏️", key=f"rename_{sid}", help="修改标题"):
@@ -306,8 +300,8 @@ with st.sidebar:
             mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
             msgs = mgr.get_messages()
             st.caption(f"消息数: {len(msgs)}")
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"当前会话消息数读取失败: {e}")
     
     st.divider()
     
@@ -319,6 +313,20 @@ with st.sidebar:
         if st.session_state.agent:
             st.session_state.agent.reset()
         st.rerun()
+
+
+# ── 辅助函数 ─────────────────────────────────────────────────
+def extract_text(content):
+    """从消息 content 中提取纯文本。content 可能是 str 或 content blocks list。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+        return " ".join(texts)
+    return str(content) if content else ""
 
 
 # ── 初始化 Agent ───────────────────────────────────────────────
@@ -356,7 +364,7 @@ if (st.session_state.agent is None or
         st.session_state.get("last_session_id") != st.session_state.chat_session_id):
     # 如果没有 session_id，尝试加载最近的会话
     sid = st.session_state.chat_session_id
-    logging.warning(f"[DEBUG-AGENT-INIT] sid={sid}, agent is None={st.session_state.agent is None}")
+
     if not sid:
         try:
             sessions = SessionManager.list_sessions(data_dir=DATA_DIR)
@@ -364,14 +372,14 @@ if (st.session_state.agent is None or
                 sid = sessions[0]["session_id"]  # 用最新的会话
                 st.session_state.chat_session_id = sid
                 st.query_params["session"] = sid
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"自动加载最近会话失败: {e}")
     # 关闭旧 Agent 的 session
     if st.session_state.agent is not None:
         try:
             st.session_state.agent.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Agent 重建时关闭旧 Agent 失败: {e}")
 
     st.session_state.agent = get_agent(sid)
     st.session_state.last_agent_config = current_config
@@ -382,14 +390,13 @@ agent = st.session_state.agent
 # 从 session 加载聊天历史（session_id 变化时重新加载）
 _loaded_sid = st.session_state.get("_loaded_session_id")
 _current_sid = st.session_state.chat_session_id
-logging.warning(f"[DEBUG-LOAD] loaded_sid={_loaded_sid}, current_sid={_current_sid}, messages={len(st.session_state.messages)}")
 if _loaded_sid != _current_sid and _current_sid:
     # session 切换了，先清空旧消息
     st.session_state.messages = []
     try:
         mgr = SessionManager(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
         history = mgr.get_messages()
-        logging.warning(f"[DEBUG-LOAD] session={st.session_state.chat_session_id}, history={len(history)} entries")
+
         loaded_count = 0
         for entry in history:
             etype = entry.get("type", "")
@@ -411,19 +418,6 @@ if _loaded_sid != _current_sid and _current_sid:
             thinking = entry.get("thinking", "") or ""
             tool_logs = entry.get("tool_logs", []) or []
 
-            # 提取文本内容（content 可能是 str 或 list）
-            def extract_text(c):
-                if isinstance(c, str):
-                    return c
-                if isinstance(c, list):
-                    # 从 content blocks 中提取 text
-                    texts = []
-                    for block in c:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            texts.append(block.get("text", ""))
-                    return " ".join(texts)
-                return str(c) if c else ""
-
             text_content = extract_text(content)
 
             # 只显示有文本内容的 user 和 assistant
@@ -438,7 +432,7 @@ if _loaded_sid != _current_sid and _current_sid:
                     "tool_logs": tool_logs,
                 })
                 loaded_count += 1
-        logging.warning(f"[DEBUG-LOAD] loaded {loaded_count} messages to session_state")
+
         st.session_state._loaded_session_id = _current_sid
     except Exception as e:
         logging.warning(f"加载会话历史失败: {e}")
@@ -456,16 +450,9 @@ def run_agent(user_input: str):
         yield (msg_type, content)
 
 
-# ── 调试信息（临时）─────────────────────────────────────────────
-_debug_sid = st.session_state.chat_session_id
-_debug_msgs = len(st.session_state.messages)
-_debug_agent = st.session_state.agent is not None
-st.caption(f"🐛 DEBUG: session={_debug_sid}, messages={_debug_msgs}, agent={_debug_agent}, query_params={dict(st.query_params)}")
-
 # ── 主聊天界面 ────────────────────────────────────────────────
 
 # 渲染历史消息
-logging.warning(f"[DEBUG-RENDER] rendering {len(st.session_state.messages)} messages")
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg.get("thinking"):
