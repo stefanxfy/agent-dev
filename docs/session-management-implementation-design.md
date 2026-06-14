@@ -2,7 +2,7 @@
 
 > 基于 Claude Code 源码深度分析，结合 agent-dev 项目落地实践
 >
-> 版本：v1.0 | 日期：2026-06-13
+> 版本：v1.1 | 日期：2026-06-14
 > 源码参考：`claude-code-analysis/src/utils/sessionStorage.ts` + `sessionTitle.ts` + `bridge/initReplBridge.ts`
 
 ---
@@ -99,6 +99,8 @@ agent-dev/
 | `custom-title` | 用户手动命名的标题 | 无，用 `customTitle` 字段 | `{"customTitle":"我的会话"}` |
 | `compact_boundary` | 上下文压缩断链标记 | 无 | 压缩后旧消息与新消息的分界 |
 | `summary` | 压缩生成的摘要 | `{"role":"system","content":"..."}` | 上下文压缩后的摘要消息 |
+| `agent-name` | Agent 名称 | 无，用 `agentName` 字段 | `{"agentName":"default"}` |
+| `mode` | 会话模式 | 无，用 `mode` 字段 | `{"mode":"write"}` |
 
 ### 2.4 Claude Code 风格的消息存储
 
@@ -174,7 +176,21 @@ SessionManager (Facade)
 - **UUID 去重**：`_uuid_set` 记录所有已分配的 UUID，防止重复
 - **自动链接**：不传 `parent_uuid` 时自动链到最新 Entry
 
-### 3.4 parentUuid 森林结构
+### 3.4 轻量读取接口（零实例化）
+
+UI 层（Streamlit 侧边栏）只需要消息数和最近几条消息，不需要创建 SessionManager 实例（避免触发 `__init__` 副作用）。为此提供两个静态方法：
+
+```python
+# 数消息行数（不创建实例）
+count = SessionStorage.count_messages(Path("data/sessions/xxx.jsonl"))
+
+# 读最近 N 条消息（不创建实例）
+msgs = SessionStorage.read_messages_lightweight(Path("data/sessions/xxx.jsonl"), limit=5)
+```
+
+**设计原因**：Streamlit 每次交互都触发完整 rerun，如果在侧边栏创建 SessionManager 实例，`__init__` 中的 `_restore_title_state()` 会在每次 rerun 时读文件并可能触发写盘（已修复，但零实例化方案更彻底——连文件读取都避免了）。
+
+### 3.5 parentUuid 森林结构
 
 ```
 Entry A (parentUuid=None)     ← 消息链头
@@ -211,6 +227,24 @@ compact_boundary (parentUuid=None)  ← 压缩断链，新链头
 3. 后续新消息从断点开始新链
 
 Resume 时只读取 `compact_boundary` 之后的 Entry + summary，避免加载全部历史。
+
+### 4.3 Re-Append 元数据机制
+
+`_reappend_metadata()` 的作用是保证 custom-title + agent-name + mode 在 tail 64KB 窗口内可见。
+
+**关键设计原则：re-append 只在显式操作时触发，绝不在 `__init__` 路径中自动触发。**
+
+| 触发位置 | 场景 | 写入内容 |
+|---------|------|---------|
+| `resume()` | Continue 恢复时（文件 > 64KB 才有意义） | custom-title + agent-name + mode |
+| `add_tag()` | 用户添加标签 | custom-title + agent-name + mode + tag |
+| `update_mode()` | 切换 plan/read/write 模式 | custom-title + agent-name + mode |
+
+**不在 `__init__` 中调用的原因**（v1.1 修复，commit `c35df83`）：
+
+Streamlit 的 rerun 模型每次交互都重建 SessionManager 实例。如果 `__init__` 触发 re-append，每次 rerun 都写 3-4 条元数据到 JSONL，导致文件爆炸（实测 3 条对话膨胀为 924 行）。
+
+> ⚠️ **`_reappend_metadata()` 尚未实现去重守卫**（计划中）。当前如果 `resume()` 被多次调用，仍会重复追加。但由于 UI 切换会话不走 `resume()`，实际不会触发。
 
 ---
 
@@ -427,7 +461,7 @@ async def _generate_ai_title(self, input_text: str, gen_seq: int) -> None:
 
 #### 重启恢复（_restore_title_state）
 
-从 JSONL tail 扫描，重建三个状态：
+从 JSONL tail 扫描，重建三个状态。**注意：恢复只读不写——不在 `__init__` 中触发 `_reappend_metadata()`**。
 
 ```python
 def _restore_title_state(self):
@@ -456,6 +490,7 @@ def _restore_title_state(self):
     # 决策优先级：custom-title > ai-title(genSeq≥2) > ai-title(genSeq=1) > NEED_TITLE
     if custom_title:
         self._title_state = TitleState.USER_SET
+        # 仅更新内存，不写盘（v1.1 修复）
     elif ai_title:
         if ai_title.get("genSeq", 1) >= 2:
             self._title_state = TitleState.FINALIZED
@@ -470,6 +505,7 @@ def _restore_title_state(self):
 - `genSeq≥2`（已重新生成过）→ `FINALIZED`（锁定）
 - `_user_msg_count` 从 JSONL 统计纯用户消息恢复（排除 tool_result）
 - `_gen_seq` 取所有 ai-title 条目中的最大 genSeq 恢复
+- **只恢复内存状态，不触发任何写盘操作**（v1.1 修复，commit `c35df83`）
 
 ---
 
@@ -487,8 +523,9 @@ def _restore_title_state(self):
 | **genSeq 防乱序** | ✅ 闭包变量 | ✅ 实例变量 + JSONL 恢复 |
 | **deriveTitle 存 JSONL** | ❌ 不存（发远程 API） | ❌ 不存（只在内存缓存） |
 | **64KB Tail + Head 双窗口** | ✅ tail 优先，head 回退 | ✅ 一致（commit `114043f`） |
-| **reAppendSessionMetadata** | ✅ resume 时 custom-title 重写到尾部 | ✅ 一致（commit `114043f`） |
-| **last-prompt Entry** | ✅ 每轮覆盖，200字截断 | ✅ 一致（commit `06fa1a2`） |
+| **reAppendSessionMetadata** | ✅ resume 时 custom-title 重写到尾部 | ✅ 一致（commit `114043f`），仅在 `resume()` 中调用 |
+| **UI 层零实例化读取** | ✅ readSessionLite 定点读取 | ✅ `count_messages()` / `read_messages_lightweight()` 静态方法（commit `c35df83`） |
+| **last-prompt Entry** | ✅ 每轮覆盖，200字截断 | ❌ 未实现 |
 | **task-summary Entry** | ✅ `claude ps` 命令用 | ❌ 未实现 |
 
 ### 6.2 Claude Code 设计精髓总结
@@ -501,24 +538,50 @@ def _restore_title_state(self):
 6. **genSeq 防乱序**：异步请求可能乱序返回，序号确保只有最新结果生效
 7. **fire-and-forget**：标题生成在后台进行，永不阻塞主流程
 8. **两层触发 + 永久锁定**：第1条生成占位，第3条用完整对话重新生成，用户改名后永久锁定
+9. **构造函数零副作用**：`__init__` 只恢复内存状态，不写盘。写操作只在显式业务方法中触发
 
 ---
 
-## 七、待补齐功能（按优先级）
+## 七、关键教训：元数据爆炸 Bug
+
+### 7.1 问题现象
+
+会话文件 924 行，实际对话只有 3 条，其余 921 行全是重复元数据（custom-title / agent-name / mode 各 300+ 条）。
+
+### 7.2 根因
+
+`_restore_title_state()` 在 `__init__` 路径中调用了 `_reappend_metadata()`。Streamlit 每次交互触发 rerun，每帧创建 6-7 个 SessionManager 实例，每个实例 `__init__` 都写 3-4 条元数据到 JSONL。
+
+### 7.3 修复（commit `c35df83`）
+
+1. 删除 `_restore_title_state()` 中的 `_reappend_metadata()` 调用
+2. re-append 移到 `resume()` 方法中显式调用
+3. UI 层 4 处 `SessionManager()` 替换为 `SessionStorage` 静态方法
+4. 清理脏数据：5cdb12a6.jsonl 924→6行，7f071c62.jsonl 1000→8行
+
+### 7.4 教训
+
+**构造函数（`__init__`）绝对不能有写盘副作用**。特别是在 Streamlit 这种每次交互都重建组件的框架中，`__init__` 的调用频率远超预期。如果需要在初始化时做某些"修复"操作，应该在调用方显式触发（如 `resume()`），而不是藏在构造函数里。
+
+---
+
+## 八、待补齐功能（按优先级）
 
 | 优先级 | 功能 | 说明 |
 |--------|------|------|
 | P0 | F5 刷新后历史消息显示 | 修复 web/app.py 的消息加载逻辑 |
+| P0 | `_reappend_metadata` 去重守卫 | 写前检查尾部是否已有相同内容，防止重复追加 |
 | P2 | 上下文管理模块 | Token 预算 + 动态压缩 + summary Entry |
+| P2 | `last-prompt` Entry | 每轮覆盖写，200字截断，保证 tail 窗口可读 |
 | P2 | `task-summary` Entry | 周期性任务摘要，用于会话列表展示 |
-| P3 | `tag` / `agent-name` | 会话标签和 Agent 类型标记 |
+| P3 | `tag` / `agent-name` 在 UI 中展示 | 会话标签和 Agent 类型标记 |
 | P3 | `file-history-snapshot` | 文件变更快照，用于进度追踪 |
 
 ---
 
-## 八、测试覆盖
+## 九、测试覆盖
 
-当前 24 个测试覆盖：
+当前 22 个测试（`agent_core/session/test_session.py`，921 行）：
 
 | 测试 | 覆盖范围 |
 |------|---------|
@@ -543,9 +606,7 @@ def _restore_title_state(self):
 | `test_read_tail_basic` | tail 窗口读取 |
 | `test_read_head_basic` | head 窗口读取 |
 | `test_custom_title_head_fallback` | 长会话 head 回退 |
-| `test_custom_title_reappend_on_restore` | resume 时 re-append |
-| `test_last_prompt_truncate` | last-prompt 截断 + 换行转空格 |
-| `test_last_prompt_restore_on_resume` | last-prompt 重启恢复 |
+| `test_custom_title_reappend_on_restore` | resume 时 re-append（验证 `__init__` 不写盘 + `resume()` 才写盘） |
 
 ---
 
@@ -566,14 +627,25 @@ def _restore_title_state(self):
 
 ## 附录 B：agent-dev 代码索引
 
-| 功能 | 文件 | 关键类/函数 |
-|------|------|------------|
-| 存储层 | `agent_core/session/storage.py` | `SessionStorage`, `append_entry()`, `read_tail()`, `flush()` |
-| 管理层 | `agent_core/session/manager.py` | `SessionManager`, `TitleState`, `_on_user_message()`, `_restore_title_state()` |
-| 元数据 | `agent_core/session/metadata.py` | `SessionMetadata`, `update_ai_title()`, `update_title()` |
-| 状态机 | `agent_core/session/state.py` | `SessionState` |
-| 进度 | `agent_core/session/progress.py` | `ProgressTracker` |
-| 恢复 | `agent_core/session/restore.py` | `resume_session()`, `continue_session()`, `fork_session()` |
-| 清理 | `agent_core/session/cleanup.py` | `SessionCleanup` |
-| 测试 | `agent_core/session/test_session.py` | 18 个测试 |
-| UI 集成 | `web/app.py` | `get_agent()`, 会话管理侧边栏 |
+| 功能 | 文件 | 行数 | 关键类/函数 |
+|------|------|------|------------|
+| 存储层 | `agent_core/session/storage.py` | 692 | `SessionStorage`, `append_entry()`, `read_tail()`, `read_head()`, `count_messages()`, `read_messages_lightweight()`, `flush()` |
+| 管理层 | `agent_core/session/manager.py` | 904 | `SessionManager`, `TitleState`, `_on_user_message()`, `_restore_title_state()`, `resume()` |
+| 元数据 | `agent_core/session/metadata.py` | 285 | `SessionMetadata`, `update_ai_title()`, `update_title()` |
+| 状态机 | `agent_core/session/state.py` | 291 | `SessionState` |
+| 进度 | `agent_core/session/progress.py` | 298 | `ProgressTracker` |
+| 恢复 | `agent_core/session/restore.py` | 444 | `resume_session()`, `continue_session()`, `fork_session()` |
+| 清理 | `agent_core/session/cleanup.py` | 374 | `SessionCleanup` |
+| 包导出 | `agent_core/session/__init__.py` | 68 | — |
+| 测试 | `agent_core/session/test_session.py` | 921 | 22 个测试 |
+| UI 集成 | `web/app.py` | — | `get_agent()`, 会话管理侧边栏（零实例化读取） |
+| **合计** | **10 文件** | **~4279 行** | |
+
+---
+
+## 变更历史
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| v1.0 | 2026-06-13 | 初版：存储结构、模块架构、标题生成系统、Claude Code 对照分析 |
+| v1.1 | 2026-06-14 | 新增：§3.4 轻量读取接口、§4.3 re-append 触发时机说明、§7 元数据爆炸 Bug 教训；修正：`__init__` 不再调 `_reappend_metadata`、last-prompt 改为未实现、测试数量 22 个 |
