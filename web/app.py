@@ -149,18 +149,8 @@ with st.sidebar:
     st.session_state.system_prompt = system_prompt  # 保存到 session_state
 
     st.divider()
-    st.subheader("📊 Token 消耗（本次会话）")
-    stats = st.session_state.token_stats
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Input", f"{stats['input']:,}")
-        st.metric("Thinking", f"{stats['thinking']:,}")
-    with col2:
-        st.metric("Output", f"{stats['output']:,}")
-        st.metric("Total", f"{stats['input'] + stats['output'] + stats['thinking']:,}")
 
     # ── 上下文预算面板 ────────────────────────────────────────
-    st.divider()
     st.subheader("📐 上下文预算")
     if st.session_state.agent:
         agent = st.session_state.agent
