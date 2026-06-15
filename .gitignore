@@ -32,3 +32,6 @@ env/
 # Bytecode
 *.pyc
 *.pyo
+# Session 备份文件（recover_uncompressed.py 生成的）
+*.jsonl.recovery-backup
+*.jsonl.bak
