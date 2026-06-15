@@ -191,6 +191,82 @@ def test_resume_and_continue(tmpdir: str):
     Test.assert_in("Continue 有边界后消息", "边界后消息", all_content)
 
 
+def test_resume_with_new_format_boundary_and_summary(tmpdir: str):
+    """测试 resume_session 识别新格式 boundary（3089a29 后）
+
+    回归测试：如果 restore.py 的 _is_compact_boundary 不识别
+    type='system' + subtype='compact_boundary'，resume 会把压缩前的旧消息
+    全部加载回来，破坏压缩的语义。
+    """
+    Test.module("3b. Resume 识别新格式 boundary + summary（3089a29）")
+
+    manager = SessionManager(data_dir=tmpdir)
+
+    # 写压缩前的旧消息
+    for i in range(3):
+        manager.add_user_message(f"旧消息{i}")
+        manager.add_assistant_message(f"旧回复{i}")
+    manager.flush()
+
+    # 模拟压缩：add_compact_boundary + add_summary（新格式）
+    manager.add_compact_boundary(trigger="auto", pre_tokens=1000, messages_summarized=6)
+    manager.add_summary("这是摘要内容", tokens_saved=500)
+    manager.flush()
+
+    # 写压缩后的新消息
+    manager.add_user_message("新消息1")
+    manager.add_assistant_message("新回复1")
+    manager.flush()
+
+    # Resume 应该只看到：summary + boundary 后的新消息
+    resume_msgs, resume_meta = resume_session(manager.session_id, data_dir=tmpdir)
+    resume_contents = [m.get("content", "") for m in resume_msgs]
+    print(f"  Resume 返回 {len(resume_msgs)} 条: {resume_contents}")
+
+    # 不应包含旧消息
+    Test.check("Resume 不含旧消息0", "旧消息0" not in resume_contents)
+    Test.check("Resume 不含旧消息1", "旧消息1" not in resume_contents)
+    Test.check("Resume 不含旧消息2", "旧消息2" not in resume_contents)
+    # 不应包含旧回复
+    Test.check("Resume 不含旧回复0", "旧回复0" not in resume_contents)
+
+    # 应包含新消息
+    Test.assert_in("Resume 有新消息1", "新消息1", resume_contents)
+    Test.assert_in("Resume 有新回复1", "新回复1", resume_contents)
+
+    # 应包含 summary（作为新链的起点）
+    summary_present = any("Previous conversation summarized" in c for c in resume_contents)
+    Test.check("Resume 有 summary", summary_present, f"contents={resume_contents}")
+
+
+def test_resume_without_summary_still_works(tmpdir: str):
+    """测试 resume_session 在没有 summary 时也能正确截断（只 boundary，无 summary）
+
+    边界情况：boundary 存在但没 add_summary。
+    旧格式代码用 type=='summary' 找，新格式代码用 _is_compact_summary() 找。
+    两者都不应误判，应该返回 (boundary 后的消息, summary=None)。
+    """
+    Test.module("3c. Resume 无 summary 时的降级行为")
+
+    manager = SessionManager(data_dir=tmpdir)
+    manager.add_user_message("旧消息")
+    manager.add_assistant_message("旧回复")
+    manager.flush()
+
+    manager.add_compact_boundary()  # 只有 boundary，没有 add_summary
+    manager.flush()
+
+    manager.add_user_message("新消息")
+    manager.flush()
+
+    resume_msgs, _ = resume_session(manager.session_id, data_dir=tmpdir)
+    contents = [m.get("content", "") for m in resume_msgs]
+    print(f"  Resume (no summary) 返回 {len(resume_msgs)} 条: {contents}")
+
+    Test.check("Resume 不含旧消息", "旧消息" not in contents)
+    Test.assert_in("Resume 有新消息", "新消息", contents)
+
+
 def test_fork(tmpdir: str):
     """测试 Fork 语义"""
     Test.module("4. Fork（分叉）")

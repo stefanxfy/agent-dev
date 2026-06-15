@@ -572,10 +572,13 @@ class ReactAgent:
                                 results.append({"tool_use_id": tc.tool_use_id, "content": output})
                                 break
                     self._session_manager.add_tool_results(results)
-                    # 清空本轮结果
-                    self._pending_tool_results = []
                 except Exception as e:
                     _logger.warning(f"Failed to save intermediate turn to session: {e}")
+                finally:
+                    # 关键：无论成功还是失败，都清空本轮结果
+                    # 防止 write 异常时本轮 _pending_tool_results 残留污染下一轮 tool_call
+                    # （LLM 会因重复 tool_use_id 的 tool_result 报 protocol error）
+                    self._pending_tool_results = []
             # 继续下一轮循环（让 LLM 看到 tool_result）
 
         else:

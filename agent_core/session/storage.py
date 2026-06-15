@@ -362,7 +362,10 @@ class SessionStorage:
                     continue
                 try:
                     entry = json.loads(line)
-                    if not include_compact_boundary and entry.get("type") == "compact-boundary":
+                    if not include_compact_boundary and (
+                        entry.get("type") == "compact-boundary"
+                        or (entry.get("type") == "system" and entry.get("subtype") == "compact_boundary")
+                    ):
                         continue
                     entries.append(entry)
                     self._entry_cache[entry["uuid"]] = entry

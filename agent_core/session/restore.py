@@ -40,8 +40,38 @@ def _now_iso() -> str:
 
 
 def _is_compact_boundary(entry: dict) -> bool:
-    """判断 entry 是否为压缩边界"""
-    return entry.get("type") == "compact-boundary" or entry.get("compact") is True
+    """判断 entry 是否为压缩边界（兼容新旧两种格式）
+
+    新格式（3089a29 引入，对齐 Claude Code sessionStorage.ts）：
+        type="system" + subtype="compact_boundary"
+    旧格式（已废弃）：
+        type="compact-boundary" 或 compact=True
+    """
+    etype = entry.get("type")
+    if etype == "compact-boundary":
+        return True
+    if etype == "system" and entry.get("subtype") == "compact_boundary":
+        return True
+    if entry.get("compact") is True:
+        return True
+    return False
+
+
+def _is_compact_summary(entry: dict) -> bool:
+    """判断 entry 是否为压缩摘要（兼容新旧两种格式）
+
+    新格式（3089a29 引入，对齐 Claude Code getCompactUserSummaryMessage）：
+        type="user" + message.isCompactSummary=True
+    旧格式（已废弃）：
+        type="summary"
+    """
+    if entry.get("type") == "summary":
+        return True
+    if entry.get("type") == "user":
+        msg = entry.get("message") or {}
+        if msg.get("isCompactSummary") is True:
+            return True
+    return False
 
 
 def _is_message_entry(entry: dict) -> bool:
@@ -113,7 +143,7 @@ def _rebuild_chain(entries: list[dict]) -> list[dict]:
 
     # 构建 child_map（boundary 不追踪自己，但其 parentUuid=None 使其成为根）
     for e in entries:
-        if e.get("type") == "compact-boundary":
+        if _is_compact_boundary(e):
             continue
         parent = e.get("parentUuid")
         if parent:
@@ -122,7 +152,7 @@ def _rebuild_chain(entries: list[dict]) -> list[dict]:
     # 找到所有根节点（parentUuid = None）
     roots = [e for e in entries if e.get("parentUuid") is None]
     if not roots:
-        return [e for e in entries if e.get("type") != "compact-boundary"]
+        return [e for e in entries if not _is_compact_boundary(e)]
 
     # 按时间戳排序各条链的根节点
     roots.sort(key=lambda e: e.get("timestamp", ""))
@@ -149,7 +179,7 @@ def _rebuild_chain(entries: list[dict]) -> list[dict]:
         result.extend(chain)
 
     # 输出时过滤掉 boundary（boundary 在 uuid_to_entry 中用于追踪，但不应出现在消息链中）
-    return [e for e in result if e.get("type") != "compact-boundary"]
+    return [e for e in result if not _is_compact_boundary(e)]
 
 
 def _read_messages_up_to_boundary(
@@ -187,9 +217,9 @@ def _read_messages_up_to_boundary(
     boundary_entry = all_entries[boundary_idx]
     summary_entry = None
 
-    # 找边界前的 summary entry
+    # 找边界前的 summary entry（新格式：type=user + isCompactSummary=True）
     for i in range(boundary_idx - 1, -1, -1):
-        if all_entries[i].get("type") == "summary":
+        if _is_compact_summary(all_entries[i]):
             summary_entry = all_entries[i]
             break
 
