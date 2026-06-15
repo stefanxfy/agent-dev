@@ -488,6 +488,8 @@ class CompactOrchestrator:
             # 忽略 thinking/usage/tool_call chunks
 
         summary = self._extract_summary(full_text)
+
+
         return summary, full_text
 
     # ── 辅助方法 ────────────────────────────────────────────────

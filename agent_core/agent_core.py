@@ -47,32 +47,9 @@ from .context.manager import ContextManager as CM
 # 创建 logger（使用单例模式防止重复配置）
 _logger = logging.getLogger("react_agent")
 
-# 防重复：检查是否已有同名 StreamHandler（最可靠的方式）
-_has_stream_handler = any(
-    isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
-    for h in _logger.handlers
-)
-if not _has_stream_handler:
-    # 先清除所有旧 handler（包括热重载残留的）
-    for h in list(_logger.handlers):
-        try:
-            _logger.removeHandler(h)
-        except Exception:
-            pass
-    
-    _logger.setLevel(logging.DEBUG)
-    
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    formatter = logging.Formatter(
-        "[%(asctime)s] %(message)s",
-        datefmt="%H:%M:%S"
-    )
-    handler.setFormatter(formatter)
-    _logger.addHandler(handler)
-    
-    # 标记已配置
-    _logger._configured = True
+# 日志统一走 root handler（由 web/app.py basicConfig 配置）
+# agent_core 不再自建 handler，避免 propagate 导致重复输出
+_logger.setLevel(logging.DEBUG)  # 自己放开 DEBUG，由 root handler 的 level 控制是否输出
 
 
 def _format_messages_for_log(messages: list) -> str:
@@ -358,12 +335,12 @@ class ReactAgent:
             thinking_text = ""
 
             # === 日志：发送给 LLM 的原始消息 ===
-            _logger.info("\n" + "=" * 60)
-            _logger.info(f"📤 【发送给 LLM】Turn {turn}/{self.max_turns}")
-            _logger.info("=" * 60)
-            _logger.info(_format_messages_for_log(messages_for_llm))
+            _logger.debug("\n" + "=" * 60)
+            _logger.debug(f"📤 【发送给 LLM】Turn {turn}/{self.max_turns}")
+            _logger.debug("=" * 60)
+            _logger.debug(_format_messages_for_log(messages_for_llm))
             if tool_schemas:
-                _logger.info(f"\n📋 可用工具: {[t['name'] for t in tool_schemas]}")
+                _logger.debug(f"\n📋 可用工具: {[t['name'] for t in tool_schemas]}")
 
             try:
                 llm_chunks = self.llm.chat(
@@ -427,16 +404,16 @@ class ReactAgent:
                 return
 
             # === 日志：LLM 返回的原始内容 ===
-            _logger.info("\n" + "=" * 60)
-            _logger.info(f"📥 【LLM 返回】Turn {turn}/{self.max_turns}")
-            _logger.info("=" * 60)
+            _logger.debug("\n" + "=" * 60)
+            _logger.debug(f"📥 【LLM 返回】Turn {turn}/{self.max_turns}")
+            _logger.debug("=" * 60)
             if full_text:
-                _logger.info(f"💬 文本输出:\n{full_text}")
+                _logger.debug(f"💬 文本输出:\n{full_text}")
             if thinking_text:
-                _logger.info(f"💭 思考过程:\n{thinking_text}")
+                _logger.debug(f"💭 思考过程:\n{thinking_text}")
             if tool_calls:
-                _logger.info(f"\n🔧 工具调用 ({len(tool_calls)} 个):")
-                _logger.info(_format_tool_calls_for_log(tool_calls))
+                _logger.debug(f"\n🔧 工具调用 ({len(tool_calls)} 个):")
+                _logger.debug(_format_tool_calls_for_log(tool_calls))
 
             # ── 如果没有 tool_call → 最终回答 ───────────────────────
             if not tool_calls:
@@ -602,7 +579,7 @@ class ReactAgent:
         if self._session_manager:
             try:
                 self._session_manager.flush()
-                _logger.info(f"Session saved: {self._session_manager.session_id}")
+                _logger.debug(f"Session saved: {self._session_manager.session_id}")
             except Exception as e:
                 _logger.warning(f"Failed to flush session: {e}")
 

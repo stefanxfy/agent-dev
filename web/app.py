@@ -13,13 +13,31 @@ import uuid
 from pathlib import Path
 
 # ── 配置日志（在加载任何模块之前）──────────────────────────────
+# 用法: python3 -m streamlit run web/app.py -- --log-level=DEBUG
+#       python3 -m streamlit run web/app.py -- --log-level debug
+#       不传默认 INFO
+_argv = sys.argv[1:]
+_log_level = logging.INFO
+for i, arg in enumerate(_argv):
+    _val = None
+    if arg.startswith("--log-level="):
+        _val = arg.split("=", 1)[1]
+    elif arg == "--log-level" and i + 1 < len(_argv):
+        _val = _argv[i + 1]
+    if _val:
+        _log_level = getattr(logging, _val.upper(), logging.INFO)
+        break
+
 logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
+    level=_log_level,
+    format='[%(asctime)s] [%(levelname)s] %(name)s: %(message)s',
     datefmt='%H:%M:%S',
 )
-# 日志级别由 agent_core.py 统一管理，这里不再重复配置
-# （避免 Streamlit 热重载导致 handler 重复添加）
+# 安静第三方库（DEBUG 模式下避免刷屏）
+if _log_level <= logging.DEBUG:
+    for _noisy in ("httpx", "httpcore", "urllib3", "openai", "anthropic",
+                   "watchdog", "git"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ── 加载 .env 文件（必须在最前面）────────────────────────────
 from dotenv import load_dotenv
