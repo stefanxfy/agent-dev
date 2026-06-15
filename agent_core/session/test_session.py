@@ -1653,3 +1653,109 @@ def test_persist_compacted_syncs_manager_last_uuid():
         Test.assert_equal("后续 assistant parent 链到 preserved head 最后一条",
                           last_assistant.get("parentUuid"), 
                           last_preserved_in_storage)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  verify_summary.py 工具脚本测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_verify_summary_script():
+    """测试 scripts/verify_summary.py 的 check_summary 函数"""
+    import sys
+    sys.path.insert(0, "scripts")
+    from verify_summary import check_summary, REQUIRED_PREFIX
+
+    # 场景 1: 完整合规（带 XML 标签）
+    good_entry = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": REQUIRED_PREFIX + "\n\n<analysis>用户问了什么</analysis><summary>1. 用户目标：问 2. 关键决策：决 3. 当前状态：完 4. 待办事项：无</summary>",
+            "isCompactSummary": True,
+        },
+    }
+    r = check_summary(good_entry, strict=False)
+    Test.check("完整合规 (宽松模式) 通过", r["passed"])
+    Test.check("核心要求满足", r["core_ok"])
+    Test.check("XML 标签全有", r["xml_ok"])
+
+    r_strict = check_summary(good_entry, strict=True)
+    Test.check("完整合规 (严格模式) 通过", r_strict["passed"])
+
+    # 场景 2: 7f071c62 现场（缺 XML 标签但 4 段结构完整）
+    glm_entry = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": REQUIRED_PREFIX + "\n\n1. 用户目标：问 2. 关键决策：决 3. 当前状态：完 4. 待办事项：无",
+            "isCompactSummary": True,
+        },
+    }
+    r = check_summary(glm_entry, strict=False)
+    Test.check("GLM 风格 (宽松) 通过", r["passed"])
+    Test.check("GLM 风格核心要求满足", r["core_ok"])
+    Test.check("GLM 风格 XML 缺失", not r["xml_ok"])
+
+    r_strict = check_summary(glm_entry, strict=True)
+    Test.check("GLM 风格 (严格) 失败", not r_strict["passed"])
+
+    # 场景 3: 太短
+    short_entry = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": REQUIRED_PREFIX + "\n\n太短",
+            "isCompactSummary": True,
+        },
+    }
+    r = check_summary(short_entry)
+    Test.check("太短被检测", not r["passed"])
+
+    # 场景 4: 缺前缀
+    no_prefix = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": "1. 用户目标：缺前缀",
+            "isCompactSummary": True,
+        },
+    }
+    r = check_summary(no_prefix)
+    Test.check("缺前缀被检测", not r["passed"])
+
+    # 场景 5: 缺 4 段
+    no_segments = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": REQUIRED_PREFIX + "\n\n只是一段话没有任何结构",
+            "isCompactSummary": True,
+        },
+    }
+    r = check_summary(no_segments)
+    Test.check("缺 4 段被检测", not r["passed"])
+
+    # 场景 6: 空内容
+    empty = {"type": "user", "message": {"role": "user", "content": "", "isCompactSummary": True}}
+    r = check_summary(empty)
+    Test.check("空内容被检测", not r["passed"])
+
+
+def test_verify_summary_cli():
+    """测试 CLI 入口"""
+    import subprocess
+
+    # --help
+    result = subprocess.run(
+        ["python3", "scripts/verify_summary.py", "--help"],
+        capture_output=True, text=True, cwd=".",
+    )
+    Test.assert_equal("--help 退出码 0", result.returncode, 0)
+
+    # 不存在 session
+    result = subprocess.run(
+        ["python3", "scripts/verify_summary.py", "no-such-session-12345"],
+        capture_output=True, text=True, cwd=".",
+    )
+    Test.assert_equal("不存在 session 退出码 2", result.returncode, 2)
+    Test.check("错误信息包含'找不到'", "找不到" in result.stderr)
