@@ -1477,3 +1477,93 @@ def test_persist_compacted_no_session_manager():
     # 不应该抛异常
     agent._persist_compacted_messages(compacted, MockCompactResult())
     Test.check("无 session_manager 不报错", True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  recover_uncompressed.py 工具脚本测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_recover_uncompressed_script():
+    """测试 scripts/recover_uncompressed.py 的核心逻辑（recover 函数）"""
+    import sys
+    import json
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    sys.path.insert(0, "scripts")
+
+    from recover_uncompressed import (
+        find_session_file, find_boundary, load_entries, recover, stats,
+        DEFAULT_SEARCH_DIRS, MAIN_TYPES, META_TYPES,
+    )
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 构造模拟压缩现场
+        session_id = "test-recover-script"
+        jsonl = Path(tmpdir) / f"{session_id}.jsonl"
+        entries = [
+            {"uuid": "1", "type": "user", "message": {"role": "user", "content": "msg1"}},
+            {"uuid": "2", "type": "assistant", "message": {"role": "assistant", "content": "reply1"}},
+            {"uuid": "3", "type": "system", "subtype": "compact_boundary",
+             "compactMetadata": {"trigger": "auto", "preTokens": 5000, "messagesSummarized": 3},
+             "parentUuid": "2"},
+            {"uuid": "4", "type": "user", "isCompactSummary": True,
+             "message": {"role": "user", "content": "[Previous conversation summarized]\n\nsummary", "isCompactSummary": True},
+             "parentUuid": "3"},
+            {"uuid": "5", "type": "assistant", "message": {"role": "assistant", "content": "new reply"},
+             "parentUuid": "4"},
+        ]
+        with open(jsonl, "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+        # 测试 1: find_boundary 找最后 boundary
+        loaded = load_entries(jsonl)
+        boundary_idx = find_boundary(loaded)
+        Test.assert_equal("find_boundary 返回 #2 (0-indexed)", boundary_idx, 2)
+
+        # 测试 2: stats 函数
+        s = stats(loaded)
+        Test.assert_equal("stats total=5", s["total"], 5)
+        Test.assert_equal("stats main=4 (user+assistant+system+summary user)", s["main"], 4)
+        Test.assert_equal("stats meta=0", s["meta"], 0)
+
+        # 测试 3: 干跑模式
+        exit_code = recover(jsonl, dry_run=True)
+        Test.assert_equal("干跑模式退出码 2", exit_code, 2)
+        # 干跑不改文件
+        Test.assert_equal("干跑不写盘", len(load_entries(jsonl)), 5)
+
+        # 测试 4: 实际恢复
+        exit_code = recover(jsonl)
+        Test.assert_equal("实际恢复退出码 0", exit_code, 0)
+        Test.assert_equal("恢复后 2 条（截断到 boundary 前）", len(load_entries(jsonl)), 2)
+
+        # 测试 5: 备份存在
+        backup = jsonl.with_suffix(jsonl.suffix + ".recovery-backup")
+        Test.check("备份文件存在", backup.exists())
+        Test.assert_equal("备份保留 5 条", len(load_entries(backup)), 5)
+
+        # 测试 6: 二次运行（已恢复）退出码 1
+        exit_code = recover(jsonl)
+        Test.assert_equal("已恢复后再次运行退出码 1", exit_code, 1)
+
+
+def test_recover_uncompressed_cli():
+    """测试 CLI 入口"""
+    import subprocess
+
+    # 测试 --help
+    result = subprocess.run(
+        ["python3", "scripts/recover_uncompressed.py", "--help"],
+        capture_output=True, text=True, cwd=".",
+    )
+    Test.assert_equal("--help 退出码 0", result.returncode, 0)
+    Test.check("--help 输出 usage", "usage:" in result.stdout)
+
+    # 测试不存在的 session
+    result = subprocess.run(
+        ["python3", "scripts/recover_uncompressed.py", "no-such-session-12345"],
+        capture_output=True, text=True, cwd=".",
+    )
+    Test.assert_equal("不存在 session 退出码 1", result.returncode, 1)
+    Test.check("错误信息包含'找不到'", "找不到" in result.stderr or "找不到" in result.stdout)
