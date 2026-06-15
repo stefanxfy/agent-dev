@@ -318,20 +318,13 @@ class ReactAgent:
                 self.messages = compacted
                 _logger.info(f"Context compacted: {compact_result.summary_str()}")
 
-                # 对齐 Claude Code: 压缩成功后写 boundary + summary 到 JSONL
+                # 对齐 Claude Code buildPostCompactMessages 单一构造点
+                # 顺序: boundary → summary → preserved head
+                # 之前 P0 bug: 只写了 boundary + summary 两方法，preserved head 6 条不写盘
+                # 现场: data/sessions/7f071c62.jsonl
                 if self._session_manager:
                     try:
-                        # 先写 compact boundary（parentUuid 链接最后一条旧消息）
-                        self._session_manager.add_compact_boundary(
-                            trigger="auto",
-                            pre_tokens=compact_result.tokens_before,
-                            messages_summarized=len(self.messages) - 1,  # 减去 summary msg
-                        )
-                        # 再写 summary（作为新链起点，parentUuid 指向 boundary）
-                        self._session_manager.add_summary(
-                            summary=compact_result.summary,
-                            tokens_saved=compact_result.tokens_freed,
-                        )
+                        self._persist_compacted_messages(self.messages, compact_result)
                     except Exception as e:
                         _logger.warning(f"Failed to persist compaction to session: {e}")
 
@@ -674,3 +667,74 @@ class ReactAgent:
     def get_session_manager(self) -> Optional["SessionManager"]:
         """获取 SessionManager 实例（用于高级操作）"""
         return self._session_manager
+
+    def _persist_compacted_messages(self, compacted: list[dict], compact_result):
+        """压缩后消息持久化到 JSONL
+
+        对齐 Claude Code buildPostCompactMessages (src/services/compact/compact.ts:325-338)
+        顺序: boundary → summary → preserved head (preserved head = compacted 跳过 system 和 summary)
+
+        Claude Code 实际行为 (query.ts:528-535):
+            const postCompactMessages = buildPostCompactMessages(compactionResult)
+            for (const message of postCompactMessages) {
+                yield message  // ← 逐条 yield，sessionStorage 接管落盘
+            }
+
+        agent-dev 之前 P0 bug: 只调 add_compact_boundary + add_summary 两方法，
+        preserved head 6 条消息永久不写盘，重启后上下文残缺。
+        现场: data/sessions/7f071c62.jsonl
+
+        Args:
+            compacted: CompactOrchestrator._build_compacted_messages 输出
+                结构: [system, summary, ...preserved_head]  共 8 条
+                - [0] system: 动态注入不持久化（每次 run 重新构造）
+                - [1] summary: user role + content 以 "[Previous conversation summarized]" 开头
+                - [2..] preserved: 最近 6 条原始 user/assistant 消息
+            compact_result: CompactionResult 实例
+        """
+        if not self._session_manager:
+            return
+
+        # 直接调 storage 层（不走 manager.add_user_message 等高阶方法）：
+        # 1) manager.add_user_message 会触发 _on_user_message 标题生成（不必要的 LLM 调用）
+        # 2) preserved head 是历史数据，不需要标题重新生成
+        storage = self._session_manager.storage
+
+        # 1. boundary（parent 链到最后一条旧消息，由 add_compact_boundary 内部 _get_last_uuid 决定）
+        storage.add_compact_boundary(
+            trigger="auto",
+            pre_tokens=compact_result.tokens_before,
+            messages_summarized=len(compacted) - 1,  # 含 summary 的 compacted 长度减 1
+        )
+
+        # 2. summary（parent 链到 boundary）
+        storage.add_summary(
+            summary=compact_result.summary,
+            tokens_saved=compact_result.tokens_freed,
+        )
+
+        # 3. preserved head（跳过 system[0] 和 summary）
+        # compacted 结构: [system, summary, ...preserved]
+        # - 跳过 system（[0]，动态注入不持久化）
+        # - 跳过 summary（已由 add_summary 写）
+        # - tool_use/tool_result 也不持久化（与未压缩前 add_user_message 行为一致）
+        for msg in compacted[1:]:
+            role = msg.get("role")
+            if role not in ("user", "assistant"):
+                continue
+
+            # 跳过已写过的 summary（用内容前缀识别，与 compact.py 输出对齐）
+            content = msg.get("content", "")
+            if role == "user" and isinstance(content, str) \
+               and content.startswith("[Previous conversation summarized]"):
+                continue
+
+            # 调底层 storage.append_entry，parent 链到上一条写入（用 _get_last_uuid 自动算，
+            # 该方法已修复跳过元数据 entry 88c28c5）
+            storage.append_entry(
+                entry_type=role,
+                message=msg,  # 原样存整个 message dict
+            )
+
+        # 4. flush 确保落盘
+        storage.flush()

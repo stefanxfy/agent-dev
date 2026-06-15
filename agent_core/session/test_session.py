@@ -1326,3 +1326,154 @@ def test_get_last_uuid_for_real_session_7f071c62():
                 # 元数据在主链末尾附近出现（说明现场 bug 确实存在过）
                 Test.check(f"现场文件确认有元数据穿插主链", True,
                            f"last_meta_pos={last_meta_pos}, last_main_pos={last_main_pos}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P0-fix: 压缩后 preserved head 消息必须落盘（对齐 Claude Code buildPostCompactMessages）
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_persist_compacted_writes_all_messages():
+    """P0 回归：压缩后 compacted 列表必须全部落盘
+
+    Claude Code 实际行为（buildPostCompactMessages + query yield）：
+    - boundary + summary + preserved head 经 yield 全部写入 JSONL
+    - 现场 7f071c62.jsonl bug: agent-dev 只写 2 条（boundary + summary），
+      6 条 preserved head 永久丢失
+
+    修复后：_persist_compacted_messages 遍历 compacted[1:] 把 6 条也写盘
+    """
+    import tempfile
+    from agent_core.session.storage import SessionStorage
+    from agent_core.session.manager import SessionManager
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sm = SessionManager("test-persist-compact", data_dir=tmpdir)
+
+        # 准备 compacted 模拟数据（与 compact.py 输出一致）
+        compacted = [
+            {"role": "system", "content": "You are a helpful assistant"},  # [0] system
+            {"role": "user", "content": "[Previous conversation summarized]\n\n用户问过 LangChain"},  # [1] summary
+            {"role": "user", "content": "你好"},  # [2] preserved
+            {"role": "assistant", "content": "你好！有什么可以帮你的？"},  # [3] preserved
+            {"role": "user", "content": "秦始皇是谁？"},  # [4] preserved
+            {"role": "assistant", "content": "秦始皇是中国第一位皇帝..."},  # [5] preserved
+            {"role": "user", "content": "请重复 50 次 LangChain 介绍"},  # [6] preserved
+            {"role": "assistant", "content": "LangChain...（重复 50 次）"},  # [7] preserved
+        ]
+
+        # 模拟 CompactionResult
+        class MockCompactResult:
+            success = True
+            tokens_before = 108755
+            tokens_freed = 95000
+            summary = "用户问过 LangChain"
+
+        # 创建 Agent 实例（不调 run，只调 _persist_compacted_messages）
+        from agent_core.agent_core import ReactAgent
+        agent = ReactAgent.__new__(ReactAgent)  # 绕过 __init__，避免依赖 llm_router.config
+        agent._session_manager = sm
+        agent.messages = []
+
+        # 调用新增的 _persist_compacted_messages
+        agent._persist_compacted_messages(compacted, MockCompactResult())
+
+        # 验证落盘结果
+        sm.storage.flush()
+
+        # 1. 验证 boundary + summary + 6 preserved 共 8 条都落盘
+        # 排除元数据 entry，只看主链
+        all_messages = sm.get_messages(stop_at_boundary=False)
+        main_chain = [m for m in all_messages if m.get("type") in {"user", "assistant", "system"}]
+        Test.assert_equal("落盘 8 条主链 entry", len(main_chain), 8)
+
+        # 2. 验证 LLM 输入（stop_at_boundary=True）能拿到 summary + 6 preserved
+        llm_messages = sm.get_messages_for_llm(stop_at_boundary=True)
+        Test.assert_equal("LLM 看到 7 条（summary + 6 preserved）", len(llm_messages), 7)
+
+        # 3. 验证 preserved head 的 parent 链到 summary
+        # llm_messages[0] 应该是 summary
+        summary_msg = llm_messages[0]
+        Test.check("首条是 summary user msg",
+                   summary_msg.get("message", {}).get("isCompactSummary") == True)
+        # llm_messages[1] 应该是 preserved #1 (user "你好")
+        # parent 应该指向 summary 的 uuid
+        # 但我们只通过 storage 验证 parent 链
+        from agent_core.session.storage import SessionStorage as S
+        first_preserved = llm_messages[1]
+        first_pres_uuid = first_preserved.get("uuid")
+        # 找这个 uuid 的 entry，看其 parent
+        for e in sm.storage.read_entries():
+            if e.get("uuid") == first_pres_uuid:
+                expected_parent = summary_msg.get("uuid")
+                Test.assert_equal("preserved head[0] parent 链到 summary",
+                                  e.get("parentUuid"), expected_parent)
+                break
+
+
+def test_persist_compacted_skips_system_and_summary():
+    """P0 回归：_persist_compacted_messages 跳过 system 和 summary
+
+    compacted 结构: [system, summary, ...preserved]
+    - system 是动态注入不持久化
+    - summary 已被 add_summary 写过
+    """
+    import tempfile
+    from agent_core.session.manager import SessionManager
+    from agent_core.agent_core import ReactAgent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sm = SessionManager("test-skip-sys", data_dir=tmpdir)
+        compacted = [
+            {"role": "system", "content": "You are..."},  # 跳过
+            {"role": "user", "content": "[Previous conversation summarized]\n\nsummary text"},  # 跳过
+            {"role": "user", "content": "msg1"},
+            {"role": "assistant", "content": "reply1"},
+        ]
+        class MockCompactResult:
+            success = True
+            tokens_before = 1000
+            tokens_freed = 500
+            summary = "summary text"
+        from agent_core.agent_core import ReactAgent
+        agent = ReactAgent.__new__(ReactAgent)
+        agent._session_manager = sm
+        agent.messages = []
+        agent._persist_compacted_messages(compacted, MockCompactResult())
+        sm.storage.flush()
+
+        # 验证：主链应该有 4 条 (boundary + summary + 2 preserved)
+        all_messages = sm.get_messages(stop_at_boundary=False)
+        main_chain = [m for m in all_messages if m.get("type") in {"user", "assistant", "system"}]
+        Test.assert_equal("主链 4 条（boundary + summary + 2 preserved）", len(main_chain), 4)
+
+        # 验证：没有 system 动态 prompt 的内容（除了 boundary 本身）
+        system_count = sum(1 for m in main_chain if m.get("type") == "system")
+        Test.assert_equal("只有 1 条 system（boundary）", system_count, 1)
+
+        # 验证：summary 内容包含"summary text"
+        summary_entries = [m for m in main_chain
+                          if m.get("type") == "user" and m.get("message", {}).get("isCompactSummary")]
+        Test.assert_equal("summary entry 1 条", len(summary_entries), 1)
+        Test.check("summary content 正确",
+                   "summary text" in summary_entries[0].get("message", {}).get("content", ""))
+
+
+def test_persist_compacted_no_session_manager():
+    """P0 边界：没有 session_manager 时不报错"""
+    from agent_core.agent_core import ReactAgent
+    agent = ReactAgent.__new__(ReactAgent)
+    agent._session_manager = None
+    agent._session_manager = None
+    compacted = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "[Previous conversation summarized]\n\nsum"},
+        {"role": "user", "content": "msg"},
+    ]
+    class MockCompactResult:
+        success = True
+        tokens_before = 100
+        tokens_freed = 50
+        summary = "sum"
+    # 不应该抛异常
+    agent._persist_compacted_messages(compacted, MockCompactResult())
+    Test.check("无 session_manager 不报错", True)
