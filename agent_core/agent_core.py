@@ -33,6 +33,9 @@ from .llm.router import (
 )
 from .tools.base import ToolRegistry
 
+# Day 5: 上下文管理器
+from .context.manager import ContextManager as CM
+
 # ── Debug 日志配置 ───────────────────────────────────────────────
 
 # 创建 logger（使用单例模式防止重复配置）
@@ -161,15 +164,21 @@ class ReactAgent:
         llm_router: LLMRouter,
         tool_registry: ToolRegistry,
         max_turns: int = 10,
-        max_context_tokens: int = 100_000,  # Day 3 新增：Token 预算（默认 100K）
-        session_id: Optional[str] = None,   # Day 4 新增：会话 ID（可选）
-        session_data_dir: Optional[str] = None,  # Day 4 新增：session 数据目录
+        max_context_tokens: int = 100_000,  # Day 3: Token 预算（已被 ContextManager 替代，保留向后兼容）
+        session_id: Optional[str] = None,   # Day 4: 会话 ID（可选）
+        session_data_dir: Optional[str] = None,  # Day 4: session 数据目录
     ):
         self.llm = llm_router
         self.tools = tool_registry
         self.max_turns = max_turns
-        self.max_context_tokens = max_context_tokens
+        self.max_context_tokens = max_context_tokens  # 保留向后兼容
         self.history: list[dict] = []  # LLM messages 格式
+        
+        # Day 5: ContextManager（替代 _trim_history）
+        self.context_manager = CM(
+            llm_router=llm_router,
+            model=getattr(llm_router.config, 'model', 'glm-4'),
+        )
         
         # P2 新增：从 LLMConfig 读取 system_prompt
         self.system_prompt = self.llm.config.system_prompt
@@ -331,8 +340,20 @@ class ReactAgent:
         self._pending_tool_logs = []
         self._pending_tool_results = []
 
-        # Day 3：检查 Token 预算，必要时截断 history
-        self._trim_history()
+        # Day 5：用 ContextManager 替代 _trim_history
+        # 检查 token 预算，必要时自动压缩
+        compacted, compact_result = self.context_manager.check_and_compact(self.history)
+        if compact_result:
+            if compact_result.success:
+                self.history = compacted
+                _logger.info(f"Context compacted: {compact_result.summary_str()}")
+                yield ("system", f"📦 上下文已压缩: {compact_result.tokens_freed:,} tokens 释放")
+            else:
+                _logger.warning(f"Context compact failed: {compact_result.error}")
+                # 压缩失败时回退到旧的截断策略
+                self._trim_history()
+        # Day 3 旧逻辑（保留作为 fallback）
+        # self._trim_history()
 
         for turn in range(1, self.max_turns + 1):
             yield ("system", f"🔄 Turn {turn}/{self.max_turns}")
