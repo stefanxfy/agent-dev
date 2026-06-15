@@ -191,24 +191,55 @@ class SessionStorage:
 
         return entry["uuid"]
 
+    # 主链 entry 类型（参与对话链，parentUuid 应指向这些类型）
+    # 排除元数据 entry：custom-title / ai-title / tag / agent-name / agent-setting / mode / fork-info 等
+    # 这些元数据 entry 写在文件里但不参与对话链，如果把它们当 parent 会出现"user 指向 custom-title"的断链
+    MAIN_CHAIN_TYPES = frozenset({"user", "assistant", "system"})
+
     def _get_last_uuid(self) -> Optional[str]:
-        """获取最新一条 Entry 的 UUID"""
-        if self._pending:
-            return self._pending[-1]["uuid"]
+        """获取主链最新一条 Entry 的 UUID
+
+        P0 修复：跳过元数据 entry（custom-title / ai-title / tag 等）。
+        原因：metadata entry 会插在消息之间，如果把它们的 uuid 当 parent，
+        会造成 user/assistant 的 parentUuid 指向 metadata（不是前一条消息），
+        断链。7f071c62.jsonl 现场就是这个 bug。
+
+        优化后：
+        - 扫 _pending（倒序，跳过元数据类型）
+        - 扫磁盘 tail（倒序，跳过元数据类型）
+        - 返回第一条主链 entry 的 uuid
+        """
+        # 1. 优先从 _pending 找（最新在末尾，倒序扫描）
+        for entry in reversed(self._pending):
+            if entry.get("type") in self.MAIN_CHAIN_TYPES:
+                return entry.get("uuid")
+
+        # 2. 从磁盘 tail 找（_entry_cache 可能有 stale，倒序扫缓存）
         if self._entry_cache:
-            # 扫描最后一条（按 timestamp）
-            # 简化：从 jsonl_path 尾部读 1 行
+            # _entry_cache 是 dict，顺序不保证，需要按文件顺序扫描
+            # 简化：从磁盘读最后 50 行（足够覆盖元数据数量）
             if self._jsonl_path and self._jsonl_path.exists():
-                with open(self._jsonl_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                if lines:
-                    last = json.loads(lines[-1])
-                    return last.get("uuid")
+                try:
+                    with open(self._jsonl_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    # 倒序扫描，跳过元数据
+                    for line in reversed(lines):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            e = json.loads(line)
+                            if e.get("type") in self.MAIN_CHAIN_TYPES:
+                                return e.get("uuid")
+                        except json.JSONDecodeError:
+                            continue
+                except Exception:
+                    pass
         return None
 
     @property
     def last_uuid(self) -> Optional[str]:
-        """公开 API：最新一条 Entry 的 UUID（用于 SessionManager 链式追踪）
+        """公开 API：主链最新一条 Entry 的 UUID（用于 SessionManager 链式追踪）
 
         对齐 Claude Code MessageState.lastUuid：维护当前对话链的尾部 UUID。
         比 _get_last_uuid 多了 public 接口语义，可被外部代码（包括 SessionManager）安全使用。
