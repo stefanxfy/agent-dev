@@ -620,41 +620,46 @@ class TestAutoCompactPctOverride:
         # total_budget=110904, compact_threshold = 110904 - 13000 = 97904
         assert bm.compact_threshold == bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS
 
-    def test_pct_override_takes_min(self):
-        """比例覆盖时取 min(比例, 固定)，更保守的赢"""
+    def test_pct_override_low_remaining_pct_uses_fixed(self):
+        """剩余10% → threshold=90%*total≈99813, 固定=97904, 固定更保守"""
         os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
         counter = SimpleTokenCounter()
         bm = ContextBudgetManager("glm-4", counter)
 
-        pct_threshold = int(bm.total_budget * 0.10)  # 11090
+        # 剩余10%: threshold = total * 0.90 ≈ 99813
+        pct_threshold = int(bm.total_budget * 0.90)  # 99813
         fixed_threshold = bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS  # 97904
-        # 10% 比例更小，应该用比例
+        # 固定缓冲更小（更保守），固定赢
         assert bm.compact_threshold == min(pct_threshold, fixed_threshold)
-        assert bm.compact_threshold == pct_threshold
+        assert bm.compact_threshold == fixed_threshold
 
-    def test_pct_override_high_pct_uses_fixed(self):
-        """高比例覆盖时固定缓冲更保守，固定赢"""
+    def test_pct_override_high_remaining_pct_uses_pct(self):
+        """剩余95% → threshold=5%*total≈5545, 比固定缓冲小得多，比例赢"""
         os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "95"
         counter = SimpleTokenCounter()
         bm = ContextBudgetManager("glm-4", counter)
 
-        pct_threshold = int(bm.total_budget * 0.95)  # 105358
+        # 剩余95%: threshold = total * 0.05 ≈ 5545
+        pct_threshold = int(bm.total_budget * 0.05)  # 5545
         fixed_threshold = bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS  # 97904
-        # 固定缓冲更小（更保守），应该用固定
+        # 比例更小（更保守），比例赢
         assert bm.compact_threshold == min(pct_threshold, fixed_threshold)
-        assert bm.compact_threshold == fixed_threshold
+        assert bm.compact_threshold == pct_threshold
 
     def test_pct_critical_is_half_of_compact(self):
-        """严重阈值 = 压缩比例的一半"""
+        """严重阈值：剩余比例 = compact剩余比例的一半"""
         os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
         counter = SimpleTokenCounter()
         bm = ContextBudgetManager("glm-4", counter)
 
-        # critical pct = 10 / 2 = 5%
-        pct_critical = int(bm.total_budget * 0.05)  # 5545
+        # compact PCT=10(剩余10%), critical PCT=5(剩余5%)
+        # critical threshold = total * 0.95 ≈ 105358
+        # fixed critical = total - 6500 = 104404
+        # 固定更保守
+        pct_critical = int(bm.total_budget * 0.95)  # 105358
         fixed_critical = bm.total_budget - CRITICAL_BUFFER_TOKENS  # 104404
         assert bm.critical_threshold == min(pct_critical, fixed_critical)
-        assert bm.critical_threshold == pct_critical
+        assert bm.critical_threshold == fixed_critical
 
     def test_invalid_pct_ignored(self):
         """无效比例值应被忽略"""
@@ -673,12 +678,13 @@ class TestAutoCompactPctOverride:
             assert bm.compact_threshold == bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS
 
     def test_pct_claude_model(self):
-        """Claude 模型的比例覆盖计算"""
+        """Claude 模型：剩余10% → threshold=90%*total≈164613, fixed=169904, 比例赢"""
         os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
         counter = SimpleTokenCounter()
         bm = ContextBudgetManager("claude-3-5-sonnet", counter)
 
-        pct_threshold = int(bm.total_budget * 0.10)  # 18290
+        # 剩余10% → threshold = total * 0.90
+        pct_threshold = int(bm.total_budget * 0.90)  # 164613
         fixed_threshold = bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS  # 169904
         assert bm.compact_threshold == min(pct_threshold, fixed_threshold)
-        assert bm.compact_threshold == pct_threshold  # 10% 更小
+        assert bm.compact_threshold == pct_threshold  # 比例更保守

@@ -48,8 +48,9 @@ MIN_EFFECTIVE_WINDOW = 50_000
 def _get_autocompact_pct_override() -> float | None:
     """
     读取 AUTOCOMPACT_PCT_OVERRIDE 环境变量
-    用于测试：设为 10 表示 10% 时触发压缩
-    参考：Claude Code CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+    语义：剩余百分比（对齐 Claude Code CLAUDE_AUTOCOMPACT_PCT_OVERRIDE）
+    设为 25 = 剩余 ≤ 25% 时触发压缩（即已用 ≥ 75%）
+    设为 10 = 剩余 ≤ 10% 时触发压缩（即已用 ≥ 90%）
     """
     val = os.environ.get("AUTOCOMPACT_PCT_OVERRIDE", "").strip()
     if not val:
@@ -238,20 +239,23 @@ class ContextBudgetManager:
         计算压缩触发阈值（双模式）
 
         模式1（默认）：固定缓冲 — total_budget - AUTOCOMPACT_BUFFER_TOKENS
-        模式2（环境变量）：比例覆盖 — total_budget * (pct / 100)
+        模式2（环境变量）：剩余比例 — 剩余 ≤ pct% 时触发
+            threshold = total_budget * (1 - pct/100)
         取两者中更小的（更早触发 = 更保守）
 
         参考：Claude Code autoCompact.ts getAutoCompactThreshold()
+        示例：PCT=25 → threshold = 75% * total_budget（剩余25%时触发）
         """
         fixed = self.total_budget - AUTOCOMPACT_BUFFER_TOKENS
 
         pct = _get_autocompact_pct_override()
         if pct is not None:
-            pct_threshold = int(self.total_budget * (pct / 100))
+            # 剩余百分比语义：剩余 ≤ pct% 时触发，即 used ≥ (1-pct%) * total
+            pct_threshold = int(self.total_budget * (1 - pct / 100))
             result = min(pct_threshold, fixed)
             logger.info(
-                f"[双模式] 比例阈值={pct_threshold:,}, 固定阈值={fixed:,}, "
-                f"取较小值={result:,}"
+                f"[双模式] 剩余比例={pct}%, 比例阈值={pct_threshold:,}, "
+                f"固定阈值={fixed:,}, 取较小值={result:,}"
             )
             return result
 
@@ -262,7 +266,9 @@ class ContextBudgetManager:
         计算严重阈值（双模式）
 
         固定缓冲：total_budget - CRITICAL_BUFFER_TOKENS
-        比例覆盖：critical pct = compact pct / 2
+        比例覆盖：critical 剩余比例 = compact 剩余比例 / 2
+            如果 compact PCT=25（剩余25%），critical PCT=12.5（剩余12.5%）
+            threshold = total_budget * (1 - critical_pct/100)
         取更保守的
         """
         fixed = self.total_budget - CRITICAL_BUFFER_TOKENS
@@ -270,7 +276,7 @@ class ContextBudgetManager:
         pct = _get_autocompact_pct_override()
         if pct is not None:
             critical_pct = pct / 2
-            pct_threshold = int(self.total_budget * (critical_pct / 100))
+            pct_threshold = int(self.total_budget * (1 - critical_pct / 100))
             return min(pct_threshold, fixed)
 
         return fixed
