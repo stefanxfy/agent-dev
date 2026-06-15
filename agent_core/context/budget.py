@@ -41,9 +41,18 @@ def _get_env_window_override() -> int | None:
 # GLM-4 / GLM-5.1 上下文窗口（验证值）
 GLM_CONTEXT_WINDOW = 128_000
 
-# Auto-Compact 缓冲：剩余 ~6.25% 时触发
-# Claude Code 用 13K/200K ≈ 6.5%，这里用 8K/128K ≈ 6.25%
-AUTOCOMPACT_BUFFER_TOKENS = 8_000
+# ── 双模式阈值常量（对齐 Claude Code autoCompact.ts）────────────
+
+# 固定缓冲模式：剩余 < AUTOCOMPACT_BUFFER_TOKENS 时触发压缩
+# Claude Code 用 13K/200K ≈ 6.5%，agent-dev 用 13K/128K ≈ 10%
+AUTOCOMPACT_BUFFER_TOKENS = 13_000
+
+# 严重阈值固定缓冲：剩余 < CRITICAL_BUFFER_TOKENS 时为临界状态
+CRITICAL_BUFFER_TOKENS = 6_500
+
+# UI 警告阈值固定缓冲（类似 Claude Code WARNING/ERROR_THRESHOLD_BUFFER_TOKENS）
+WARNING_BUFFER_TOKENS = 20_000
+ERROR_BUFFER_TOKENS = 20_000
 
 # Summary API 最大输出预留
 MAX_OUTPUT_TOKENS_FOR_SUMMARY = 4_096
@@ -53,6 +62,26 @@ MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
 
 # 最低有效窗口保证
 MIN_EFFECTIVE_WINDOW = 50_000
+
+
+# ── 比例覆盖（环境变量，测试用）──────────────────────────────────
+
+def _get_autocompact_pct_override() -> float | None:
+    """
+    读取 AUTOCOMPACT_PCT_OVERRIDE 环境变量
+    用于测试：设为 10 表示 10% 时触发压缩
+    参考：Claude Code CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+    """
+    val = os.environ.get("AUTOCOMPACT_PCT_OVERRIDE", "").strip()
+    if not val:
+        return None
+    try:
+        pct = float(val)
+        if 0 < pct <= 100:
+            return pct
+        return None
+    except ValueError:
+        return None
 
 
 # ── 模型配置 ────────────────────────────────────────────────────
@@ -136,6 +165,10 @@ class BudgetState:
     used_tokens: int
     reserved_tokens: int
 
+    # 双模式阈值（由 ContextBudgetManager 计算后传入）
+    compact_threshold: int = 0    # should_auto_compact 触发线
+    critical_threshold: int = 0   # is_critical 触发线
+
     @property
     def available(self) -> int:
         return self.total_budget - self.used_tokens
@@ -146,13 +179,30 @@ class BudgetState:
 
     @property
     def should_auto_compact(self) -> bool:
-        """剩余空间低于缓冲阈值时触发"""
-        return self.available < AUTOCOMPACT_BUFFER_TOKENS
+        """已用 token 达到压缩阈值时触发（对齐 Claude Code: used >= threshold）"""
+        if self.compact_threshold <= 0:
+            # 兼容旧用法：无阈值时用固定缓冲
+            return self.available < AUTOCOMPACT_BUFFER_TOKENS
+        return self.used_tokens >= self.compact_threshold
 
     @property
     def is_critical(self) -> bool:
-        """剩余空间低于缓冲阈值的一半"""
-        return self.available < AUTOCOMPACT_BUFFER_TOKENS // 2
+        """已用 token 达到严重阈值时触发"""
+        if self.critical_threshold <= 0:
+            return self.available < CRITICAL_BUFFER_TOKENS
+        return self.used_tokens >= self.critical_threshold
+
+    @property
+    def is_warning(self) -> bool:
+        """已用 token 达到警告阈值（UI 黄色提示）"""
+        warning_line = self.compact_threshold - WARNING_BUFFER_TOKENS
+        return self.used_tokens >= warning_line if warning_line > 0 else False
+
+    @property
+    def is_error(self) -> bool:
+        """已用 token 达到错误阈值（UI 红色提示）"""
+        error_line = self.compact_threshold - ERROR_BUFFER_TOKENS
+        return self.used_tokens >= error_line if error_line > 0 else False
 
     def summary(self) -> str:
         """生成可读的状态摘要"""
@@ -202,9 +252,57 @@ class ContextBudgetManager:
         self.total_budget = get_effective_context_window(model)
         self.reserved = MAX_OUTPUT_TOKENS_FOR_SUMMARY
 
+        # 双模式阈值计算（对齐 Claude Code getAutoCompactThreshold）
+        self.compact_threshold = self._calc_compact_threshold()
+        self.critical_threshold = self._calc_critical_threshold()
+
         # 熔断状态
         self.consecutive_failures = 0
         self.last_compact_time: Optional[float] = None
+
+    # ── 双模式阈值计算 ────────────────────────────────────────
+
+    def _calc_compact_threshold(self) -> int:
+        """
+        计算压缩触发阈值（双模式）
+
+        模式1（默认）：固定缓冲 — total_budget - AUTOCOMPACT_BUFFER_TOKENS
+        模式2（环境变量）：比例覆盖 — total_budget * (pct / 100)
+        取两者中更小的（更早触发 = 更保守）
+
+        参考：Claude Code autoCompact.ts getAutoCompactThreshold()
+        """
+        fixed = self.total_budget - AUTOCOMPACT_BUFFER_TOKENS
+
+        pct = _get_autocompact_pct_override()
+        if pct is not None:
+            pct_threshold = int(self.total_budget * (pct / 100))
+            result = min(pct_threshold, fixed)
+            logger.info(
+                f"[双模式] 比例阈值={pct_threshold:,}, 固定阈值={fixed:,}, "
+                f"取较小值={result:,}"
+            )
+            return result
+
+        return fixed
+
+    def _calc_critical_threshold(self) -> int:
+        """
+        计算严重阈值（双模式）
+
+        固定缓冲：total_budget - CRITICAL_BUFFER_TOKENS
+        比例覆盖：critical pct = compact pct / 2
+        取更保守的
+        """
+        fixed = self.total_budget - CRITICAL_BUFFER_TOKENS
+
+        pct = _get_autocompact_pct_override()
+        if pct is not None:
+            critical_pct = pct / 2
+            pct_threshold = int(self.total_budget * (critical_pct / 100))
+            return min(pct_threshold, fixed)
+
+        return fixed
 
     def compute_budget_state(self, messages: list[dict]) -> BudgetState:
         """计算当前预算状态"""
@@ -213,6 +311,8 @@ class ContextBudgetManager:
             total_budget=self.total_budget,
             used_tokens=used,
             reserved_tokens=self.reserved,
+            compact_threshold=self.compact_threshold,
+            critical_threshold=self.critical_threshold,
         )
 
     def should_compact(self, messages: list[dict]) -> tuple[bool, str]:
@@ -234,10 +334,10 @@ class ContextBudgetManager:
         state = self.compute_budget_state(messages)
 
         if state.is_critical:
-            return True, f"临界状态：剩余 {state.available:,} tokens ({state.usage_ratio:.0%})"
+            return True, f"临界状态：已用 {state.used_tokens:,} / {self.critical_threshold:,} ({state.usage_ratio:.0%})"
 
         if state.should_auto_compact:
-            return True, f"缓冲触发：剩余 {state.available:,} < {AUTOCOMPACT_BUFFER_TOKENS:,} tokens"
+            return True, f"压缩触发：已用 {state.used_tokens:,} / {self.compact_threshold:,} ({state.usage_ratio:.0%})"
 
         return False, f"预算充足：{state.summary()}"
 
@@ -251,6 +351,10 @@ class ContextBudgetManager:
             "usage_ratio": state.usage_ratio,
             "should_compact": state.should_auto_compact,
             "is_critical": state.is_critical,
+            "is_warning": state.is_warning,
+            "is_error": state.is_error,
+            "compact_threshold": self.compact_threshold,
+            "critical_threshold": self.critical_threshold,
             "consecutive_failures": self.consecutive_failures,
             "model": self.model,
         }

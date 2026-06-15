@@ -163,13 +163,16 @@ with st.sidebar:
         total = usage["total_budget"]
         available = usage["available_tokens"]
 
-        # 颜色判断
+        # 颜色判断（四档：正常/警告/压缩/临界）
         if usage["is_critical"]:
             bar_color = "🔴"
             status_text = "临界"
         elif usage["should_compact"]:
             bar_color = "🟡"
-            status_text = "缓冲区"
+            status_text = "需压缩"
+        elif usage.get("is_warning"):
+            bar_color = "🟠"
+            status_text = "警告"
         else:
             bar_color = "🟢"
             status_text = "正常"
@@ -177,7 +180,7 @@ with st.sidebar:
         st.metric(
             "上下文使用",
             f"{used:,} / {total:,}",
-            delta=f"{available:,} 可用 ({ratio:.0%}) {bar_color}",
+            delta=f"{available:,} 可用 ({ratio:.0%}) {bar_color} 阈值={usage.get('compact_threshold', 'N/A'):,}",
         )
 
         # 进度条

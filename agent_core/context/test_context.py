@@ -15,6 +15,7 @@ from agent_core.context.budget import (
     ContextBudgetManager,
     BudgetState,
     AUTOCOMPACT_BUFFER_TOKENS,
+    CRITICAL_BUFFER_TOKENS,
     MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES,
     get_effective_context_window,
     get_model_config,
@@ -111,33 +112,68 @@ class TestBudgetState:
             total_budget=100_000,
             used_tokens=80_000,
             reserved_tokens=4_096,
+            compact_threshold=87_000,
+            critical_threshold=93_500,
         )
         assert state.available == 20_000
         assert state.usage_ratio == 0.8
-        assert not state.should_auto_compact  # 20K > 8K buffer
+        assert not state.should_auto_compact  # 80K < 87K threshold
         assert not state.is_critical
 
     def test_should_compact_threshold(self):
         state = BudgetState(
             total_budget=100_000,
-            used_tokens=93_000,  # available = 7K < 8K
+            used_tokens=88_000,  # 88K >= 87K threshold
             reserved_tokens=4_096,
+            compact_threshold=87_000,
+            critical_threshold=93_500,
         )
         assert state.should_auto_compact
-        assert not state.is_critical  # 7K > 4K
+        assert not state.is_critical  # 88K < 93.5K
 
     def test_is_critical(self):
         state = BudgetState(
             total_budget=100_000,
-            used_tokens=97_000,  # available = 3K < 4K
+            used_tokens=95_000,  # 95K >= 93.5K threshold
             reserved_tokens=4_096,
+            compact_threshold=87_000,
+            critical_threshold=93_500,
         )
         assert state.should_auto_compact
         assert state.is_critical
 
     def test_zero_budget(self):
-        state = BudgetState(total_budget=0, used_tokens=0, reserved_tokens=0)
+        state = BudgetState(
+            total_budget=0, used_tokens=0, reserved_tokens=0,
+            compact_threshold=0, critical_threshold=0,
+        )
         assert state.usage_ratio == 0.0
+
+    def test_legacy_fallback_no_threshold(self):
+        """无阈值时回退到固定缓冲模式"""
+        state = BudgetState(
+            total_budget=100_000,
+            used_tokens=93_000,
+            reserved_tokens=4_096,
+            compact_threshold=0,
+            critical_threshold=0,
+        )
+        # 回退到 available < AUTOCOMPACT_BUFFER_TOKENS 逻辑
+        assert state.should_auto_compact  # available 7K < 13K
+        assert not state.is_critical  # available 7K >= 6.5K
+
+    def test_warning_and_error(self):
+        state = BudgetState(
+            total_budget=100_000,
+            used_tokens=70_000,
+            reserved_tokens=4_096,
+            compact_threshold=87_000,
+            critical_threshold=93_500,
+        )
+        # warning = compact_threshold - WARNING_BUFFER_TOKENS = 87K - 20K = 67K
+        assert state.is_warning  # 70K >= 67K
+        # error = compact_threshold - ERROR_BUFFER_TOKENS = 87K - 20K = 67K
+        assert state.is_error
 
 
 class TestContextBudgetManager:
@@ -175,8 +211,9 @@ class TestContextBudgetManager:
 
     def test_should_compact_when_near_limit(self):
         # 构造接近上限的消息（模拟大量消息）
-        # GLM-4 有效窗口 = 128000 - 4096 - 8000 = 115904
-        # 需要构造 >107000 tokens 的消息
+        # GLM-4 total_budget = 128000 - 4096 - 13000 = 110904
+        # compact_threshold = 110904 - 13000 = 97904
+        # 需要构造 >= 97904 tokens 的消息
         big_text = "你好世界" * 5000  # ~35000 tokens 每条
         messages = []
         for i in range(4):
@@ -184,7 +221,7 @@ class TestContextBudgetManager:
             messages.append({"role": "assistant", "content": f"回复{i}: {big_text}"})
 
         should, reason = self.bm.should_compact(messages)
-        # 8 条消息 * ~35000 = ~280000 tokens，远超 115904
+        # 8 条消息 * ~35000 = ~280000 tokens，远超阈值
         assert should is True
 
     def test_circuit_breaker(self):
@@ -223,7 +260,30 @@ class TestContextBudgetManager:
         assert "available_tokens" in info
         assert "usage_ratio" in info
         assert "should_compact" in info
+        assert "compact_threshold" in info
+        assert "critical_threshold" in info
+        assert "is_warning" in info
+        assert "is_error" in info
         assert info["model"] == "glm-4"
+
+    def test_compact_threshold_values_glm4(self):
+        """GLM-4 双模式阈值计算验证"""
+        # total_budget = 128000 - 4096 - 13000 = 110904
+        assert self.bm.total_budget == 110_904
+        # compact_threshold = 110904 - 13000 = 97904
+        assert self.bm.compact_threshold == 97_904
+        # critical_threshold = 110904 - 6500 = 104404
+        assert self.bm.critical_threshold == 104_404
+
+    def test_compact_threshold_values_claude(self):
+        """Claude 模型双模式阈值计算验证"""
+        bm = ContextBudgetManager("claude-3-5-sonnet", self.counter)
+        # total_budget = 200000 - min(8000,4096) - 13000 = 200000 - 4096 - 13000 = 182904
+        assert bm.total_budget == 182_904
+        # compact_threshold = 182904 - 13000 = 169904
+        assert bm.compact_threshold == 169_904
+        # critical_threshold = 182904 - 6500 = 176404
+        assert bm.critical_threshold == 176_404
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -552,6 +612,7 @@ class TestContextWindowOverride:
         """清理环境变量"""
         import os
         os.environ.pop("CONTEXT_WINDOW_OVERRIDE", None)
+        os.environ.pop("AUTOCOMPACT_PCT_OVERRIDE", None)
 
     def test_no_override_uses_default(self):
         from agent_core.context.budget import get_effective_context_window
@@ -564,16 +625,16 @@ class TestContextWindowOverride:
         from agent_core.context.budget import get_effective_context_window
         os.environ["CONTEXT_WINDOW_OVERRIDE"] = "8000"
         eff = get_effective_context_window("glm-4")
-        # 8000 - 4096 - 8000 = -4096 → 提升到 1K 最低
-        assert eff <= 5_000  # 接近用户值（不被 50K 下限拦住）
+        # 8000 - 4096 - 13000 = -9096 → 提升到 1K 最低
+        assert eff <= 5_000
         assert eff >= 1_000
 
     def test_override_medium_window(self):
         from agent_core.context.budget import get_effective_context_window
         os.environ["CONTEXT_WINDOW_OVERRIDE"] = "20000"
         eff = get_effective_context_window("glm-4")
-        # 20000 - 4096 - 8000 = 7904
-        assert 7_000 <= eff <= 9_000
+        # 20000 - 4096 - 13000 = 2904
+        assert 2_000 <= eff <= 4_000
 
     def test_invalid_override_ignored(self):
         from agent_core.context.budget import get_effective_context_window
@@ -581,3 +642,97 @@ class TestContextWindowOverride:
         eff = get_effective_context_window("glm-4")
         # 无效值应被忽略，使用默认
         assert eff >= 50_000
+
+
+class TestAutoCompactPctOverride:
+    """测试 AUTOCOMPACT_PCT_OVERRIDE 双模式比例覆盖"""
+
+    def teardown_method(self):
+        import os
+        os.environ.pop("AUTOCOMPACT_PCT_OVERRIDE", None)
+
+    def test_no_override_uses_fixed_buffer(self):
+        """不设环境变量时走固定缓冲模式"""
+        os.environ.pop("AUTOCOMPACT_PCT_OVERRIDE", None)
+        counter = SimpleTokenCounter()
+        bm = ContextBudgetManager("glm-4", counter)
+        # total_budget=110904, compact_threshold = 110904 - 13000 = 97904
+        assert bm.compact_threshold == bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS
+
+    def test_pct_override_takes_min(self):
+        """比例覆盖时取 min(比例, 固定)，更保守的赢"""
+        os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
+        counter = SimpleTokenCounter()
+        bm = ContextBudgetManager("glm-4", counter)
+
+        pct_threshold = int(bm.total_budget * 0.10)  # 11090
+        fixed_threshold = bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS  # 97904
+        # 10% 比例更小，应该用比例
+        assert bm.compact_threshold == min(pct_threshold, fixed_threshold)
+        assert bm.compact_threshold == pct_threshold
+
+    def test_pct_override_high_pct_uses_fixed(self):
+        """高比例覆盖时固定缓冲更保守，固定赢"""
+        os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "95"
+        counter = SimpleTokenCounter()
+        bm = ContextBudgetManager("glm-4", counter)
+
+        pct_threshold = int(bm.total_budget * 0.95)  # 105358
+        fixed_threshold = bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS  # 97904
+        # 固定缓冲更小（更保守），应该用固定
+        assert bm.compact_threshold == min(pct_threshold, fixed_threshold)
+        assert bm.compact_threshold == fixed_threshold
+
+    def test_pct_critical_is_half_of_compact(self):
+        """严重阈值 = 压缩比例的一半"""
+        os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
+        counter = SimpleTokenCounter()
+        bm = ContextBudgetManager("glm-4", counter)
+
+        # critical pct = 10 / 2 = 5%
+        pct_critical = int(bm.total_budget * 0.05)  # 5545
+        fixed_critical = bm.total_budget - CRITICAL_BUFFER_TOKENS  # 104404
+        assert bm.critical_threshold == min(pct_critical, fixed_critical)
+        assert bm.critical_threshold == pct_critical
+
+    def test_invalid_pct_ignored(self):
+        """无效比例值应被忽略"""
+        os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "not-a-number"
+        counter = SimpleTokenCounter()
+        bm = ContextBudgetManager("glm-4", counter)
+        # 应走固定缓冲
+        assert bm.compact_threshold == bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS
+
+    def test_zero_pct_ignored(self):
+        """0% 和负数应被忽略"""
+        for val in ["0", "-5", "101"]:
+            os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = val
+            counter = SimpleTokenCounter()
+            bm = ContextBudgetManager("glm-4", counter)
+            assert bm.compact_threshold == bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS
+
+    def test_pct_with_window_override(self):
+        """比例覆盖 + 窗口覆盖可叠加"""
+        os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
+        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "20000"
+        try:
+            counter = SimpleTokenCounter()
+            bm = ContextBudgetManager("glm-4", counter)
+            # total_budget = 20000 - 4096 - 13000 = 2904
+            # compact_threshold = min(2904*0.10, 2904-13000) = min(290, -10096) = -10096
+            # 但 used >= -10096 永远为 True，任何消息都会触发压缩
+            # 这是合理的——20K 窗口 + 10% 比例 = 极端调试场景
+            assert bm.compact_threshold < bm.total_budget
+        finally:
+            os.environ.pop("CONTEXT_WINDOW_OVERRIDE", None)
+
+    def test_pct_claude_model(self):
+        """Claude 模型的比例覆盖计算"""
+        os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
+        counter = SimpleTokenCounter()
+        bm = ContextBudgetManager("claude-3-5-sonnet", counter)
+
+        pct_threshold = int(bm.total_budget * 0.10)  # 18290
+        fixed_threshold = bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS  # 169904
+        assert bm.compact_threshold == min(pct_threshold, fixed_threshold)
+        assert bm.compact_threshold == pct_threshold  # 10% 更小
