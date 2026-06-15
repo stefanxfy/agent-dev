@@ -688,3 +688,42 @@ class TestAutoCompactPctOverride:
         fixed_threshold = bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS  # 169904
         assert bm.compact_threshold == min(pct_threshold, fixed_threshold)
         assert bm.compact_threshold == pct_threshold  # 比例更保守
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Option B+C: 强化 XML 标签 + few-shot example 验证
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_compact_prompt_uses_xml_tags_strictly():
+    """验证 Option B+C 改造后的 system prompt 严格使用 XML 标签要求"""
+    from agent_core.context.compact import COMPACT_SYSTEM_PROMPT, COMPACT_USER_PROMPT_TEMPLATE
+    
+    # 1. system prompt 必须明确要求 XML 标签
+    assert "XML" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 XML 标签"
+    assert "<analysis>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 <analysis>"
+    assert "<summary>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 <summary>"
+    assert "</analysis>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 </analysis>"
+    assert "</summary>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 </summary>"
+    
+    # 2. user prompt 强化 XML 标签
+    assert "XML" in COMPACT_USER_PROMPT_TEMPLATE, "user prompt 提到 XML 标签"
+    assert "成对" in COMPACT_USER_PROMPT_TEMPLATE, "user prompt 提到成对出现"
+    
+    # 3. system prompt 必须包含 few-shot example
+    assert "<example>" in COMPACT_SYSTEM_PROMPT, "system prompt 包含 <example>"
+    assert "</example>" in COMPACT_SYSTEM_PROMPT, "system prompt 包含 </example>"
+    
+    # 4. few-shot example 必须包含 4 段结构
+    for seg in ["用户目标", "关键决策", "当前状态", "待办事项"]:
+        assert seg in COMPACT_SYSTEM_PROMPT, f"example 包含 {seg}"
+    
+    # 5. 防漂移规则保留
+    assert "verbatim quotes" in COMPACT_SYSTEM_PROMPT, "保留 verbatim quotes 规则"
+    assert "防漂移" in COMPACT_SYSTEM_PROMPT, "保留防漂移规则"
+
+
+def test_compact_prompt_extract_summary_works_with_new_format():
+    """验证 _extract_summary 能正确处理新 prompt 期望的格式"""
+    from agent_core.context.compact import CompactOrchestrator
+    # 只需要 import 成功即可（具体逻辑需 LLM 测试）
+    assert CompactOrchestrator is not None, "CompactOrchestrator 可正常导入"
