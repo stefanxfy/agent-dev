@@ -7,8 +7,8 @@
     python3 scripts/test_compact_fill.py
 
 可选环境变量：
-    CONTEXT_WINDOW_OVERRIDE=20000   # 缩小窗口加速触发
-    FILL_TARGET_RATIO=0.95          # 填充到总预算的 95%
+    AUTOCOMPACT_PCT_OVERRIDE=10    # 10% 即触发压缩（快速测试）
+    FILL_TARGET_RATIO=0.95         # 填充到总预算的 95%
 """
 
 import os
@@ -112,10 +112,10 @@ def main():
     # ── 1. 初始化组件 ─────────────────────────────────────
     counter = SimpleTokenCounter()
 
-    # 检查是否有环境变量覆盖
-    env_override = os.environ.get("CONTEXT_WINDOW_OVERRIDE", "").strip()
-    if env_override:
-        print(f"\n⚡ CONTEXT_WINDOW_OVERRIDE = {env_override}")
+    # 检查是否有比例覆盖
+    env_pct = os.environ.get("AUTOCOMPACT_PCT_OVERRIDE", "").strip()
+    if env_pct:
+        print(f"\n⚡ AUTOCOMPACT_PCT_OVERRIDE = {env_pct}%")
 
     effective_window = get_effective_context_window(MODEL)
     print(f"\n📊 模型: {MODEL}")

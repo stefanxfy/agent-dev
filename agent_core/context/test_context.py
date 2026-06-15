@@ -605,45 +605,6 @@ class TestContextManager:
         assert self.cm.compact_count == 1
 
 
-class TestContextWindowOverride:
-    """测试 CONTEXT_WINDOW_OVERRIDE 环境变量覆盖（调试用）"""
-
-    def teardown_method(self):
-        """清理环境变量"""
-        import os
-        os.environ.pop("CONTEXT_WINDOW_OVERRIDE", None)
-        os.environ.pop("AUTOCOMPACT_PCT_OVERRIDE", None)
-
-    def test_no_override_uses_default(self):
-        from agent_core.context.budget import get_effective_context_window
-        os.environ.pop("CONTEXT_WINDOW_OVERRIDE", None)
-        eff = get_effective_context_window("glm-4")
-        # 不覆盖：应遵循 50K 下限
-        assert eff >= 50_000
-
-    def test_override_small_window(self):
-        from agent_core.context.budget import get_effective_context_window
-        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "8000"
-        eff = get_effective_context_window("glm-4")
-        # 8000 - 4096 - 13000 = -9096 → 提升到 1K 最低
-        assert eff <= 5_000
-        assert eff >= 1_000
-
-    def test_override_medium_window(self):
-        from agent_core.context.budget import get_effective_context_window
-        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "20000"
-        eff = get_effective_context_window("glm-4")
-        # 20000 - 4096 - 13000 = 2904
-        assert 2_000 <= eff <= 4_000
-
-    def test_invalid_override_ignored(self):
-        from agent_core.context.budget import get_effective_context_window
-        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "not-a-number"
-        eff = get_effective_context_window("glm-4")
-        # 无效值应被忽略，使用默认
-        assert eff >= 50_000
-
-
 class TestAutoCompactPctOverride:
     """测试 AUTOCOMPACT_PCT_OVERRIDE 双模式比例覆盖"""
 
@@ -710,21 +671,6 @@ class TestAutoCompactPctOverride:
             counter = SimpleTokenCounter()
             bm = ContextBudgetManager("glm-4", counter)
             assert bm.compact_threshold == bm.total_budget - AUTOCOMPACT_BUFFER_TOKENS
-
-    def test_pct_with_window_override(self):
-        """比例覆盖 + 窗口覆盖可叠加"""
-        os.environ["AUTOCOMPACT_PCT_OVERRIDE"] = "10"
-        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "20000"
-        try:
-            counter = SimpleTokenCounter()
-            bm = ContextBudgetManager("glm-4", counter)
-            # total_budget = 20000 - 4096 - 13000 = 2904
-            # compact_threshold = min(2904*0.10, 2904-13000) = min(290, -10096) = -10096
-            # 但 used >= -10096 永远为 True，任何消息都会触发压缩
-            # 这是合理的——20K 窗口 + 10% 比例 = 极端调试场景
-            assert bm.compact_threshold < bm.total_budget
-        finally:
-            os.environ.pop("CONTEXT_WINDOW_OVERRIDE", None)
 
     def test_pct_claude_model(self):
         """Claude 模型的比例覆盖计算"""

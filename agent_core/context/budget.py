@@ -15,27 +15,6 @@ from typing import Optional, Protocol, runtime_checkable
 logger = logging.getLogger("context.budget")
 
 
-def _get_env_window_override() -> int | None:
-    """
-    调试用：读取环境变量 CONTEXT_WINDOW_OVERRIDE 覆盖模型窗口
-    用于快速验证压缩流程（无需发几万字对话）
-
-    用法：
-        export CONTEXT_WINDOW_OVERRIDE=8000
-        # 然后对话中达到 ~6K tokens 就触发压缩
-    """
-    val = os.environ.get("CONTEXT_WINDOW_OVERRIDE", "").strip()
-    if not val:
-        return None
-    try:
-        n = int(val)
-        if n <= 0:
-            return None
-        return n
-    except ValueError:
-        return None
-
-
 # ── 常量配置 ────────────────────────────────────────────────────
 
 # GLM-4 / GLM-5.1 上下文窗口（验证值）
@@ -141,14 +120,6 @@ def get_effective_context_window(model: str) -> int:
     config = get_model_config(model)
     context_window = config["context_window"]
     max_output = config["max_output"]
-
-    # 调试用：环境变量覆盖窗口（优先级最高）
-    override = _get_env_window_override()
-    if override is not None:
-        # 调试模式：不设下限，完整尊重用户值
-        effective = override - min(max_output, MAX_OUTPUT_TOKENS_FOR_SUMMARY) - AUTOCOMPACT_BUFFER_TOKENS
-        logger.info(f"[DEBUG] CONTEXT_WINDOW_OVERRIDE={override}, effective={effective}")
-        return max(effective, 1_000)  # 最低 1K，保证有足够空间
 
     reserved = min(max_output, MAX_OUTPUT_TOKENS_FOR_SUMMARY)
     effective = context_window - reserved - AUTOCOMPACT_BUFFER_TOKENS
