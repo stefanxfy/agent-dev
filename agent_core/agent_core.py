@@ -738,3 +738,12 @@ class ReactAgent:
 
         # 4. flush 确保落盘
         storage.flush()
+
+        # 5. P1 修复：同步 manager 的 _last_uuid 到 preserved head 最后一条
+        # 为什么需要：storage.add_* 只更新 storage 内部状态，不调 manager.add_user_message 等
+        # 高阶方法。manager._last_uuid 仍是压缩前的最后一条（如 838f3b94）。
+        # 下次 manager.add_assistant_message/add_user_message 写后续对话时，
+        # parent = self._last_uuid 会链到旧链（错位）。
+        # 现场: 7f071c62.jsonl 后续 assistant parent 指向 boundary 之前的 user message。
+        # 修复后: manager._last_uuid 同步到 storage.last_uuid（preserved head 最后一条）。
+        self._session_manager._last_uuid = storage.last_uuid

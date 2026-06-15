@@ -1567,3 +1567,89 @@ def test_recover_uncompressed_cli():
     )
     Test.assert_equal("不存在 session 退出码 1", result.returncode, 1)
     Test.check("错误信息包含'找不到'", "找不到" in result.stderr or "找不到" in result.stdout)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P1-fix: _persist_compacted_messages 必须同步 manager._last_uuid
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_persist_compacted_syncs_manager_last_uuid():
+    """P1 回归：_persist_compacted_messages 写盘后必须同步 manager._last_uuid
+
+    现场 bug (7f071c62.jsonl 新压缩后):
+    - preserved head 6 条 parent 链正确（storage.add_message 用 _get_last_uuid 自动算）
+    - 但 manager._last_uuid 仍是压缩前的最后一条 (838f3b94)
+    - 下次 manager.add_assistant_message 写后续对话，parent = 838f3b94（错位到旧链）
+
+    修复后：写盘后同步 manager._last_uuid = storage.last_uuid
+    """
+    import tempfile
+    from agent_core.session.manager import SessionManager
+    from agent_core.agent_core import ReactAgent
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        sm = SessionManager("test-sync-lastuuid", data_dir=tmpdir)
+        sm.add_user_message("原始消息 1")
+        sm.add_assistant_message("原始回复 1")
+        sm.add_user_message("原始消息 2")
+        sm.flush()
+        
+        # 记录压缩前 manager._last_uuid
+        before_uuid = sm._last_uuid
+        print(f"  压缩前 manager._last_uuid = {before_uuid[:8] if before_uuid else 'None'}")
+        
+        # 模拟 compacted（preserved head 6 条）
+        compacted = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "[Previous conversation summarized]\n\nsummary"},
+            {"role": "user", "content": "preserved-1"},
+            {"role": "assistant", "content": "preserved-1-reply"},
+            {"role": "user", "content": "preserved-2"},
+            {"role": "assistant", "content": "preserved-2-reply"},
+            {"role": "user", "content": "preserved-3"},
+            {"role": "assistant", "content": "preserved-3-reply"},
+        ]
+        class R:
+            success = True
+            tokens_before = 100
+            tokens_freed = 50
+            summary = "summary"
+        
+        agent = ReactAgent.__new__(ReactAgent)
+        agent._session_manager = sm
+        agent.messages = []
+        agent._persist_compacted_messages(compacted, R())
+        
+        # 验证：manager._last_uuid 应该被同步
+        after_uuid = sm._last_uuid
+        storage_uuid = sm.storage.last_uuid
+        Test.check(f"manager._last_uuid 同步到 storage.last_uuid",
+                   after_uuid == storage_uuid,
+                   f"manager={after_uuid[:8] if after_uuid else None}, storage={storage_uuid[:8] if storage_uuid else None}")
+        Test.check(f"manager._last_uuid 不再是压缩前的 {before_uuid[:8]}",
+                   after_uuid != before_uuid)
+        
+        # 模拟写后续对话（manager.add_assistant_message）
+        sm.add_assistant_message("压缩后的 LLM 响应")
+        sm.flush()
+        
+        # 验证：后续对话的 parent 链到 preserved head 最后一条
+        # 而不是链到压缩前的最后一条
+        # 找最后一条 assistant entry
+        all_main = [m for m in sm.get_messages(stop_at_boundary=False) if m.get("type") in {"user", "assistant", "system"}]
+        last_assistant = next(m for m in reversed(all_main) if m.get("type") == "assistant")
+        last_preserved_uuid = compacted[-1]  # 最后一条 preserved
+        
+        # 找 preserved head 最后一条的 uuid
+        preserved_uuids = [e.get("uuid") for e in sm.storage.read_entries()
+                          if e.get("type") == "assistant" and e.get("uuid") != last_assistant.get("uuid")]
+        # 倒序找到最新一条 preserved assistant
+        last_preserved_in_storage = None
+        for e in reversed(sm.storage.read_entries()):
+            if e.get("type") == "assistant" and e.get("uuid") != last_assistant.get("uuid"):
+                last_preserved_in_storage = e.get("uuid")
+                break
+        
+        Test.assert_equal("后续 assistant parent 链到 preserved head 最后一条",
+                          last_assistant.get("parentUuid"), 
+                          last_preserved_in_storage)
