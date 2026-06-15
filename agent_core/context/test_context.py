@@ -695,29 +695,36 @@ class TestAutoCompactPctOverride:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_compact_prompt_uses_xml_tags_strictly():
-    """验证 Option B+C 改造后的 system prompt 严格使用 XML 标签要求"""
+    """验证 Claude Code 风格的 prompt 设计 (4 道防线)"""
     from agent_core.context.compact import COMPACT_SYSTEM_PROMPT, COMPACT_USER_PROMPT_TEMPLATE
     
-    # 1. system prompt 必须明确要求 XML 标签
-    assert "XML" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 XML 标签"
+    # 防线 1: 开头 CRITICAL 警告 (仿 Claude Code NO_TOOLS_PREAMBLE)
+    assert "CRITICAL" in COMPACT_SYSTEM_PROMPT, "system prompt 开头有 CRITICAL 警告"
+    assert "TEXT ONLY" in COMPACT_SYSTEM_PROMPT, "开头要求 TEXT ONLY"
+    assert "Do NOT call any tools" in COMPACT_SYSTEM_PROMPT, "开头禁止调用工具"
+    assert "REJECTED" in COMPACT_SYSTEM_PROMPT, "说明工具调用会被 REJECTED"
+    
+    # 防线 2: 主体 XML 标签要求
     assert "<analysis>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 <analysis>"
     assert "<summary>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 <summary>"
     assert "</analysis>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 </analysis>"
     assert "</summary>" in COMPACT_SYSTEM_PROMPT, "system prompt 提到 </summary>"
     
-    # 2. user prompt 强化 XML 标签
-    assert "XML" in COMPACT_USER_PROMPT_TEMPLATE, "user prompt 提到 XML 标签"
-    assert "成对" in COMPACT_USER_PROMPT_TEMPLATE, "user prompt 提到成对出现"
-    
-    # 3. system prompt 必须包含 few-shot example
+    # 防线 3: 主体 few-shot example
     assert "<example>" in COMPACT_SYSTEM_PROMPT, "system prompt 包含 <example>"
     assert "</example>" in COMPACT_SYSTEM_PROMPT, "system prompt 包含 </example>"
     
-    # 4. few-shot example 必须包含 4 段结构
-    for seg in ["用户目标", "关键决策", "当前状态", "待办事项"]:
-        assert seg in COMPACT_SYSTEM_PROMPT, f"example 包含 {seg}"
+    # 防线 4: 结尾 REMINDER 再次强调
+    assert "REMINDER" in COMPACT_SYSTEM_PROMPT, "system prompt 结尾有 REMINDER"
     
-    # 5. 防漂移规则保留
+    # user prompt 同样有 REMINDER
+    assert "REMINDER" in COMPACT_USER_PROMPT_TEMPLATE, "user prompt 也有 REMINDER"
+    
+    # 4 段结构 (中文友好, 融合 Claude Code 9 段)
+    for seg in ["用户目标", "关键决策", "当前状态", "待办事项"]:
+        assert seg in COMPACT_SYSTEM_PROMPT, f"4 段结构包含 {seg}"
+    
+    # 防漂移规则
     assert "verbatim quotes" in COMPACT_SYSTEM_PROMPT, "保留 verbatim quotes 规则"
     assert "防漂移" in COMPACT_SYSTEM_PROMPT, "保留防漂移规则"
 
