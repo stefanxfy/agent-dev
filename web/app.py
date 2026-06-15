@@ -155,7 +155,7 @@ with st.sidebar:
     if st.session_state.agent:
         agent = st.session_state.agent
         cm = agent.context_manager
-        usage = cm.get_usage_info(agent.history)
+        usage = cm.get_usage_info(agent.messages)
 
         # 预算进度条
         ratio = usage["usage_ratio"]
@@ -201,7 +201,7 @@ with st.sidebar:
             )
 
         # 消息数
-        st.metric("History 长度", f"{len(agent.history)} 条")
+        st.metric("History 长度", f"{len(agent.messages)} 条")
     else:
         st.caption("Agent 未初始化")
 
@@ -662,10 +662,10 @@ if prompt := st.chat_input("输入消息..."):
     })
 
     # 更新 agent history
-    # （agent.run() 内部已经更新了 agent.history）
+    # （agent.run() 内部已经更新了 agent.messages）
 
     # 触发 sidebar 刷新：让上下文预算面板、History 长度等 widget
-    # 重新从 agent.history 读取最新值（Streamlit 渲染顺序：sidebar 先、
+    # 重新从 agent.messages 读取最新值（Streamlit 渲染顺序：sidebar 先、
     # 主区后，sidebar 在 run() 启动时取的是旧值，run() 完后需要 rerun 一次
     # 才能让 sidebar 看到新 history）。
     st.rerun()

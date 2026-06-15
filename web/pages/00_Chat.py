@@ -246,5 +246,5 @@ with st.expander("🔧 调试信息"):
     st.write("**Session ID:**", st.session_state.chat_session_id)
     if agent:
         st.write("**Agent Session ID:**", agent.session_id)
-        st.write("**History Length:**", len(agent.history))
+        st.write("**History Length:**", len(agent.messages))
         st.write("**LLM Provider:**", agent.llm.config.provider)

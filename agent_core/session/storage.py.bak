@@ -237,42 +237,22 @@ class SessionStorage:
         self,
         summary: str,
         tokens_saved: int = 0,
-        parent_uuid: Optional[str] = None,
+        format: str = "BASE",
         **extra,
     ) -> str:
-        """添加摘要 Entry（压缩产物）
+        """添加 summary Entry（压缩产物）
 
-        对齐 Claude Code getCompactUserSummaryMessage:
-        - 写一条普通 user message，不是独立 summary 类型
-        - isCompactSummary=True 标记此消息为压缩摘要
-        - 内容格式: "[Previous conversation summarized]\n\n{summary}"
-
-        存储格式：message = {"role": "user", "content": "[Previous...]...", "isCompactSummary": true}
+        存储格式：message = {"summary": ..., "tokens_saved": ..., "format": ...}
         """
-        formatted = f"[Previous conversation summarized]\n\n{summary}"
-        entry_uuid = str(uuid.uuid4())
-        if parent_uuid is None:
-            parent_uuid = self._get_last_uuid()
-
-        entry = {
-            "uuid": entry_uuid,
-            "parentUuid": parent_uuid,
-            "sessionId": self.session_id,
-            "type": "user",
-            "timestamp": datetime.now().isoformat(),
-            "message": {
-                "role": "user",
-                "content": formatted,
-                "isCompactSummary": True,
+        return self.append_entry(
+            entry_type="summary",
+            message={
+                "summary": summary,
+                "tokens_saved": tokens_saved,
+                "format": format,
             },
-            "tokens_saved": tokens_saved,
             **extra,
-        }
-        self._pending.append(entry)
-        self._entry_cache[entry_uuid] = entry
-        self._uuid_set.add(entry_uuid)
-        logger.debug(f"[{self.session_id[:8]}] summary: uuid={entry_uuid[:8]}")
-        return entry_uuid
+        )
 
     def append_raw_entry(self, entry: dict) -> str:
         """直接追加已构造好的 Entry（不走 message 包装，用于 metadata entries）
@@ -292,41 +272,15 @@ class SessionStorage:
 
         return entry.get("uuid", "")
 
-    def add_compact_boundary(
-        self,
-        parent_uuid: Optional[str] = None,
-        trigger: str = "auto",
-        pre_tokens: int = 0,
-        messages_summarized: int = 0,
-        **extra,
-    ) -> str:
-        """添加压缩边界 Entry
-
-        对齐 Claude Code createCompactBoundaryMessage:
-        - parentUuid 链接到最后一条旧消息（不是 None）
-        - type 改为 "system" + subtype="compact_boundary"（对齐 Claude Code）
-        - 携带 compactMetadata（trigger/preTokens/messagesSummarized）
-
-        加载时反向扫描找最后一个 compact_boundary，从其后开始读。
-        boundary 本身是 system message，不送给 LLM。
-        """
+    def add_compact_boundary(self, **extra) -> str:
+        """添加压缩边界 Entry（parentUuid = None，断链标记）"""
         entry_uuid = str(uuid.uuid4())
-        # parentUuid: 链接到最后一条消息（断链靠 subtype 标记，不靠 parentUuid=None）
-        if parent_uuid is None:
-            parent_uuid = self._get_last_uuid()
-
         entry = {
             "uuid": entry_uuid,
-            "parentUuid": parent_uuid,  # ← 链接，不断链
+            "parentUuid": None,  # ← 断链！
             "sessionId": self.session_id,
-            "type": "system",
-            "subtype": "compact_boundary",  # ← Claude Code 风格
+            "type": "compact-boundary",
             "timestamp": datetime.now().isoformat(),
-            "compactMetadata": {
-                "trigger": trigger,
-                "preTokens": pre_tokens,
-                "messagesSummarized": messages_summarized,
-            },
             **extra,
         }
         self._pending.append(entry)
@@ -481,53 +435,24 @@ class SessionStorage:
     def get_messages(
         self,
         stop_at_boundary: bool = True,
-        include_compact_summary: bool = True,
     ) -> list[dict]:
         """
         获取消息列表（排除元数据 entry）
 
-        对齐 Claude Code findLastCompactBoundaryIndex:
-        反向扫描找最后一个 compact_boundary，从其后开始返回消息。
-
         Args:
-            stop_at_boundary: 是否在压缩边界处截断（只返回 boundary 之后的消息）
-            include_compact_summary: 是否包含压缩摘要消息（isCompactSummary=True 的 user msg）
-                                     UI 显示时可设为 False 隐藏摘要原文
+            stop_at_boundary: 是否在压缩边界处停止
 
         Returns:
-            消息 Entry 列表（时间正序）
+            消息 Entry 列表
         """
         entries = self.read_entries(include_compact_boundary=True)
-
-        if stop_at_boundary:
-            # 反向扫描找最后一个 compact_boundary
-            boundary_idx = -1
-            for i in range(len(entries) - 1, -1, -1):
-                entry = entries[i]
-                # 兼容旧格式 "compact-boundary" 和新格式 "system"+subtype
-                etype = entry.get("type")
-                is_boundary = (
-                    etype == "compact-boundary"
-                    or (etype == "system" and entry.get("subtype") == "compact_boundary")
-                )
-                if is_boundary:
-                    boundary_idx = i
-                    break
-
-            if boundary_idx >= 0:
-                # 从 boundary 之后开始（boundary 本身是 system message，不送给 LLM）
-                entries = entries[boundary_idx + 1:]
-
-        # 过滤：只保留消息类型（排除 metadata entries）
         messages = []
+
         for entry in entries:
             etype = entry.get("type")
+            if stop_at_boundary and etype == "compact-boundary":
+                break  # 停在边界处，boundary 本身不包含
             if etype in ("user", "assistant", "tool_use", "tool_result", "system"):
-                # 可选过滤压缩摘要
-                if not include_compact_summary:
-                    msg = entry.get("message", {})
-                    if msg.get("isCompactSummary"):
-                        continue
                 messages.append(entry)
 
         return messages

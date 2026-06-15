@@ -142,12 +142,20 @@ def test_compact_boundary(tmpdir: str):
 
     # 所有消息（包括边界后，但目前边界后没新消息）
     all_entries = manager.storage.read_entries(include_compact_boundary=True)
-    boundary_entries = [e for e in all_entries if e.get("type") == "compact-boundary"]
+    # 兼容新旧格式：旧 "compact-boundary" / 新 "system"+subtype
+    boundary_entries = [
+        e for e in all_entries
+        if e.get("type") == "compact-boundary"
+        or (e.get("type") == "system" and e.get("subtype") == "compact_boundary")
+    ]
 
     Test.assert_equal("边界 entry 存在", len(boundary_entries), 1)
-    Test.assert_equal("边界 parentUuid=None（断链）", boundary_entries[0].get("parentUuid"), None)
+    # 对齐 Claude Code: parentUuid 链接最后一条旧消息（不再是 None）
+    Test.assert_not_none("边界 parentUuid 链接（非None）", boundary_entries[0].get("parentUuid"))
     Test.assert_equal("边界 UUID 正确", boundary_entries[0].get("uuid"), boundary_uuid)
-    Test.assert_equal("stop_at_boundary=True 停在边界前", len(msgs_with_boundary), 10)  # 5*2条消息
+    Test.assert_equal("边界有 compactMetadata", "compactMetadata" in boundary_entries[0], True)
+    # 反向扫描：boundary 后无消息 → 返回空列表
+    Test.assert_equal("stop_at_boundary=True 返回boundary后(空)", len(msgs_with_boundary), 0)
 
 
 def test_resume_and_continue(tmpdir: str):
@@ -171,14 +179,13 @@ def test_resume_and_continue(tmpdir: str):
     manager.add_assistant_message("边界后回复")
     manager.flush()
 
-    # Resume：从断链处恢复
+    # Resume：从断链处恢复（反向扫描找最后 boundary，取其后缀）
     resume_msgs, resume_meta = resume_session(manager.session_id, data_dir=tmpdir)
-    Test.assert_in("Resume 有边界后消息", "边界后消息",
-                    [m.get("content", "") for m in resume_msgs])
+    resume_contents = [m.get("content", "") for m in resume_msgs]
+    Test.assert_in("Resume 有边界后消息", "边界后消息", resume_contents)
 
     # Continue：读取全部消息
     cont_msgs, cont_meta = continue_session(manager.session_id, data_dir=tmpdir)
-    # Continue 应该有边界前 + 边界后的所有消息
     all_content = [m.get("content", "") for m in cont_msgs]
     Test.assert_in("Continue 有边界前消息", "消息0", all_content)
     Test.assert_in("Continue 有边界后消息", "边界后消息", all_content)

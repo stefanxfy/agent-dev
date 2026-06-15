@@ -365,41 +365,19 @@ class SessionManager:
         self,
         summary: str,
         tokens_saved: int = 0,
+        format: str = "BASE",
         **extra,
     ) -> str:
-        """添加摘要（对齐 Claude Code: 写普通 user message + isCompactSummary）
-
-        在 add_compact_boundary 之后调用，作为新链的起点。
-        """
+        """添加摘要"""
         self.progress.record_compaction()
-        uuid_ = self.storage.add_summary(
-            summary=summary,
-            tokens_saved=tokens_saved,
-            parent_uuid=self._last_uuid,
-            **extra,
-        )
+        uuid_ = self.storage.add_summary(summary, tokens_saved, format, parent_uuid=self._last_uuid)
         self._last_uuid = uuid_
         return uuid_
 
-    def add_compact_boundary(
-        self,
-        trigger: str = "auto",
-        pre_tokens: int = 0,
-        messages_summarized: int = 0,
-        **extra,
-    ) -> str:
-        """添加压缩边界（对齐 Claude Code createCompactBoundaryMessage）
-
-        parentUuid 链接到最后一条旧消息（不是 None）。
-        加载时反向扫描找最后一个 compact_boundary 取其后缀。
-        """
-        uuid_ = self.storage.add_compact_boundary(
-            parent_uuid=self._last_uuid,  # ← 链接最后一条消息
-            trigger=trigger,
-            pre_tokens=pre_tokens,
-            messages_summarized=messages_summarized,
-            **extra,
-        )
+    def add_compact_boundary(self, **extra) -> str:
+        """添加压缩边界"""
+        uuid_ = self.storage.add_compact_boundary(parent_uuid=None)  # ← 断链
+        # 边界后的消息应该指向 boundary 自己（作为独立根节点）
         self._last_uuid = uuid_
         return uuid_
 

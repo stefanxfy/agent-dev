@@ -9,16 +9,10 @@ Day 3 改进：
 - Debug 日志输出（便于观察 ReAct 过程）
 
 Day 4 改进：
-- SessionManager 融合：可选 session_id 实现 messages 持久化
-- 自动从 session 加载 messages（Resume语义）
-- 每次交互后实时写入 session（逐条写入，非全量重写）
+- SessionManager 融合：可选 session_id 实现历史持久化
+- 自动从 session 加载历史（Resume语义）
+- 每次交互后自动保存到 session
 - 保持向后兼容（不传 session_id = 纯内存模式）
-
-Day 6 改进（对齐 Claude Code）：
-- self.history → self.messages（对齐 Claude Code messages: Message[]）
-- 压缩成功后持久化 boundary + summary 到 JSONL
-- 删除 _save_to_session()（消除双写根因）
-- load_history() → load_messages()
 """
 
 from __future__ import annotations
@@ -178,7 +172,7 @@ class ReactAgent:
         self.tools = tool_registry
         self.max_turns = max_turns
         self.max_context_tokens = max_context_tokens  # 保留向后兼容
-        self.messages: list[dict] = []  # 当前对话消息列表（对齐 Claude Code messages: Message[]）
+        self.history: list[dict] = []  # LLM messages 格式
         
         # Day 5: ContextManager（替代 _trim_history）
         self.context_manager = CM(
@@ -198,8 +192,8 @@ class ReactAgent:
                 data_dir=session_data_dir,
             )
             # 从 session 加载历史（Resume 语义：只加载断链后的消息）
-            self.messages = self._session_manager.get_messages_for_llm()
-            _logger.info(f"Session loaded: {session_id}, {len(self.messages)} messages")
+            self.history = self._session_manager.get_messages_for_llm()
+            _logger.info(f"Session loaded: {session_id}, {len(self.history)} messages")
 
         # ── 流式过程中记录 thinking/tool_logs，用于 session 持久化 ───
         self._pending_thinking: str = ""
@@ -267,11 +261,11 @@ class ReactAgent:
         保留：系统消息 + 最近的消息
         策略：从最老的消息开始删，直到 Token 预算内
         """
-        if not self.messages:
+        if not self.history:
             return
 
         # 估算当前总 Token
-        total_tokens = sum(self._estimate_message_tokens(m) for m in self.messages)
+        total_tokens = sum(self._estimate_message_tokens(m) for m in self.history)
         
         if total_tokens <= self.max_context_tokens:
             return  # 不需要截断
@@ -280,9 +274,45 @@ class ReactAgent:
         target_tokens = int(self.max_context_tokens * 0.8)
         
         # 从最老的消息开始删
-        while total_tokens > target_tokens and len(self.messages) > 2:
-            removed = self.messages.pop(0)
+        while total_tokens > target_tokens and len(self.history) > 2:
+            removed = self.history.pop(0)
             total_tokens -= self._estimate_message_tokens(removed)
+
+    def _save_to_session(self):
+        """Day 4: 将当前 history 保存到 session（如果启用了 session）"""
+        if self._session_manager is None:
+            return
+        try:
+            # 追加所有未保存的消息到 session
+            for msg in self.history:
+                role = msg.get("role", "")
+                if role == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        self._session_manager.add_user_message(content)
+                    else:
+                        # tool_results 包在 user 的 content 数组里
+                        self._session_manager.storage.add_message(
+                            "user", entry_type="user",
+                            message=msg,
+                            parent_uuid=self._session_manager._last_uuid,
+                        )
+                elif role == "assistant":
+                    self._session_manager.add_assistant_message(message=msg)
+                elif role == "tool":
+                    # tool 角色转为 Claude Code 风格 user Entry
+                    self._session_manager.storage.add_message(
+                        "user", entry_type="user",
+                        message={"role": "user", "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": msg.get("tool_call_id", ""),
+                            "content": msg.get("content", ""),
+                        }]},
+                        parent_uuid=self._session_manager._last_uuid,
+                    )
+            self._session_manager.flush()
+        except Exception as e:
+            _logger.warning(f"Failed to save to session: {e}")
 
     # ── 主循环 ──────────────────────────────────────────────────────
 
@@ -296,7 +326,7 @@ class ReactAgent:
         # system prompt 不持久化到 JSONL（与 Claude Code 一致：每次 run 动态注入）
 
         # 追加用户消息（内存）
-        self.messages.append({"role": "user", "content": user_message})
+        self.history.append({"role": "user", "content": user_message})
         
         # Day 4: 保存 user message 到 session
         if self._session_manager:
@@ -312,29 +342,11 @@ class ReactAgent:
 
         # Day 5：用 ContextManager 替代 _trim_history
         # 检查 token 预算，必要时自动压缩
-        compacted, compact_result = self.context_manager.check_and_compact(self.messages)
+        compacted, compact_result = self.context_manager.check_and_compact(self.history)
         if compact_result:
             if compact_result.success:
-                self.messages = compacted
+                self.history = compacted
                 _logger.info(f"Context compacted: {compact_result.summary_str()}")
-
-                # 对齐 Claude Code: 压缩成功后写 boundary + summary 到 JSONL
-                if self._session_manager:
-                    try:
-                        # 先写 compact boundary（parentUuid 链接最后一条旧消息）
-                        self._session_manager.add_compact_boundary(
-                            trigger="auto",
-                            pre_tokens=compact_result.tokens_before,
-                            messages_summarized=len(self.messages) - 1,  # 减去 summary msg
-                        )
-                        # 再写 summary（作为新链起点，parentUuid 指向 boundary）
-                        self._session_manager.add_summary(
-                            summary=compact_result.summary,
-                            tokens_saved=compact_result.tokens_freed,
-                        )
-                    except Exception as e:
-                        _logger.warning(f"Failed to persist compaction to session: {e}")
-
                 yield ("system", f"📦 上下文已压缩: {compact_result.tokens_freed:,} tokens 释放")
             else:
                 _logger.warning(f"Context compact failed: {compact_result.error}")
@@ -347,7 +359,7 @@ class ReactAgent:
             yield ("system", f"🔄 Turn {turn}/{self.max_turns}")
 
             # ── 准备发送给 LLM 的 messages ──────────────────────────
-            messages_for_llm = list(self.messages)
+            messages_for_llm = list(self.history)
             
             # P2 新增：如果有 system_prompt，添加到消息开头
             if self.system_prompt:
@@ -384,7 +396,7 @@ class ReactAgent:
                 yield ("system", f"❌ {error_msg}")
                 yield ("text", f"抱歉，遇到了技术问题无法回答：{error_msg}")
                 yield ("system", "✅ 回答完成")
-                self.messages.append({"role": "assistant", "content": f"抱歉，遇到了技术问题：{e}"})
+                self.history.append({"role": "assistant", "content": f"抱歉，遇到了技术问题：{e}"})
                 # Day 4: 保存到 session
                 if self._session_manager:
                     try:
@@ -429,7 +441,7 @@ class ReactAgent:
             if not tool_calls:
                 # 最终回答已通过 text_delta 流式输出
                 # 把 assistant 消息追加到 history
-                self.messages.append({
+                self.history.append({
                     "role": "assistant",
                     "content": full_text,
                 })
@@ -462,7 +474,7 @@ class ReactAgent:
             if full_text:
                 assistant_content.insert(0, {"type": "text", "text": full_text})
 
-            self.messages.append({"role": "assistant", "content": assistant_content})
+            self.history.append({"role": "assistant", "content": assistant_content})
 
             # Day 3：并行执行所有工具（如果工具之间无依赖）
             # 如果只有一个工具，串行执行更简单
@@ -499,7 +511,7 @@ class ReactAgent:
                         yield ("system", f"⚠️ 工具执行失败且达到最大轮次，结束循环")
                         return
 
-                self.messages.append(_make_tool_result_block(tc.tool_use_id, tool_output))
+                self.history.append(_make_tool_result_block(tc.tool_use_id, tool_output))
                 self._pending_tool_results.append((tc.tool_use_id, tool_output))
             else:
                 # Day 3：多工具并行执行
@@ -553,7 +565,7 @@ class ReactAgent:
                             })
                             self._pending_tool_logs.append({"type": "result", "name": tc.tool_name, "output": tool_output, "success": False})
 
-                        self.messages.append(_make_tool_result_block(tc.tool_use_id, tool_output))
+                        self.history.append(_make_tool_result_block(tc.tool_use_id, tool_output))
                         self._pending_tool_results.append((tc.tool_use_id, tool_output))
             if self._session_manager:
                 try:
@@ -615,7 +627,7 @@ class ReactAgent:
 
     def reset(self):
         """重置会话历史"""
-        self.messages.clear()
+        self.history.clear()
         # Day 4: 同时清空 session
         if self._session_manager:
             try:
@@ -623,8 +635,8 @@ class ReactAgent:
             except Exception:
                 pass
 
-    def load_messages(self, history: list[dict]):
-        self.messages = list(history)
+    def load_history(self, history: list[dict]):
+        self.history = list(history)
 
     # ── Day 4: Session 相关 ───────────────────────────────────────────
 
@@ -643,10 +655,10 @@ class ReactAgent:
             return None
         return self._session_manager.fork(new_session_id)
 
-    def add_compact_boundary(self, **kwargs):
-        """在当前会话中添加压缩边界标记（委托给 SessionManager）"""
+    def add_compact_boundary(self):
+        """在当前 history 中添加压缩边界标记（用于触发压缩）"""
         if self._session_manager:
-            self._session_manager.add_compact_boundary(**kwargs)
+            self._session_manager.add_compact_boundary()
 
     def get_session_manager(self) -> Optional["SessionManager"]:
         """获取 SessionManager 实例（用于高级操作）"""
