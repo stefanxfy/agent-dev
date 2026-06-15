@@ -660,3 +660,9 @@ if prompt := st.chat_input("输入消息..."):
 
     # 更新 agent history
     # （agent.run() 内部已经更新了 agent.history）
+
+    # 触发 sidebar 刷新：让上下文预算面板、History 长度等 widget
+    # 重新从 agent.history 读取最新值（Streamlit 渲染顺序：sidebar 先、
+    # 主区后，sidebar 在 run() 启动时取的是旧值，run() 完后需要 rerun 一次
+    # 才能让 sidebar 看到新 history）。
+    st.rerun()
