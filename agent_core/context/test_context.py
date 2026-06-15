@@ -727,3 +727,107 @@ def test_compact_prompt_extract_summary_works_with_new_format():
     from agent_core.context.compact import CompactOrchestrator
     # 只需要 import 成功即可（具体逻辑需 LLM 测试）
     assert CompactOrchestrator is not None, "CompactOrchestrator 可正常导入"
+
+
+def test_compact_debug_logging_emits_expected_events():
+    """验证 DEBUG 日志输出关键事件（Compact START / LLM Call / Extract / Build）"""
+    import logging
+    from io import StringIO
+    
+    # 捕获日志
+    log_stream = StringIO()
+    handler = logging.StreamHandler(log_stream)
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('[%(levelname)s] %(message)s')
+    handler.setFormatter(formatter)
+    
+    compact_logger = logging.getLogger("context.compact")
+    compact_logger.addHandler(handler)
+    compact_logger.setLevel(logging.DEBUG)
+    
+    try:
+        from agent_core.llm.router import StreamChunk, TextDelta
+        
+        class MockLLM:
+            def chat(self, messages, tools=None):
+                yield StreamChunk(text_delta=TextDelta(
+                    text="<analysis>分析内容</analysis><summary>1. 用户目标：A 2. 关键决策：B 3. 当前状态：完 4. 待办事项：无</summary>"
+                ))
+        
+        compactor = CompactOrchestrator(
+            llm_router=MockLLM(),
+            budget_manager=ContextBudgetManager("glm-4", SimpleTokenCounter()),
+            token_counter=SimpleTokenCounter(),
+        )
+        compactor.compact([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ])
+        
+        log_output = log_stream.getvalue()
+        
+        # 验证关键事件都被记录
+        assert "🔧 [Compact START]" in log_output, "记录 START 事件"
+        assert "📦 [Preprocess]" in log_output, "记录 Preprocess 事件"
+        assert "🤖 [LLM Call]" in log_output, "记录 LLM Call 事件"
+        assert "🏷️  [Extract]" in log_output, "记录 Extract 事件"
+        assert "🏗️  [Build Compacted]" in log_output, "记录 Build 事件"
+        assert "🔧 [Compact DONE]" in log_output, "记录 DONE 事件"
+        
+        # 验证 Extract 路径
+        assert "<summary> 标签提取成功" in log_output, "识别 <summary> 标签路径"
+        
+        # 验证 preserved head 内容被打印
+        assert "preserved head" in log_output, "记录 preserved head"
+    finally:
+        compact_logger.removeHandler(handler)
+
+
+def test_compact_debug_logging_shows_ptl_retry():
+    """验证 DEBUG 日志显示 PTL 重试过程"""
+    import logging
+    from io import StringIO
+    
+    log_stream = StringIO()
+    handler = logging.StreamHandler(log_stream)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    
+    compact_logger = logging.getLogger("context.compact")
+    compact_logger.addHandler(handler)
+    compact_logger.setLevel(logging.DEBUG)
+    
+    try:
+        from agent_core.llm.router import StreamChunk, TextDelta
+        
+        call_count = [0]
+        class MockLLM:
+            def chat(self, messages, tools=None):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    # 第一次触发 PTL
+                    raise ValueError("prompt too long: context length exceeded")
+                # 第二次成功
+                yield StreamChunk(text_delta=TextDelta(
+                    text="<summary>1. 用户目标：A 2. 关键决策：B 3. 当前状态：完 4. 待办事项：无</summary>"
+                ))
+        
+        compactor = CompactOrchestrator(
+            llm_router=MockLLM(),
+            budget_manager=ContextBudgetManager("glm-4", SimpleTokenCounter()),
+            token_counter=SimpleTokenCounter(),
+        )
+        result = compactor.compact([
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ])
+        
+        log_output = log_stream.getvalue()
+        assert result.success, "最终成功"
+        assert "🥝 [PTL Retry" in log_output, "记录 PTL 重试"
+        assert "truncated" in log_output, "记录截断动作"
+        assert "attempt=2/4" in log_output, "记录第二次尝试"
+    finally:
+        compact_logger.removeHandler(handler)

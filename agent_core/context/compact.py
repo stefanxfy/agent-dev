@@ -16,6 +16,30 @@ from typing import Optional
 
 logger = logging.getLogger("context.compact")
 
+# DEBUG 日志辅助函数
+def _truncate(text: str, max_len: int = 200) -> str:
+    """截断长文本避免刷屏"""
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + f"... [+{len(text) - max_len} chars]"
+
+
+def _debug_box(title: str, content: str, max_width: int = 80):
+    """DEBUG 打印一个带标题的盒子"""
+    lines = content.split('\n')
+    box = f"\n{'=' * max_width}\n"
+    box += f"🔍 {title}\n"
+    box += f"{'=' * max_width}\n"
+    for line in lines:
+        if len(line) > max_width:
+            box += f"  {line[:max_width - 5]}...\n"
+        else:
+            box += f"  {line}\n"
+    box += f"{'=' * max_width}"
+    logger.debug(box)
+
 
 # ── 常量 ────────────────────────────────────────────────────────
 
@@ -172,9 +196,26 @@ class CompactOrchestrator:
         start = time.time()
         tokens_before = self.token_counter.count_messages(messages)
 
+        # ── DEBUG: 压缩起点 ────────────────────────────────
+        logger.info(
+            f"🔧 [Compact START] messages={len(messages)}, "
+            f"tokens_before={tokens_before:,}"
+        )
+        logger.debug(
+            f"  ├─ First msg: {messages[0].get('role', '?')} "
+            f"content={_truncate(str(messages[0].get('content', ''))[:80])}"
+        )
+        logger.debug(
+            f"  └─ Last msg: {messages[-1].get('role', '?')} "
+            f"content={_truncate(str(messages[-1].get('content', ''))[:80])}"
+        )
+
         try:
             # 1. 预处理
             preprocessed = self._preprocess(messages)
+            logger.debug(
+                f"📦 [Preprocess] {len(messages)} → {len(preprocessed)} messages"
+            )
 
             # 2-3. 生成摘要（含 PTL 防御）
             summary, ptl_retries = self._generate_summary_with_ptl(preprocessed)
@@ -191,9 +232,14 @@ class CompactOrchestrator:
             self.budget.record_compact_success()
 
             logger.info(
-                f"Compact succeeded: {tokens_before:,} → {tokens_after:,} tokens "
+                f"🔧 [Compact DONE] {tokens_before:,} → {tokens_after:,} tokens "
                 f"(freed {tokens_before - tokens_after:,}), "
-                f"PTL retries: {ptl_retries}, {elapsed:.0f}ms"
+                f"PTL retries: {ptl_retries}, {elapsed:.0f}ms, "
+                f"preserved_head={len(compacted) - 2}"
+            )
+            logger.debug(
+                f"  └─ Final structure: [system] + [summary] + "
+                f"[{len(compacted) - 2} preserved head]"
             )
 
             return CompactionResult(
@@ -207,7 +253,7 @@ class CompactOrchestrator:
             )
 
         except Exception as e:
-            logger.error(f"Compact failed: {e}")
+            logger.error(f"❌ [Compact FAILED] {e}")
             self.budget.record_compact_failure()
             elapsed = (time.time() - start) * 1000
             return CompactionResult(
@@ -320,14 +366,36 @@ class CompactOrchestrator:
                 conversation=conversation_text
             )
 
+            # ── DEBUG: 每轮 LLM 调用起点 ────────────────────────────
+            logger.debug(
+                f"🤖 [LLM Call] attempt={attempt + 1}/{MAX_PTL_RETRIES + 1}, "
+                f"to_summarize={len(to_summarize)} msgs, "
+                f"prompt_len={len(prompt)} chars"
+            )
+            logger.debug(
+                f"  ├─ Conversation preview:\n{_truncate(conversation_text, 300)}"
+            )
+
             try:
-                summary = self._call_llm_for_summary(prompt)
+                summary, raw_text = self._call_llm_for_summary(prompt)
                 if summary:
+                    # ── DEBUG: 提取成功 ─────────────────────────────
+                    logger.debug(
+                        f"  ├─ LLM raw output ({len(raw_text)} chars):\n"
+                        f"{_truncate(raw_text, 500)}"
+                    )
+                    logger.debug(
+                        f"  └─ Extracted summary ({len(summary)} chars):\n"
+                        f"{_truncate(summary, 500)}"
+                    )
                     return summary, attempt
 
                 # 空响应，可能是 LLM 异常
                 last_error = "LLM returned empty summary"
-                logger.warning(f"Empty summary on attempt {attempt + 1}")
+                logger.warning(
+                    f"⚠️  [Empty Summary] attempt {attempt + 1}, "
+                    f"raw_output={_truncate(raw_text, 200)}"
+                )
 
             except Exception as e:
                 last_error = str(e)
@@ -354,25 +422,30 @@ class CompactOrchestrator:
                             + to_summarize[truncate_count + 1:]  # 去掉最旧的
                         )
                     logger.warning(
-                        f"PTL retry {attempt + 1}/{MAX_PTL_RETRIES}: "
+                        f"🥝 [PTL Retry {attempt + 1}/{MAX_PTL_RETRIES}] "
                         f"truncated {truncate_count} oldest messages, "
-                        f"{len(to_summarize)} remaining"
+                        f"{len(to_summarize)} remaining, "
+                        f"error={_truncate(last_error, 100)}"
                     )
                     continue
 
                 # 非 PTL 错误或重试用完，抛出
+                logger.error(f"❌ [LLM Call FAILED] {e}")
                 raise
 
         raise ValueError(
             f"PTL defense exhausted after {MAX_PTL_RETRIES} retries: {last_error}"
         )
 
-    def _call_llm_for_summary(self, prompt: str) -> str:
+    def _call_llm_for_summary(self, prompt: str) -> tuple[str, str]:
         """
         调用 LLM 生成摘要
 
         LLMRouter.chat() 返回同步生成器（StreamChunk），
         需要消费生成器收集文本。
+
+        Returns:
+            (extracted_summary, raw_llm_output)
         """
         chunks = self.llm.chat(
             messages=[
@@ -388,7 +461,8 @@ class CompactOrchestrator:
                 full_text += chunk.text_delta.text
             # 忽略 thinking/usage/tool_call chunks
 
-        return self._extract_summary(full_text)
+        summary = self._extract_summary(full_text)
+        return summary, full_text
 
     # ── 辅助方法 ────────────────────────────────────────────────
 
@@ -450,14 +524,33 @@ class CompactOrchestrator:
             start = text.find("<summary>") + len("<summary>")
             end = text.find("</summary>")
             if end > start:
-                return text[start:end].strip()
+                summary = text[start:end].strip()
+                logger.debug(
+                    f"  🏷️  [Extract] <summary> 标签提取成功, "
+                    f"len={len(summary)} chars"
+                )
+                return summary
+            else:
+                logger.debug(
+                    f"  🏷️  [Extract] <summary> 开标签有但缺闭标签, "
+                    f"fallback 到 <analysis>"
+                )
 
         # <analysis> 标签兜底（包含 analysis + 后续内容）
         if "<analysis>" in text:
             start = text.find("<analysis>")
-            return text[start:].strip()
+            summary = text[start:].strip()
+            logger.debug(
+                f"  🏷️  [Extract] <analysis> 标签提取, "
+                f"len={len(summary)} chars"
+            )
+            return summary
 
         # 纯文本兜底
+        logger.debug(
+            f"  🏷️  [Extract] 无 XML 标签, 纯文本兜底, "
+            f"len={len(text)} chars"
+        )
         return text.strip()
 
     def _build_compacted_messages(
@@ -498,5 +591,23 @@ class CompactOrchestrator:
         # 3. 保留最近 N 条消息
         recent = non_system[-preserved_head:] if len(non_system) > preserved_head else non_system
         result.extend(recent)
+
+        # ── DEBUG: 构建结果 ─────────────────────────────────────
+        logger.debug(
+            f"🏗️  [Build Compacted] {len(original)} → {len(result)} messages"
+        )
+        logger.debug(
+            f"  ├─ [0] system: "
+            f"{_truncate(str(result[0].get('content', ''))[:80])}"
+        )
+        logger.debug(
+            f"  ├─ [1] summary: {len(summary)} chars, "
+            f"prefix={summary[:30]!r}..."
+        )
+        logger.debug(f"  └─ [2..{len(result)-1}] preserved head ({len(recent)} msgs):")
+        for i, msg in enumerate(recent):
+            role = msg.get("role", "?")
+            content = str(msg.get("content", ""))[:60].replace("\n", " ")
+            logger.debug(f"      [{i+2}] {role}: {content!r}")
 
         return result
