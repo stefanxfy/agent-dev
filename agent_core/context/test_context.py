@@ -543,3 +543,41 @@ class TestContextManager:
         result = self.cm.force_compact(messages)
         assert result.success is True
         assert self.cm.compact_count == 1
+
+
+class TestContextWindowOverride:
+    """测试 CONTEXT_WINDOW_OVERRIDE 环境变量覆盖（调试用）"""
+
+    def teardown_method(self):
+        """清理环境变量"""
+        import os
+        os.environ.pop("CONTEXT_WINDOW_OVERRIDE", None)
+
+    def test_no_override_uses_default(self):
+        from agent_core.context.budget import get_effective_context_window
+        os.environ.pop("CONTEXT_WINDOW_OVERRIDE", None)
+        eff = get_effective_context_window("glm-4")
+        # 不覆盖：应遵循 50K 下限
+        assert eff >= 50_000
+
+    def test_override_small_window(self):
+        from agent_core.context.budget import get_effective_context_window
+        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "8000"
+        eff = get_effective_context_window("glm-4")
+        # 8000 - 4096 - 8000 = -4096 → 提升到 1K 最低
+        assert eff <= 5_000  # 接近用户值（不被 50K 下限拦住）
+        assert eff >= 1_000
+
+    def test_override_medium_window(self):
+        from agent_core.context.budget import get_effective_context_window
+        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "20000"
+        eff = get_effective_context_window("glm-4")
+        # 20000 - 4096 - 8000 = 7904
+        assert 7_000 <= eff <= 9_000
+
+    def test_invalid_override_ignored(self):
+        from agent_core.context.budget import get_effective_context_window
+        os.environ["CONTEXT_WINDOW_OVERRIDE"] = "not-a-number"
+        eff = get_effective_context_window("glm-4")
+        # 无效值应被忽略，使用默认
+        assert eff >= 50_000
