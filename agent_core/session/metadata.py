@@ -54,6 +54,7 @@ class SessionMetadata:
         mode: str = "write",
         worktree_state: Optional[dict] = None,
         project_slug: Optional[str] = None,
+        preview: Optional[str] = None,
     ):
         self.session_id = session_id
         self.title = title
@@ -64,6 +65,7 @@ class SessionMetadata:
         self.mode = mode
         self.worktree_state = worktree_state or {}
         self.project_slug = project_slug or "default"
+        self.preview = preview  # 会话预览（首条 user message 前 50 字符）
         self._updated_at = time.time()
 
     # ── 更新方法 ─────────────────────────────────────────────────
@@ -252,6 +254,16 @@ class SessionMetadata:
             elif etype == "worktree-state":
                 meta.worktree_state = entry.get("worktreeSession", {})
                 seen_types.add("worktree-state")
+
+            elif etype == "user":
+                # P1-3 修复：从 tail 提取 preview（首条 user message 前 50 字符）
+                # list_sessions 需要 preview，逻辑收敛到 from_tail 避免重复
+                if meta.preview is None:
+                    msg = entry.get("message") or {}
+                    content = msg.get("content", "")
+                    if isinstance(content, str) and content:
+                        meta.preview = content[:50]
+                        seen_types.add("user")  # 标记为已取，防止后续覆盖
 
         return meta
 

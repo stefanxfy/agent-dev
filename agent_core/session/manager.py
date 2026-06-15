@@ -110,7 +110,8 @@ class SessionManager:
         self.progress = ProgressTracker(session_id=self.session_id)
 
         # ── 内部缓存 ──
-        self._message_cache: list[dict] = []
+        # 不再维护 _message_cache 镜像（与 disk 漂移风险，唯一真相源是 JSONL）
+        # _last_uuid 是对话链尾部指针，用于 parentUuid 链接（对齐 Claude Code MessageState.lastUuid）
         self._last_uuid: Optional[str] = None
         self._closed = False
 
@@ -182,9 +183,9 @@ class SessionManager:
         self.state = SessionState(session_id=session_id)
         self.progress = ProgressTracker(session_id=session_id)
 
-        # 恢复消息缓存
+        # 恢复消息缓存（不维护 _message_cache，唯一真相源是 JSONL）
+        # 加载全部历史（含 boundary）以正确恢复 _last_uuid 链式指针
         messages = self.storage.get_messages(stop_at_boundary=False)
-        self._message_cache = messages
         self._last_uuid = messages[-1]["uuid"] if messages else None
 
         # 恢复标题状态
@@ -235,7 +236,7 @@ class SessionManager:
             data_dir=str(self.data_dir),
         )
         self.metadata = metadata
-        self._message_cache = messages
+        # 不维护 _message_cache 镜像，唯一真相源是 JSONL
         self._last_uuid = messages[-1]["uuid"] if messages else None
 
         # 恢复标题状态
@@ -267,7 +268,6 @@ class SessionManager:
         self.state.set_running("user input")
         uuid_ = self.storage.add_message("user", content, parent_uuid=self._last_uuid)
         self._last_uuid = uuid_
-        self._message_cache.append({"role": "user", "content": content, "uuid": uuid_})
 
         # 触发标题生成（fire-and-forget，不阻塞主流程）
         self._on_user_message(content)
@@ -298,7 +298,6 @@ class SessionManager:
             **extra,
         )
         self._last_uuid = uuid_
-        self._message_cache.append({"role": "assistant", "content": message.get("content", ""), "uuid": uuid_})
         self.state.set_idle()
         return uuid_
 
@@ -832,31 +831,15 @@ class SessionManager:
     def get_messages(
         self,
         stop_at_boundary: bool = True,
-        include_pending: bool = False,
     ) -> list[dict]:
         """
-        获取消息列表
+        获取消息列表（直接读 JSONL，唯一真相源）
 
         Args:
-            stop_at_boundary: 是否在压缩边界处停止
-            include_pending: 是否包含 pending 队列中的未刷写消息
-                             （默认 False，直接读磁盘，适合冷启动场景）
+            stop_at_boundary: 是否在压缩边界处停止（默认 True，给 LLM 用）
         """
         self.storage.flush()
-
-        # 读磁盘
-        disk_messages = self.storage.get_messages(stop_at_boundary=stop_at_boundary)
-
-        if include_pending:
-            # 合并 pending 队列（排除已在磁盘的）
-            disk_uuids = {m["uuid"] for m in disk_messages}
-            pending_messages = [
-                m for m in self._message_cache
-                if m.get("uuid") not in disk_uuids
-            ]
-            return disk_messages + pending_messages
-
-        return disk_messages
+        return self.storage.get_messages(stop_at_boundary=stop_at_boundary)
 
     def get_history(self) -> list[dict]:
         """Get conversation history for agent_core compatibility.
@@ -918,9 +901,10 @@ class SessionManager:
     # ── 诊断 ───────────────────────────────────────────────────
 
     def __repr__(self):
+        # 不再依赖 _message_cache 计数，改用 storage 的 entry cache
         return (
             f"SessionManager(session_id={self.session_id[:8]}, "
             f"status={self.state.status}, "
             f"title_state={self._title_state.value}, "
-            f"messages={len(self._message_cache)})"
+            f"entries={len(self.storage._entry_cache)})"
         )

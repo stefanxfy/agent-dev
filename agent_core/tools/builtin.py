@@ -82,10 +82,22 @@ CALC_TOOL = ToolDef(
 # ── 联网搜索（DuckDuckGo Instant Answer API）─────────────────────────────
 
 def search_handler(**kwargs) -> str:
-    """Search 工具处理函数（免费，无需 API Key）"""
+    """Search 工具处理函数（免费，无需 API Key）
+
+    错误处理策略（对齐 ToolRegistry.execute 的错误分类重试）：
+    - ValueError：参数错误，不重试（用户输入有问题，重试无意义）
+    - (ConnectionError, TimeoutError, requests.exceptions.RequestException)：
+      网络错误，向上抛，让 ToolRegistry.execute 走指数退避重试逻辑
+    - 其他 Exception：推测是不可恢复错误，返回错误字符串
+
+    之前所有异常都被 catch 后返回 "搜索失败: ..." 字符串，ToolRegistry 看不到
+    异常，导致重试机制失效（即使是临时网络抖动也无法重试）。
+    """
     query = kwargs.get("query", "")
     if not query:
-        return "错误：缺少 query 参数"
+        raise ValueError("缺少 query 参数")
+
+    import requests.exceptions
     try:
         resp = requests.get(
             "https://api.duckduckgo.com/",
@@ -94,20 +106,22 @@ def search_handler(**kwargs) -> str:
         )
         resp.raise_for_status()
         data = resp.json()
+    except (ConnectionError, TimeoutError, requests.exceptions.RequestException) as e:
+        # 网络错误：向上抛，让 ToolRegistry.execute 走重试逻辑
+        # （重试 3 次，指数退避 1s, 2s, 4s）
+        raise
 
-        # 取 Instant Answer 或 AbstractText
-        answer = data.get("Answer") or data.get("AbstractText") or ""
-        if answer:
-            return answer[:500]  # 截断，避免过长
+    # 取 Instant Answer 或 AbstractText
+    answer = data.get("Answer") or data.get("AbstractText") or ""
+    if answer:
+        return answer[:500]  # 截断，避免过长
 
-        # 没有 instant answer，返回相关主题列表
-        related = [r["Text"] for r in data.get("RelatedTopics", [])[:3]]
-        if related:
-            return "\n".join(related)
+    # 没有 instant answer，返回相关主题列表
+    related = [r["Text"] for r in data.get("RelatedTopics", [])[:3] if r.get("Text")]
+    if related:
+        return "\n".join(related)
 
-        return f"未找到「{query}」的相关结果"
-    except Exception as e:
-        return f"搜索失败: {e}"
+    return f"未找到「{query}」的相关结果"
 
 
 SEARCH_TOOL = ToolDef(

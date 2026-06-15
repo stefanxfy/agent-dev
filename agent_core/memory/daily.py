@@ -6,6 +6,7 @@
 from __future__ import annotations
 import json
 import re
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -19,11 +20,16 @@ class DailyLogger:
     - Append-only，永不覆写
     - 结构化 Markdown 格式
     - 支持全文搜索 + 元数据过滤
+    - 多线程安全（Stage3 Fork Agent 接入后多个提取 Agent 会并发写）
     """
     
     def __init__(self, log_dir: str = ".agent_data/logs"):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        # P2-1 修复：多线程写锁。Stage3 会接入 Fork Agent 异步提取，
+        # 不同 agent 并发 log() 会交叉写导致 Markdown 格式错乱。
+        # 使用 Lock 而非 RLock（不需要重入），开销最小。
+        self._write_lock = threading.Lock()
     
     def _get_log_path(self, date: Optional[datetime] = None) -> Path:
         """获取指定日期的日志文件路径"""
@@ -63,14 +69,16 @@ class DailyLogger:
         entry = "\n".join(entry_lines)
         
         # 检查是否有今天的日志，没有则写 Header
-        if not log_path.exists():
-            header = f"# 日志: {now.strftime('%Y-%m-%d')}\n\n"
-            log_path.write_text(header, encoding="utf-8")
-        
-        # Append 日志条目
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n## [{now.strftime('%Y-%m-%d %H:%M')}] Session: {session_id}\n\n")
-            f.write(entry + "\n")
+        # P2-1：多线程安全。整个写块包在锁内，包括"检查 + 写 Header + Append"
+        with self._write_lock:
+            if not log_path.exists():
+                header = f"# 日志: {now.strftime('%Y-%m-%d')}\n\n"
+                log_path.write_text(header, encoding="utf-8")
+            
+            # Append 日志条目（原子写整个 entry，避免跨线程交叉写）
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n## [{now.strftime('%Y-%m-%d %H:%M')}] Session: {session_id}\n\n")
+                f.write(entry + "\n")
     
     def search_text(self, query: str, days: int = 7) -> list[str]:
         """

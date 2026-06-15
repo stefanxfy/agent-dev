@@ -1002,3 +1002,194 @@ def test_custom_title_reappend_on_restore():
         assert len(tail_titles) >= 1, "resume() re-append 后 tail 应包含 custom-title"
         assert tail_titles[-1]["customTitle"] == "用户自定义标题"
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P1-1: 删除 _message_cache 后的回归测试
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_no_message_cache_attribute():
+    """P1-1 回归：SessionManager 不再维护 _message_cache 镜像
+
+    唯一真相源是 JSONL。消除 cache/disk 漂移风险。
+    """
+    Test.module("P1-1. 消除 _message_cache 埋雷")
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mgr = SessionManager(data_dir=tmpdir)
+        # 核心断言：_message_cache 不再存在
+        Test.check("SessionManager 无 _message_cache 属性",
+                   not hasattr(mgr, "_message_cache"),
+                   "_message_cache 字段应被删除")
+
+        # _last_uuid 仍然维护（链式指针）
+        mgr.add_user_message("hello")
+        Test.check("_last_uuid 仍被维护", mgr._last_uuid is not None)
+
+        # get_messages() 不再接受 include_pending 参数
+        import inspect
+        sig = inspect.signature(mgr.get_messages)
+        Test.check("get_messages() 不再有 include_pending 参数",
+                   "include_pending" not in sig.parameters,
+                   f"signature={sig}")
+
+
+def test_list_sessions_uses_from_tail(tmpdir: str):
+    """P1-3 回归：list_sessions 通过 SessionMetadata.from_tail 提取元数据
+
+    之前 list_sessions 用内联 50 行逻辑提取 title/ai_title/tags/preview，
+    与 SessionMetadata.from_tail 语义不一致（"找到第一个就用" vs "取最新"）。
+    修复后 list_sessions 与 SessionManager 加载走同一条路径。
+    """
+    Test.module("P1-3. list_sessions 走 from_tail")
+
+    manager = SessionManager(data_dir=tmpdir)
+    manager.add_user_message("第一条用户消息：搜索北京天气")
+    manager.flush()
+    manager.update_ai_title("AI 标题：北京天气")
+    manager.flush()
+    manager.add_tag("weather")
+    manager.flush()
+
+    # 列出所有 session
+    sessions = SessionStorage.list_sessions(data_dir=tmpdir)
+    Test.assert_equal("list_sessions 返回 1 个 session", len(sessions), 1)
+
+    if sessions:
+        s = sessions[0]
+        # 标题应该正确（来自 from_tail 的"取最新"语义）
+        Test.check("title 取自 ai_title（最新）",
+                   s["title"] == "AI 标题：北京天气",
+                   f"got {s['title']!r}")
+        # 标签
+        Test.check("tags 包含 'weather'",
+                   "weather" in s.get("tags", []),
+                   f"got {s.get('tags', [])}")
+        # preview 应该来自首条 user message
+        Test.check("preview 取自首条 user message",
+                   "北京天气" in s.get("preview", ""),
+                   f"got {s.get('preview', '')!r}")
+
+
+def test_list_sessions_custom_title_head_fallback(tmpdir: str):
+    """P1-3 回归：长会话 tail 读不到 custom-title 时，list_sessions 回退到 head
+
+    之前的内联逻辑有这个回退（但语义和 from_tail 不一致），
+    修复后通过统一的 _read_head_window 走 from_tail 提取。
+    """
+    Test.module("P1-3. list_sessions head fallback（长会话）")
+
+    manager = SessionManager(data_dir=tmpdir)
+
+    # 写自定义标题（首条元数据）
+    manager.update_title("长会话标题")
+    manager.flush()
+
+    # 写大量 user/assistant 消息撑大文件（>64KB）
+    for i in range(500):
+        manager.add_user_message(f"用户消息 {i}: " + "x" * 200)
+        manager.add_assistant_message(f"助手回复 {i}: " + "y" * 200)
+    manager.flush()
+
+    # 触发 re-append（resume）让 custom-title 出现在 tail
+    manager.resume()
+
+    # 列出 sessions
+    sessions = SessionStorage.list_sessions(data_dir=tmpdir)
+    Test.assert_equal("list_sessions 返回 1 个 session", len(sessions), 1)
+
+    if sessions:
+        s = sessions[0]
+        # custom-title 应被正确识别（无论走 tail 还是 head fallback）
+        Test.check("custom-title 被正确提取",
+                   s["title"] == "长会话标题",
+                   f"got {s['title']!r}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P2-1: daily.py 多线程锁
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_daily_logger_thread_safety():
+    """P2-1 回归：DailyLogger 多线程并发 log() 不交叉写
+
+    Stage3 会接入 Fork Agent 异步提取，必须支持多线程并发写日志。
+    """
+    import tempfile, threading, importlib.util
+    # 绕过 agent_core/memory/__init__.py（它 import 了尚未实现的 memory_store/distiller/scheduler）
+    spec = importlib.util.spec_from_file_location(
+        "daily_module",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "memory", "daily.py")
+    )
+    daily_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(daily_module)
+    DailyLogger = daily_module.DailyLogger
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logger = DailyLogger(log_dir=tmpdir)
+
+        # 启动 10 个线程并发写 100 条日志
+        def worker(thread_id: int):
+            for i in range(100):
+                logger.log(
+                    session_id=f"thread-{thread_id}",
+                    category="user_preference",
+                    key=f"key-{thread_id}-{i}",
+                    value=f"value-{thread_id}-{i}",
+                )
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # 验证：10*100 = 1000 条日志都被写入
+        from pathlib import Path
+        from datetime import datetime as _dt
+        today = _dt.now().strftime("%Y-%m-%d")
+        log_file = Path(tmpdir) / f"{today}.md"
+        content = log_file.read_text(encoding="utf-8")
+        # 统计 "Session: thread-" 出现次数
+        session_count = content.count("Session: thread-")
+        Test.assert_equal("1000 条日志全部写入", session_count, 1000)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  P2-2: search 工具网络错误向上抛
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_search_raises_network_errors():
+    """P2-2 回归：search 工具对网络错误向上抛，让 ToolRegistry.execute 重试
+
+    之前 search_handler 把所有异常 catch 后返回 "搜索失败: ..." 字符串，
+    ToolRegistry 看不到异常 → 重试机制失效。
+    """
+    from agent_core.tools.builtin import search_handler
+    from unittest.mock import patch
+    import requests.exceptions
+
+    # 1. 网络错误（ConnectionError）应该向上抛
+    with patch("agent_core.tools.builtin.requests.get",
+               side_effect=requests.exceptions.ConnectionError("network down")):
+        try:
+            search_handler(query="test")
+            Test.check("网络错误时抛异常", False, "未抛异常")
+        except (ConnectionError, requests.exceptions.RequestException):
+            Test.check("网络错误时抛异常", True)
+
+    # 2. 参数错误（缺 query）抛 ValueError
+    try:
+        search_handler()  # 缺 query
+        Test.check("缺参数时抛 ValueError", False, "未抛异常")
+    except ValueError:
+        Test.check("缺参数时抛 ValueError", True)
+
+    # 3. 正常返回（无答案时）返回字符串而非异常
+    with patch("agent_core.tools.builtin.requests.get") as mock_get:
+        mock_resp = mock_get.return_value
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json.return_value = {"Answer": "", "AbstractText": "", "RelatedTopics": []}
+        result = search_handler(query="完全无结果的问题")
+        Test.check("无结果时返回字符串", isinstance(result, str) and "未找到" in result,
+                   f"got {result!r}")

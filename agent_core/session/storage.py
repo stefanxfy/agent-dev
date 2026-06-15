@@ -206,6 +206,15 @@ class SessionStorage:
                     return last.get("uuid")
         return None
 
+    @property
+    def last_uuid(self) -> Optional[str]:
+        """公开 API：最新一条 Entry 的 UUID（用于 SessionManager 链式追踪）
+
+        对齐 Claude Code MessageState.lastUuid：维护当前对话链的尾部 UUID。
+        比 _get_last_uuid 多了 public 接口语义，可被外部代码（包括 SessionManager）安全使用。
+        """
+        return self._get_last_uuid()
+
     # ── 消息类型快捷方法 ───────────────────────────────────────────
 
     def add_message(
@@ -374,6 +383,61 @@ class SessionStorage:
                     logger.warning(f"Failed to decode JSONL line: {line[:100]}")
                     continue
 
+        return entries
+
+    @staticmethod
+    def _read_tail_window(jsonl_path: Path, kb: int = 64) -> list[dict]:
+        """读取 JSONL 尾部 kb KB，解析为 Entry 列表
+
+        轻量版本：不创建 SessionStorage 实例，仅做 tail 读 + JSON 解析。
+        用于 list_sessions 等需要快速访问尾部元数据的场景。
+        """
+        if not jsonl_path.exists():
+            return []
+
+        file_size = jsonl_path.stat().st_size
+        byte_limit = kb * 1024
+
+        with open(jsonl_path, "rb") as f:
+            if file_size <= byte_limit:
+                f.seek(0)
+            else:
+                f.seek(-byte_limit, os.SEEK_END)
+                f.readline()  # 丢弃可能截断的首行
+            raw = f.read()
+
+        entries = []
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return entries
+
+    @staticmethod
+    def _read_head_window(jsonl_path: Path, kb: int = 64) -> list[dict]:
+        """读取 JSONL 头部 kb KB，解析为 Entry 列表
+
+        用于 list_sessions 在 tail 找不到 custom-title 时回退到 head 读取。
+        """
+        if not jsonl_path.exists():
+            return []
+
+        with open(jsonl_path, "rb") as f:
+            raw = f.read(kb * 1024)
+
+        entries = []
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
         return entries
 
     def read_tail(self, kb: int = 64, lines: Optional[int] = None) -> list[dict]:
@@ -564,69 +628,30 @@ class SessionStorage:
             mtime = datetime.fromtimestamp(stat.st_mtime)
             size = stat.st_size
 
-            # 读取元数据：先 tail（快），tail 读不到 custom-title 再 head 回退
-            meta = {}
+            # 延迟导入避免循环依赖
+            from agent_core.session.metadata import SessionMetadata
+
             try:
-                # tail 读取（默认 64KB）
-                with open(f, "rb") as fp:
-                    fp.seek(0, os.SEEK_END)
-                    fsize = fp.tell()
-                    tail_bytes = min(fsize, 64 * 1024)
-                    fp.seek(-tail_bytes, os.SEEK_END) if fsize > tail_bytes else fp.seek(0)
-                    if fsize > tail_bytes:
-                        fp.readline()  # 丢弃可能截断的首行
-                    raw_tail = fp.read()
+                # 读 tail 64KB 提取元数据
+                tail_entries = cls._read_tail_window(f, kb=64)
+                metadata = SessionMetadata.from_tail(tail_entries, session_id)
 
-                tail_has_custom = False
-                for line in raw_tail.decode("utf-8", errors="replace").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        e = json.loads(line)
-                        if e.get("type") == "custom-title":
-                            meta["title"] = e.get("customTitle")
-                            tail_has_custom = True
-                        elif e.get("type") == "ai-title":
-                            meta["ai_title"] = e.get("aiTitle")
-                        elif e.get("type") == "tag":
-                            meta["tags"] = meta.get("tags", [])
-                            meta["tags"].append(e.get("tag"))
-                        elif e.get("type") == "user":
-                            # 从 user Entry 提取 preview
-                            msg = e.get("message", {})
-                            content = msg.get("content", "")
-                            if isinstance(content, str) and content:
-                                meta["preview"] = content[:50]
-                    except json.JSONDecodeError:
-                        continue
-
-                # tail 没找到 custom-title，回退到 head 读取
-                if not tail_has_custom and fsize > tail_bytes:
-                    with open(f, "rb") as fp:
-                        raw_head = fp.read(64 * 1024)
-                    for line in raw_head.decode("utf-8", errors="replace").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            e = json.loads(line)
-                            if e.get("type") == "custom-title":
-                                meta["title"] = e.get("customTitle")
-                                break  # 找到就够了
-                        except json.JSONDecodeError:
-                            continue
+                # tail 没找到 custom-title 且文件 > 64KB，回退到 head 读
+                if metadata.title is None and size > 64 * 1024:
+                    head_entries = cls._read_head_window(f, kb=64)
+                    head_metadata = SessionMetadata.from_tail(head_entries, session_id)
+                    metadata.title = head_metadata.title
             except Exception:
-                pass
+                metadata = SessionMetadata(session_id=session_id)
 
             sessions.append({
                 "session_id": session_id,
                 "updated_at": mtime,
                 "created_at": datetime.fromtimestamp(stat.st_ctime),
                 "size": size,
-                "title": meta.get("title") or meta.get("ai_title") or "新会话",
-                "tags": meta.get("tags", []),
-                "preview": meta.get("preview", ""),
+                "title": metadata.title or metadata.ai_title or "新会话",
+                "tags": metadata.tags,
+                "preview": metadata.preview or "",
             })
 
         # 按更新时间倒序

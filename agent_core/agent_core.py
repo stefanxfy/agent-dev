@@ -393,25 +393,45 @@ class ReactAgent:
                         pass
                 return
 
-            for chunk in llm_chunks:
-                # 文本增量 → 转发给 UI
-                if chunk.text_delta:
-                    full_text += chunk.text_delta.text
-                    yield ("text", chunk.text_delta.text)
+            # P1-2 修复：for chunk 循环也要 catch 异常（生成器 yield 过程中异常）
+            # 之前只 catch 了 llm.chat() 调用异常，生成器中途中断（如 OpenAI 网络中断）会逃出 run() 循环
+            try:
+                for chunk in llm_chunks:
+                    # 文本增量 → 转发给 UI
+                    if chunk.text_delta:
+                        full_text += chunk.text_delta.text
+                        yield ("text", chunk.text_delta.text)
 
-                # 思考过程 → 转发给 UI
-                if chunk.thinking_delta:
-                    thinking_text += chunk.thinking_delta.thinking
-                    self._pending_thinking += chunk.thinking_delta.thinking
-                    yield ("thinking", chunk.thinking_delta.thinking)
+                    # 思考过程 → 转发给 UI
+                    if chunk.thinking_delta:
+                        thinking_text += chunk.thinking_delta.thinking
+                        self._pending_thinking += chunk.thinking_delta.thinking
+                        yield ("thinking", chunk.thinking_delta.thinking)
 
-                # 工具调用 → 收集（不立即执行，等本轮 LLM 响应结束）
-                if chunk.tool_call:
-                    tool_calls.append(chunk.tool_call)
+                    # 工具调用 → 收集（不立即执行，等本轮 LLM 响应结束）
+                    if chunk.tool_call:
+                        tool_calls.append(chunk.tool_call)
 
-                # Token 消耗 → 转发给 UI
-                if chunk.usage:
-                    yield ("usage", chunk.usage)
+                    # Token 消耗 → 转发给 UI
+                    if chunk.usage:
+                        yield ("usage", chunk.usage)
+            except Exception as e:
+                # 生成器 yield 过程中异常（如 OpenAI/Anthropic 网络中断、stream context 关闭）
+                # 关键修复：之前这种情况会让 run() 主循环爆掉，整个 session 失败
+                error_msg = f"LLM 流式响应中断: {type(e).__name__}: {e}"
+                _logger.error(error_msg)
+                yield ("system", f"❌ {error_msg}")
+                yield ("text", f"抱歉，响应被中断：{error_msg}")
+                yield ("system", "✅ 回答完成")
+                # 保存中断状态到 session（让用户能看到部分内容）
+                partial = full_text or f"[响应中断：{e}]"
+                self.messages.append({"role": "assistant", "content": partial})
+                if self._session_manager:
+                    try:
+                        self._session_manager.add_assistant_message(partial)
+                    except Exception:
+                        pass
+                return
 
             # === 日志：LLM 返回的原始内容 ===
             _logger.info("\n" + "=" * 60)
