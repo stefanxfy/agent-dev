@@ -180,7 +180,7 @@ class ReactAgent:
         self.max_context_tokens = max_context_tokens  # 保留向后兼容
         self.messages: list[dict] = []  # 当前对话消息列表（对齐 Claude Code messages: Message[]）
         
-        # Day 5: ContextManager（替代 _trim_history）
+        # Day 5: ContextManager（替代 _trim_messages）
         self.context_manager = CM(
             llm_router=llm_router,
             model=getattr(llm_router.config, 'model', 'glm-4'),
@@ -261,7 +261,7 @@ class ReactAgent:
             return total
         return 0
 
-    def _trim_history(self):
+    def _trim_messages(self):
         """
         Day 3 新增：按 Token 预算截断 history。
         保留：系统消息 + 最近的消息
@@ -310,7 +310,7 @@ class ReactAgent:
         self._pending_tool_logs = []
         self._pending_tool_results = []
 
-        # Day 5：用 ContextManager 替代 _trim_history
+        # Day 5：用 ContextManager 替代 _trim_messages
         # 检查 token 预算，必要时自动压缩
         compacted, compact_result = self.context_manager.check_and_compact(self.messages)
         if compact_result:
@@ -339,9 +339,9 @@ class ReactAgent:
             else:
                 _logger.warning(f"Context compact failed: {compact_result.error}")
                 # 压缩失败时回退到旧的截断策略
-                self._trim_history()
+                self._trim_messages()
         # Day 3 旧逻辑（保留作为 fallback）
-        # self._trim_history()
+        # self._trim_messages()
 
         for turn in range(1, self.max_turns + 1):
             yield ("system", f"🔄 Turn {turn}/{self.max_turns}")

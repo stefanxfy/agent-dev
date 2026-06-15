@@ -4,7 +4,7 @@ ContextManager — 统一上下文管理器
 职责边界：
 - 监控 token 用量（通过 ContextBudgetManager）
 - 触发压缩（通过 CompactOrchestrator）
-- 不存储消息（复用 SessionStorage / Agent.history）
+- 不存储消息（复用 SessionStorage / Agent.messages）
 - 不追踪状态（agent-dev 当前不需要）
 
 LLMRouter.chat() 是同步生成器，本模块保持同步接口。

@@ -841,18 +841,6 @@ class SessionManager:
         self.storage.flush()
         return self.storage.get_messages(stop_at_boundary=stop_at_boundary)
 
-    def get_history(self) -> list[dict]:
-        """Get conversation history for agent_core compatibility.
-
-        从 message 字段直接提取 role + content，零转换。
-        """
-        result = []
-        for m in self.get_messages(stop_at_boundary=False):
-            msg = m.get("message")
-            if msg and msg.get("role") in ("user", "assistant"):
-                result.append({"role": msg["role"], "content": msg.get("content", "")})
-        return result
-
     def get_metadata(self) -> SessionMetadata:
         """获取元数据"""
         return self.metadata
