@@ -151,25 +151,66 @@ with st.sidebar:
     st.divider()
     st.subheader("📊 Token 消耗（本次会话）")
     stats = st.session_state.token_stats
-    st.metric("Input", f"{stats['input']:,}")
-    st.metric("Output", f"{stats['output']:,}")
-    st.metric("Thinking", f"{stats['thinking']:,}")
-    st.metric("Total", f"{stats['input'] + stats['output'] + stats['thinking']:,}")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Input", f"{stats['input']:,}")
+        st.metric("Thinking", f"{stats['thinking']:,}")
+    with col2:
+        st.metric("Output", f"{stats['output']:,}")
+        st.metric("Total", f"{stats['input'] + stats['output'] + stats['thinking']:,}")
 
+    # ── 上下文预算面板 ────────────────────────────────────────
     st.divider()
-    st.subheader("📊 Agent 状态")
+    st.subheader("📐 上下文预算")
     if st.session_state.agent:
         agent = st.session_state.agent
+        cm = agent.context_manager
+        usage = cm.get_usage_info(agent.history)
+
+        # 预算进度条
+        ratio = usage["usage_ratio"]
+        used = usage["used_tokens"]
+        total = usage["total_budget"]
+        available = usage["available_tokens"]
+
+        # 颜色判断
+        if usage["is_critical"]:
+            bar_color = "🔴"
+            status_text = "临界"
+        elif usage["should_compact"]:
+            bar_color = "🟡"
+            status_text = "缓冲区"
+        else:
+            bar_color = "🟢"
+            status_text = "正常"
+
+        st.metric(
+            "上下文使用",
+            f"{used:,} / {total:,}",
+            delta=f"{available:,} 可用 ({ratio:.0%}) {bar_color}",
+        )
+
+        # 进度条
+        progress_bar = st.progress(min(ratio, 1.0),
+                                   text=f"{bar_color} {status_text} · {ratio:.0%} 已用")
+
+        # 熔断状态
+        fails = usage.get("consecutive_failures", 0)
+        if fails > 0:
+            st.warning(f"⚠️ 连续压缩失败 {fails} 次")
+
+        # 压缩统计
+        stats_cm = cm.get_stats()
+        if stats_cm["compact_count"] > 0:
+            st.caption(
+                f"📦 已压缩 {stats_cm['compact_count']} 次 · "
+                f"释放 {stats_cm['total_tokens_freed']:,} tokens"
+            )
+
+        # 消息数
         st.metric("History 长度", f"{len(agent.history)} 条")
-        # 估算 Token
-        est_tokens = sum(agent._estimate_message_tokens(m) for m in agent.history)
-        st.metric("预估 Token", f"{est_tokens:,}")
-        st.caption(f"预算: {agent.max_context_tokens:,}")
-        
-        # 显示最后一条消息的 role
-        if agent.history:
-            last_role = agent.history[-1].get("role", "unknown")
-            st.caption(f"最后消息: {last_role}")
+    else:
+        st.caption("Agent 未初始化")
 
     # 历史记录查看器（直接从磁盘读取，不创建 SessionManager 实例）
     _view_sid = st.session_state.get("chat_session_id")
@@ -562,6 +603,11 @@ if prompt := st.chat_input("输入消息..."):
                 elif "回答完成" in str(content):
                     turn_indicator.empty()  # 完成后清除 Turn 指示器
                     tool_status.update(label="✅ 回答完成", state="complete")
+                elif "上下文已压缩" in str(content):
+                    # Day 5: 压缩通知
+                    st.info(f"{content}")
+                elif "强制结束" in str(content) or "工具执行失败" in str(content):
+                    st.warning(content)
                 else:
                     st.info(content)
             elif msg_type == "usage":
