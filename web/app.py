@@ -102,6 +102,22 @@ if "chat_session_id" not in st.session_state:
 
 # ── 侧边栏：LLM 配置 ─────────────────────────────────────────
 with st.sidebar:
+    # ── Token 消耗面板（永久显示） ───────────────────────────────
+    stats = st.session_state.token_stats
+    total = stats["input"] + stats["output"] + stats["thinking"]
+    st.subheader("📊 Token 消耗")
+    if total > 0:
+        st.metric(
+            label="累计",
+            value=f"{total:,}",
+            delta=f"in {stats['input']:,} · out {stats['output']:,}",
+        )
+        if stats["thinking"]:
+            st.caption(f"💭 thinking: {stats['thinking']:,}")
+    else:
+        st.caption("📝 发送消息后显示")
+
+    st.divider()
     st.header("⚙️ LLM 配置")
 
     # 从 .env 读取默认厂商
@@ -542,6 +558,14 @@ for msg in st.session_state.messages:
             display_content = content
         st.markdown(display_content)
 
+        # 显示该条消息的 Token 消耗（如果有）
+        msg_usage = msg.get("usage")
+        if msg_usage and (msg_usage.get("input") or msg_usage.get("output")):
+            parts = [f"input={msg_usage['input']:,}", f"output={msg_usage['output']:,}"]
+            if msg_usage.get("thinking"):
+                parts.append(f"thinking={msg_usage['thinking']:,}")
+            st.caption(f"📊 {' · '.join(parts)}")
+
 
 # 用户输入
 if prompt := st.chat_input("输入消息..."):
@@ -690,6 +714,11 @@ if prompt := st.chat_input("输入消息..."):
         "content": full_text,
         "thinking": thinking_text,
         "tool_logs": tool_logs,
+        "usage": {
+            "input": last_turn_usage.input_tokens if last_turn_usage else 0,
+            "output": last_turn_usage.output_tokens if last_turn_usage else 0,
+            "thinking": last_turn_usage.thinking_tokens if last_turn_usage else 0,
+        } if last_turn_usage else None,
     })
 
     # 更新 agent history
