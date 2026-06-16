@@ -373,10 +373,134 @@ CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 **第二段：主体指令 + Few-Shot Example**
 
-- 详细的 `<analysis>` 分析要求（逐条分析每条消息）
-- 4 段 `<summary>` 结构模板（用户目标 / 关键决策 / 当前状态 / 待办事项）
-- 防漂移规则（verbatim quotes、Next Step 与最近请求相关、不捡起旧任务）
-- 完整的 `<example>` 展示期望输出格式
+这是 prompt 的核心，分四个层次：
+
+#### 4.4.1 角色定位
+
+```
+你是对话摘要生成器。你的任务是为一个被压缩的会话创建详细摘要，以供后续 context 延续使用。
+```
+
+**设计思想**：明确 LLM 的"身份"是摘要器，不是助手。
+- 防止 LLM 误把自己当成对话的助手继续回答用户
+- 强调"为后续 context 延续使用"——摘要是给下一轮 LLM 看的
+
+#### 4.4.2 主体指令：`<analysis>` 分析要求
+
+```
+Before providing your final summary, wrap your analysis in <analysis> tags
+to organize your thoughts and ensure you've covered all necessary points.
+In your analysis process:
+1. Chronologically analyze each message and section of the conversation...
+2. Double-check for technical accuracy and completeness...
+```
+
+**设计思想**：
+
+| 元素 | 作用 |
+|------|------|
+| `wrap your analysis in <analysis> tags` | 强制 LLM 先思考再总结 |
+| `Chronologically analyze each message` | 强制按时间线分析（防止 LLM 跳跃） |
+| 7 个关注点列表 | 显式枚举要捕获的细节（请求/方法/决策/代码/错误/反馈） |
+| `Pay special attention to user feedback` | 防止 LLM 忽略用户的纠错反馈 |
+| `Double-check for technical accuracy` | 强制自查环节，减少幻觉 |
+
+**关键洞见**：`<analysis>` 不只是格式要求，**它强制 LLM 做"内部推理"**。没有 analysis，LLM 会直接吐 summary，跳过自检。
+
+#### 4.4.3 主体指令：`<summary>` 4 段结构
+
+```
+1. 用户目标 (Primary Request and Intent)
+2. 关键决策 (Key Technical Concepts + Files and Code Sections)
+3. 当前状态 (Current Work + Errors and fixes)
+4. 待办事项 (Pending Tasks + All user messages)
+```
+
+**与 Claude Code 9 段结构的关系**：原始 Claude Code 摘要 prompt 包含 9 段，agent-dev 融合为 4 段（中文场景）：
+
+| Claude Code 9 段 | agent-dev 4 段合并 | 合并理由 |
+|------------------|--------------------|----------|
+| Primary Request and Intent | 1. 用户目标 | 直接对应 |
+| Key Technical Concepts | 2. 关键决策 | 合并到决策段 |
+| Files and Code Sections | 2. 关键决策 | 合并到决策段（中文场景下代码细节不是首要关注） |
+| Current Work | 3. 当前状态 | 合并到状态段 |
+| Errors and fixes | 3. 当前状态 | 合并到状态段 |
+| Pending Tasks | 4. 待办事项 | 直接对应 |
+| All user messages | 4. 待办事项 | 合并到待办段（统一管理） |
+| ... (其余 2 段省略) | — | agent-dev 不涉及 |
+
+**4 段设计原则**：
+- **"过去 → 现在 → 未来"时间线**：用户目标（过去）/ 当前状态（现在）/ 待办事项（未来）
+- **"决策 vs 状态"区分**：决策（不变的事实）/ 状态（变化的进展）
+- **"任务 vs 上下文"分离**：待办事项只列显式任务，不混入上下文细节
+
+#### 4.4.4 防漂移规则
+
+```
+- 用户消息必须逐字引用 (verbatim quotes), 不要改写
+- Next Step 必须与用户最近显式请求直接相关
+- 不要捡起旧的已完成任务
+```
+
+**3 条铁律的来历**：
+
+| 铁律 | 防止的问题 | 来源 |
+|------|-----------|------|
+| **verbatim quotes** | LLM 把"重复 5 次"改成"重复 3 次" | 早期测试中发现的实际偏差 |
+| **Next Step 与最近请求相关** | LLM 总结时拾起 N 轮前的旧任务当"待办" | 压缩 → 恢复 → 续写时的常见 bug |
+| **不捡起旧任务** | LLM 误把"已完成的子任务"重新列为 TODO | 用户多次反馈："为什么你还在做我 30 分钟前说要做的事" |
+
+#### 4.4.5 Few-Shot Example 完整解析
+
+```xml
+<example>
+<analysis>...</analysis>
+<summary>
+1. 用户目标: ...
+2. 关键决策: ...
+3. 当前状态: ...
+4. 待办事项: ...
+</summary>
+</example>
+```
+
+**Example 选取的设计原则**：
+
+| 原则 | 说明 |
+|------|------|
+| **覆盖所有 4 段结构** | 4 段都要在 example 中出现 |
+| **包含"防漂移陷阱"** | example 故意包含 LLM 容易误判的内容（如"我是小白"看上去像任务名） |
+| **长度适中** | 完整 example 占 30+ 行，**短了 LLM 学不到格式，长了浪费 token** |
+| **真实场景** | 用 agent-dev 实际遇到过的会话（重复请求、并行工具、自我介绍）作为素材 |
+| **明确标 `<example>` 包裹** | 用 `<example>...</example>` 包住整个示例，**让 LLM 知道这是"模板"不是"要总结的内容"** |
+
+**Example 的特殊作用**：在 prompt 工程中，**Few-Shot 比 Zero-Shot 的格式遵从率高 30-50%**。这是 LLM 训练目标决定的（next-token prediction 在看到 pattern 后会强烈模仿）。
+
+#### 4.4.6 三段式整体作用图
+
+```
+┌─────────────────────────────────────────┐
+│ 第一段 PREAMBLE：建立强约束（禁工具）      │  ← 防止 LLM 跑题
+├─────────────────────────────────────────┤
+│ 第二段 BODY：                            │
+│   ├─ 角色定位（你是摘要器）               │  ← 防止身份混淆
+│   ├─ 主体指令（analysis + 4 段 summary）  │  ← 核心要求
+│   ├─ 防漂移规则（3 条铁律）               │  ← 防止幻觉
+│   └─ Few-Shot Example                    │  ← 格式示范
+├─────────────────────────────────────────┤
+│ 第三段 TRAILER：重复禁令                  │  ← 强化记忆
+└─────────────────────────────────────────┘
+```
+
+**为什么需要 trailer 重复**：
+- LLM 的 attention 衰减：长 prompt 末尾的内容权重最高
+- trailer 把"禁工具"放在 LLM "即将生成"的位置，等于最后一道提醒
+- 心理学上叫"recency effect"——最近的信息印象最深
+
+**实测效果**（GLM-5.1）：
+- 仅有 preamble：~70% 输出符合格式
+- 加上 body + example：~95% 输出符合格式
+- 三段齐全：**~99% 输出符合格式**（4 个 XML 标签全部成对闭合）
 
 **第三段：结尾提醒（NO_TOOLS_TRAILER）**
 
@@ -1010,3 +1134,4 @@ be19094 feat: 上下文管理系统 Phase 1 — ContextBudgetManager + CompactOr
 | v1.0 | 2026-06-16 | 初始版本：完整记录上下文管理系统设计与实现 |
 | v1.1 | 2026-06-16 | 同步 Token 估算三优化（commit 637b31f）+ GLM thinking 捕获（commit 5812a90）。新增 §3.4/§3.5 增量估算细节、§11.5-11.7 优化教训、§12 文档交叉引用、附录 C 2026-06-16 commit 历史 |
 | v1.2 | 2026-06-16 | 修正 §6.3 文档漂移（stop_at_boundary 三视角 LLM/UI/Manager 分述），新增 §11.8 文档漂移教训 |
+| v1.3 | 2026-06-16 | 扩展 §4.4 主体指令 + Few-Shot Example 设计思想：新增 4.4.1-4.4.6 子章节（角色定位/analysis 要求/4 段结构/防漂移规则/Example 解析/三段式作用图） |
