@@ -269,20 +269,43 @@ with st.sidebar:
                 # 滚动容器：高度 400px（与会话列表一致），可上下滑动
                 with st.container(height=400):
                     for i, entry in enumerate(_all_msgs):
-                        role = entry.get("message", {}).get("role", "unknown")
-                        content_preview = _content_preview(entry)
+                        entry_type = entry.get("type", "")
+                        msg = entry.get("message", {}) or {}
+
+                        # 识别 entry 类型
+                        if entry_type == "system" and entry.get("subtype") == "compact_boundary":
+                            role = "🚧 压缩边界"
+                            content_preview = entry.get("compactMetadata", {})
+                            expander_title = f"⏸️ 压缩边界 #{i+1}"
+                            show_raw_json = False
+                            show_metadata = True
+                        elif entry_type == "user" and msg.get("isCompactSummary"):
+                            role = "📝 压缩摘要"
+                            content_preview = msg.get("content", "")[:50]
+                            expander_title = f"📝 压缩摘要（{len(msg.get('content', ''))} 字符）"
+                            show_raw_json = True
+                            show_metadata = False
+                        else:
+                            role = msg.get("role", "unknown")
+                            content_preview = (
+                                msg.get("content", "")[:50]
+                                if isinstance(msg.get("content", ""), str)
+                                else f"[{len(msg.get('content', []))} blocks]"
+                            )
+                            expander_title = f"{i+1}. {role}: {content_preview}..."
+                            show_raw_json = True
+                            show_metadata = False
 
                         # 在 boundary 处显示「压缩前/后」标签
                         if i == _boundary_idx:
                             st.caption("⏸️ --- 以下是压缩前的旧消息 ---")
 
-                        if i == _boundary_idx + 1 and entry.get("type") == "user" and entry.get("message", {}).get("isCompactSummary"):
-                            # summary 消息特殊标注
-                            with st.expander(f"📝 压缩摘要（{len(entry.get('message', {}).get('content', ''))} 字符）"):
-                                st.json(entry.get("message", {}))
-                        else:
-                            with st.expander(f"{i+1}. {role}: {content_preview}..."):
-                                st.json(entry.get("message", {}))
+                        with st.expander(expander_title):
+                            if show_metadata:
+                                # boundary 显示 compactMetadata
+                                st.json(entry.get("compactMetadata", {}))
+                            if show_raw_json:
+                                st.json(msg)
 
                         if _boundary_idx >= 0 and i == _boundary_idx:
                             st.caption("⏸️ --- 压缩后新对话开始 ---")
