@@ -570,6 +570,7 @@ if prompt := st.chat_input("输入消息..."):
         thinking_text = ""
         tool_logs = []
         turn_count = 0  # P2 新增：Turn 计数
+        last_turn_usage = None  # 每轮 LLM 响应的 usage（用于显示单轮 token 消耗）
 
         # 逐 chunk 处理
         for msg_type, content in run_agent(prompt):
@@ -626,6 +627,7 @@ if prompt := st.chat_input("输入消息..."):
                 stats["input"] += content.input_tokens
                 stats["output"] += content.output_tokens
                 stats["thinking"] += content.thinking_tokens
+                last_turn_usage = content  # 记录本轮最新 usage，用于显示单轮消耗
 
         # 流式结束：清理 UI
         text_placeholder.markdown(full_text)
@@ -663,12 +665,23 @@ if prompt := st.chat_input("输入消息..."):
 
         # Token 消耗摘要
         stats = st.session_state.token_stats
-        st.caption(
-            f"📊 Token: input={stats['input']:,} · "
-            f"output={stats['output']:,} · "
-            f"thinking={stats['thinking']:,} · "
-            f"total={stats['input'] + stats['output'] + stats['thinking']:,}"
-        )
+        # 本轮 LLM 响应的 token 消耗（per-turn）
+        if last_turn_usage:
+            turn_input = last_turn_usage.input_tokens
+            turn_output = last_turn_usage.output_tokens
+            turn_thinking = last_turn_usage.thinking_tokens
+            turn_total = turn_input + turn_output + turn_thinking
+            st.caption(
+                f"📊 本轮: input={turn_input:,} · output={turn_output:,}"
+                + (f" · thinking={turn_thinking:,}" if turn_thinking else "")
+                + f" · 累计: input={stats['input']:,} · output={stats['output']:,} · thinking={stats['thinking']:,}"
+            )
+        else:
+            st.caption(
+                f"📊 累计: input={stats['input']:,} · "
+                f"output={stats['output']:,} · "
+                f"thinking={stats['thinking']:,}"
+            )
 
     # 保存助手消息（兼容新旧格式）
     # 历史消息中 tool_logs 保持 dict 格式，渲染时按结构化显示
