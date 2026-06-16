@@ -239,18 +239,32 @@ with st.sidebar:
     else:
         st.caption("Agent 未初始化")
 
-    # 历史记录查看器（包含压缩前的旧消息，按 boundary 分段）
+    # 历史记录查看器（包含压缩前的旧消息，按 boundary 分段 + 滑动框控制条数）
     _view_sid = st.session_state.get("chat_session_id")
     if _view_sid:
         try:
             _jsonl_path = Path(DATA_DIR) / f"{_view_sid}.jsonl"
-            # 全部消息（含 boundary 之前的旧消息）
-            _view_msgs = SessionStorage.read_messages_lightweight(_jsonl_path, limit=999, include_all_types=True)
-            if _view_msgs:
+            # 全部消息（含 boundary 之前的旧消息），上限 500
+            _all_msgs = SessionStorage.read_messages_lightweight(_jsonl_path, limit=500, include_all_types=True)
+            if _all_msgs:
                 st.divider()
-                st.subheader("📜 历史记录")
+                _total = len(_all_msgs)
+                st.subheader(f"📜 历史记录 ({_total} 条)")
 
-                # 检测 boundary 位置，按"压缩前 / 压缩后"分段展示
+                # 滑动框：控制显示条数
+                _limit = st.slider(
+                    "显示条数",
+                    min_value=1,
+                    max_value=min(_total, 100),
+                    value=min(20, _total),
+                    key=f"history_limit_{_view_sid}",
+                    help="从最后一条向前显示 N 条",
+                )
+
+                # 取最后 _limit 条
+                _view_msgs = _all_msgs[-_limit:]
+
+                # 重新计算 boundary 索引（基于裁剪后的子集）
                 _boundary_idx = -1
                 for _idx, _e in enumerate(_view_msgs):
                     if _e.get("type") == "system" and _e.get("subtype") == "compact_boundary":
@@ -265,12 +279,17 @@ with st.sidebar:
                         return content[:50]
                     return f"[{len(content)} blocks]"
 
+                # 如果有未显示的旧消息，在顶部提示
+                _hidden = _total - len(_view_msgs)
+                if _hidden > 0:
+                    st.caption(f"⏪ 还有 {_hidden} 条更早的消息未显示（拖动滑动框查看）")
+
                 # 渲染
                 for i, entry in enumerate(_view_msgs):
                     role = entry.get("message", {}).get("role", "unknown")
                     content_preview = _content_preview(entry)
 
-                    # 在 boundary 之前显示「压缩前」标签
+                    # 在 boundary 处显示「压缩前/后」标签
                     if i == _boundary_idx:
                         st.caption("⏸️ --- 以下是压缩前的旧消息 ---")
 
