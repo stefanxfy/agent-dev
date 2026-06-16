@@ -838,3 +838,136 @@ def test_compact_debug_logging_shows_ptl_retry():
         assert "attempt=2/4" in log_output, "记录第二次尝试"
     finally:
         compact_logger.removeHandler(handler)
+
+
+# ══════════════════════════════════════════════════════════════
+# 增量估算 + image/document 脱水 测试
+# ══════════════════════════════════════════════════════════════
+
+
+class TestIncrementalEstimation:
+    """对齐 Claude Code tokenCountWithEstimation 增量估算"""
+
+    def test_set_baseline_enables_incremental(self):
+        """设置基准后，compute_budget_state 使用增量估算"""
+        bm = ContextBudgetManager("glm-4", SimpleTokenCounter())
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "world"},
+        ]
+        # 全量估算
+        state1 = bm.compute_budget_state(messages)
+        full_used = state1.used_tokens
+
+        # 设置基准（模拟 API 返回 input_tokens=50，消息数=2）
+        bm.set_baseline(input_tokens=50, message_count=2)
+
+        # 加一条新消息
+        messages.append({"role": "user", "content": "new question"})
+        state2 = bm.compute_budget_state(messages)
+
+        # 增量：50（API基准） + 新消息粗略估算
+        new_msg_tokens = SimpleTokenCounter().count_messages(messages[2:])
+        assert state2.used_tokens == 50 + new_msg_tokens
+
+    def test_no_baseline_falls_back_to_full(self):
+        """没有基准时降级为全量估算"""
+        bm = ContextBudgetManager("glm-4", SimpleTokenCounter())
+        messages = [{"role": "user", "content": "test"}]
+        state = bm.compute_budget_state(messages)
+        # 全量估算：应该 > 0
+        assert state.used_tokens > 0
+
+    def test_invalidate_baseline(self):
+        """invalidate_baseline 后降级为全量估算"""
+        bm = ContextBudgetManager("glm-4", SimpleTokenCounter())
+        bm.set_baseline(input_tokens=100, message_count=1)
+        assert bm._baseline_valid is True
+
+        bm.invalidate_baseline()
+        assert bm._baseline_valid is False
+
+        # 降级为全量
+        messages = [{"role": "user", "content": "test"}]
+        state = bm.compute_budget_state(messages)
+        assert state.used_tokens > 0  # 全量估算
+
+    def test_baseline_after_compact_invalidated(self):
+        """压缩成功后 baseline 被失效"""
+        from agent_core.context.manager import ContextManager
+        cm = ContextManager.__new__(ContextManager)
+        cm.llm = None
+        cm.model = "glm-4"
+        cm.token_counter = SimpleTokenCounter()
+        cm.budget = ContextBudgetManager("glm-4", SimpleTokenCounter())
+        cm.compactor = None
+        cm.compact_count = 0
+        cm.total_tokens_freed = 0
+
+        # 设置基准
+        cm.set_baseline(100, 2)
+        assert cm.budget._baseline_valid is True
+
+        # 模拟压缩成功（手动调用 invalidate）
+        cm.invalidate_baseline()
+        assert cm.budget._baseline_valid is False
+
+    def test_zero_input_tokens_ignored(self):
+        """input_tokens=0 不设置基准"""
+        bm = ContextBudgetManager("glm-4", SimpleTokenCounter())
+        bm.set_baseline(input_tokens=0, message_count=5)
+        assert bm._baseline_valid is False
+
+    def test_baseline_msg_count_eq_current(self):
+        """基准消息数 == 当前消息数时，全量估算（无新增）"""
+        bm = ContextBudgetManager("glm-4", SimpleTokenCounter())
+        messages = [{"role": "user", "content": "hello"}]
+        bm.set_baseline(input_tokens=100, message_count=1)
+        state = bm.compute_budget_state(messages)
+        # 基准有效但无新增 → 用基准
+        assert state.used_tokens == 100
+
+
+class TestImageDocumentTokenEstimation:
+    """image/document blocks 按 Claude Code 方式固定 2000 tokens"""
+
+    def test_image_block_2000_tokens(self):
+        """image block 估算为 2000 tokens（不是 base64 字符数）"""
+        counter = SimpleTokenCounter()
+        messages = [
+            {"role": "user", "content": [
+                {"type": "text", "text": "看这张图"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo..." * 1000}},
+            ]}
+        ]
+        count = counter.count_messages(messages)
+        # image block = 2000 + "看这张图" ~5 + role overhead 10
+        # 如果用 base64 字符数算，会是 50000+ tokens
+        assert 2000 < count < 3000, f"image block should be ~2015, got {count}"
+
+    def test_document_block_2000_tokens(self):
+        """document block 估算为 2000 tokens"""
+        counter = SimpleTokenCounter()
+        messages = [
+            {"role": "user", "content": [
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLj..." * 500}},
+            ]}
+        ]
+        count = counter.count_messages(messages)
+        # document block = 2000 + role overhead 10
+        assert 2000 < count < 2100, f"document block should be ~2010, got {count}"
+
+    def test_no_image_fallback_unaffected(self):
+        """没有 image/document 的消息不受影响"""
+        counter = SimpleTokenCounter()
+        messages = [
+            {"role": "user", "content": "纯文本消息"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "回复"},
+                {"type": "tool_use", "id": "tu_1", "name": "search", "input": {"q": "test"}},
+            ]},
+        ]
+        count = counter.count_messages(messages)
+        # 纯文本 + tool_use，不含 image/document
+        assert count > 0
+        assert count < 500  # 不会算到 2000

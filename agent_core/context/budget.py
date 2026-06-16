@@ -228,9 +228,48 @@ class ContextBudgetManager:
         self.compact_threshold = self._calc_compact_threshold()
         self.critical_threshold = self._calc_critical_threshold()
 
+        # 增量估算基准（对齐 Claude Code tokenCountWithEstimation）
+        # 用上次 API 响应的 usage.input_tokens 作基准，只估算新增消息
+        self._baseline_tokens: int = 0         # 上次 API 响应的 input_tokens
+        self._baseline_msg_count: int = 0       # 上次 API 响应时的消息数
+        self._baseline_valid: bool = False      # 基准是否有效（压缩/session切换后失效）
+
         # 熔断状态
         self.consecutive_failures = 0
         self.last_compact_time: Optional[float] = None
+
+    # ── 增量估算基准 ──────────────────────────────────────────
+
+    def set_baseline(self, input_tokens: int, message_count: int) -> None:
+        """
+        从第 N-1 轮 LLM 响应的 usage 中捕获基准。
+
+        参考：Claude Code tokenCountWithEstimation()
+        核心思想：当前上下文大小 ≈ 上次 API input_tokens + 新增消息粗略估算
+
+        Args:
+            input_tokens: API 返回的 usage.input_tokens（权威数字）
+            message_count: 捕获 usage 时的 self.messages 长度
+        """
+        if input_tokens <= 0:
+            return
+        self._baseline_tokens = input_tokens
+        self._baseline_msg_count = message_count
+        self._baseline_valid = True
+        logger.debug(
+            f"[增量基准] input_tokens={input_tokens:,}, "
+            f"msg_count={message_count}"
+        )
+
+    def invalidate_baseline(self) -> None:
+        """
+        使增量基准失效。
+
+        场景：压缩发生/session 切换/消息列表被改写后，
+        上次 API 的 input_tokens 不再准确，需要重新全量估算。
+        """
+        self._baseline_valid = False
+        logger.debug("[增量基准] 已失效")
 
     # ── 双模式阈值计算 ────────────────────────────────────────
 
@@ -282,8 +321,8 @@ class ContextBudgetManager:
         return fixed
 
     def compute_budget_state(self, messages: list[dict]) -> BudgetState:
-        """计算当前预算状态"""
-        used = self.token_counter.count_messages(messages)
+        """计算当前预算状态（优先增量估算，降级全量估算）"""
+        used = self._estimate_used_tokens(messages)
         return BudgetState(
             total_budget=self.total_budget,
             used_tokens=used,
@@ -291,6 +330,47 @@ class ContextBudgetManager:
             compact_threshold=self.compact_threshold,
             critical_threshold=self.critical_threshold,
         )
+
+    def _estimate_used_tokens(self, messages: list[dict]) -> int:
+        """
+        估算当前上下文 token 数（增量优先，全量降级）。
+
+        参考：Claude Code tokenCountWithEstimation()
+        逻辑：
+        1. 如果有有效基准 → 基准 + 新增消息粗略估算（O(ΔN)）
+        2. 否则 → 全量粗略估算（O(N)）
+
+        注意：增量估算可能高估（cache_read_input_tokens 计入了基准但不占实际窗口），
+        高估 = 更保守 = 安全余量。
+        """
+        msg_count = len(messages)
+
+        # 增量路径：基准 + 新增
+        if (
+            self._baseline_valid
+            and self._baseline_msg_count > 0
+            and self._baseline_msg_count <= msg_count
+        ):
+            new_messages = messages[self._baseline_msg_count:]
+            if new_messages:
+                estimated_new = self.token_counter.count_messages(new_messages)
+                result = self._baseline_tokens + estimated_new
+                logger.debug(
+                    f"[增量估算] baseline={self._baseline_tokens:,} + "
+                    f"new({len(new_messages)} msgs)={estimated_new:,} = {result:,}"
+                )
+                return result
+            else:
+                # 无新增 → 直接用基准（API 权威数字比粗略估算更准确）
+                logger.debug(
+                    f"[增量估算] baseline={self._baseline_tokens:,}, 无新增"
+                )
+                return self._baseline_tokens
+
+        # 全量路径
+        used = self.token_counter.count_messages(messages)
+        logger.debug(f"[全量估算] {msg_count} msgs = {used:,} tokens")
+        return used
 
     def should_compact(self, messages: list[dict]) -> tuple[bool, str]:
         """

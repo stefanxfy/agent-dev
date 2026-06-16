@@ -382,9 +382,16 @@ class ReactAgent:
                     if chunk.tool_call:
                         tool_calls.append(chunk.tool_call)
 
-                    # Token 消耗 → 转发给 UI
+                    # Token 消耗 → 转发给 UI + 回传给 context manager
                     if chunk.usage:
                         yield ("usage", chunk.usage)
+                        # 对齐 Claude Code tokenCountWithEstimation：
+                        # 用 API 权威数字作增量基准，减少全量估算开销
+                        if self.context_manager:
+                            self.context_manager.set_baseline(
+                                chunk.usage.input_tokens,
+                                len(self.messages),
+                            )
             except Exception as e:
                 # 生成器 yield 过程中异常（如 OpenAI/Anthropic 网络中断、stream context 关闭）
                 # 关键修复：之前这种情况会让 run() 主循环爆掉，整个 session 失败

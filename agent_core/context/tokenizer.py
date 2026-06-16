@@ -94,6 +94,12 @@ class SimpleTokenCounter:
                         # thinking block 不计入 LLM 上下文（但占输出 token）
                         pass
 
+                    elif block_type in ("image", "document"):
+                        # 对齐 Claude Code roughTokenCountEstimation：
+                        # image/document 固定返回 2000 tokens（API 按像素计费，不是 base64 字符数）
+                        # 不然用 str(block) 算 base64 会高估 10-50 倍
+                        total += 2000
+
                     else:
                         total += self.count(str(block))
 

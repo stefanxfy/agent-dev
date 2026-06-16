@@ -64,6 +64,14 @@ class ContextManager:
         """检查是否需要压缩"""
         return self.budget.should_compact(messages)
 
+    def set_baseline(self, input_tokens: int, message_count: int) -> None:
+        """捕获 API usage 到增量估算基准"""
+        self.budget.set_baseline(input_tokens, message_count)
+
+    def invalidate_baseline(self) -> None:
+        """使增量基准失效（压缩/session切换后调用）"""
+        self.budget.invalidate_baseline()
+
     def get_usage_info(self, messages: list[dict]) -> dict:
         """获取 token 用量信息（用于 UI 显示）"""
         info = self.budget.get_usage_info(messages)
@@ -91,6 +99,7 @@ class ContextManager:
         if result.success:
             self.compact_count += 1
             self.total_tokens_freed += result.tokens_freed
+            self.budget.invalidate_baseline()  # 压缩后消息列表被改写，基准失效
             logger.info(result.summary_str())
             return result.compacted_messages, result
         else:
