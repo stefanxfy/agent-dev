@@ -716,14 +716,24 @@ class SessionStorage:
         return count
 
     @staticmethod
-    def read_messages_lightweight(jsonl_path: Path, limit: int = 5) -> list[dict]:
+    def read_messages_lightweight(
+        jsonl_path: Path,
+        limit: int = 5,
+        include_all_types: bool = False,
+    ) -> list[dict]:
         """轻量读取最近 N 条消息（不创建实例，不触发 __init__ 副作用）
 
         用于 UI 历史查看器等只需要最近几条消息的场景。
+
+        Args:
+            jsonl_path: JSONL 文件路径
+            limit: 最多返回多少条
+            include_all_types: 是否包含 boundary/summary 等元数据 entry
+                              默认 False（只返回 user/assistant，UI 历史查看用）
+                              True 用于「查看完整历史（含压缩前）」场景
         """
         entries = []
         try:
-            # 先读全部行（JSONL 文件通常不大），取最后 limit 条消息
             all_msgs = []
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -732,7 +742,9 @@ class SessionStorage:
                         continue
                     try:
                         e = json.loads(line)
-                        if e.get("type") in ("user", "assistant"):
+                        if include_all_types:
+                            all_msgs.append(e)
+                        elif e.get("type") in ("user", "assistant"):
                             all_msgs.append(e)
                     except json.JSONDecodeError:
                         continue

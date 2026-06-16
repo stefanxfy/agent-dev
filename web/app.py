@@ -239,24 +239,51 @@ with st.sidebar:
     else:
         st.caption("Agent 未初始化")
 
-    # 历史记录查看器（直接从磁盘读取，不创建 SessionManager 实例）
+    # 历史记录查看器（包含压缩前的旧消息，按 boundary 分段）
     _view_sid = st.session_state.get("chat_session_id")
     if _view_sid:
         try:
             _jsonl_path = Path(DATA_DIR) / f"{_view_sid}.jsonl"
-            _view_msgs = SessionStorage.read_messages_lightweight(_jsonl_path, limit=5)
+            # 全部消息（含 boundary 之前的旧消息）
+            _view_msgs = SessionStorage.read_messages_lightweight(_jsonl_path, limit=999, include_all_types=True)
             if _view_msgs:
                 st.divider()
                 st.subheader("📜 历史记录")
+
+                # 检测 boundary 位置，按"压缩前 / 压缩后"分段展示
+                _boundary_idx = -1
+                for _idx, _e in enumerate(_view_msgs):
+                    if _e.get("type") == "system" and _e.get("subtype") == "compact_boundary":
+                        _boundary_idx = _idx
+                        break
+
+                # 工具函数：取内容预览
+                def _content_preview(entry):
+                    msg = entry.get("message", {})
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        return content[:50]
+                    return f"[{len(content)} blocks]"
+
+                # 渲染
                 for i, entry in enumerate(_view_msgs):
                     role = entry.get("message", {}).get("role", "unknown")
-                    content = entry.get("message", {}).get("content", "")
-                    if isinstance(content, str):
-                        content_preview = content[:50]
+                    content_preview = _content_preview(entry)
+
+                    # 在 boundary 之前显示「压缩前」标签
+                    if i == _boundary_idx:
+                        st.caption("⏸️ --- 以下是压缩前的旧消息 ---")
+
+                    if i == _boundary_idx + 1 and entry.get("type") == "user" and entry.get("message", {}).get("isCompactSummary"):
+                        # summary 消息特殊标注
+                        with st.expander(f"📝 压缩摘要（{len(entry.get('message', {}).get('content', ''))} 字符）"):
+                            st.json(entry.get("message", {}))
                     else:
-                        content_preview = f"[{len(content)} blocks]"
-                    with st.expander(f"{i+1}. {role}: {content_preview}..."):
-                        st.json(entry.get("message", {}))
+                        with st.expander(f"{i+1}. {role}: {content_preview}..."):
+                            st.json(entry.get("message", {}))
+
+                if _boundary_idx >= 0:
+                    st.caption(f"⏸️ --- 压缩后新对话开始 ---")
         except Exception as e:
             logging.warning(f"侧边栏历史记录加载失败: {e}")
 
