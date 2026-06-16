@@ -10,9 +10,9 @@
 2. [压缩的本质：不是"压缩文件"，而是"压缩历史"](#2-压缩的本质不是压缩文件而是压缩历史)
 3. [Token 估算的根本问题：你永远不知道 API 收到了多少](#3-token-估算的根本问题你永远不知道-api-收到了多少)
 4. [Claude Code 的三层 Token 估算架构](#4-claude-code-的三层-token-估算架构)
-5. [agent-dev 的 Token 估算现状](#5-agent-dev-的-token-估算现状)
-6. [增量估算：用 API usage 作基准的核心思想](#6-增量估算用-api-usage-作基准的核心思想)
-7. [对比总结与优化建议](#7-对比总结与优化建议)
+5. [agent-dev 的 Token 估算实现（已对齐 Claude Code）](#5-agent-dev-的-token-估算实现已对齐-claude-code)
+6. [增量估算：API usage 基准的核心实现](#6-增量估算api-usage-基准的核心实现)
+7. [对比总结与已完成的优化](#7-对比总结与已完成的优化)
 
 ---
 
@@ -319,11 +319,15 @@ export function tokenCountWithEstimation(
 
 ---
 
-## 5. agent-dev 的 Token 估算现状
+## 5. agent-dev 的 Token 估算实现（已对齐 Claude Code）
 
-### 5.1 当前实现：`SimpleTokenCounter`
+> 源码位置：`agent_core/context/tokenizer.py` + `budget.py` + `manager.py` + `agent_core.py`
+>
+> **以下三个优化已在 2026-06-16 实现**，对应 commit `637b31f`，107/107 测试全过。
 
-> 源码位置：`agent_core/context/tokenizer.py`
+### 5.1 `SimpleTokenCounter`：粗略估算核心
+
+**文件**：`agent_core/context/tokenizer.py`
 
 ```python
 class SimpleTokenCounter:
@@ -337,165 +341,304 @@ class SimpleTokenCounter:
         total = 0
         for msg in messages:
             total += self.ROLE_OVERHEAD
+            content = msg.get("content", "")
+
             if isinstance(content, str):
-                total += self.count(content)
+                total += self.count(content)          # 字符比例估算
+
             elif isinstance(content, list):
                 for block in content:
-                    if block.type == "tool_use":
+                    block_type = block.get("type", "text")
+
+                    if block_type == "text":
+                        total += self.count(block.get("text", ""))
+
+                    elif block_type == "tool_use":
                         total += self.TOOL_CALL_FIXED
-                        total += self.count(json.dumps(block.input))
-                    elif block.type == "tool_result":
+                        total += self.count(json.dumps(block.get("input", {})))
+
+                    elif block_type == "tool_result":
                         total += self.TOOL_RESULT_FIXED
-                        total += self.count(block.content)
-                    # ...
+                        total += self.count(block.get("content", ""))
+
+                    elif block_type == "thinking":
+                        pass                          # 不计入（占输出 token，不占输入）
+
+                    elif block_type in ("image", "document"):
+                        # 固定 2000 tokens（对齐 Claude Code）
+                        # 之前用 str(block) 算 base64，会高估 10-50 倍
+                        total += 2000
+
+                    else:
+                        total += self.count(str(block))  # 兜底
         return total
 ```
 
-**特点**：
-- 每次检查阈值时，**全量遍历所有消息**
-- 用字符比例估算（中文 1.4t/字，英文 0.25t/字符）
-- 没有用 API 响应的 `usage` 信息
+**关键特性**：
+- `image`/`document` blocks 固定 2000 tokens（之前用 `str(block)` 算 base64，高估 10-50 倍）
+- `thinking` block 不计入（API 层自动过滤，不占输入 token）
+- 工具调用/结果：固定开销 + 内容粗估
 
-### 5.2 与 Claude Code 的对比
+### 5.2 `ContextBudgetManager`：增量估算 + 阈值判断
+
+**文件**：`agent_core/context/budget.py`
+
+核心是 `_estimate_used_tokens()` 方法，实现**增量优先、全量兜底**：
+
+```python
+class ContextBudgetManager:
+    # 新增字段：增量基准（对齐 Claude Code tokenCountWithEstimation）
+    _baseline_tokens: int = 0      # 上次 API 响应的 input_tokens
+    _baseline_msg_count: int = 0    # 上次 API 响应时的消息数
+    _baseline_valid: bool = False   # 基准是否有效
+
+    def set_baseline(self, input_tokens: int, message_count: int) -> None:
+        if input_tokens <= 0:
+            return
+        self._baseline_tokens = input_tokens
+        self._baseline_msg_count = message_count
+        self._baseline_valid = True
+
+    def invalidate_baseline(self) -> None:
+        # 压缩/session切换后，基准失效
+        self._baseline_valid = False
+
+    def _estimate_used_tokens(self, messages: list[dict]) -> int:
+        msg_count = len(messages)
+
+        # 增量路径：三个条件全满足
+        if (
+            self._baseline_valid
+            and self._baseline_msg_count > 0
+            and self._baseline_msg_count <= msg_count
+        ):
+            new_messages = messages[self._baseline_msg_count:]
+            if new_messages:
+                estimated_new = self.token_counter.count_messages(new_messages)
+                return self._baseline_tokens + estimated_new
+            else:
+                # 无新增 → 直接用 API 数字（比粗略估算更准）
+                return self._baseline_tokens
+
+        # 全量兜底：首次启动 / 压缩后 / session 切换
+        return self.token_counter.count_messages(messages)
+```
+
+**增量估算的直觉**：
+
+```
+第 N-1 轮结束时：
+    _baseline_tokens = 48000   （API 说"这轮收到了 48000 tokens"）
+    _baseline_msg_count = 12   （当时有 12 条消息）
+
+第 N 轮开始：
+    messages = [12条旧消息, assistant回复, 用户新消息] = 15 条
+    new_messages = messages[12:] = [assistant回复, 用户新消息] = 3 条
+    result = 48000 + count_messages(3条新增)
+```
+
+### 5.3 `agent_core.py`：usage 捕获并回传
+
+**文件**：`agent_core/agent_core.py` 第 386-391 行
+
+```python
+for chunk in llm_stream:
+    # ... 文本/thinking/tool_call 处理 ...
+
+    # Token 消耗 → 转发给 UI + 回传给 context manager
+    if chunk.usage:
+        yield ("usage", chunk.usage)          # → UI 面板展示
+
+        # 对齐 Claude Code tokenCountWithEstimation
+        if self.context_manager:
+            self.context_manager.set_baseline(
+                chunk.usage.input_tokens,      # API 权威数字
+                len(self.messages),             # 当前消息数
+            )
+```
+
+**双重用途**：`chunk.usage` 同时驱动两个消费者：
+1. `yield ("usage", chunk.usage)` → Streamlit UI Token 面板
+2. `set_baseline(...)` → ContextBudgetManager 增量基准
+
+### 5.4 `manager.py`：压缩成功后自动失效
+
+**文件**：`agent_core/context/manager.py`
+
+```python
+def check_and_compact(self, messages: list[dict]) -> CompactionResult | None:
+    result = self.budget.should_compact(messages)
+
+    if result.trigger_compact:
+        compaction_result = self.compactor.compact(...)
+        if compaction_result.success:
+            # 压缩改写了消息列表，旧基准失效
+            self.budget.invalidate_baseline()
+            self.budget.record_compaction(...)
+```
+
+**为什么压缩后必须失效？**
+
+```
+压缩前：12 条消息 → API input_tokens = 48000
+压缩后：[system, summary, 最新6条] = 8 条
+
+_baseline_msg_count = 12 > len(messages) = 8
+→ 条件 _baseline_msg_count <= msg_count 不满足
+→ 自动走全量路径 → 重建基准
+```
+
+这个机制**不需要显式判断"是否刚压缩过"**，条件检查自动触发降级。
+
+### 5.5 对比表（优化后）
 
 | 维度 | Claude Code | agent-dev |
 |---|---|---|
-| API usage 捕获 | ✅ `app.py` 捕获了 `usage` | ✅ `app.py` 捕获了 `usage` |
-| API usage 回传 budget manager | ✅ | ❌（只用于 UI 展示） |
-| 增量估算 | ✅ 基准 + 新消息 | ❌ 每次全量 |
-| 精确计数 API | ✅ `countTokensWithAPI()` | ❌ |
-| 粗略估算 | ✅ 字符级 | ✅ 字符级（中文 1.4t/字） |
-
-### 5.3 为什么当前实现"够用"？
-
-1. **压缩触发不频繁**：只有逼近阈值时才触发，估算误差 ±20% 不会导致误触发
-2. **GLM-5.1 上下文窗口较小**（128K），压缩触发更频繁，但误差影响不大
-3. **实现简单**：不需要维护"上次 usage"状态，不需要处理缓存逻辑
-
----
-
-## 6. 增量估算：用 API usage 作基准的核心思想
+| API usage 捕获 | ✅ | ✅ `agent_core.py` |
+| API usage 回传 budget manager | ✅ | ✅ `set_baseline()` |
+| 增量估算 | ✅ 基准 + 新消息 | ✅ `_estimate_used_tokens()` |
+| 全量兜底 | ✅ 无基准时 | ✅ `_baseline_valid=False` 时 |
+| image/document 固定 2000 | ✅ | ✅ `tokenizer.py` |
+| thinking 不计入 | ✅ | ✅ `tokenizer.py` |
+| 压缩后基准失效 | ✅ | ✅ `invalidate_baseline()` |
+| L1 精确计数 API | ✅ `countTokensWithAPI()` | ❌（GLM 无此接口）|
+## 6. 增量估算：API usage 基准的核心实现
 
 ### 6.1 为什么需要增量估算？
 
-当前 agent-dev 的问题是：**每次检查阈值都要全量遍历所有消息**。
+全量遍历的问题：**每次检查阈值都要遍历所有消息**。
 
 ```
-第1轮：遍历 2 条消息   → 快
-第10轮：遍历 20 条消息  → 快
-第100轮：遍历 200 条消息 → 慢（200 条 * 每条估算 = 可观开销）
-第1000轮：遍历 2000 条消息 → 更慢
+第1轮：遍历 2 条消息     → 快
+第10轮：遍历 20 条消息   → 快
+第100轮：遍历 200 条消息  → 可观开销
+第1000轮：遍历 2000 条消息 → 显著延迟
 ```
 
-如果用了增量估算，无论第几轮，**基准部分是 O(1)**（直接用上次 API 数字），只有新增部分是 O(N)（N = 上次调用之后新增的消息数，通常很小）。
+增量估算的改进：**基准部分是 O(1)**（直接用上次 API 数字），只有新增部分是 O(ΔN)（新增消息数，通常很小）。
 
 ### 6.2 增量估算的时间线
 
 ```
 第 N-1 轮结束：
-  LLM 最终调用完成
-  → usage.input_tokens = 8,200
-  → 记录：_baseline_tokens = 8,200
-  → 记录：_baseline_message_index = 最后一条 assistant 消息的索引
+  LLM API 响应完成
+  → usage.input_tokens = 48000
+  → set_baseline(48000, msg_count=12)
 
-第 N 轮开始（用户发了一条新消息）：
-  self.messages = [
-    ...压缩后的历史（已被 _baseline 覆盖）,
-    第 N-1 轮 assistant 回复,
-    用户新消息,
-  ]
-  → 需要估算的部分 = 第 N-1 轮 assistant 回复 + 用户新消息
-  → current ≈ _baseline_tokens + rough_estimate(新增部分)
+第 N 轮开始（用户发了新消息）：
+  messages = [12条旧消息, assistant回复, 用户新消息] = 14 条
+  new_messages = messages[12:] = [assistant回复, 用户新消息]
+  current ≈ 48000 + count_messages(2条新增)
 ```
 
-### 6.3 实现增量估算需要改什么？
+### 6.3 四个核心字段
 
-**`ContextBudgetManager` 需要新增**：
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `_baseline_tokens` | `int` | 上次 API 响应的 `input_tokens` |
+| `_baseline_msg_count` | `int` | 捕获基准时的消息条数 |
+| `_baseline_valid` | `bool` | 基准是否有效 |
+| `consecutive_failures` | `int` | 熔断计数器 |
 
-```python
-class ContextBudgetManager:
-    def __init__(self, ...):
-        # ...现有字段...
-        self._baseline_tokens: int = 0          # 上次 API 响应的 input_tokens
-        self._baseline_message_count: int = 0   # 上次 API 响应时的消息数
+### 6.4 基准失效时机
 
-    def set_baseline(self, usage: UsageStats) -> None:
-        """从第 N-1 轮 LLM 响应中捕获 usage，设置基准"""
-        self._baseline_tokens = usage.input_tokens
-        self._baseline_message_count = len(self.messages)  # 需要外部传入
+| 事件 | 是否失效 | 原因 |
+|---|---|---|
+| **压缩成功** | ✅ `invalidate_baseline()` | 消息列表被改写（旧消息换成 summary） |
+| **Session 切换** | ✅ 设计已预留 | 不同 session 的 usage 不能共用 |
+| **API 调用失败** | ❌ 不调 | 消息列表没变，旧基准仍有效 |
+| **第一次启动** | ❌（初始就是 False） | 还没调用过 LLM，没有基准 |
 
-    def _check_budget_incremental(self, messages: list[dict]) -> tuple[bool, str]:
-        """增量估算当前上下文大小"""
-        new_messages = messages[self._baseline_message_count:]
-        estimated_new = self.token_counter.count_messages(new_messages)
+### 6.5 增量 vs 全量：完整时序
 
-        current = self._baseline_tokens + estimated_new
-        # ...后续判断逻辑...
+```
+Session 启动
+    │
+    ├─ 第1轮检查 ──────────────────────────────────────────→ 全量（无基准）
+    │                                                          │
+    ├─ 第1轮 LLM 响应 ──→ set_baseline(input_tokens, msg_count)
+    │                                                          │
+    ├─ 第2轮检查 ──────────────────────────────────────────→ 增量
+    │   (baseline=48K + count(new_msgs))                       │
+    │                                                          │
+    ├─ 第N轮 LLM 响应 ──→ set_baseline(new_tokens, new_count)
+    │                                                          │
+    │    ... 增量若干轮 ...
+    │                                                          │
+    ├─ 触发压缩 ─────────→ invalidate_baseline()
+    │                                                          │
+    ├─ 压缩后第1轮检查 ───────────────────────────────────→ 全量（基准已失效）
+    │   (消息列表被改写了，旧的 msg_count 对不上)               │
+    │                                                          │
+    └─ 压缩后 LLM 响应 ──→ set_baseline(new_tokens, new_count) → 重建基准
+                                                              │
+                                                  下一批增量轮次...
 ```
 
-**`app.py` 需要改**：
+### 6.6 为什么压缩后必须失效？
 
-```python
-# 在 Streamlit 主循环中，每次捕获到 usage 时：
-if msg_type == "usage":
-    stats["input"] += content.input_tokens
-    stats["output"] += content.output_tokens
-    # 新增：回传给 context manager
-    agent.context_manager.set_baseline(content.input_tokens, len(agent.messages))
+**关键**：`set_baseline` 捕获的是"当时那条消息列表"发给 API 后，API 说"我收到了多少 tokens"。
+
+压缩改变了消息列表的结构：
+- 压缩前：12 条原始消息 → API 说 48000 tokens
+- 压缩后：8 条消息（system + summary + 6条）→ API 会说完全不同的数字
+
+```
+_baseline_msg_count = 12（压缩前）
+len(messages) = 8（压缩后）
+
+12 > 8 → 条件 _baseline_msg_count <= msg_count 不满足
+→ 自动走全量路径 → 重新建立基准
 ```
 
-### 6.4 边界情况
-
-| 情况 | 处理方式 |
-|---|---|
-| 第一次调用（没有 baseline） | 降级为全量估算 |
-| 压缩发生后（消息列表被改写） | 重置 baseline（因为消息列表变了，之前的 baseline 无效） |
-| API 调用失败（没有 usage） | 保持上一次 baseline，或用全量估算 |
-| 切换 session | 重置 baseline（不同 session 的 usage 不能共用） |
-
----
-
-## 7. 对比总结与优化建议
+这个机制**不需要显式判断"是否刚压缩过"**——条件检查自动降级。
+## 7. 对比总结与已完成的优化
 
 ### 7.1 Token 估算方法对比
 
-| 方法 | 准确度 | 速度 | 成本 | 适用场景 |
+| 方法 | 准确度 | 速度 | 成本 | agent-dev 状态 |
 |---|---|---|---|---|
-| **全量粗略估算**（agent-dev 当前） | ±20% | 慢（O(N)） | 免费 | 开发阶段、消息量少 |
-| **增量估算**（Claude Code） | ±5% | 快（O(1)+O(ΔN)） | 免费 | 生产环境、消息量多 |
-| **精确 API 计数**（L1） | ±0% | 慢（API 调用） | 有成本 | 压缩前精确判断 |
-| **Haiku fallback**（L2） | ±1% | 慢（API 调用） | 低成本 | L1 失败时的降级 |
+| **全量粗略估算** | ±20% | 慢（O(N)） | 免费 | ✅ 兜底路径 |
+| **增量估算**（Claude Code） | 基准±0%，新增±20% | 快（O(1)+O(ΔN)） | 免费 | ✅ 已实现 |
+| **精确 API 计数**（L1） | ±0% | 慢（API 调用） | 有成本 | ❌ GLM 无此接口 |
+| **Haiku fallback**（L2） | ±1% | 慢（API 调用） | 低成本 | ❌ 不需要 |
 
-### 7.2 agent-dev 优化建议
+### 7.2 agent-dev 已完成的优化（commit `637b31f`）
 
-**优先级 P0：捕获并回传 API usage**
+| 优化 | 文件 | 核心改动 | 对齐 Claude Code |
+|---|---|---|---|
+| **P0: API usage 回传** | `agent_core.py` | `chunk.usage.input_tokens` → `set_baseline()` | ✅ |
+| **P1: 增量估算** | `budget.py` | `set_baseline()` + `_estimate_used_tokens()` | ✅ |
+| **P1: 增量兜底** | `budget.py` | 基准失效 → 全量估算 | ✅ |
+| **P1: 压缩后失效** | `manager.py` | 压缩成功 → `invalidate_baseline()` | ✅ |
+| **P2: image/doc 固定 2000** | `tokenizer.py` | image/document blocks → 固定 2000 tokens | ✅ |
+| **P2: thinking 不计入** | `tokenizer.py` | thinking block → `+0` | ✅ |
 
-```python
-# agent_core.py 的 run() 方法中，捕获 usage 后：
-if chunk.usage:
-    self._last_usage = chunk.usage
-    if self.context_manager:
-        self.context_manager.set_baseline(chunk.usage, len(self.messages))
+### 7.3 仍需关注的优化方向
+
+| 优化 | 状态 | 说明 |
+|---|---|---|
+| **L1 精确计数** | ❌ 待探索 | GLM API 是否有 `count_tokens` 端点待验证 |
+| **image/document 脱水** | 🔶 部分 | `tokenizer.py` 已固定 2000，`compact.py` 的 `_preprocess()` 已替换占位符 |
+| **文件重附机制** | ❌ 暂无 | agent-dev 未实现，无需 `stripReinjectedAttachments` |
+
+### 7.4 测试覆盖
+
+新增 **9 个测试**（`agent_core/context/test_context.py`），107/107 全过：
+
 ```
+TestIncrementalEstimation（6个）
+├── test_budget_set_baseline_incremental        # 增量路径正确
+├── test_budget_set_baseline_full_fallback       # 基准无效时全量
+├── test_budget_invalidate_baseline              # 失效后走全量
+├── test_budget_invalidate_after_compaction       # 压缩后失效（自动）
+├── test_budget_set_baseline_zero_ignored         # input_tokens<=0 忽略
+└── test_budget_incremental_no_new_messages      # 无新增时直接用基准
 
-**优先级 P1：实现增量估算**
-
-参考 Claude Code 的 `tokenCountWithEstimation()`，在 `ContextBudgetManager` 中实现：
-- `set_baseline(usage, message_count)`
-- `_check_budget_incremental(messages)`
-
-**优先级 P2：调 GLM API 的 countTokens 接口（如果有）**
-
-GLM API 是否支持 `count_tokens` 端点需要验证。如果支持，可以实现 L1 精确计数。
-
-**优先级 P3：预处理（脱水）增强**
-
-参考 Claude Code 的 `stripImagesFromMessages()` 和 `stripReinjectedAttachments()`：
-- 如果 agent-dev 未来支持图片，需要过滤 image/document blocks
-- 如果实现了文件重附机制，需要防止文件内容雪崩
-
----
-
+TestImageDocumentTokenEstimation（3个）
+├── test_image_block_2000_tokens                 # image 固定 2000
+├── test_document_block_2000_tokens              # document 固定 2000
+└── test_plain_text_unaffected                   # 纯文本不受影响
 ## 附录 A：压缩前后 Token 数变化示例
 
 假设一个真实场景：
