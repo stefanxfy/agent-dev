@@ -365,6 +365,11 @@ class LLMRouter:
                 logger.debug(f"[OpenAI] usage: {usage.summary('OpenAI')}")
                 yield StreamChunk(usage=usage)
 
+        # 流式结束后，yield 完整的 thinking（GLM reasoning_content）
+        if reasoning_buffer:
+            full_thinking = "".join(reasoning_buffer)
+            yield StreamChunk(thinking_delta=ThinkingDelta(thinking=full_thinking))
+
         # 流式结束后，如果有完整的 tool_calls，yield 它们
         for idx in sorted(tool_calls_buffer.keys()):
             tc = tool_calls_buffer[idx]
@@ -458,13 +463,20 @@ class LLMRouter:
         # 收集 tool_calls（流式响应中可能分散在多个 chunk）
         tool_calls_buffer = {}  # index -> {"id": ..., "name": ..., "arguments": ...}
 
+        # GLM thinking 内容缓冲区（reasoning_content 字段，逐块到达）
+        reasoning_buffer = []
+
         for chunk in stream:
             if chunk.choices:
                 delta = chunk.choices[0].delta
-                
+
                 # 文本增量
                 if delta.content:
                     yield StreamChunk(text_delta=TextDelta(text=delta.content))
+
+                # GLM thinking 内容增量（reasoning_content 字段）
+                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    reasoning_buffer.append(delta.reasoning_content)
                 
                 # 工具调用增量（OpenAI 格式）
                 if delta.tool_calls:
@@ -482,6 +494,11 @@ class LLMRouter:
             if hasattr(chunk, "usage") and chunk.usage:
                 usage = UsageStats.from_chunk_usage(chunk.usage)
                 yield StreamChunk(usage=usage)
+
+        # 流式结束后，yield 完整的 thinking（GLM reasoning_content）
+        if reasoning_buffer:
+            full_thinking = "".join(reasoning_buffer)
+            yield StreamChunk(thinking_delta=ThinkingDelta(thinking=full_thinking))
 
         # 流式结束后，如果有完整的 tool_calls，yield 它们
         for idx in sorted(tool_calls_buffer.keys()):
