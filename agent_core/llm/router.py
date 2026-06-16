@@ -82,9 +82,30 @@ class ToolCallDelta:
     is_final: bool = True  # 当前实现为完整返回，非增量
 
 
+def _get_int(obj, *attrs, default=0):
+    """从 Pydantic model 或 dict 中取第一个存在的整数字段"""
+    for attr in attrs:
+        val = getattr(obj, attr, None) if hasattr(obj, attr) else obj.get(attr) if isinstance(obj, dict) else None
+        if val is not None:
+            return int(val)
+    return default
+
+
+def _get_nested(obj, *attrs, default=0):
+    """取嵌套属性：先取中间对象，再取目标字段（Pydantic+dict 混合）"""
+    cur = obj
+    for attr in attrs:
+        if cur is None:
+            return default
+        cur = getattr(cur, attr, None) if hasattr(cur, attr) else cur.get(attr) if isinstance(cur, dict) else None
+    if cur is None:
+        return default
+    return int(cur) if isinstance(cur, (int, float)) else default
+
+
 @dataclass
 class UsageStats:
-    """Token 消耗统计"""
+    """Token 消耗统计（统一格式，适配所有 LLM provider）"""
     input_tokens: int = 0
     output_tokens: int = 0
     thinking_tokens: int = 0
@@ -92,6 +113,47 @@ class UsageStats:
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens + self.thinking_tokens
+
+    @classmethod
+    def from_chunk_usage(cls, usage_obj) -> "UsageStats":
+        """
+        从不同 LLM provider 的 chunk.usage 对象提取统计，自动适配字段名。
+
+        支持的格式：
+        - Anthropic:     input_tokens, output_tokens, thinking_tokens
+        - OpenAI/GLM:    prompt_tokens, completion_tokens,
+                         completion_tokens_details.reasoning_tokens
+        """
+        if usage_obj is None:
+            return cls()
+
+        # input_tokens / prompt_tokens
+        input_tokens = _get_int(usage_obj, "input_tokens", "prompt_tokens")
+        # output_tokens / completion_tokens
+        output_tokens = _get_int(usage_obj, "output_tokens", "completion_tokens")
+        # thinking_tokens（优先 Anthropic 格式，其次 GLM/OpenAI 嵌套格式）
+        thinking_tokens = _get_int(usage_obj, "thinking_tokens")
+        if not thinking_tokens:
+            # GLM/OpenAI: completion_tokens_details.reasoning_tokens
+            thinking_tokens = _get_nested(
+                usage_obj, "completion_tokens_details", "reasoning_tokens"
+            )
+
+        return cls(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            thinking_tokens=thinking_tokens,
+        )
+
+    def summary(self, provider: str = "") -> str:
+        """格式化统计摘要（用于日志/UI）"""
+        parts = [f"in={self.input_tokens:,}", f"out={self.output_tokens:,}"]
+        if self.thinking_tokens:
+            parts.append(f"think={self.thinking_tokens:,}")
+        parts.append(f"total={self.total_tokens:,}")
+        if provider:
+            return f"[{provider}] " + " · ".join(parts)
+        return " · ".join(parts)
 
 
 @dataclass
@@ -297,12 +359,10 @@ class LLMRouter:
                     if tc.function and tc.function.arguments:
                         tool_calls_buffer[idx]["arguments"] += tc.function.arguments
 
-            # Token 消耗（最后一个 chunk 携带）
+            # Token 消耗（最后一个 chunk 携带，自动适配字段名）
             if hasattr(chunk, "usage") and chunk.usage:
-                usage = UsageStats(
-                    input_tokens=chunk.usage.prompt_tokens,
-                    output_tokens=chunk.usage.completion_tokens,
-                )
+                usage = UsageStats.from_chunk_usage(chunk.usage)
+                logger.debug(f"[OpenAI] usage: {usage.summary('OpenAI')}")
                 yield StreamChunk(usage=usage)
 
         # 流式结束后，如果有完整的 tool_calls，yield 它们
@@ -420,12 +480,9 @@ class LLMRouter:
                             tool_calls_buffer[idx]["arguments"] += tc.function.arguments
 
             if hasattr(chunk, "usage") and chunk.usage:
-                usage = UsageStats(
-                    input_tokens=chunk.usage.prompt_tokens,
-                    output_tokens=chunk.usage.completion_tokens,
-                )
+                usage = UsageStats.from_chunk_usage(chunk.usage)
                 yield StreamChunk(usage=usage)
-        
+
         # 流式结束后，如果有完整的 tool_calls，yield 它们
         for idx in sorted(tool_calls_buffer.keys()):
             tc = tool_calls_buffer[idx]
