@@ -27,6 +27,7 @@ import concurrent.futures
 import json
 import logging
 import time
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from .llm.router import (
@@ -182,6 +183,84 @@ class ReactAgent:
         self._pending_thinking: str = ""
         self._pending_tool_logs: list = []
         self._pending_tool_results: list = []  # [(tool_use_id, output), ...]
+        # Day 7 改进：记录本轮 LLM 返回的 usage 统计，用于持久化到 jsonl
+        # 解决 F5 刷新后 baseline 从 API 真实值（33,345）跳变到字面估算（58,406）的 bug
+        self._last_turn_usage: Optional[UsageStats] = None
+
+        # Day 7 改进：从 session 历史最后一条带 usage 的 entry 恢复 baseline
+        # 优先级：API 真实数字 > 字面估算。F5 刷新后仍能保持 33,345 而不是 58,406。
+        self._restore_usage_baseline()
+
+    def _restore_usage_baseline(self):
+        """
+        从 jsonl 历史最后一条带 usage 的 entry 恢复 context_manager baseline。
+
+        为什么需要：
+        - F5 刷新后，agent 重建会重新走 _estimate_used_tokens 字面估算路径
+        - 字面估算不准（灌水内容 SimpleTokenCounter 高估 ~43%）
+        - 如果 jsonl 最后一条 entry 里有 usage 字段（API 返回的 input_tokens），
+          用真实数字作 baseline，0 跳变。
+
+        复杂度：O(1) read_tail(64KB) 快路径 + O(n) read_entries() 兑底。
+        - 99% 场景：read_tail 一次搞定（O(1)）
+        - 1% 场景（灌水 entry > 64KB 在结尾）：fallback 到全量扫（O(n)）
+
+        兼容性：
+        - 老 jsonl（没 usage 字段）：entry.get("usage") 返回 None，fallback 到原路径
+        - 新 jsonl（有 usage 字段）：用 API 真实数字
+        - 天然平滑升级，无需迁移脚本
+        """
+        if not self.context_manager or not self._session_manager:
+            return
+
+        try:
+            from .session.storage import SessionStorage
+            storage = self._session_manager.storage
+
+            # 快路径：O(1) tail 64KB 窗口
+            try:
+                tail_entries = storage.read_tail(kb=64)
+            except Exception:
+                tail_entries = []
+
+            for entry in reversed(tail_entries):
+                usage = entry.get("usage")
+                if usage and usage.get("input_tokens"):
+                    # entry 是最后一条 assistant，它的 input_tokens 不含自己
+                    # 刷新后 self.messages 包含这条，所以 baseline_msg_count = len - 1
+                    msg_count = len(self.messages) - 1
+                    self.context_manager.set_baseline(
+                        usage["input_tokens"],
+                        msg_count,
+                    )
+                    _logger.debug(
+                        f"🔄 [Restore O(1)] baseline={usage['input_tokens']:,} "
+                        f"msg_count={msg_count} "
+                        f"from tail (uuid={entry.get('uuid', '?')[:8]})"
+                    )
+                    return
+
+            # Fallback：tail 没找到（灌水 entry > 64KB 或老 jsonl 无 usage）
+            # 降级到全量扫，极少触发
+            all_entries = storage.read_entries(include_compact_boundary=True)
+            for entry in reversed(all_entries):
+                usage = entry.get("usage")
+                if usage and usage.get("input_tokens"):
+                    msg_count = len(self.messages) - 1
+                    self.context_manager.set_baseline(
+                        usage["input_tokens"],
+                        msg_count,
+                    )
+                    _logger.debug(
+                        f"🔄 [Restore fallback] baseline={usage['input_tokens']:,} "
+                        f"msg_count={msg_count} "
+                        f"from full scan (uuid={entry.get('uuid', '?')[:8]})"
+                    )
+                    return
+
+            _logger.debug("🔄 [Restore] no usage in history, baseline stays 0")
+        except Exception as e:
+            _logger.debug(f"🔄 [Restore] failed (silent fallback): {e}")
 
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
@@ -365,7 +444,10 @@ class ReactAgent:
                 # Day 4: 保存到 session
                 if self._session_manager:
                     try:
-                        self._session_manager.add_assistant_message(f"抱歉，遇到了技术问题：{e}")
+                        self._session_manager.add_assistant_message(
+                            f"抱歉，遇到了技术问题：{e}",
+                            usage=asdict(self._last_turn_usage) if self._last_turn_usage else None,
+                        )
                     except Exception:
                         pass
                 return
@@ -391,6 +473,8 @@ class ReactAgent:
 
                     # Token 消耗 → 转发给 UI + 回传给 context manager
                     if chunk.usage:
+                        # Day 7 改进：保存到 self，供持久化时写入 jsonl
+                        self._last_turn_usage = chunk.usage
                         yield ("usage", chunk.usage)
                         # 对齐 Claude Code tokenCountWithEstimation：
                         # 用 API 权威数字作增量基准，减少全量估算开销
@@ -412,7 +496,10 @@ class ReactAgent:
                 self.messages.append({"role": "assistant", "content": partial})
                 if self._session_manager:
                     try:
-                        self._session_manager.add_assistant_message(partial)
+                        self._session_manager.add_assistant_message(
+                            partial,
+                            usage=asdict(self._last_turn_usage) if self._last_turn_usage else None,
+                        )
                     except Exception:
                         pass
                 return
@@ -444,10 +531,14 @@ class ReactAgent:
                             full_text,
                             thinking=self._pending_thinking,
                             tool_logs=self._pending_tool_logs,
+                            # Day 7：把本轮 API 返回的 usage 持久化到 jsonl
+                            # 下次 F5 刷新后能从这里恢复 baseline，0 跳变
+                            usage=asdict(self._last_turn_usage) if self._last_turn_usage else None,
                         )
                         # 保存后重置，避免跨 run 累积
                         self._pending_thinking = ""
                         self._pending_tool_logs = []
+                        self._last_turn_usage = None  # Day 7：用完清零
                     except Exception:
                         pass
                 yield ("system", "✅ 回答完成")

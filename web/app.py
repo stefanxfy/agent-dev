@@ -365,33 +365,13 @@ with st.sidebar:
                         logging.warning(f"会话消息数读取失败 (sid={sid}): {e}")
                         msg_count = 0
 
-                    # P3 cache 累计统计（侧车文件）
-                    try:
-                        cache_stats = sess.get("cache_stats", {})
-                        cache_hit = cache_stats.get("hit_rate", 0.0)
-                        cache_calls = cache_stats.get("total_calls", 0)
-                    except Exception as e:
-                        logging.warning(f"cache stats 读取失败 (sid={sid}): {e}")
-                        cache_hit, cache_calls = 0.0, 0
-
                     # 一行：加载按钮 + 操作按钮
                     cols = st.columns([4, 1, 1])
                     with cols[0]:
-                        cache_label = ""
-                        if cache_calls > 0 and cache_hit > 0:
-                            cache_label = f" 🔥{cache_hit*100:.0f}%"
-                        label = f"📄 {title} ({msg_count}条){cache_label}"
-                        # hover 上同时显示 cache 明细
-                        hit_detail = (
-                            f"\n\n🔥 Cache 命中率: {cache_hit*100:.1f}%"
-                            f"\n   调用 {cache_calls} 次"
-                            f"\n   命中 {cache_stats.get('cached_tokens', 0):,} / "
-                            f"{cache_stats.get('input_tokens', 0):,} tokens"
-                            if cache_calls > 0 else ""
-                        )
+                        label = f"📄 {title} ({msg_count}条)"
                         help_text = (
-                            f"{sid}\n最近: {preview}{hit_detail}"
-                            if preview else f"{sid}{hit_detail}"
+                            f"{sid}\n最近: {preview}"
+                            if preview else f"{sid}"
                         )
                         if st.button(label, key=f"load_{sid}", help=help_text):
                             if sid != st.session_state.get("chat_session_id"):
@@ -579,11 +559,15 @@ if _loaded_sid != _current_sid and _current_sid:
                 st.session_state.messages.append({"role": "user", "content": text_content})
                 loaded_count += 1
             elif role == "assistant" and text_content:
+                # Day 7：从 entry 顶层取 usage（API 真实 token 统计）
+                # 加载后 sidebar 会话信息面板能直接用这个数字，不用重算
+                entry_usage = entry.get("usage")
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": text_content,
                     "thinking": thinking,
                     "tool_logs": tool_logs,
+                    "usage": entry_usage,  # 可能为 None（老 session）
                 })
                 loaded_count += 1
 
@@ -645,13 +629,13 @@ for msg in st.session_state.messages:
 
         # 显示该条消息的 Token 消耗（如果有）
         msg_usage = msg.get("usage")
-        if msg_usage and (msg_usage.get("input") or msg_usage.get("output")):
-            parts = [f"input={msg_usage['input']:,}", f"output={msg_usage['output']:,}"]
-            if msg_usage.get("thinking"):
-                parts.append(f"thinking={msg_usage['thinking']:,}")
-            cached = msg_usage.get("cached", 0)
+        if msg_usage and (msg_usage.get("input_tokens") or msg_usage.get("output_tokens")):
+            parts = [f"input={msg_usage['input_tokens']:,}", f"output={msg_usage['output_tokens']:,}"]
+            if msg_usage.get("thinking_tokens"):
+                parts.append(f"thinking={msg_usage['thinking_tokens']:,}")
+            cached = msg_usage.get("cached_tokens", 0)
             if cached:
-                hit_rate = cached / max(msg_usage["input"], 1) * 100
+                hit_rate = cached / max(msg_usage["input_tokens"], 1) * 100
                 parts.append(f"🔥cache={cached:,} ({hit_rate:.1f}%)")
             st.caption(f"📊 {' · '.join(parts)}")
 
@@ -780,17 +764,6 @@ if prompt := st.chat_input("输入消息..."):
                 stats["cached"] = stats.get("cached", 0) + (content.cached_tokens or 0)
                 last_turn_usage = content  # 记录本轮最新 usage，用于显示单轮消耗
 
-                # P3 累计缓存命中写入 sidecar（供 sidebar 会话列表显示）
-                try:
-                    _cache_sid = st.session_state.get("chat_session_id")
-                    if _cache_sid:
-                        SessionStorage.write_cache_stats(
-                            Path(DATA_DIR) / f"{_cache_sid}.jsonl",
-                            content,
-                        )
-                except Exception as _ce:
-                    logging.warning(f"cache stats 写入失败: {_ce}")
-
                 # Debug 日志：缓存命中明细
                 hit_rate = (content.cached_tokens or 0) / max(content.input_tokens, 1) * 100
                 logging.debug(
@@ -861,11 +834,11 @@ if prompt := st.chat_input("输入消息..."):
         if last_turn_usage:
             turn_input = last_turn_usage.input_tokens
             turn_output = last_turn_usage.output_tokens
-            turn_thinking = last_turn_usage.thinking_tokens
-            turn_total = turn_input + turn_output + turn_thinking
+            turn_thinking_tokens = last_turn_usage.thinking_tokens
+            turn_total = turn_input + turn_output + turn_thinking_tokens
             st.caption(
                 f"📊 本轮: input={turn_input:,} · output={turn_output:,}"
-                + (f" · thinking={turn_thinking:,}" if turn_thinking else "")
+                + (f" · thinking={turn_thinking_tokens:,}" if turn_thinking_tokens else "")
                 + f" · 累计: input={stats['input']:,} · output={stats['output']:,} · thinking={stats['thinking']:,}"
             )
         else:
@@ -877,16 +850,20 @@ if prompt := st.chat_input("输入消息..."):
 
     # 保存助手消息（兼容新旧格式）
     # 历史消息中 tool_logs 保持 dict 格式，渲染时按结构化显示
+    # P5 修复：thinking_text 拼自 turn_thinking（多轮 turn 之间用 \n\n 分隔）
+    thinking_text = "\n\n".join(turn_thinking.values()) if turn_thinking else ""
     st.session_state.messages.append({
         "role": "assistant",
         "content": full_text,
         "thinking": thinking_text,
         "tool_logs": tool_logs,
+        # Day 7：schema 跟 jsonl entry.usage 对齐（全名 input_tokens 等），
+        # 加载历史时直接 entry.get("usage") 就能用，无需转换
         "usage": {
-            "input": last_turn_usage.input_tokens if last_turn_usage else 0,
-            "output": last_turn_usage.output_tokens if last_turn_usage else 0,
-            "thinking": last_turn_usage.thinking_tokens if last_turn_usage else 0,
-            "cached": last_turn_usage.cached_tokens if last_turn_usage else 0,
+            "input_tokens": last_turn_usage.input_tokens if last_turn_usage else 0,
+            "output_tokens": last_turn_usage.output_tokens if last_turn_usage else 0,
+            "thinking_tokens": last_turn_usage.thinking_tokens if last_turn_usage else 0,
+            "cached_tokens": last_turn_usage.cached_tokens if last_turn_usage else 0,
         } if last_turn_usage else None,
     })
 

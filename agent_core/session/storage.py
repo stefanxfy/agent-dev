@@ -683,8 +683,6 @@ class SessionStorage:
                 "title": metadata.title or metadata.ai_title or "新会话",
                 "tags": metadata.tags,
                 "preview": metadata.preview or "",
-                # Cache 累计统计（sidecar 文件，未生成时返回空 stats）
-                "cache_stats": cls.read_cache_stats(f),
             })
 
         # 按更新时间倒序
@@ -774,89 +772,6 @@ class SessionStorage:
         if path.exists():
             path.unlink()
             logger.info(f"Deleted session: {session_id}")
-        # 同步删除 sidecar cache 文件
-        cache_path = dd / f"{session_id}.cache.json"
-        if cache_path.exists():
-            cache_path.unlink()
-
-    # ── Cache Stats 侧车存储（用于 UI 会话列表显示 cache 命中率）────
-
-    @staticmethod
-    def _cache_stats_path(jsonl_path: Path) -> Path:
-        """从 jsonl 路径推导 sidecar 路径"""
-        return jsonl_path.with_suffix(".cache.json")
-
-    @staticmethod
-    def read_cache_stats(jsonl_path: Path) -> dict:
-        """读取会话累计 cache 统计
-
-        Returns:
-            dict 含 cached_tokens / input_tokens / total_calls / hit_rate
-            文件不存在返回空 dict
-        """
-        cache_path = SessionStorage._cache_stats_path(jsonl_path)
-        if not cache_path.exists():
-            return {
-                "cached_tokens": 0,
-                "input_tokens": 0,
-                "total_calls": 0,
-                "hit_rate": 0.0,
-            }
-        try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # 兼容字段名
-            return {
-                "cached_tokens": data.get("cached_tokens", 0),
-                "input_tokens": data.get("input_tokens", 0),
-                "total_calls": data.get("total_calls", 0),
-                "hit_rate": data.get("hit_rate", 0.0),
-                "last_updated": data.get("last_updated"),
-            }
-        except Exception as e:
-            logger.warning(f"读取 cache stats 失败 ({cache_path}): {e}")
-            return {
-                "cached_tokens": 0,
-                "input_tokens": 0,
-                "total_calls": 0,
-                "hit_rate": 0.0,
-            }
-
-    @staticmethod
-    def write_cache_stats(jsonl_path: Path, usage) -> None:
-        """增量累加 LLM 调用的 cache 统计并原子写入 sidecar
-
-        Args:
-            jsonl_path: 会话 jsonl 路径
-            usage: UsageStats 对象（提供 cached_tokens / input_tokens）
-        """
-        cache_path = SessionStorage._cache_stats_path(jsonl_path)
-        # 读现有统计
-        existing = SessionStorage.read_cache_stats(jsonl_path)
-        new_cached = existing["cached_tokens"] + (usage.cached_tokens or 0)
-        new_input = existing["input_tokens"] + (usage.input_tokens or 0)
-        new_calls = existing["total_calls"] + 1
-        hit_rate = new_cached / new_input if new_input > 0 else 0.0
-        data = {
-            "cached_tokens": new_cached,
-            "input_tokens": new_input,
-            "total_calls": new_calls,
-            "hit_rate": hit_rate,
-            "last_updated": datetime.now().isoformat(),
-        }
-        # 原子写入：先写 .tmp 再 rename
-        tmp_path = cache_path.with_suffix(".cache.json.tmp")
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            tmp_path.replace(cache_path)
-        except Exception as e:
-            logger.warning(f"写入 cache stats 失败 ({cache_path}): {e}")
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except Exception:
-                    pass
 
     # ── 写队列 + 批量刷新 ─────────────────────────────────────────
 
