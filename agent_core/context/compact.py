@@ -54,6 +54,15 @@ TRUNCATE_RATIO = 0.2
 # 压缩后保留最近 N 条原始消息
 PRESERVED_HEAD_MESSAGES = 6
 
+# preserved head 总 token 预算（防止灌水消息吃光 budget）
+# 实际实现：从后往前累积 turn，超过预算就停
+PRESERVED_HEAD_MAX_TOKENS = 4000
+
+# preserved head 单条超长截断阈值
+# 单条 > 此值 → 截断到 PRESERVED_HEAD_TRUNCATE_CHARS + 省略提示
+PRESERVED_HEAD_MAX_SINGLE_CHARS = 1500
+PRESERVED_HEAD_TRUNCATE_CHARS = 500
+
 # 工具结果截断上限（字符数）
 TOOL_RESULT_TRUNCATE_CHARS = 8000
 
@@ -148,6 +157,215 @@ This summary should be thorough in capturing technical details, code patterns, a
 
 
 # ── 压缩结果 ────────────────────────────────────────────────────
+
+
+# ── Preserved head 构建器 ───────────────────────────────────────
+
+def _estimate_msg_tokens(msg: dict) -> int:
+    """
+    估算单条消息的 token 数（用于 preserved head 预算控制）
+
+    粗估：中文 ~0.7 tok/字，英文 ~0.25 tok/字。
+    这里统一按 0.7 tok/字符 估（偏保守，避免超出 budget）。
+    """
+    content = msg.get("content", "")
+    chars = 0
+    if isinstance(content, str):
+        chars = len(content)
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict):
+                # text block / tool_result block
+                text_val = b.get("text", b.get("content", ""))
+                if isinstance(text_val, str):
+                    chars += len(text_val)
+                elif isinstance(text_val, list):
+                    for sub in text_val:
+                        if isinstance(sub, dict):
+                            chars += len(str(sub.get("text", "")))
+    # 加 role 开销
+    return int(chars * 0.7) + 4
+
+
+def _truncate_msg_content(
+    msg: dict, max_chars: int, truncate_chars: int
+) -> dict:
+    """
+    截断超长消息（返回新 dict，不修改原对象）
+
+    单条 > max_chars 时：保留前 truncate_chars 字 + 省略提示
+    - 字符串 content：直接截断
+    - list content（tool_use/tool_result blocks）：逐 block 截断 text 部分
+    - tool_use 的 name/input 保留（以让 LLM 知道调了什么）
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        if len(content) <= max_chars:
+            return msg
+        new_msg = dict(msg)
+        omitted = len(content) - truncate_chars
+        new_msg["content"] = (
+            content[:truncate_chars]
+            + f"\n\n[... 省略 {omitted} 字符以节省 token ...]"
+        )
+        return new_msg
+    if isinstance(content, list):
+        new_blocks = []
+        truncated_any = False
+        for b in content:
+            if not isinstance(b, dict):
+                new_blocks.append(b)
+                continue
+            btype = b.get("type")
+            if btype == "text":
+                text = str(b.get("text", ""))
+                if len(text) > max_chars:
+                    truncated_any = True
+                    new_b = dict(b)
+                    omitted = len(text) - truncate_chars
+                    new_b["text"] = (
+                        text[:truncate_chars]
+                        + f"\n[... 省略 {omitted} 字符 ...]"
+                    )
+                    new_blocks.append(new_b)
+                else:
+                    new_blocks.append(b)
+            elif btype == "tool_result":
+                # tool_result.content 可能是 str 或 list[dict]
+                tr_content = b.get("content", "")
+                if isinstance(tr_content, str) and len(tr_content) > max_chars:
+                    truncated_any = True
+                    new_b = dict(b)
+                    omitted = len(tr_content) - truncate_chars
+                    new_b["content"] = (
+                        tr_content[:truncate_chars]
+                        + f"\n[... 省略 {omitted} 字符 ...]"
+                    )
+                    new_blocks.append(new_b)
+                else:
+                    new_blocks.append(b)
+            else:
+                # tool_use 等：完整保留（不截断以免破坏 schema）
+                new_blocks.append(b)
+        if truncated_any:
+            new_msg = dict(msg)
+            new_msg["content"] = new_blocks
+            return new_msg
+    return msg
+
+
+def _pair_messages_to_turns(messages: list[dict]) -> list[list[dict]]:
+    """
+    把消息列表配对成 turn（user → assistant → user → ...）
+
+    返回：[[user, assistant], [user, assistant], ...]
+    边界：
+    - 开头的 assistant（无 user）→ 单独成 turn
+    - 结尾未配对的 user → 单独成 turn
+    - tool_use/tool_result 等中间 block 不拆 turn
+    """
+    turns = []
+    pending_user = None
+    for msg in messages:
+        role = msg.get("role")
+        if role == "user":
+            if pending_user is not None:
+                # 上一个 user 没配上 assistant（连续 user）
+                turns.append([pending_user])
+            pending_user = msg
+        elif role == "assistant":
+            if pending_user is not None:
+                turns.append([pending_user, msg])
+                pending_user = None
+            else:
+                # 开头 assistant 无 user
+                turns.append([msg])
+        else:
+            # tool / system / 其他：附加到当前 turn
+            if pending_user is not None:
+                pending_user = None  # 中断配对
+            if turns:
+                turns[-1].append(msg)
+            else:
+                turns.append([msg])
+    if pending_user is not None:
+        turns.append([pending_user])
+    return turns
+
+
+def _build_preserved_head(
+    non_system: list[dict],
+    max_total_tokens: int,
+    max_single_chars: int,
+    truncate_chars: int,
+    max_messages: int,
+) -> list[dict]:
+    """
+    构建 preserved head：配对 + token 预算 + 超长截断
+
+    3 原则：
+    1. **配对**：user+assistant 配对成 turn，不拆散
+    2. **Token 预算**：从后往前累积 turn，趋近预算上限就停
+       （但至少保留 1 个 turn，避免完全没上下文）
+    3. **超长截断**：单条 > max_single_chars → 截断到 truncate_chars
+
+    Args:
+        non_system: 非 system 消息列表（按时间顺序）
+        max_total_tokens: preserved head 总 token 上限
+        max_single_chars: 单条超长截断阈值
+        truncate_chars: 截断后保留多少字符
+        max_messages: 保留消息条数上限（兼容旧 API）
+
+    Returns:
+        保留的消息列表（时间正序）
+    """
+    if not non_system:
+        return []
+
+    # 1. 配对
+    turns = _pair_messages_to_turns(non_system)
+
+    # 2. 从后往前选 turn，直到总 token 趋近预算
+    # 注意：至少保留 1 个 turn（避免完全没上下文）
+    # 关键：超长 turn 先截断再算 token，避免被超长文本“全额”预算挤掉
+    selected_turns = []
+    total = 0
+    msg_count = 0
+    for turn in reversed(turns):
+        # 先截断 turn 内的超长单条，让 token 估算公平
+        truncated_turn = [
+            _truncate_msg_content(m, max_single_chars, truncate_chars)
+            for m in turn
+        ]
+        turn_tokens = sum(_estimate_msg_tokens(m) for m in truncated_turn)
+        if total + turn_tokens > max_total_tokens and selected_turns:
+            logger.debug(
+                f"📦 [Preserved Head] budget={max_total_tokens} "
+                f"已用={total}，加 turn ({turn_tokens} tok) 超预算，停止"
+            )
+            break
+        if msg_count + len(truncated_turn) > max_messages and selected_turns:
+            logger.debug(
+                f"📦 [Preserved Head] max_messages={max_messages} "
+                f"超限，停止"
+            )
+            break
+        selected_turns.insert(0, truncated_turn)
+        total += turn_tokens
+        msg_count += len(truncated_turn)
+
+    # 3. 展平
+    result = []
+    for turn in selected_turns:
+        for m in turn:
+            result.append(m)
+
+    logger.debug(
+        f"📦 [Preserved Head] 选 {len(selected_turns)} turn / "
+        f"{len(result)} 条消息，~{total} tokens，"
+        f"budget={max_total_tokens}/{max_messages}条"
+    )
+    return result
 
 
 # 旧模式：对话转纯文本拼在 user prompt 末尾
@@ -796,7 +1014,7 @@ class CompactOrchestrator:
         """
         组装压缩后的消息列表
 
-        结构：[system] + [summary message] + [最近 N 条原始消息]
+        结构：[system] + [summary message] + [最近对话配对保留]
 
         参考 Claude Code 的压缩后消息结构：
         [System 边界宣告] + [精简摘要] + [最近对话]
@@ -804,7 +1022,12 @@ class CompactOrchestrator:
         策略：
         1. 保留原始消息中的 system prompt（第一条）
         2. 插入摘要消息（role=user，标记为之前对话的摘要）
-        3. 保留最近 N 条非 system 消息
+        3. preserved head 选 3 原则：
+           a. 配对：user+assistant 配成 turn，不拆散
+              （避免 LLM 看到 user 指令但 assistant 被截后困惑）
+           b. Token 预算：从后往前累积 turn，趋近预算上限就停
+              （防止"逐字重复 50 次"这类灌水消息吃光 budget）
+           c. 超长截断：单条 > max_single_chars → 截断到 truncate_chars + 省略提示
         """
         result = []
 
@@ -822,9 +1045,18 @@ class CompactOrchestrator:
             "content": f"[Previous conversation summarized]\n\n{summary}"
         })
 
-        # 3. 保留最近 N 条消息
+        # 3. 配对 + token 预算的 preserved head
         head_count = preserved_head if preserved_head is not None else config.int("PRESERVED_HEAD_MESSAGES", 6)
-        recent = non_system[-head_count:] if len(non_system) > head_count else non_system
+        max_total_tokens = config.int("PRESERVED_HEAD_MAX_TOKENS", 4000)
+        max_single_chars = config.int("PRESERVED_HEAD_MAX_SINGLE_CHARS", 1500)
+        truncate_chars = config.int("PRESERVED_HEAD_TRUNCATE_CHARS", 500)
+        recent = _build_preserved_head(
+            non_system=non_system,
+            max_total_tokens=max_total_tokens,
+            max_single_chars=max_single_chars,
+            truncate_chars=truncate_chars,
+            max_messages=head_count,  # 保留条数上限
+        )
         result.extend(recent)
 
         # ── DEBUG: 构建结果 ─────────────────────────────────────
