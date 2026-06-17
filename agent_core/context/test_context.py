@@ -29,11 +29,10 @@ from agent_core.context.compact import (
     MAX_PTL_RETRIES,
     _build_preserved_head,
     _pair_messages_to_turns,
-    _truncate_msg_content,
     _estimate_msg_tokens,
     PRESERVED_HEAD_MAX_TOKENS,
-    PRESERVED_HEAD_MAX_SINGLE_CHARS,
-    PRESERVED_HEAD_TRUNCATE_CHARS,
+    MAX_PRESERVED_TURNS,
+    MAX_TURN_TOKENS,
 )
 from agent_core.context.manager import ContextManager
 
@@ -1097,13 +1096,19 @@ class TestImageDocumentTokenEstimation:
         assert count < 500  # 不会算到 2000
 
 
-# ── Preserved Head 优化测试 ──────────────────────────────────────
+# ── Preserved Head 优化测试（drop-not-truncate 策略）─────────────
 
 class TestPreservedHeadBuilder:
-    """P6 修复：preserved head 配对 + token 预算 + 超长截断
+    """P6 重构：preserved head 配对 + token 预算 + 整对丢弃
 
-    原 bug：non_system[-6:] 直接拿最近 6 条，灌水消息（"逐字重复 50 次"）
-    完整保留，占满 98% budget。压缩后 LLM 还是看到一堆灌水内容。
+    原方案（已废弃）：non_system[-6:] 取最近 6 条
+    - 灌水消息（如"逐字重复 50 次"）完整保留，吃光 budget
+    - 截断到 500 chars 会破坏代码/JSON/Markdown 结构，误导 LLM
+
+    新方案（用户提议）：
+    1. 配对：user+assistant 配成 turn，不拆散
+    2. Drop 不 Truncate：单 turn > MAX_TURN_TOKENS → 整 turn 丢弃
+    3. 变量数量 + 上限：按 budget 决定保留几对，max_turns 封顶
     """
 
     def test_pair_user_assistant_into_turns(self):
@@ -1129,55 +1134,18 @@ class TestPreservedHeadBuilder:
             {"role": "assistant", "content": "a2"},
         ]
         turns = _pair_messages_to_turns(msgs)
-        # u1 单独 + [u2, a2] 配对
         assert len(turns) == 2
         assert turns[0] == [{"role": "user", "content": "u1"}]
         assert turns[1] == [{"role": "user", "content": "u2"},
                              {"role": "assistant", "content": "a2"}]
 
-    def test_truncate_short_message_unchanged(self):
-        """短消息不截断"""
-        msg = {"role": "assistant", "content": "短回答"}
-        result = _truncate_msg_content(msg, max_chars=1500, truncate_chars=500)
-        assert result == msg  # 不修改
+    def test_empty_messages_returns_empty(self):
+        """空消息列表返回空"""
+        result = _build_preserved_head(non_system=[])
+        assert result == []
 
-    def test_truncate_long_text_message(self):
-        """长 assistant 文本被截断"""
-        long_text = "x" * 3000
-        msg = {"role": "assistant", "content": long_text}
-        result = _truncate_msg_content(msg, max_chars=1500, truncate_chars=500)
-        assert len(result["content"]) < 1000  # 500 + 省略提示
-        assert "省略 2500 字符" in result["content"]
-        assert msg["content"] == long_text  # 原对象未修改
-
-    def test_truncate_tool_result_block(self):
-        """tool_result 长内容被截断"""
-        msg = {
-            "role": "user",
-            "content": [
-                {"type": "tool_result", "tool_use_id": "t1",
-                 "content": "y" * 3000}
-            ]
-        }
-        result = _truncate_msg_content(msg, max_chars=1500, truncate_chars=500)
-        tr = result["content"][0]
-        assert "省略" in tr["content"]
-        assert len(tr["content"]) < 1000
-
-    def test_preserve_tool_use_block_unchanged(self):
-        """tool_use block 不截断（避免破坏 schema）"""
-        msg = {
-            "role": "assistant",
-            "content": [
-                {"type": "tool_use", "id": "tu_1", "name": "search",
-                 "input": {"q": "x" * 5000}}
-            ]
-        }
-        result = _truncate_msg_content(msg, max_chars=1500, truncate_chars=500)
-        assert result["content"][0]["input"]["q"] == "x" * 5000  # 未截断
-
-    def test_build_preserved_head_normal_case(self):
-        """正常情况：6 条短对话完整保留"""
+    def test_normal_short_dialogue_preserved(self):
+        """正常短对话：所有 turn 完整保留"""
         msgs = [
             {"role": "user", "content": "u1"},
             {"role": "assistant", "content": "a1"},
@@ -1189,16 +1157,17 @@ class TestPreservedHeadBuilder:
         result = _build_preserved_head(
             non_system=msgs,
             max_total_tokens=4000,
-            max_single_chars=1500,
-            truncate_chars=500,
-            max_messages=6,
+            max_turns=3,
+            max_single_turn_tokens=2000,
         )
+        # 3 个 turn × 2 msg = 6 条
         assert len(result) == 6
+        assert result[0]["content"] == "u1"
+        assert result[-1]["content"] == "a3"
 
-    def test_build_preserved_head_truncates_flooding(self):
-        """P6 核心场景：灌水消息被截断到 500 字符"""
-        # 模拟 7f071c62 场景：用户让"逐字重复 50 次"，assistant 输出 13187 字符
-        flood = "x" * 13187
+    def test_drop_oversized_turn(self):
+        """P6 核心：灌水 turn 整 turn 丢弃，不截断"""
+        flood = "x" * 13187  # 模拟"逐字重复 50 次"输出
         msgs = [
             {"role": "user", "content": "请逐字重复 50 次"},
             {"role": "assistant", "content": flood},
@@ -1208,65 +1177,110 @@ class TestPreservedHeadBuilder:
         result = _build_preserved_head(
             non_system=msgs,
             max_total_tokens=4000,
-            max_single_chars=1500,
-            truncate_chars=500,
-            max_messages=6,
+            max_turns=3,
+            max_single_turn_tokens=2000,
         )
-        # 灌水被截断
-        flood_msg = [m for m in result if "x" in m["content"]][0]
-        assert len(flood_msg["content"]) < 1000  # 截断到 500 + 提示
-        assert "省略" in flood_msg["content"]
+        # 灌水 turn 整 turn 丢弃，只保留"我是谁" turn
+        assert len(result) == 2
+        assert result[0]["content"] == "我是谁"
+        assert result[1]["content"] == "你好小明"
+        # 灌水 turn 完全不出现
+        assert not any("x" in m["content"] for m in result)
+        # 灌水 turn 的 user 指令也一并丢弃（不拆 turn）
+        assert not any("逐字重复" in m["content"] for m in result)
 
-    def test_build_preserved_head_respects_budget(self):
-        """超 token 预算的 turn 不被选"""
-        # 构造 10 个 1000 chars 的 turn（每个 ~700 tok）
+    def test_respects_max_turns_upper_limit(self):
+        """turn 数不超过 max_turns 上限"""
+        # 5 个 turn，每个都短
         msgs = []
-        for i in range(10):
-            msgs.append({"role": "user", "content": f"u{i} " + "x" * 1000})
-            msgs.append({"role": "assistant", "content": f"a{i} " + "x" * 1000})
+        for i in range(5):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
         result = _build_preserved_head(
             non_system=msgs,
-            max_total_tokens=4000,  # 约能装 5-6 turn
-            max_single_chars=1500,
-            truncate_chars=500,
-            max_messages=6,
+            max_total_tokens=4000,
+            max_turns=3,  # 限制最多 3 对
+            max_single_turn_tokens=2000,
         )
-        # 总 token 不应超太多（max_messages=6 会先限住）
-        total = sum(_estimate_msg_tokens(m) for m in result)
-        # 因为 max_messages=6，且每条都被截断到 500 字符
-        # 6 * 500 * 0.7 = 2100 < 4000
-        assert total < 4000, f"超 budget: {total} tok"
+        # 只保留最后 3 turn（最近的）
+        assert len(result) == 6
+        assert result[0]["content"] == "u2"
+        assert result[-1]["content"] == "a4"
 
-    def test_build_preserved_head_at_least_one_turn(self):
-        """即使超 budget 也至少保留 1 个 turn（避免空上下文）"""
-        # 1 个 10000 chars 的大 turn（远超 budget）
+    def test_respects_token_budget(self):
+        """总 token 超 max_total_tokens 停止"""
+        # 4 个 turn，每个 ~500 tok（700 chars）
+        msgs = []
+        for i in range(4):
+            msgs.append({
+                "role": "user",
+                "content": f"u{i} " + "x" * 700,
+            })
+            msgs.append({
+                "role": "assistant",
+                "content": f"a{i} " + "x" * 700,
+            })
+        # max_total=2000 → 约能装 2 个 turn（每个 980 tok）
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=2000,
+            max_turns=3,
+            max_single_turn_tokens=2000,
+        )
+        # 2 turn × 2 msg = 4 条
+        assert len(result) == 4
+        # 选的是后 2 个 turn（最近的）
+        assert "u2" in result[0]["content"]
+        assert "a3" in result[-1]["content"]
+
+    def test_oversized_turns_dont_count_toward_max_turns(self):
+        """超大 turn 跳过，不占 max_turns 名额"""
+        # 4 turn：2 个超大 + 2 个小
         msgs = [
-            {"role": "user", "content": "x" * 10000},
-            {"role": "assistant", "content": "y" * 10000},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1 " + "x" * 5000},  # ~3500 tok, 超
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2 " + "x" * 5000},  # ~3500 tok, 超
+            {"role": "user", "content": "u3 short"},
+            {"role": "assistant", "content": "a3 short"},
+            {"role": "user", "content": "u4 short"},
+            {"role": "assistant", "content": "a4 short"},
         ]
         result = _build_preserved_head(
             non_system=msgs,
-            max_total_tokens=100,  # 极小 budget
-            max_single_chars=1500,
-            truncate_chars=500,
-            max_messages=6,
-        )
-        assert len(result) == 2  # 至少保留 1 turn
-
-    def test_build_preserved_head_empty(self):
-        """空消息列表返回空"""
-        result = _build_preserved_head(
-            non_system=[],
             max_total_tokens=4000,
-            max_single_chars=1500,
-            truncate_chars=500,
-            max_messages=6,
+            max_turns=3,  # 限制 3 对
+            max_single_turn_tokens=2000,
         )
-        assert result == []
+        # 跳过 2 个灌水 turn，保留 2 个小 turn
+        # 2 turn × 2 msg = 4 条
+        assert len(result) == 4
+        assert "u3" in result[0]["content"]
+        assert "a4" in result[-1]["content"]
+        # 灌水 turn 完全不出现
+        assert not any("x" * 10 in m["content"] for m in result)
 
-    def test_compacted_uses_budget_strategy(self):
-        """端到端：_build_compacted_messages 用新策略"""
-        # 模拟 7f071c62 灌水场景
+    def test_all_oversized_fallback_to_smallest(self):
+        """所有 turn 都超 → 兜底选最小的"""
+        msgs = [
+            {"role": "user", "content": "u1 " + "x" * 5000},  # 超大
+            {"role": "assistant", "content": "a1 " + "x" * 5000},  # 超大
+            {"role": "user", "content": "u2 " + "x" * 3000},  # 稍小
+            {"role": "assistant", "content": "a2 " + "x" * 3000},  # 稍小
+        ]
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+            max_single_turn_tokens=2000,
+        )
+        # 兜底选 turn 2（稍小）
+        assert len(result) == 2
+        assert "u2" in result[0]["content"]
+
+    def test_compacted_uses_drop_strategy(self):
+        """端到端：_build_compacted_messages 用 drop 策略"""
+        # 模拟 7f071c62：灌水 turn + 正常 turn
         flood = "灌水 " * 3000  # ~9000 chars
         messages = [
             {"role": "system", "content": "You are helpful"},
@@ -1274,6 +1288,8 @@ class TestPreservedHeadBuilder:
             {"role": "assistant", "content": flood},
             {"role": "user", "content": "我是谁"},
             {"role": "assistant", "content": "你好小明"},
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好，小明！很高兴见到你"},
         ]
         compactor = CompactOrchestrator(
             llm_router=None,  # 不调用 LLM
@@ -1284,11 +1300,13 @@ class TestPreservedHeadBuilder:
             summary="这是摘要内容",
             original=messages,
         )
-        # 1 system + 1 summary + 保留的 turn
+        # 1 system + 1 summary + 2 turn × 2 msg = 6 条
         assert compacted[0]["role"] == "system"
         assert compacted[1]["role"] == "user"  # summary
         assert "这是摘要" in compacted[1]["content"]
-        # 灌水消息必须被截断
-        flood_msg = [m for m in recent if "灌水" in m["content"]]
-        assert len(flood_msg) == 1
-        assert len(flood_msg[0]["content"]) < 1000
+        # 灌水 turn 完全消失（包括 user 指令）
+        assert not any("灌水" in str(m.get("content", "")) for m in recent)
+        assert not any("逐字重复" in str(m.get("content", "")) for m in recent)
+        # 保留"我是谁"和"你好"两 turn
+        assert any("我是谁" in str(m.get("content", "")) for m in recent)
+        assert any("你好" in str(m.get("content", "")) for m in recent)
