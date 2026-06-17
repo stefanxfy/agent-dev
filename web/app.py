@@ -766,15 +766,17 @@ if prompt := st.chat_input("输入消息..."):
         # 流式结束：清理 UI
         text_placeholder.markdown(full_text)
         # P3 修复：不要再 thinking_expander.empty()，否则占位上的内容会被清空
-        # P3 修复：思考过程不存在时显示友好提示（GLM/OpenAI 不支持原生 thinking）
         if thinking_text:
             thinking_placeholder.markdown(
                 f"**💭 LLM 思考过程**\n\n```\n{thinking_text}\n```"
             )
         else:
-            # 当前模型/Provider 不支持原生思考过程（zhipu/openai）
+            # 注意：GLM/Claude 都支持思考过程。空的原因可能是：
+            # 1) 本轮没启动思考（请求未传 enable_thinking/未触发）
+            # 2) Provider 返回了空 reasoning_content
+            # 3) Compact 路径（LLM 只输出 summary，不算思考）
             thinking_placeholder.caption(
-                f"💡 当前模型 {model} 未提供思考过程（仅 Anthropic Claude 3.7+ 支持）"
+                f"💭 本轮未返回思考过程（{model}）"
             )
         
         # P2 改进：结构化显示工具调用
