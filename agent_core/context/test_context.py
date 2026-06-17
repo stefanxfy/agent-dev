@@ -32,7 +32,6 @@ from agent_core.context.compact import (
     _estimate_msg_tokens,
     PRESERVED_HEAD_MAX_TOKENS,
     MAX_PRESERVED_TURNS,
-    MAX_TURN_TOKENS,
 )
 from agent_core.context.manager import ContextManager
 
@@ -1096,19 +1095,17 @@ class TestImageDocumentTokenEstimation:
         assert count < 500  # 不会算到 2000
 
 
-# ── Preserved Head 优化测试（drop-not-truncate 策略）─────────────
+
+# ── Preserved Head 测试（连续性优先）──────────────────────────
 
 class TestPreservedHeadBuilder:
-    """P6 重构：preserved head 配对 + token 预算 + 整对丢弃
+    """preserved head 配对 + max_turns 硬停，保证对话连续性
 
-    原方案（已废弃）：non_system[-6:] 取最近 6 条
-    - 灌水消息（如"逐字重复 50 次"）完整保留，吃光 budget
-    - 截断到 500 chars 会破坏代码/JSON/Markdown 结构，误导 LLM
-
-    新方案（用户提议）：
-    1. 配对：user+assistant 配成 turn，不拆散
-    2. Drop 不 Truncate：单 turn > MAX_TURN_TOKENS → 整 turn 丢弃
-    3. 变量数量 + 上限：按 budget 决定保留几对，max_turns 封顶
+    设计原则（用户最终方案）：
+    1. 配对：user+assistant 配对成 turn，不拆散
+    2. max_turns 硬停：达到 N turn 立即停止
+    3. max_total_tokens 软限制：超 budget 不停（连续性优先）
+    4. 不丢弃 turn：保证 preserved head 是连续时段
     """
 
     def test_pair_user_assistant_into_turns(self):
@@ -1135,63 +1132,28 @@ class TestPreservedHeadBuilder:
         ]
         turns = _pair_messages_to_turns(msgs)
         assert len(turns) == 2
-        assert turns[0] == [{"role": "user", "content": "u1"}]
-        assert turns[1] == [{"role": "user", "content": "u2"},
-                             {"role": "assistant", "content": "a2"}]
 
     def test_empty_messages_returns_empty(self):
         """空消息列表返回空"""
-        result = _build_preserved_head(non_system=[])
-        assert result == []
+        assert _build_preserved_head(non_system=[]) == []
 
-    def test_normal_short_dialogue_preserved(self):
-        """正常短对话：所有 turn 完整保留"""
-        msgs = [
-            {"role": "user", "content": "u1"},
-            {"role": "assistant", "content": "a1"},
-            {"role": "user", "content": "u2"},
-            {"role": "assistant", "content": "a2"},
-            {"role": "user", "content": "u3"},
-            {"role": "assistant", "content": "a3"},
-        ]
+    def test_normal_short_dialogue_all_preserved(self):
+        """正常短对话：所有 turn 完整保留（未达上限）"""
+        msgs = []
+        for i in range(3):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
         result = _build_preserved_head(
             non_system=msgs,
             max_total_tokens=4000,
             max_turns=3,
-            max_single_turn_tokens=2000,
         )
-        # 3 个 turn × 2 msg = 6 条
         assert len(result) == 6
-        assert result[0]["content"] == "u1"
-        assert result[-1]["content"] == "a3"
+        assert result[0]["content"] == "u0"
+        assert result[-1]["content"] == "a2"
 
-    def test_drop_oversized_turn(self):
-        """P6 核心：灌水 turn 整 turn 丢弃，不截断"""
-        flood = "x" * 13187  # 模拟"逐字重复 50 次"输出
-        msgs = [
-            {"role": "user", "content": "请逐字重复 50 次"},
-            {"role": "assistant", "content": flood},
-            {"role": "user", "content": "我是谁"},
-            {"role": "assistant", "content": "你好小明"},
-        ]
-        result = _build_preserved_head(
-            non_system=msgs,
-            max_total_tokens=4000,
-            max_turns=3,
-            max_single_turn_tokens=2000,
-        )
-        # 灌水 turn 整 turn 丢弃，只保留"我是谁" turn
-        assert len(result) == 2
-        assert result[0]["content"] == "我是谁"
-        assert result[1]["content"] == "你好小明"
-        # 灌水 turn 完全不出现
-        assert not any("x" in m["content"] for m in result)
-        # 灌水 turn 的 user 指令也一并丢弃（不拆 turn）
-        assert not any("逐字重复" in m["content"] for m in result)
-
-    def test_respects_max_turns_upper_limit(self):
-        """turn 数不超过 max_turns 上限"""
-        # 5 个 turn，每个都短
+    def test_max_turns_hard_cap_stops_iteration(self):
+        """max_turns 硬停：达到 N turn 立即停"""
         msgs = []
         for i in range(5):
             msgs.append({"role": "user", "content": f"u{i}"})
@@ -1199,114 +1161,128 @@ class TestPreservedHeadBuilder:
         result = _build_preserved_head(
             non_system=msgs,
             max_total_tokens=4000,
-            max_turns=3,  # 限制最多 3 对
-            max_single_turn_tokens=2000,
+            max_turns=3,
         )
-        # 只保留最后 3 turn（最近的）
         assert len(result) == 6
         assert result[0]["content"] == "u2"
         assert result[-1]["content"] == "a4"
 
-    def test_respects_token_budget(self):
-        """总 token 超 max_total_tokens 停止"""
-        # 4 个 turn，每个 ~500 tok（700 chars）
+    def test_max_total_tokens_is_soft_limit(self):
+        """max_total_tokens 软限制：超 budget 不停（连续性优先）"""
+        # 4 turn, 每个 ~980 tok
         msgs = []
         for i in range(4):
-            msgs.append({
-                "role": "user",
-                "content": f"u{i} " + "x" * 700,
-            })
-            msgs.append({
-                "role": "assistant",
-                "content": f"a{i} " + "x" * 700,
-            })
-        # max_total=2000 → 约能装 2 个 turn（每个 980 tok）
+            msgs.append({"role": "user", "content": f"u{i} " + "x" * 700})
+            msgs.append({"role": "assistant", "content": f"a{i} " + "x" * 700})
         result = _build_preserved_head(
             non_system=msgs,
-            max_total_tokens=2000,
-            max_turns=3,
-            max_single_turn_tokens=2000,
+            max_total_tokens=2000,  # 软限制（超了也继续）
+            max_turns=4,
         )
-        # 2 turn × 2 msg = 4 条
-        assert len(result) == 4
-        # 选的是后 2 个 turn（最近的）
-        assert "u2" in result[0]["content"]
+        # 4 turn × 2 = 8 条全保留（超 budget）
+        assert len(result) == 8
+        assert "u0" in result[0]["content"]
         assert "a3" in result[-1]["content"]
 
-    def test_oversized_turns_dont_count_toward_max_turns(self):
-        """超大 turn 跳过，不占 max_turns 名额"""
-        # 4 turn：2 个超大 + 2 个小
+    def test_oversized_turn_kept_for_continuity(self):
+        """核心：超大 turn 保留（连续性优先），budget 会被超"""
+        flood = "x" * 13187
         msgs = [
-            {"role": "user", "content": "u1"},
-            {"role": "assistant", "content": "a1 " + "x" * 5000},  # ~3500 tok, 超
-            {"role": "user", "content": "u2"},
-            {"role": "assistant", "content": "a2 " + "x" * 5000},  # ~3500 tok, 超
-            {"role": "user", "content": "u3 short"},
-            {"role": "assistant", "content": "a3 short"},
-            {"role": "user", "content": "u4 short"},
-            {"role": "assistant", "content": "a4 short"},
-        ]
-        result = _build_preserved_head(
-            non_system=msgs,
-            max_total_tokens=4000,
-            max_turns=3,  # 限制 3 对
-            max_single_turn_tokens=2000,
-        )
-        # 跳过 2 个灌水 turn，保留 2 个小 turn
-        # 2 turn × 2 msg = 4 条
-        assert len(result) == 4
-        assert "u3" in result[0]["content"]
-        assert "a4" in result[-1]["content"]
-        # 灌水 turn 完全不出现
-        assert not any("x" * 10 in m["content"] for m in result)
-
-    def test_all_oversized_fallback_to_smallest(self):
-        """所有 turn 都超 → 兜底选最小的"""
-        msgs = [
-            {"role": "user", "content": "u1 " + "x" * 5000},  # 超大
-            {"role": "assistant", "content": "a1 " + "x" * 5000},  # 超大
-            {"role": "user", "content": "u2 " + "x" * 3000},  # 稍小
-            {"role": "assistant", "content": "a2 " + "x" * 3000},  # 稍小
+            {"role": "user", "content": "turn1 user"},
+            {"role": "assistant", "content": "turn1 assistant"},
+            {"role": "user", "content": "turn2 user"},
+            {"role": "assistant", "content": "turn2 assistant"},
+            {"role": "user", "content": "turn3 灌水 user"},
+            {"role": "assistant", "content": flood},  # 灌水
+            {"role": "user", "content": "turn4 user"},
+            {"role": "assistant", "content": "turn4 assistant"},
         ]
         result = _build_preserved_head(
             non_system=msgs,
             max_total_tokens=4000,
             max_turns=3,
-            max_single_turn_tokens=2000,
         )
-        # 兜底选 turn 2（稍小）
-        assert len(result) == 2
-        assert "u2" in result[0]["content"]
+        # max_turns=3 硬限 → 取最近 3 turn：turn2, turn3(灌水), turn4
+        # 连续：3 turn 连续包含
+        assert len(result) == 6
+        # 保留的是 turn2/turn3/turn4（连续）
+        assert "turn2 user" in str(result[0]["content"])
+        assert "turn2 assistant" in str(result[1]["content"])
+        assert "turn3 灌水 user" in str(result[2]["content"])
+        assert "x" in str(result[3]["content"])  # 灌水保留
+        assert "turn4 user" in str(result[4]["content"])
+        assert "turn4 assistant" in str(result[5]["content"])
+        # turn1 不在
+        assert not any("turn1" in str(m.get("content", "")) for m in result)
+        # budget 会被超（软限制）
+        total = sum(len(str(m.get("content", ""))) for m in result)
+        assert total > 4000
 
-    def test_compacted_uses_drop_strategy(self):
-        """端到端：_build_compacted_messages 用 drop 策略"""
-        # 模拟 7f071c62：灌水 turn + 正常 turn
-        flood = "灌水 " * 3000  # ~9000 chars
+    def test_continuity_no_gaps(self):
+        """连续性：保留的 turn 在原消息列表中必须相邻（无 gap）"""
+        msgs = []
+        for i in range(10):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+        )
+        assert len(result) == 6
+        assert result[0]["content"] == "u7"
+        assert result[1]["content"] == "a7"
+        assert result[2]["content"] == "u8"
+        assert result[3]["content"] == "a8"
+        assert result[4]["content"] == "u9"
+        assert result[5]["content"] == "a9"
+        assert "u5" not in [m["content"] for m in result]
+        assert "u6" not in [m["content"] for m in result]
+
+    def test_orphan_assistant_turn_handled(self):
+        """孤儿 assistant turn（无配对 user）也作为 turn 保留"""
+        msgs = [
+            {"role": "assistant", "content": "orphan灌水 assistant"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+        )
+        # 3 turn 都保留（含孤儿）
+        assert len(result) == 3
+        assert "orphan" in str(result[0]["content"])
+
+    def test_compacted_uses_continuity_strategy(self):
+        """端到端：_build_compacted_messages 用连续性策略"""
+        flood = "灌水 " * 3000
         messages = [
             {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "请逐字重复 50 次"},
-            {"role": "assistant", "content": flood},
-            {"role": "user", "content": "我是谁"},
-            {"role": "assistant", "content": "你好小明"},
-            {"role": "user", "content": "你好"},
-            {"role": "assistant", "content": "你好，小明！很高兴见到你"},
+            {"role": "user", "content": "turn1: 我是谁"},
+            {"role": "assistant", "content": "turn1: 你好小明"},
+            {"role": "user", "content": "turn2: 请逐字重复 50 次"},
+            {"role": "assistant", "content": flood},  # 灌水
+            {"role": "user", "content": "turn3: 你好"},
+            {"role": "assistant", "content": "turn3: 你好，小明"},
         ]
         compactor = CompactOrchestrator(
-            llm_router=None,  # 不调用 LLM
+            llm_router=None,
             budget_manager=None,
             token_counter=SimpleTokenCounter(),
         )
         compacted, recent = compactor._build_compacted_messages(
-            summary="这是摘要内容",
+            summary="这是摘要",
             original=messages,
         )
-        # 1 system + 1 summary + 2 turn × 2 msg = 6 条
         assert compacted[0]["role"] == "system"
-        assert compacted[1]["role"] == "user"  # summary
-        assert "这是摘要" in compacted[1]["content"]
-        # 灌水 turn 完全消失（包括 user 指令）
-        assert not any("灌水" in str(m.get("content", "")) for m in recent)
-        assert not any("逐字重复" in str(m.get("content", "")) for m in recent)
-        # 保留"我是谁"和"你好"两 turn
-        assert any("我是谁" in str(m.get("content", "")) for m in recent)
-        assert any("你好" in str(m.get("content", "")) for m in recent)
+        assert compacted[1]["role"] == "user"
+        # 连续性：3 turn 都保留（含 turn2 灌水）
+        assert len(recent) == 6
+        assert "turn1" in str(recent[0]["content"])
+        assert "turn1" in str(recent[1]["content"])
+        assert "turn2" in str(recent[2]["content"])
+        assert "灌水" in str(recent[3]["content"])
+        assert "turn3" in str(recent[4]["content"])
+        assert "turn3" in str(recent[5]["content"])

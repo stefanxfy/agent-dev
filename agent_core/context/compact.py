@@ -51,28 +51,30 @@ MAX_PTL_RETRIES = 3
 # 每次剥掉最旧的 20% 消息
 TRUNCATE_RATIO = 0.2
 
-# 压缩后保留最近对话（配对 turn，不一定固定 N 条）
+# 压缩后保留最近对话（配对 turn，保证连续性）
 #
 # 设计原则（用户提议）：
 # 1. 配对：user+assistant 配对成 turn，不拆散
-# 2. 整对丢弃：单 turn 超 MAX_TURN_TOKENS → 整 turn 丢弃（不截断）
-#    - 避免截断破坏代码/JSON/Markdown 结构
-#    - 灌水 turn（如"逐字重复 50 次"）整 turn 丢弃，让 LLM 不再看垃圾
-# 3. 变量数量：不是固定 6 条，而是按 budget 决定保留几对
-#    - turn 数有 MAX_PRESERVED_TURNS 上限
+# 2. 两个限制：达到任一即停
+#    - MAX_PRESERVED_TURNS：turn 对数上限
+#    - PRESERVED_HEAD_MAX_TOKENS：总 token 预算
+# 3. **不丢弃 turn**：保证 preserved head 是连续时段
+#    - 丢弃超大 turn 会让前后出现 “洞”，破坏连续性
+#    - 超大 turn 的内容交给 summary 负责压缩
+#
+# 7f071c62 实例：3 个 turn （最近→最远）
+#   turn3 "你好→你好小明" ≈ 23 tok  → 保留
+#   turn2 "重复 50 次→13187 字符"  ≈ 9230 tok  → 保留（连续性优先）
+#   turn1 "我是谁→你好小明" ≈ 5 tok  → 超预算，停
+# 结果：turn2+turn3 （连续 4 条），灌水交给 summary
 
 # preserved head 总 token 预算
 PRESERVED_HEAD_MAX_TOKENS = 4000
 
 # preserved head 最多保留几对（turn = user + assistant）
-# 注意：丢弃的超大 turn 不占名额
 MAX_PRESERVED_TURNS = 3
 
-# 单 turn 超过此 token 数 → 整 turn 丢弃（不截断）
-# 7f071c62 的"逐字重复 50 次" 灌水 turn ≈ 9230 tok，会被整 turn 丢弃
-MAX_TURN_TOKENS = 2000
-
-# 旧常量（保留为默认参数，兼容老 API 调用）
+# 旧常量（保留以防有外部代码引用）
 PRESERVED_HEAD_MESSAGES = 6
 
 # 工具结果截断上限（字符数）
@@ -243,35 +245,35 @@ def _build_preserved_head(
     non_system: list[dict],
     max_total_tokens: int = 4000,
     max_turns: int = 3,
-    max_single_turn_tokens: int = 2000,
 ) -> list[dict]:
     """
-    构建 preserved head：配对 + token 预算 + 整对丢弃
+    构建 preserved head：配对 + max_turns 硬停，保证对话连续性
 
-    3 原则（用户提议，代替之前的"截断"策略）：
+    设计原则（用户提议的 v3）：
     1. **配对**：user+assistant 配对成 turn，不拆散
-    2. **Drop 不 Truncate**：单 turn > max_single_turn_tokens → 整 turn 丢弃
-       - 避免截断破坏代码/JSON/Markdown 闭合
-       - 灌水 turn（如"逐字重复 50 次" 13187 字符）整 turn 丢弃
-         → LLM 不再看 500 字符垃圾
-    3. **变量数量**：不是固定 6 条，而是按 budget 决定保留几对
-       - turn 数有 max_turns 上限（默认 3 对）
-       - 丢弃的超大 turn 不占名额
+    2. **max_turns 硬停**：达到 N 对 turn 立即停止
+    3. **max_total_tokens 软限制**：仅 logging，不停止
+       - 原因：如果 budget 硬停，““灌水 turn 在中间”” 场景会让上下文变孤立
+       - 例：4 turn 中 turn3 灌水 → 硬停得 [turn4] （孤立）
+       - 软限制得 [turn2, turn3, turn4] （连续）
+    4. **不丢弃 turn**：保证 preserved head 是连续时段
+
+    为什么不用 MAX_TURN_TOKENS 丢弃超大 turn？
+    - 丢弃超大 turn 会让前后 turn 出现 “洞”（不连续）
+    - 例如：turn1→turn2(灌水)→turn3，drop turn2 得 [turn1, turn3]（中间缺一段）
 
     迭代顺序：从后往前（最近的优先）
-    - 最近 turn 总是被优先考虑
-    - 超大 turn 跳过（不占 max_turns 名额）
-    - 总 token 超预算停止（但保证至少 1 个 turn）
-    - 达到 max_turns 上限停止
+    - max_turns 限制：已经有 N turn → 停
+    - max_total_tokens 仅记录超 budget 情况（连续性优先）
+    - 单 turn 超大：依然包含（保证最近几个 turn 是连续的）
 
     Args:
         non_system: 非 system 消息列表（按时间正序）
-        max_total_tokens: preserved head 总 token 预算
-        max_turns: 最多保留几对（turn = user + assistant）
-        max_single_turn_tokens: 单 turn 超此值 → 整 turn 丢弃
+        max_total_tokens: preserved head 总 token 预算（软限制）
+        max_turns: 最多保留几对（turn = user + assistant），硬限制
 
     Returns:
-        保留的消息列表（时间正序）
+        保留的消息列表（时间正序，连续）
     """
     if not non_system:
         return []
@@ -279,55 +281,38 @@ def _build_preserved_head(
     # 1. 配对
     turns = _pair_messages_to_turns(non_system)
 
-    # 2. 从后往前选 turn
+    # 2. 从后往前选 turn，直到 max_turns 硬停
+    # max_total_tokens 是软限制：超了也继续（连续性优先）
     selected_turns = []
     total = 0
 
     for turn in reversed(turns):
-        # 不截断，直接算 token
         turn_tokens = sum(_estimate_msg_tokens(m) for m in turn)
 
-        # 原则 2: 整 turn 超大 → 跳过（不占名额）
-        if turn_tokens > max_single_turn_tokens:
-            logger.debug(
-                f"📦 [Preserved Head] drop oversized turn "
-                f"({turn_tokens} > {max_single_turn_tokens} tok, "
-                f"{len(turn)} msg)"
-            )
-            continue
-
-        # 原则 3a: turn 数已到上限 → 停止
-        if selected_turns and len(selected_turns) >= max_turns:
+        # 硬限制: turn 数已到上限
+        if len(selected_turns) >= max_turns:
             break
 
-        # 原则 3b: 总 token 超预算 → 停止（但至少 1 个）
-        if selected_turns and total + turn_tokens > max_total_tokens:
-            break
-
+        # 总是包含（保证连续性）
         selected_turns.insert(0, turn)
         total += turn_tokens
 
-    # 边界：所有 turn 都超 max_single_turn_tokens → 选最小的
-    if not selected_turns and turns:
-        smallest = min(
-            turns,
-            key=lambda t: sum(_estimate_msg_tokens(m) for m in t),
-        )
-        selected_turns = [smallest]
-        total = sum(_estimate_msg_tokens(m) for m in smallest)
+    # 3. 软限制检查：超 budget 仅记录，不拆 turn
+    if total > max_total_tokens and selected_turns:
         logger.debug(
-            f"📦 [Preserved Head] all turns oversized, "
-            f"fallback to smallest ({total} tok)"
+            f"📦 [Preserved Head] over budget (soft): "
+            f"{total} > {max_total_tokens} tok, "
+            f"keep all for continuity ({len(selected_turns)} turn)"
         )
 
-    # 3. 展平
+    # 4. 展平
     result = [m for turn in selected_turns for m in turn]
 
     msg_count = len(result)
     logger.debug(
         f"📦 [Preserved Head] 选 {len(selected_turns)} turn / "
         f"{msg_count} msg, ~{total} tok, "
-        f"budget={max_total_tokens}tok/{max_turns}turns"
+        f"hard_cap={max_turns}turns / soft_budget={max_total_tokens}tok"
     )
     return result
 
@@ -987,11 +972,10 @@ class CompactOrchestrator:
         策略：
         1. 保留原始消息中的 system prompt（第一条）
         2. 插入摘要消息（role=user，标记为之前对话的摘要）
-        3. preserved head 选 3 原则（用户提议）：
+        3. preserved head 选 2 原则（用户提议，保证连续性）：
            a. 配对：user+assistant 配成 turn，不拆散
-           b. Drop 不 Truncate：单 turn > MAX_TURN_TOKENS → 整 turn 丢弃
-              （避免截断破坏代码/JSON 结构，避免 LLM 看 500 字符垃圾）
-           c. 变量数量 + 上限：按 budget 决定保留几对，max_turns 封顶
+           b. max_turns 硬停 + max_total_tokens 软限制
+              （连续性优先，灌水 turn 也不拆）
         """
         result = []
 
@@ -1009,10 +993,9 @@ class CompactOrchestrator:
             "content": f"[Previous conversation summarized]\n\n{summary}"
         })
 
-        # 3. 配对 + token 预算 + 整对丢弃的 preserved head
+        # 3. 配对 + 双限制的 preserved head（保证连续性）
         max_total_tokens = config.int("PRESERVED_HEAD_MAX_TOKENS", 4000)
         max_turns = config.int("MAX_PRESERVED_TURNS", 3)
-        max_single_turn_tokens = config.int("MAX_TURN_TOKENS", 2000)
         # 兼容老 API：preserved_head=N 仍可调用，但语义是"最大 turn 数"上限
         if preserved_head is not None:
             # 老接口：preserved_head=6 表示 6 条 = 3 对
@@ -1021,7 +1004,6 @@ class CompactOrchestrator:
             non_system=non_system,
             max_total_tokens=max_total_tokens,
             max_turns=max_turns,
-            max_single_turn_tokens=max_single_turn_tokens,
         )
         result.extend(recent)
 
