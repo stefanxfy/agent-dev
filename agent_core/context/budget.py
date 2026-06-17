@@ -1,7 +1,7 @@
 """
 ContextBudgetManager — 上下文预算管理器
 参考：Claude Code src/services/compact/autoCompact.ts
-适配：支持多模型，配置由 MODEL_CONFIGS 提供，硬编码值仅作后备
+适配：支持多模型，配置通过 agent_core.config.Config 从 .env 读取
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional, Protocol, runtime_checkable
 
+from agent_core.config import config
+
 logger = logging.getLogger("context.budget")
 
 
@@ -19,7 +21,7 @@ logger = logging.getLogger("context.budget")
 
 # ── 双模式阈值常量（对齐 Claude Code autoCompact.ts）────────────
 
-# 默认缓冲量（可被 MODEL_CONFIGS[model]["autocompact_buffer"] 覆盖）
+# 默认缓冲量（可被模型专属 autocompact_buffer 覆盖）
 # Claude Code 用 13K/200K ≈ 6.5%，默认值 13K/128K ≈ 10%
 DEFAULT_AUTOCOMPACT_BUFFER_TOKENS = 13_000
 
@@ -61,78 +63,17 @@ def _get_autocompact_pct_override() -> float | None:
         return None
 
 
-# ── 模型配置 ────────────────────────────────────────────────────
-
-MODEL_CONFIGS: dict[str, dict] = {
-    # GLM 系列
-    "glm-4": {
-        "context_window": 128_000,
-        "max_output": 4_096,
-        "autocompact_buffer": 13_000,
-    },
-    "glm-4-flash": {
-        "context_window": 128_000,
-        "max_output": 4_096,
-        "autocompact_buffer": 13_000,
-    },
-    "glm-5": {
-        "context_window": 128_000,
-        "max_output": 8_192,
-        "autocompact_buffer": 13_000,
-    },
-    "glm-5.1": {
-        "context_window": 128_000,
-        "max_output": 8_192,
-        "autocompact_buffer": 13_000,
-    },
-    # Claude 系列
-    "claude-3-5-sonnet": {
-        "context_window": 200_000,
-        "max_output": 8_000,
-        "autocompact_buffer": 13_000,
-    },
-    "claude-3-7-sonnet": {
-        "context_window": 200_000,
-        "max_output": 8_000,
-        "autocompact_buffer": 13_000,
-    },
-    # OpenAI GPT 系列（示例，可按需添加）
-    "gpt-4o": {
-        "context_window": 128_000,
-        "max_output": 16_384,
-        "autocompact_buffer": 13_000,
-    },
-    "gpt-4-turbo": {
-        "context_window": 128_000,
-        "max_output": 4_096,
-        "autocompact_buffer": 13_000,
-    },
-    "gpt-3.5-turbo": {
-        "context_window": 16_385,
-        "max_output": 4_096,
-        "autocompact_buffer": 2_000,
-    },
-}
-
+# ── 模型配置（从 .env 读取）────────────────────────────────────
 
 def get_model_config(model: str) -> dict:
-    """获取模型配置，支持模糊匹配；未知模型返回保守默认值"""
-    model_lower = model.lower()
-    for key, config in MODEL_CONFIGS.items():
-        if key in model_lower:
-            return config
-    # 未知模型：保守默认值（中等上下文窗口）
-    return {
-        "context_window": 32_000,
-        "max_output": 4_096,
-        "autocompact_buffer": DEFAULT_AUTOCOMPACT_BUFFER_TOKENS,
-    }
+    """获取模型配置，支持模糊匹配；未知模型返回保守默认值（从 .env 读取）"""
+    return config.get_model_config(model)
 
 
 def _get_autocompact_buffer(model: str) -> int:
     """获取模型专属的 autocompact 缓冲量（字节），未知模型用默认值"""
-    config = get_model_config(model)
-    return config.get("autocompact_buffer", DEFAULT_AUTOCOMPACT_BUFFER_TOKENS)
+    cfg = get_model_config(model)
+    return cfg.get("autocompact_buffer", DEFAULT_AUTOCOMPACT_BUFFER_TOKENS)
 
 
 def get_effective_context_window(model: str) -> int:
@@ -141,7 +82,7 @@ def get_effective_context_window(model: str) -> int:
 
     参考：Claude Code getEffectiveContextWindowSize()
 
-    缓冲量由模型配置决定（MODEL_CONFIGS[model]["autocompact_buffer"]），
+    缓冲量由模型配置决定（通过 Config 从 .env 读取），
     未知模型使用 DEFAULT_AUTOCOMPACT_BUFFER_TOKENS。
 
     这保证了当触发压缩时，API 还有足够空间容纳：
@@ -420,7 +361,7 @@ class ContextBudgetManager:
         4. 否则不触发
         """
         # 熔断检查
-        if self.consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES:
+        if self.consecutive_failures >= self._max_failures():
             return False, f"熔断保护：连续 {self.consecutive_failures} 次压缩失败"
 
         state = self.compute_budget_state(messages)
@@ -457,12 +398,15 @@ class ContextBudgetManager:
         self.last_compact_time = time.time()
         logger.info("Compact succeeded, circuit breaker reset")
 
+    def _max_failures(self) -> int:
+        return config.int("MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES", MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES)
+
     def record_compact_failure(self):
         """记录压缩失败"""
         self.consecutive_failures += 1
         logger.warning(
             f"Compact failure #{self.consecutive_failures}/"
-            f"{MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES}"
+            f"{self._max_failures()}"
         )
 
     def reset_circuit_breaker(self):

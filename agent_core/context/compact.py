@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from agent_core.config import config
+
 logger = logging.getLogger("context.compact")
 
 # DEBUG 日志辅助函数
@@ -750,7 +752,7 @@ class CompactOrchestrator:
         self,
         summary: str,
         original: list[dict],
-        preserved_head: int = PRESERVED_HEAD_MESSAGES,
+        preserved_head: Optional[int] = None,
     ) -> list[dict]:
         """
         组装压缩后的消息列表
@@ -782,7 +784,8 @@ class CompactOrchestrator:
         })
 
         # 3. 保留最近 N 条消息
-        recent = non_system[-preserved_head:] if len(non_system) > preserved_head else non_system
+        head_count = preserved_head if preserved_head is not None else config.int("PRESERVED_HEAD_MESSAGES", 6)
+        recent = non_system[-head_count:] if len(non_system) > head_count else non_system
         result.extend(recent)
 
         # ── DEBUG: 构建结果 ─────────────────────────────────────
