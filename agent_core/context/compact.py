@@ -288,31 +288,37 @@ class CompactOrchestrator:
                 parent_tools=parent_tools,
                 parent_messages=parent_messages,
             )
+            cached = 0
+            if usage_stats:
+                ptd = getattr(usage_stats, 'prompt_tokens_details', None)
+                if isinstance(ptd, dict):
+                    cached = ptd.get('cached_tokens', 0)
             logger.debug(
                 f"🔧 [Compact] usage_stats: input={usage_stats.input_tokens if usage_stats else 'N/A'}, "
-                f"cached={usage_stats.prompt_tokens_details.get('cached_tokens', 0) if usage_stats and usage_stats.prompt_tokens_details else 'N/A'}"
+                f"cached={cached}"
             )
 
             if not summary:
                 raise ValueError("LLM 返回空摘要")
 
             # 4. 组装压缩后消息
-            compacted = self._build_compacted_messages(summary, messages)
+            compacted, recent = self._build_compacted_messages(summary, messages)
 
             tokens_after = self.token_counter.count_messages(compacted)
             elapsed = (time.time() - start) * 1000
 
             self.budget.record_compact_success()
 
+            # recent 直接来自 _build_compacted_messages，不再依赖 len(compacted)-2 公式
             logger.info(
                 f"🔧 [Compact DONE] {tokens_before:,} → {tokens_after:,} tokens "
                 f"(freed {tokens_before - tokens_after:,}), "
                 f"PTL retries: {ptl_retries}, {elapsed:.0f}ms, "
-                f"preserved_head={len(compacted) - 2}"
+                f"preserved_head={len(recent)}"
             )
             logger.debug(
                 f"  └─ Final structure: [system] + [summary] + "
-                f"[{len(compacted) - 2} preserved head]"
+                f"[{len(recent)} preserved head]"
             )
 
             return CompactionResult(
@@ -800,10 +806,11 @@ class CompactOrchestrator:
             f"  ├─ [1] summary: {len(summary)} chars, "
             f"prefix={summary[:30]!r}..."
         )
-        logger.debug(f"  └─ [2..{len(result)-1}] preserved head ({len(recent)} msgs):")
+        # DEBUG: 直接用 recent 列表，不依赖 result[2:]（可能有多个 system msg）
+        logger.debug(f"  └─ recent ({len(recent)} msgs):")
         for i, msg in enumerate(recent):
             role = msg.get("role", "?")
             content = str(msg.get("content", ""))[:60].replace("\n", " ")
             logger.debug(f"      [{i+2}] {role}: {content!r}")
 
-        return result
+        return result, recent

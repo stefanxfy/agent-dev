@@ -411,20 +411,22 @@ class TestCompactOrchestrator:
             {"role": "user", "content": "recent1"},
             {"role": "assistant", "content": "recent_reply"},
         ]
-        result = self.compactor._build_compacted_messages(
+        compacted, recent = self.compactor._build_compacted_messages(
             summary="这是摘要",
             original=messages,
             preserved_head=4,
         )
         # 1 system + 1 summary + 4 recent = 6
-        assert len(result) == 6
+        assert len(compacted) == 6
         # 第一条是 system
-        assert result[0]["role"] == "system"
+        assert compacted[0]["role"] == "system"
         # 第二条是摘要（role=user）
-        assert result[1]["role"] == "user"
-        assert "这是摘要" in result[1]["content"]
+        assert compacted[1]["role"] == "user"
+        assert "这是摘要" in compacted[1]["content"]
         # 最近 4 条保留
-        assert result[2]["content"] == "msg3"
+        assert compacted[2]["content"] == "msg3"
+        # recent 应该是最后 4 条非 system 消息
+        assert len(recent) == 4
 
     def test_build_compacted_preserves_system(self):
         """没有 system 消息时不应崩溃"""
@@ -432,12 +434,12 @@ class TestCompactOrchestrator:
             {"role": "user", "content": "msg1"},
             {"role": "assistant", "content": "reply1"},
         ]
-        result = self.compactor._build_compacted_messages(
+        compacted, recent = self.compactor._build_compacted_messages(
             summary="摘要",
             original=messages,
         )
         # 无 system + summary + 2 recent = 3
-        assert len(result) == 3
+        assert len(compacted) == 3
 
     def test_compact_success_with_mock_llm(self):
         """用 Mock LLM 测试完整压缩流程"""

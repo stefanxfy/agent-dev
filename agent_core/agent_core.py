@@ -295,6 +295,7 @@ class ReactAgent:
             self.messages,
             parent_system=self.system_prompt,
             parent_tools=tool_schemas or None,
+            parent_messages=self.messages,
         )
         if compact_result:
             if compact_result.success:
@@ -675,11 +676,13 @@ class ReactAgent:
         现场: data/sessions/7f071c62.jsonl
 
         Args:
-            compacted: CompactOrchestrator._build_compacted_messages 输出
-                结构: [system, summary, ...preserved_head]  共 8 条
+            compacted: CompactOrchestrator._build_compacted_messages 输出，tuple[list[dict], list[dict]]
+                - compacted[0]: [system, summary, ...preserved_head]
+                - compacted[1] (recent): 最近 N 条非 system 消息
+                结构:
                 - [0] system: 动态注入不持久化（每次 run 重新构造）
                 - [1] summary: user role + content 以 "[Previous conversation summarized]" 开头
-                - [2..] preserved: 最近 6 条原始 user/assistant 消息
+                - [2..] preserved: 最近 N 条原始 user/assistant 消息
             compact_result: CompactionResult 实例
         """
         if not self._session_manager:
@@ -691,19 +694,22 @@ class ReactAgent:
         storage = self._session_manager.storage
 
         # 1. boundary（parent 链到最后一条旧消息，由 add_compact_boundary 内部 _get_last_uuid 决定）
-        storage.add_compact_boundary(
+        boundary_uuid = storage.add_compact_boundary(
             trigger="auto",
             pre_tokens=compact_result.tokens_before,
             messages_summarized=len(compacted) - 1,  # 含 summary 的 compacted 长度减 1
         )
+        _logger.debug(f"💾 [Persist] boundary written: uuid={boundary_uuid}, parent→旧链末尾")
 
         # 2. summary（parent 链到 boundary）
-        storage.add_summary(
+        summary_uuid = storage.add_summary(
             summary=compact_result.summary,
             tokens_saved=compact_result.tokens_freed,
         )
+        _logger.debug(f"💾 [Persist] summary written: uuid={summary_uuid}, len={len(compact_result.summary)} chars")
 
         # 3. preserved head（跳过 system[0] 和 summary）
+        preserved_count = 0
         # compacted 结构: [system, summary, ...preserved]
         # - 跳过 system（[0]，动态注入不持久化）
         # - 跳过 summary（已由 add_summary 写）
@@ -725,9 +731,15 @@ class ReactAgent:
                 entry_type=role,
                 message=msg,  # 原样存整个 message dict
             )
+            preserved_count += 1
+
+        _logger.debug(f"💾 [Persist] preserved head: {preserved_count} messages")
 
         # 4. flush 确保落盘
         storage.flush()
+        _logger.debug(f"💾 [Persist] flush done, storage.last_uuid={storage.last_uuid}")
+
+        _logger.debug(f"💾 [Sync] manager._last_uuid: {self._session_manager._last_uuid} → {storage.last_uuid}")
 
         # 5. P1 修复：同步 manager 的 _last_uuid 到 preserved head 最后一条
         # 为什么需要：storage.add_* 只更新 storage 内部状态，不调 manager.add_user_message 等

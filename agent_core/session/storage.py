@@ -790,10 +790,24 @@ class SessionStorage:
             path = self._ensure_path()
 
             # 直接追加到文件（每次 flush 会追加多行）
+            # Write barrier: 确保数据落盘，防止进程异常退出后 append 时
+            # 文件末尾无 \n 导致新 entry 与上一条粘在同一行（两条拼一行 bug）
             try:
+                # 写入前：若文件存在且末尾无换行，补一个（容错上次异常中断）
+                if path.exists():
+                    with open(path, "rb") as rf:
+                        rf.seek(-1, 2)
+                        last_byte = rf.read(1)
+                        if last_byte != b"\n":
+                            with open(path, "a", encoding="utf-8") as af:
+                                af.write("\n")
+
                 with open(path, "a", encoding="utf-8") as f:
                     for entry in to_write:
                         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    # Write barrier: 强制刷 OS buffer 到磁盘
+                    f.flush()
+                    os.fsync(f.fileno())
 
                 logger.debug(
                     f"[{self.session_id[:8]}] flushed {len(to_write)} entries"
