@@ -1,7 +1,7 @@
 """
 ContextBudgetManager — 上下文预算管理器
 参考：Claude Code src/services/compact/autoCompact.ts
-适配：GLM 模型参数，删除 Claude 专有逻辑
+适配：支持多模型，配置由 MODEL_CONFIGS 提供，硬编码值仅作后备
 """
 
 from __future__ import annotations
@@ -17,14 +17,11 @@ logger = logging.getLogger("context.budget")
 
 # ── 常量配置 ────────────────────────────────────────────────────
 
-# GLM-4 / GLM-5.1 上下文窗口（验证值）
-GLM_CONTEXT_WINDOW = 128_000
-
 # ── 双模式阈值常量（对齐 Claude Code autoCompact.ts）────────────
 
-# 固定缓冲模式：剩余 < AUTOCOMPACT_BUFFER_TOKENS 时触发压缩
-# Claude Code 用 13K/200K ≈ 6.5%，agent-dev 用 13K/128K ≈ 10%
-AUTOCOMPACT_BUFFER_TOKENS = 13_000
+# 默认缓冲量（可被 MODEL_CONFIGS[model]["autocompact_buffer"] 覆盖）
+# Claude Code 用 13K/200K ≈ 6.5%，默认值 13K/128K ≈ 10%
+DEFAULT_AUTOCOMPACT_BUFFER_TOKENS = 13_000
 
 # 严重阈值固定缓冲：剩余 < CRITICAL_BUFFER_TOKENS 时为临界状态
 CRITICAL_BUFFER_TOKENS = 6_500
@@ -67,45 +64,75 @@ def _get_autocompact_pct_override() -> float | None:
 # ── 模型配置 ────────────────────────────────────────────────────
 
 MODEL_CONFIGS: dict[str, dict] = {
+    # GLM 系列
     "glm-4": {
         "context_window": 128_000,
         "max_output": 4_096,
+        "autocompact_buffer": 13_000,
     },
     "glm-4-flash": {
         "context_window": 128_000,
         "max_output": 4_096,
+        "autocompact_buffer": 13_000,
     },
     "glm-5": {
         "context_window": 128_000,
         "max_output": 8_192,
+        "autocompact_buffer": 13_000,
     },
     "glm-5.1": {
         "context_window": 128_000,
         "max_output": 8_192,
+        "autocompact_buffer": 13_000,
     },
-    # Claude 模型（通过 ANTHROPIC_BASE_URL 指向智谱兼容层时可能用）
+    # Claude 系列
     "claude-3-5-sonnet": {
         "context_window": 200_000,
         "max_output": 8_000,
+        "autocompact_buffer": 13_000,
     },
     "claude-3-7-sonnet": {
         "context_window": 200_000,
         "max_output": 8_000,
+        "autocompact_buffer": 13_000,
+    },
+    # OpenAI GPT 系列（示例，可按需添加）
+    "gpt-4o": {
+        "context_window": 128_000,
+        "max_output": 16_384,
+        "autocompact_buffer": 13_000,
+    },
+    "gpt-4-turbo": {
+        "context_window": 128_000,
+        "max_output": 4_096,
+        "autocompact_buffer": 13_000,
+    },
+    "gpt-3.5-turbo": {
+        "context_window": 16_385,
+        "max_output": 4_096,
+        "autocompact_buffer": 2_000,
     },
 }
 
 
 def get_model_config(model: str) -> dict:
-    """获取模型配置，支持模糊匹配"""
+    """获取模型配置，支持模糊匹配；未知模型返回保守默认值"""
     model_lower = model.lower()
     for key, config in MODEL_CONFIGS.items():
         if key in model_lower:
             return config
-    # 默认配置（保守）
+    # 未知模型：保守默认值（中等上下文窗口）
     return {
-        "context_window": 128_000,
+        "context_window": 32_000,
         "max_output": 4_096,
+        "autocompact_buffer": DEFAULT_AUTOCOMPACT_BUFFER_TOKENS,
     }
+
+
+def _get_autocompact_buffer(model: str) -> int:
+    """获取模型专属的 autocompact 缓冲量（字节），未知模型用默认值"""
+    config = get_model_config(model)
+    return config.get("autocompact_buffer", DEFAULT_AUTOCOMPACT_BUFFER_TOKENS)
 
 
 def get_effective_context_window(model: str) -> int:
@@ -114,16 +141,20 @@ def get_effective_context_window(model: str) -> int:
 
     参考：Claude Code getEffectiveContextWindowSize()
 
+    缓冲量由模型配置决定（MODEL_CONFIGS[model]["autocompact_buffer"]），
+    未知模型使用 DEFAULT_AUTOCOMPACT_BUFFER_TOKENS。
+
     这保证了当触发压缩时，API 还有足够空间容纳：
     - 压缩 prompt
-    - Summary 输出（最多 4,096 tokens）
+    - Summary 输出（最多 max_output tokens）
     """
     config = get_model_config(model)
     context_window = config["context_window"]
     max_output = config["max_output"]
+    buffer = _get_autocompact_buffer(model)
 
     reserved = min(max_output, MAX_OUTPUT_TOKENS_FOR_SUMMARY)
-    effective = context_window - reserved - AUTOCOMPACT_BUFFER_TOKENS
+    effective = context_window - reserved - buffer
 
     return max(effective, MIN_EFFECTIVE_WINDOW)
 
@@ -154,7 +185,7 @@ class BudgetState:
         """已用 token 达到压缩阈值时触发（对齐 Claude Code: used >= threshold）"""
         if self.compact_threshold <= 0:
             # 兼容旧用法：无阈值时用固定缓冲
-            return self.available < AUTOCOMPACT_BUFFER_TOKENS
+            return self.available < DEFAULT_AUTOCOMPACT_BUFFER_TOKENS
         return self.used_tokens >= self.compact_threshold
 
     @property
@@ -277,7 +308,7 @@ class ContextBudgetManager:
         """
         计算压缩触发阈值（双模式）
 
-        模式1（默认）：固定缓冲 — total_budget - AUTOCOMPACT_BUFFER_TOKENS
+        模式1（默认）：固定缓冲 — total_budget - 模型专属缓冲量
         模式2（环境变量）：剩余比例 — 剩余 ≤ pct% 时触发
             threshold = total_budget * (1 - pct/100)
         取两者中更小的（更早触发 = 更保守）
@@ -285,7 +316,8 @@ class ContextBudgetManager:
         参考：Claude Code autoCompact.ts getAutoCompactThreshold()
         示例：PCT=25 → threshold = 75% * total_budget（剩余25%时触发）
         """
-        fixed = self.total_budget - AUTOCOMPACT_BUFFER_TOKENS
+        buffer = _get_autocompact_buffer(self.model)
+        fixed = self.total_budget - buffer
 
         pct = _get_autocompact_pct_override()
         if pct is not None:
@@ -304,13 +336,16 @@ class ContextBudgetManager:
         """
         计算严重阈值（双模式）
 
-        固定缓冲：total_budget - CRITICAL_BUFFER_TOKENS
+        固定缓冲：total_budget - 模型专属 critical_buffer（= autocompact_buffer × 0.5）
         比例覆盖：critical 剩余比例 = compact 剩余比例 / 2
             如果 compact PCT=25（剩余25%），critical PCT=12.5（剩余12.5%）
             threshold = total_budget * (1 - critical_pct/100)
         取更保守的
         """
-        fixed = self.total_budget - CRITICAL_BUFFER_TOKENS
+        # critical_buffer 与 autocompact_buffer 保持 0.5 倍比例
+        model_buffer = _get_autocompact_buffer(self.model)
+        critical_fixed = int(model_buffer * 0.5)
+        fixed = self.total_budget - critical_fixed
 
         pct = _get_autocompact_pct_override()
         if pct is not None:
@@ -434,3 +469,7 @@ class ContextBudgetManager:
         """手动重置熔断器"""
         self.consecutive_failures = 0
         logger.info("Circuit breaker manually reset")
+
+
+# ── 向后兼容别名（旧常量名仍可导入）────────────────────────────────
+AUTOCOMPACT_BUFFER_TOKENS = DEFAULT_AUTOCOMPACT_BUFFER_TOKENS

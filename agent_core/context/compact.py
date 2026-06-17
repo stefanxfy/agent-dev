@@ -170,6 +170,7 @@ class CompactionResult:
     compact_time_ms: float = 0
     ptl_retries: int = 0
     usage_stats: Optional[UsageStats] = None
+    fork_fallback: bool = False  # True = Fork 失败后由旧模式兜底
 
     @property
     def tokens_freed(self) -> int:
@@ -179,8 +180,9 @@ class CompactionResult:
         """生成可读的结果摘要"""
         if not self.success:
             return f"Compact failed: {self.error}"
+        fb = " (Fork降级)" if self.fork_fallback else ""
         return (
-            f"Compact OK: {self.tokens_before:,} → {self.tokens_after:,} tokens "
+            f"Compact{fb} OK: {self.tokens_before:,} → {self.tokens_after:,} tokens "
             f"(freed {self.tokens_freed:,}), "
             f"{len(self.compacted_messages)} messages, "
             f"{self.compact_time_ms:.0f}ms, "
@@ -278,7 +280,7 @@ class CompactOrchestrator:
             )
 
             # 2-3. 生成摘要（含 PTL 防御）
-            summary, ptl_retries, usage_stats = self._generate_summary_with_ptl(
+            summary, ptl_retries, fork_fallback, usage_stats = self._generate_summary_with_ptl(
                 preprocessed,
                 parent_system=parent_system,
                 parent_tools=parent_tools,
@@ -320,6 +322,7 @@ class CompactOrchestrator:
                 compact_time_ms=elapsed,
                 ptl_retries=ptl_retries,
                 usage_stats=usage_stats,
+                fork_fallback=fork_fallback,
             )
 
         except Exception as e:
@@ -422,7 +425,7 @@ class CompactOrchestrator:
         parent_system: Optional[str] = None,
         parent_tools: Optional[list[dict]] = None,
         parent_messages: Optional[list[dict]] = None,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, bool]:
         """
         生成摘要，含 PTL（Prompt-Too-Long）防御
 
@@ -436,6 +439,14 @@ class CompactOrchestrator:
         LLM 调用复用主 agent 的 cache-key params，
         messages = [...parent_messages, summaryRequest]，
         仿照 Claude Code runForkedAgent。
+
+        Fork 失败时降级（FORK_FALLBACK）：
+        当 Fork 模式触发非 PTL 错误（如网络超时、API 报错、模型不支持），
+        自动降级到旧模式重试，保证压缩不因 Fork 而完全失败。
+
+        Returns:
+            (summary, attempt_count, fork_fallback)
+            fork_fallback=True 表示 Fork 模式失败后由旧模式兜底成功
         """
         to_summarize = messages
         last_error = ""
@@ -479,7 +490,8 @@ class CompactOrchestrator:
                         f"  └─ Extracted summary ({len(summary)} chars):\n"
                         f"{_truncate(summary, 500)}"
                     )
-                    return summary, attempt, usage_stats
+                    # Fork 模式成功（非降级）
+                    return summary, attempt, False, usage_stats  # (summary, retries, fork_fallback, usage_stats)
 
                 # 空响应，可能是 LLM 异常
                 last_error = "LLM returned empty summary"
@@ -501,6 +513,48 @@ class CompactOrchestrator:
                     "token limit",
                     "输入过长",
                 ])
+
+                # 非 PTL 错误：Fork 模式降级重试
+                use_fork = (
+                    parent_system is not None
+                    and parent_messages is not None
+                )
+                if use_fork and not is_ptl:
+                    logger.warning(
+                        f"⚠️  [Fork FAILED] non-PTL error, "
+                        f"falling back to legacy mode: {e}"
+                    )
+                    # Fork 降级：清空 Fork 参数，用旧模式兜底
+                    parent_system = None
+                    parent_tools = None
+                    parent_messages = None
+                    to_summarize = messages  # 恢复完整消息，不截断
+                    # 用旧模式再跑一轮
+                    conversation_text = self._messages_to_text(to_summarize)
+                    prompt = COMPACT_USER_PROMPT_TEMPLATE.format(
+                        conversation=conversation_text
+                    )
+                    try:
+                        summary, raw_text, usage_stats = self._call_llm_for_summary(
+                            prompt,
+                            parent_system=None,
+                            parent_tools=None,
+                            parent_messages=None,
+                        )
+                        if summary:
+                            logger.info(
+                                f"✅ [Fork Fallback OK] legacy mode succeeded, "
+                                f"summary={len(summary)} chars"
+                            )
+                            return summary, attempt + 1, True, usage_stats  # fork_fallback=True
+                        last_error = "Legacy mode also returned empty summary"
+                    except Exception as fallback_error:
+                        # 旧模式也失败了，不再重试，直接抛出原始错误
+                        logger.error(
+                            f"❌ [Fork FALLBACK FAILED] legacy mode also errored: "
+                            f"{fallback_error}"
+                        )
+                        raise fallback_error from e
 
                 if is_ptl and attempt < MAX_PTL_RETRIES:
                     truncate_count = max(

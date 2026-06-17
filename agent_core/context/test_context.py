@@ -192,7 +192,7 @@ class TestContextBudgetManager:
 
     def test_model_config_unknown_fallback(self):
         config = get_model_config("unknown-model")
-        assert config["context_window"] == 128_000  # 默认保守值
+        assert config["context_window"] == 32_000   # 默认保守值（中等窗口）
 
     def test_model_config_glm5(self):
         config = get_model_config("glm-5.1")
