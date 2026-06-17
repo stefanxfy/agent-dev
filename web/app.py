@@ -669,11 +669,16 @@ if prompt := st.chat_input("输入消息..."):
     # 调用 Agent（流式）
     with st.chat_message("assistant"):
         thinking_expander = st.expander("💭 思考过程", expanded=False)
+        # P3 修复：使用 st.empty() 占位 + markdown 更新
+        # 原 bug：with thinking_expander: thinking_expander.markdown(...)
+        # 这个写法会**追加**内容而不是覆盖，导致流式更新失效
+        # 正确模式：在容器内放一个 empty()，每次更新 empty()
+        thinking_placeholder = thinking_expander.empty()
         tool_expander = st.expander("🔧 工具调用", expanded=True)
         tool_status = st.status("🔄 思考中...", expanded=True)
         text_placeholder = st.empty()
         turn_indicator = st.empty()  # P2 新增：Turn 指示器
-        
+
         full_text = ""
         thinking_text = ""
         tool_logs = []
@@ -687,9 +692,10 @@ if prompt := st.chat_input("输入消息..."):
                 text_placeholder.markdown(full_text + "▌")
             elif msg_type == "thinking":
                 thinking_text += content
-                # P2 改进：实时流式显示思考过程
-                with thinking_expander:
-                    thinking_expander.markdown(f"**💭 思考过程**\n\n{thinking_text}▌")
+                # P3 修复：直接在 thinking_placeholder 上调 markdown（覆盖，不是追加）
+                thinking_placeholder.markdown(
+                    f"**💭 思考过程**\n\n{thinking_text}▌"
+                )
             elif msg_type == "tool_call":
                 # Day 3 支持并行工具调用
                 if content.get("parallel"):
@@ -759,13 +765,17 @@ if prompt := st.chat_input("输入消息..."):
 
         # 流式结束：清理 UI
         text_placeholder.markdown(full_text)
-        thinking_expander.empty()  # 清除流式思考过程
-
-        # P2 改进：结构化显示思考过程
-        with thinking_expander:
-            if thinking_text:
-                st.markdown("**💭 LLM 思考过程**")
-                st.code(thinking_text)
+        # P3 修复：不要再 thinking_expander.empty()，否则占位上的内容会被清空
+        # P3 修复：思考过程不存在时显示友好提示（GLM/OpenAI 不支持原生 thinking）
+        if thinking_text:
+            thinking_placeholder.markdown(
+                f"**💭 LLM 思考过程**\n\n```\n{thinking_text}\n```"
+            )
+        else:
+            # 当前模型/Provider 不支持原生思考过程（zhipu/openai）
+            thinking_placeholder.caption(
+                f"💡 当前模型 {model} 未提供思考过程（仅 Anthropic Claude 3.7+ 支持）"
+            )
         
         # P2 改进：结构化显示工具调用
         with tool_expander:
