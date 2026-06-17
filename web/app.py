@@ -683,10 +683,32 @@ if prompt := st.chat_input("输入消息..."):
         turn_indicator = st.empty()  # P2 新增：Turn 指示器
 
         full_text = ""
-        thinking_text = ""
+        # P5 优化：按 turn 分段累积思考（多轮场景下方便区分 Turn 1/2/3）
+        # turn_thinking[turn_num] = 该轮的 thinking 文本
+        turn_thinking: dict[int, str] = {}
+        current_turn: int = 1  # 默认 turn 1，收到 "Turn N" 事件时更新
         tool_logs = []
         turn_count = 0  # P2 新增：Turn 计数
         last_turn_usage = None  # 每轮 LLM 响应的 usage（用于显示单轮 token 消耗）
+
+        def render_thinking_with_turns(cursor: str = ""):
+            """渲染思考区（带 Turn 标签分隔多轮）
+
+            Args:
+                cursor: 流式光标（流式期间为 "▌"，完成后为空）
+            """
+            if not turn_thinking:
+                return
+            parts = []
+            for tnum in sorted(turn_thinking.keys()):
+                text = turn_thinking[tnum]
+                if not text:
+                    continue
+                parts.append(
+                    f"**🔄 Turn {tnum}**\n\n```text\n{text}{cursor}\n```"
+                )
+            if parts:
+                thinking_placeholder.markdown("\n\n---\n\n".join(parts))
 
         # 逐 chunk 处理
         for msg_type, content in run_agent(prompt):
@@ -694,12 +716,12 @@ if prompt := st.chat_input("输入消息..."):
                 full_text += content
                 text_placeholder.markdown(full_text + "▌")
             elif msg_type == "thinking":
-                thinking_text += content
-                # P4 视觉优化：灰底等宽字体（text 代码块）+ 流式光标
-                # 对比正文：文本主体用 markdown，思考用 monospace + 灰底，视觉区分
-                thinking_placeholder.markdown(
-                    f"```text\n{thinking_text}▌\n```"
-                )
+                # P5：累积到当前 turn 的思考区
+                if current_turn not in turn_thinking:
+                    turn_thinking[current_turn] = ""
+                turn_thinking[current_turn] += content
+                # 重新渲染（带 Turn 标签）
+                render_thinking_with_turns(cursor="▌")
             elif msg_type == "tool_call":
                 # Day 3 支持并行工具调用
                 if content.get("parallel"):
@@ -730,6 +752,11 @@ if prompt := st.chat_input("输入消息..."):
                     turn_count += 1
                     turn_indicator.markdown(f"📍 **Turn {turn_count}**")
                     tool_status.update(label=f"🔄 Turn {turn_count}：思考中...")
+                    # P5：从 "🔄 Turn N/M" 中提取 turn 号，跟踪当前 turn 用于分段 thinking
+                    import re
+                    m = re.search(r"Turn (\d+)/", str(content))
+                    if m:
+                        current_turn = int(m.group(1))
                 elif "回答完成" in str(content):
                     turn_indicator.empty()  # 完成后清除 Turn 指示器
                     tool_status.update(label="✅ 回答完成", state="complete")
@@ -771,14 +798,20 @@ if prompt := st.chat_input("输入消息..."):
         # 文本区去掉光标
         text_placeholder.markdown(full_text)
 
-        # P4 视觉优化：思考状态转为 complete（自动折叠 + 绿勾）
-        if thinking_text:
-            # 灰底等宽字体 + 去除光标
-            thinking_placeholder.markdown(
-                f"```text\n{thinking_text}\n```"
+        # P5 优化：按 turn 分段渲染思考区（带 Turn 标签）
+        # 计算总 thinking 字数（跨所有 turn 求和）
+        total_thinking_chars = sum(len(t) for t in turn_thinking.values())
+        if turn_thinking:
+            # 去掉光标重新渲染（如果某些 turn 仍在 stream 状态）
+            render_thinking_with_turns(cursor="")
+            # 多轮提示 label
+            turn_label = (
+                f"💭 思考过程 · {len(turn_thinking)} 轮 · {total_thinking_chars} 字"
+                if len(turn_thinking) > 1
+                else f"💭 思考过程 · {total_thinking_chars} 字"
             )
             thinking_status.update(
-                label=f"💭 思考过程 · {len(thinking_text)} 字",
+                label=turn_label,
                 state="complete",  # 自动折叠 + 绿勾
                 expanded=False,
             )
