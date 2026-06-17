@@ -284,14 +284,17 @@ class LLMRouter:
         elif provider == "openai":
             # OpenAI/Zhipu 保留 system 在 messages 中
             # Fork 模式：需要用 override 替换/注入 system
+            # ⚠️ Bug 修复：使用真值判断（`if system_prompt_override`）而不是 `is not None`
+            #    空字符串也是 is not None True，会被注入空 system message，
+            #    破坏 cache prefix 对齐（主 agent 路径空 system_prompt 时不发送 system）
             final_messages = messages
-            if system_prompt_override is not None:
+            if system_prompt_override:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
             yield from self._chat_openai(final_messages, tools, tool_choice)
         elif provider == "zhipu":
             final_messages = messages
-            if system_prompt_override is not None:
+            if system_prompt_override:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
             yield from self._chat_zhipu(final_messages, tools, tool_choice)
