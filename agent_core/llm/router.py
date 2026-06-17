@@ -543,9 +543,8 @@ class LLMRouter:
         # 收集 tool_calls（流式响应中可能分散在多个 chunk）
         tool_calls_buffer = {}  # index -> {"id": ..., "name": ..., "arguments": ...}
 
-        # GLM thinking 内容缓冲区（reasoning_content 字段，逐块到达）
-        reasoning_buffer = []
-
+        # P3 优化：GLM thinking 改为实时流式 yield（之前缓存后在流结束一次性 yield，
+        # 导致 UI 看到'先出回答，后出思考'。现在逐块 yield 就能真正流式）
         for chunk in stream:
             if chunk.choices:
                 delta = chunk.choices[0].delta
@@ -554,10 +553,13 @@ class LLMRouter:
                 if delta.content:
                     yield StreamChunk(text_delta=TextDelta(text=delta.content))
 
-                # GLM thinking 内容增量（reasoning_content 字段）
+                # GLM thinking 实时流式（reasoning_content 字段逐块到达）
+                # 与 Anthropic 不同：Anthropic SDK 不提供 thinking streaming delta，
+                # 只能在 get_final_message() 后一次性拿到。GLM 原生支持流式。
                 if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                    reasoning_buffer.append(delta.reasoning_content)
-                
+                    yield StreamChunk(
+                        thinking_delta=ThinkingDelta(thinking=delta.reasoning_content)
+                    )
                 # 工具调用增量（OpenAI 格式）
                 if delta.tool_calls:
                     for tc in delta.tool_calls:
@@ -575,10 +577,8 @@ class LLMRouter:
                 usage = UsageStats.from_chunk_usage(chunk.usage)
                 yield StreamChunk(usage=usage)
 
-        # 流式结束后，yield 完整的 thinking（GLM reasoning_content）
-        if reasoning_buffer:
-            full_thinking = "".join(reasoning_buffer)
-            yield StreamChunk(thinking_delta=ThinkingDelta(thinking=full_thinking))
+        # P3：thinking 已在流式循环内逐块 yield（router.py:557-563），
+        # 这里不再需要流结束后一次性 yield。
 
         # 流式结束后，如果有完整的 tool_calls，yield 它们
         for idx in sorted(tool_calls_buffer.keys()):
