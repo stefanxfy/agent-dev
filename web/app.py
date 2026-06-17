@@ -83,7 +83,7 @@ if "messages" not in st.session_state:
 if "agent" not in st.session_state:
     st.session_state.agent = None
 if "token_stats" not in st.session_state:
-    st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
+    st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0, "cached": 0}
 if "current_thinking" not in st.session_state:
     st.session_state.current_thinking = ""
 if "tool_logs" not in st.session_state:
@@ -114,6 +114,11 @@ with st.sidebar:
         )
         if stats["thinking"]:
             st.caption(f"💭 thinking: {stats['thinking']:,}")
+        # P3 cache 命中累计
+        cached_total = stats.get("cached", 0)
+        if cached_total:
+            hit_rate = cached_total / max(stats["input"], 1) * 100
+            st.caption(f"🔥 cache: {cached_total:,} ({hit_rate:.1f}%)")
     else:
         st.caption("📝 发送消息后显示")
 
@@ -359,12 +364,35 @@ with st.sidebar:
                     except Exception as e:
                         logging.warning(f"会话消息数读取失败 (sid={sid}): {e}")
                         msg_count = 0
-                    
+
+                    # P3 cache 累计统计（侧车文件）
+                    try:
+                        cache_stats = sess.get("cache_stats", {})
+                        cache_hit = cache_stats.get("hit_rate", 0.0)
+                        cache_calls = cache_stats.get("total_calls", 0)
+                    except Exception as e:
+                        logging.warning(f"cache stats 读取失败 (sid={sid}): {e}")
+                        cache_hit, cache_calls = 0.0, 0
+
                     # 一行：加载按钮 + 操作按钮
                     cols = st.columns([4, 1, 1])
                     with cols[0]:
-                        label = f"📄 {title} ({msg_count}条)"
-                        help_text = f"{sid}\n最近: {preview}" if preview else sid
+                        cache_label = ""
+                        if cache_calls > 0 and cache_hit > 0:
+                            cache_label = f" 🔥{cache_hit*100:.0f}%"
+                        label = f"📄 {title} ({msg_count}条){cache_label}"
+                        # hover 上同时显示 cache 明细
+                        hit_detail = (
+                            f"\n\n🔥 Cache 命中率: {cache_hit*100:.1f}%"
+                            f"\n   调用 {cache_calls} 次"
+                            f"\n   命中 {cache_stats.get('cached_tokens', 0):,} / "
+                            f"{cache_stats.get('input_tokens', 0):,} tokens"
+                            if cache_calls > 0 else ""
+                        )
+                        help_text = (
+                            f"{sid}\n最近: {preview}{hit_detail}"
+                            if preview else f"{sid}{hit_detail}"
+                        )
                         if st.button(label, key=f"load_{sid}", help=help_text):
                             if sid != st.session_state.get("chat_session_id"):
                                 if st.session_state.agent is not None:
@@ -428,7 +456,7 @@ with st.sidebar:
     if st.button("🗑️ 清空会话"):
         st.session_state.messages = []
         st.session_state.tool_logs = []
-        st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
+        st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0, "cached": 0}
         st.session_state.current_thinking = ""
         if st.session_state.agent:
             st.session_state.agent.reset()
@@ -616,6 +644,10 @@ for msg in st.session_state.messages:
             parts = [f"input={msg_usage['input']:,}", f"output={msg_usage['output']:,}"]
             if msg_usage.get("thinking"):
                 parts.append(f"thinking={msg_usage['thinking']:,}")
+            cached = msg_usage.get("cached", 0)
+            if cached:
+                hit_rate = cached / max(msg_usage["input"], 1) * 100
+                parts.append(f"🔥cache={cached:,} ({hit_rate:.1f}%)")
             st.caption(f"📊 {' · '.join(parts)}")
 
 
@@ -703,7 +735,27 @@ if prompt := st.chat_input("输入消息..."):
                 stats["input"] += content.input_tokens
                 stats["output"] += content.output_tokens
                 stats["thinking"] += content.thinking_tokens
+                stats["cached"] = stats.get("cached", 0) + (content.cached_tokens or 0)
                 last_turn_usage = content  # 记录本轮最新 usage，用于显示单轮消耗
+
+                # P3 累计缓存命中写入 sidecar（供 sidebar 会话列表显示）
+                try:
+                    _cache_sid = st.session_state.get("chat_session_id")
+                    if _cache_sid:
+                        SessionStorage.write_cache_stats(
+                            Path(DATA_DIR) / f"{_cache_sid}.jsonl",
+                            content,
+                        )
+                except Exception as _ce:
+                    logging.warning(f"cache stats 写入失败: {_ce}")
+
+                # Debug 日志：缓存命中明细
+                hit_rate = (content.cached_tokens or 0) / max(content.input_tokens, 1) * 100
+                logging.debug(
+                    f"🔥 [Cache] in={content.input_tokens:,} · "
+                    f"cached={content.cached_tokens:,} · "
+                    f"hit={hit_rate:.1f}%"
+                )
 
         # 流式结束：清理 UI
         text_placeholder.markdown(full_text)
@@ -770,6 +822,7 @@ if prompt := st.chat_input("输入消息..."):
             "input": last_turn_usage.input_tokens if last_turn_usage else 0,
             "output": last_turn_usage.output_tokens if last_turn_usage else 0,
             "thinking": last_turn_usage.thinking_tokens if last_turn_usage else 0,
+            "cached": last_turn_usage.cached_tokens if last_turn_usage else 0,
         } if last_turn_usage else None,
     })
 
