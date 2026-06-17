@@ -544,7 +544,12 @@ if _loaded_sid != _current_sid and _current_sid:
     try:
         # 直接用 SessionStorage 读取，不创建 SessionManager（避免 _restore_title_state 副作用）
         _storage = SessionStorage(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
-        history = _storage.get_messages()
+        # P5 修复：include_compact_summary=False 跳过压缩摘要 user message
+        # 原 bug：add_summary 写入的 type="user" + message.isCompactSummary=True
+        # 主聊天区 UI 加载时，etype in (..., "summary") 判断永不生效
+        # （type 是 "user"），导致 1370 字符的摘要被当成普通用户消息加载
+        # 解决：用 storage 内置 API 在加载阶段就过滤掉
+        history = _storage.get_messages(include_compact_summary=False)
 
         loaded_count = 0
         for entry in history:
