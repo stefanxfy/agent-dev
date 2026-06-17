@@ -452,7 +452,7 @@ class CompactOrchestrator:
                 f"prompt_len={len(prompt)} chars"
             )
             logger.debug(
-                f"  ├─ Conversation preview:\n{_truncate(conversation_text, 300)}"
+                f"  ├─ Conversation preview:\n{_truncate(prompt, 300)}"
             )
 
             try:
