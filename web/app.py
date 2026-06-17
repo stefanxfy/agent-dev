@@ -668,12 +668,15 @@ if prompt := st.chat_input("输入消息..."):
 
     # 调用 Agent（流式）
     with st.chat_message("assistant"):
-        thinking_expander = st.expander("💭 思考过程", expanded=False)
-        # P3 修复：使用 st.empty() 占位 + markdown 更新
-        # 原 bug：with thinking_expander: thinking_expander.markdown(...)
-        # 这个写法会**追加**内容而不是覆盖，导致流式更新失效
-        # 正确模式：在容器内放一个 empty()，每次更新 empty()
-        thinking_placeholder = thinking_expander.empty()
+        # P4 视觉优化：思考用 st.status（自带 spinner + 自动折叠 + 绿勾）
+        # - 思考中：状态 running + 展开，用户能看到流式思考
+        # - 完成后：状态 complete + 自动折叠，不抢占主区
+        thinking_status = st.status(
+            "💭 思考中...",
+            state="running",
+            expanded=True,
+        )
+        thinking_placeholder = thinking_status.empty()
         tool_expander = st.expander("🔧 工具调用", expanded=True)
         tool_status = st.status("🔄 思考中...", expanded=True)
         text_placeholder = st.empty()
@@ -692,9 +695,10 @@ if prompt := st.chat_input("输入消息..."):
                 text_placeholder.markdown(full_text + "▌")
             elif msg_type == "thinking":
                 thinking_text += content
-                # P3 修复：直接在 thinking_placeholder 上调 markdown（覆盖，不是追加）
+                # P4 视觉优化：灰底等宽字体（text 代码块）+ 流式光标
+                # 对比正文：文本主体用 markdown，思考用 monospace + 灰底，视觉区分
                 thinking_placeholder.markdown(
-                    f"**💭 思考过程**\n\n{thinking_text}▌"
+                    f"```text\n{thinking_text}▌\n```"
                 )
             elif msg_type == "tool_call":
                 # Day 3 支持并行工具调用
@@ -764,19 +768,29 @@ if prompt := st.chat_input("输入消息..."):
                 )
 
         # 流式结束：清理 UI
+        # 文本区去掉光标
         text_placeholder.markdown(full_text)
-        # P3 修复：不要再 thinking_expander.empty()，否则占位上的内容会被清空
+
+        # P4 视觉优化：思考状态转为 complete（自动折叠 + 绿勾）
         if thinking_text:
+            # 灰底等宽字体 + 去除光标
             thinking_placeholder.markdown(
-                f"**💭 LLM 思考过程**\n\n```\n{thinking_text}\n```"
+                f"```text\n{thinking_text}\n```"
+            )
+            thinking_status.update(
+                label=f"💭 思考过程 · {len(thinking_text)} 字",
+                state="complete",  # 自动折叠 + 绿勾
+                expanded=False,
             )
         else:
-            # 注意：GLM/Claude 都支持思考过程。空的原因可能是：
-            # 1) 本轮没启动思考（请求未传 enable_thinking/未触发）
-            # 2) Provider 返回了空 reasoning_content
-            # 3) Compact 路径（LLM 只输出 summary，不算思考）
+            # 本轮无 thinking（Compact 路径、enable_thinking 未触发、Provider 返回空等）
             thinking_placeholder.caption(
                 f"💭 本轮未返回思考过程（{model}）"
+            )
+            thinking_status.update(
+                label=f"💭 未返回思考过程（{model}）",
+                state="complete",
+                expanded=False,
             )
         
         # P2 改进：结构化显示工具调用
