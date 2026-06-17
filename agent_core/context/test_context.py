@@ -738,6 +738,121 @@ def test_compact_prompt_extract_summary_works_with_new_format():
     assert CompactOrchestrator is not None, "CompactOrchestrator 可正常导入"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  统一压缩 Prompt 设计：旧模式 + Fork 模式共享 COMPACT_INSTRUCTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestUnifiedCompactPrompt:
+    """统一压缩 Prompt：一份指令源，两种拼接方式"""
+
+    def test_compact_instruction_exists(self):
+        """统一源 COMPACT_INSTRUCTION 必须存在"""
+        from agent_core.context.compact import COMPACT_INSTRUCTION
+        assert isinstance(COMPACT_INSTRUCTION, str)
+        assert len(COMPACT_INSTRUCTION) > 1000, "指令模板应该足够长（含 example）"
+
+    def test_build_compact_fork_prompt_deterministic(self):
+        """Fork 模式必须返回字节级一致的字符串（保 cache）"""
+        from agent_core.context.compact import build_compact_fork_prompt
+        p1 = build_compact_fork_prompt()
+        p2 = build_compact_fork_prompt()
+        assert p1 == p2, "build_compact_fork_prompt 每次必须返回相同字符串（cache 命中）"
+
+    def test_build_compact_fork_prompt_no_conversation_text(self):
+        """Fork 模式 user prompt 不应含对话内容（对话在 parent_messages 里）"""
+        from agent_core.context.compact import build_compact_fork_prompt
+        p = build_compact_fork_prompt()
+        assert "对话内容" not in p, "Fork 模式 user prompt 不应含对话内容"
+        assert "the messages above" in p, "Fork 模式应指向 parent_messages"
+
+    def test_build_compact_user_prompt_has_conversation(self):
+        """旧模式 user prompt 必须含对话文本"""
+        from agent_core.context.compact import build_compact_user_prompt
+        p = build_compact_user_prompt("用户：你好\n助手：你好！")
+        assert "对话内容" in p, "旧模式 user prompt 必须含对话内容标题"
+        assert "用户：你好" in p, "旧模式必须含实际对话文本"
+        assert "the text below" in p, "旧模式应指向 prompt 内的对话"
+
+    def test_unified_instruction_in_both_modes(self):
+        """旧模式和 Fork 模式必须用同一份指令（去掉 conversation_location 差异）"""
+        from agent_core.context.compact import (
+            build_compact_user_prompt, build_compact_fork_prompt,
+        )
+        old_prompt = build_compact_user_prompt("")
+        fork_prompt = build_compact_fork_prompt()
+        # 提取指令部分（旧模式后面拼接 \n\n## 对话内容...，剥掉它）
+        old_instruction = old_prompt.split("## 对话内容")[0].rstrip()
+        # Fork prompt 可能含尾部换行，一起 rstrip 归一化
+        fork_instruction = fork_prompt.rstrip()
+        # 占位符归一化后应与 fork 指令部分一致
+        normalized_old = old_instruction.replace("the text below", "the messages above")
+        assert normalized_old == fork_instruction, (
+            "旧模式和 Fork 模式必须用同一份指令源（仅 conversation_location 差异）"
+        )
+
+    def test_fork_prompt_has_4_layer_defense(self):
+        """Fork 模式必须包含 4 道防调工具防线（仿 Claude Code）"""
+        from agent_core.context.compact import build_compact_fork_prompt
+        p = build_compact_fork_prompt()
+        # 防线 1: CRITICAL 前置警告
+        assert "CRITICAL" in p, "防线 1: CRITICAL 前置警告"
+        assert "TEXT ONLY" in p, "防线 1: TEXT ONLY"
+        assert "Do NOT call any tools" in p, "防线 1: 禁止调工具"
+        # 防线 2: 工具黑名单
+        for tool in ["Read", "Bash", "Grep", "Glob", "Edit", "Write"]:
+            assert tool in p, f"防线 2: 工具黑名单含 {tool}"
+        # 防线 3: only turn 警告（仿 Claude Code 防 2.79% 触发）
+        assert "only turn" in p, "防线 3: only turn 警告（防 Sonnet 4.6+ 自适应调工具）"
+        assert "REJECTED" in p, "防线 3: REJECTED 后果警告"
+        # 防线 4: 末尾 REMINDER 重复警告
+        assert "REMINDER" in p, "防线 4: 末尾 REMINDER 重复警告"
+        # 格式要求
+        assert "<analysis>" in p and "</analysis>" in p, "格式要求 <analysis> 标签"
+        assert "<summary>" in p and "</summary>" in p, "格式要求 <summary> 标签"
+        # example + 防漂移
+        assert "<example>" in p, "few-shot example"
+        assert "verbatim quotes" in p, "防漂移规则"
+        assert "防漂移" in p, "防漂移中文标识"
+
+    def test_backward_compat_aliases(self):
+        """向后兼容：旧常量名仍可访问且内容正确"""
+        from agent_core.context.compact import (
+            COMPACT_SYSTEM_PROMPT, COMPACT_USER_PROMPT_TEMPLATE,
+        )
+        # COMPACT_SYSTEM_PROMPT 现在是 COMPACT_INSTRUCTION 的别名
+        assert "CRITICAL" in COMPACT_SYSTEM_PROMPT
+        assert "TEXT ONLY" in COMPACT_SYSTEM_PROMPT
+        # COMPACT_USER_PROMPT_TEMPLATE 现在是已 format 的最终字符串
+        # 含 "{conversation}" 占位符（不替换）
+        assert "对话内容" in COMPACT_USER_PROMPT_TEMPLATE
+        assert "{conversation}" in COMPACT_USER_PROMPT_TEMPLATE
+
+    def test_compact_fork_prompt_removed(self):
+        """旧版 COMPACT_FORK_PROMPT 应被删除（被 build_compact_fork_prompt 替代）"""
+        from agent_core.context import compact
+        assert not hasattr(compact, "COMPACT_FORK_PROMPT"), (
+            "COMPACT_FORK_PROMPT 应已删除，使用 build_compact_fork_prompt()"
+        )
+
+    def test_conversation_location_placeholder(self):
+        """{conversation_location} 占位符必须存在并被 format"""
+        from agent_core.context.compact import (
+            COMPACT_INSTRUCTION, build_compact_user_prompt, build_compact_fork_prompt,
+        )
+        # 原始模板应含占位符
+        assert "{conversation_location}" in COMPACT_INSTRUCTION, (
+            "原始指令模板必须含 {conversation_location} 占位符"
+        )
+        # 旧模式：替换为 "the text below"
+        old = build_compact_user_prompt("x")
+        assert "the text below" in old
+        assert "{conversation_location}" not in old, "占位符必须被替换"
+        # Fork 模式：替换为 "the messages above"
+        fork = build_compact_fork_prompt()
+        assert "the messages above" in fork
+        assert "{conversation_location}" not in fork, "占位符必须被替换"
+
+
 def test_compact_debug_logging_emits_expected_events():
     """验证 DEBUG 日志输出关键事件（Compact START / LLM Call / Extract / Build）"""
     import logging

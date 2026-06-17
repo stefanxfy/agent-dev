@@ -208,15 +208,16 @@ class LLMRouter:
         messages: list[dict],
         tools: Optional[list[dict]] = None,
         system_prompt_override: Optional[str] = None,
+        tool_choice: Optional[str] = None,
     ) -> Generator[StreamChunk, None, None]:
         """
         统一 chat 接口，返回 StreamChunk 生成器（同步）。
         根据 provider 路由到不同厂商。
-        
+
         特殊处理 system message：
         - Anthropic: 提取 system 作为顶层参数
         - OpenAI/Zhipu: 保留在 messages 中
-        
+
         Args:
             messages: 对话消息列表
             tools: 工具 schema 列表
@@ -224,9 +225,12 @@ class LLMRouter:
                 仿照 Claude Code createCacheSafeParams，Fork Agent 必须
                 使用主 agent 的 system prompt 字节才能命中 prompt cache。
                 传入时，忽略 messages 中的 system message，用此值替代。
+            tool_choice: 工具选择策略。None=auto（默认）、"none"=禁用工具调用、
+                "auto"=同 None、"required"=必须调用工具。
+                压缩场景下传 "none" 防止 LLM 调工具打破输出格式。
         """
         provider = self.config.provider.value if isinstance(self.config.provider, Enum) else self.config.provider
-        
+
         # 提取 system message
         # Fork 模式：system_prompt_override 优先（保证字节级一致）
         system_message = system_prompt_override
@@ -241,7 +245,7 @@ class LLMRouter:
                 filtered_messages.append(m)
         
         if provider == "anthropic":
-            yield from self._chat_anthropic(filtered_messages, tools, system_message)
+            yield from self._chat_anthropic(filtered_messages, tools, system_message, tool_choice)
         elif provider == "openai":
             # OpenAI/Zhipu 保留 system 在 messages 中
             # Fork 模式：需要用 override 替换/注入 system
@@ -249,13 +253,13 @@ class LLMRouter:
             if system_prompt_override is not None:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
-            yield from self._chat_openai(final_messages, tools)
+            yield from self._chat_openai(final_messages, tools, tool_choice)
         elif provider == "zhipu":
             final_messages = messages
             if system_prompt_override is not None:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
-            yield from self._chat_zhipu(final_messages, tools)
+            yield from self._chat_zhipu(final_messages, tools, tool_choice)
         else:
             raise ValueError(f"不支持的厂商: {self.config.provider}")
 
@@ -266,6 +270,7 @@ class LLMRouter:
         messages: list[dict],
         tools: Optional[list[dict]],
         system_message: Optional[str] = None,  # P2 新增：system prompt
+        tool_choice: Optional[str] = None,    # Fork 压缩：传 "none" 禁调工具
     ) -> Generator[StreamChunk, None, None]:
         """Anthropic Claude 流式调用（同步，支持 thinking blocks）"""
         client = self._get_anthropic_client()
@@ -277,6 +282,12 @@ class LLMRouter:
         }
         if tools:
             kwargs["tools"] = tools
+            # tool_choice 必须在传 tools 时才有效
+            # Anthropic 接受: "auto" / "any" / "tool" / "none"
+            if tool_choice == "none":
+                kwargs["tool_choice"] = {"type": "none"}
+            elif tool_choice == "auto":
+                kwargs["tool_choice"] = {"type": "auto"}
         if self.config.temperature > 0:
             kwargs["temperature"] = self.config.temperature
         
@@ -341,6 +352,7 @@ class LLMRouter:
         self,
         messages: list[dict],
         tools: Optional[list[dict]],
+        tool_choice: Optional[str] = None,  # Fork 压缩：传 "none" 禁调工具
     ) -> Generator[StreamChunk, None, None]:
         """OpenAI GPT 流式调用（同步，支持 tool_calls 解析）"""
         client = self._get_openai_client()
@@ -354,6 +366,9 @@ class LLMRouter:
         }
         if tools:
             kwargs["tools"] = [{"type": "function", "function": t} for t in tools]
+            if tool_choice is not None:
+                # OpenAI 接受: "auto" / "none" / "required" / {"type": "function", "function": {"name": "..."}}
+                kwargs["tool_choice"] = tool_choice
         if self.config.temperature > 0:
             kwargs["temperature"] = self.config.temperature
 
@@ -430,6 +445,7 @@ class LLMRouter:
         self,
         messages: list[dict],
         tools: Optional[list[dict]],
+        tool_choice: Optional[str] = None,  # Fork 压缩：传 "none" 禁调工具
     ) -> Generator[StreamChunk, None, None]:
         """智谱 GLM 流式调用（Coding Plan 专用端点）"""
         client = self._get_zhipu_client()
@@ -478,6 +494,9 @@ class LLMRouter:
                         }
                     })
             kwargs["tools"] = openai_tools
+            if tool_choice is not None:
+                # GLM (OpenAI 兼容) 接受: "auto" / "none" / "required"
+                kwargs["tool_choice"] = tool_choice
         if self.config.temperature > 0:
             kwargs["temperature"] = self.config.temperature
 

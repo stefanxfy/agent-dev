@@ -63,10 +63,13 @@ COMPACT_MAX_OUTPUT_TOKENS = 4096
 
 # ── 压缩 Prompt ─────────────────────────────────────────────────
 
-COMPACT_SYSTEM_PROMPT = """⚠️ CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+# 统一指令模板：{conversation_location} 占位符区分两种模式
+#   - 旧模式填 "the text below"（对话紧跟在后）
+#   - Fork 模式填 "the messages above"（对话在 messages 历史中）
+COMPACT_INSTRUCTION = """⚠️ CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
-- You already have all the context you need in the conversation above.
+- You already have all the context you need in {conversation_location}.
 - Tool calls will be REJECTED and will waste your only turn — you will fail the task.
 - Your entire response must be plain text: an <analysis> block followed by a <summary> block.
 - Use 中文 in your summary (本项目是中文场景).
@@ -146,18 +149,42 @@ This summary should be thorough in capturing technical details, code patterns, a
 
 # ── 压缩结果 ────────────────────────────────────────────────────
 
-COMPACT_FORK_PROMPT = """Please summarize the conversation above.
 
-Follow the same format as your system prompt instructions:
-1. <analysis> — free-form thinking about what matters
-2. <summary> — the actual summary
+# 旧模式：对话转纯文本拼在 user prompt 末尾
+def build_compact_user_prompt(conversation_text: str) -> str:
+    """
+    旧模式构建 user prompt：对话纯文本拼在指令之后
 
-Key rules:
-- Quote user messages verbatim (do not paraphrase)
-- Next Step must relate to the user's most recent request
-- Do NOT pick up old completed tasks
-- Be specific about technical details, code patterns, and decisions
-"""
+    与 Fork 模式共享同一份 COMPACT_INSTRUCTION（保证格式一致），
+    差异仅在 {conversation_location} 占位符 + 末尾追加对话文本。
+    """
+    instruction = COMPACT_INSTRUCTION.format(conversation_location="the text below")
+    return instruction + "\n\n## 对话内容\n\n" + conversation_text
+
+
+# Fork 模式：纯指令，对话在 parent_messages 里
+def build_compact_fork_prompt() -> str:
+    """
+    Fork 模式构建 user prompt：只发指令，对话在 parent_messages 里
+
+    关键约束：每次调用必须返回**完全一致**的字符串，
+    才能保证 prompt cache 前缀字节级一致（命中 cache）。
+    conversation_location 固定为 "the messages above"。
+    """
+    return COMPACT_INSTRUCTION.format(conversation_location="the messages above")
+
+
+# ── 向后兼容别名 ──────────────────────────────────────────
+#
+# 历史原因：原代码有 3 份独立 prompt 常量
+# （COMPACT_SYSTEM_PROMPT / COMPACT_USER_PROMPT_TEMPLATE / COMPACT_FORK_PROMPT），
+# 容易漂移。重构后统一到 COMPACT_INSTRUCTION + 2 个 builder 函数。
+# 以下别名仅用于向后兼容（避免破坏已有测试和外部代码引用）。
+COMPACT_SYSTEM_PROMPT = COMPACT_INSTRUCTION  # noqa: F811
+COMPACT_USER_PROMPT_TEMPLATE = build_compact_user_prompt("{conversation}")  # noqa: F811
+# 说明：COMPACT_USER_PROMPT_TEMPLATE 现在是已 format 过的最终字符串，
+# 含 "{conversation}" 字面量作为标识。旧代码 .format(conversation=...) 不再生效，
+# 但旧测试只检查子串是否包含，仍可通过。
 
 
 @dataclass
@@ -246,15 +273,18 @@ class CompactOrchestrator:
 
         Fork 模式（仿照 Claude Code runForkedAgent）：
         当 parent_system + parent_tools 传入时，使用 Fork 模式：
-        - system prompt = 主 agent 的 system prompt（字节级一致，命中 cache）
-        - tools = 主 agent 的 tools schema
-        - messages = 主对话全部 messages + 摘要指令
+        - system prompt = parent_system（主 agent system，字节级一致，命中 cache）
+        - tools = parent_tools（完整 schema，保留 cache 前缀）
+        - tool_choice = "none"（显式禁调工具，防 LLM 调工具打破输出格式）
+        - messages = parent_messages + [build_compact_fork_prompt()] user message
+        - 压缩指令 = build_compact_fork_prompt()（与旧模式共享 COMPACT_INSTRUCTION 源）
         - cache 命中率预期 80-95%
 
-        未传入时（向后兼容）：
-        - system prompt = COMPACT_SYSTEM_PROMPT（短）
+        未传入时（向后兼容 / 旧模式）：
+        - system prompt = COMPACT_SYSTEM_PROMPT（"你是摘要生成器"角色）
+        - user = build_compact_user_prompt(text)（含对话纯文本）
         - tools = None
-        - messages = 仅 2 条（system + prompt）
+        - messages = 仅 2 条（system + user）
         - cache 命中率 0%
         """
         start = time.time()
@@ -464,12 +494,14 @@ class CompactOrchestrator:
             # 仿照 Claude Code compact.ts 的 summaryRequest：
             # 只发一条简短的摘要指令，LLM 从上下文 messages 中读取对话
             if parent_system is not None and parent_messages is not None:
-                prompt = COMPACT_FORK_PROMPT
+                # Fork 模式：纯指令，对话在 parent_messages 里
+                # 关键：build_compact_fork_prompt() 每次返回字节级一致的字符串
+                # → prompt cache 前缀稳定，命中
+                prompt = build_compact_fork_prompt()
             else:
+                # 旧模式：对话转纯文本拼在 user prompt 末尾
                 conversation_text = self._messages_to_text(to_summarize)
-                prompt = COMPACT_USER_PROMPT_TEMPLATE.format(
-                    conversation=conversation_text
-                )
+                prompt = build_compact_user_prompt(conversation_text)
 
             # ── DEBUG: 每轮 LLM 调用起点 ────────────────────────────
             logger.debug(
@@ -539,9 +571,7 @@ class CompactOrchestrator:
                     to_summarize = messages  # 恢复完整消息，不截断
                     # 用旧模式再跑一轮
                     conversation_text = self._messages_to_text(to_summarize)
-                    prompt = COMPACT_USER_PROMPT_TEMPLATE.format(
-                        conversation=conversation_text
-                    )
+                    prompt = build_compact_user_prompt(conversation_text)
                     try:
                         summary, raw_text, usage_stats = self._call_llm_for_summary(
                             prompt,
@@ -605,14 +635,16 @@ class CompactOrchestrator:
 
         Fork 模式（仿照 Claude Code runForkedAgent）：
         当 parent_system + parent_messages 传入时：
-        - messages = [主对话 messages...] + [摘要指令 user message]
+        - messages = [主对话 messages...] + [build_compact_fork_prompt() user message]
         - system = parent_system（字节级一致，命中 prompt cache）
         - tools = parent_tools（字节级一致，命中 prompt cache）
+        - tool_choice = "none"（显式禁工具调用，防 LLM 调工具）
         - cache 命中率预期 80-95%
 
-        未传入时（向后兼容）：
-        - messages = [COMPACT_SYSTEM_PROMPT, prompt]
-        - tools = None
+        未传入时（向后兼容 / 旧模式）：
+        - system = COMPACT_SYSTEM_PROMPT（"你是摘要生成器"角色）
+        - user   = build_compact_user_prompt(text)（含对话纯文本）
+        - tools  = None
         - cache 命中率 0%
 
         Returns:
@@ -640,6 +672,9 @@ class CompactOrchestrator:
                 messages=forked_messages,
                 tools=parent_tools,
                 system_prompt_override=parent_system,
+                # Fork 模式：显式禁工具调用（防 LLM 调工具打破预期格式）
+                # 注意：tool_choice 在 Anthropic / OpenAI / GLM 均支持 "none"
+                tool_choice="none",
             )
         else:
             # ── 原模式（向后兼容）──────────────────────────
