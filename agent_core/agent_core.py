@@ -289,7 +289,13 @@ class ReactAgent:
 
         # Day 5：用 ContextManager 替代 _trim_messages
         # 检查 token 预算，必要时自动压缩
-        compacted, compact_result = self.context_manager.check_and_compact(self.messages)
+        # Fork 模式：传入主 agent 的 system_prompt + tools，复用 cache prefix
+        tool_schemas = self.tools.list_schemas(provider=self._detect_provider())
+        compacted, compact_result = self.context_manager.check_and_compact(
+            self.messages,
+            parent_system=self.system_prompt,
+            parent_tools=tool_schemas or None,
+        )
         if compact_result:
             if compact_result.success:
                 self.messages = compacted

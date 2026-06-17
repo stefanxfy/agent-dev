@@ -80,7 +80,10 @@ class ContextManager:
         return info
 
     def check_and_compact(
-        self, messages: list[dict]
+        self,
+        messages: list[dict],
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
     ) -> tuple[list[dict], Optional[CompactionResult]]:
         """
         检查并在需要时执行压缩
@@ -88,13 +91,21 @@ class ContextManager:
         返回：(压缩后的消息列表, 压缩结果)
         如果不需要压缩，返回 (原消息, None)
         如果压缩失败，返回 (原消息, CompactionResult(success=False))
+
+        Fork 模式参数透传给 CompactOrchestrator.compact()：
+        - parent_system: 主 agent 的 system prompt（字节级一致）
+        - parent_tools: 主 agent 的 tools schema
         """
         should, reason = self.budget.should_compact(messages)
         if not should:
             return messages, None
 
         logger.info(f"Auto-compact triggered: {reason}")
-        result = self.compactor.compact(messages)
+        result = self.compactor.compact(
+            messages,
+            parent_system=parent_system,
+            parent_tools=parent_tools,
+        )
 
         if result.success:
             self.compact_count += 1
@@ -106,14 +117,23 @@ class ContextManager:
             logger.warning(f"Compact failed: {result.error}")
             return messages, result
 
-    def force_compact(self, messages: list[dict]) -> CompactionResult:
+    def force_compact(
+        self,
+        messages: list[dict],
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
+    ) -> CompactionResult:
         """
         强制压缩（忽略预算检查）
 
         用于手动触发压缩的场景。
         """
         logger.info("Force compact requested")
-        result = self.compactor.compact(messages)
+        result = self.compactor.compact(
+            messages,
+            parent_system=parent_system,
+            parent_tools=parent_tools,
+        )
 
         if result.success:
             self.compact_count += 1

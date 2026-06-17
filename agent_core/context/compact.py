@@ -144,6 +144,20 @@ This summary should be thorough in capturing technical details, code patterns, a
 
 # ── 压缩结果 ────────────────────────────────────────────────────
 
+COMPACT_FORK_PROMPT = """Please summarize the conversation above.
+
+Follow the same format as your system prompt instructions:
+1. <analysis> — free-form thinking about what matters
+2. <summary> — the actual summary
+
+Key rules:
+- Quote user messages verbatim (do not paraphrase)
+- Next Step must relate to the user's most recent request
+- Do NOT pick up old completed tasks
+- Be specific about technical details, code patterns, and decisions
+"""
+
+
 @dataclass
 class CompactionResult:
     """压缩结果"""
@@ -209,7 +223,12 @@ class CompactOrchestrator:
         self.budget = budget_manager
         self.token_counter = token_counter
 
-    def compact(self, messages: list[dict]) -> CompactionResult:
+    def compact(
+        self,
+        messages: list[dict],
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
+    ) -> CompactionResult:
         """
         执行压缩
 
@@ -218,6 +237,19 @@ class CompactOrchestrator:
         2. 构建压缩 prompt
         3. 调 LLM 生成摘要（含 PTL 防御）
         4. 组装压缩后消息
+
+        Fork 模式（仿照 Claude Code runForkedAgent）：
+        当 parent_system + parent_tools 传入时，使用 Fork 模式：
+        - system prompt = 主 agent 的 system prompt（字节级一致，命中 cache）
+        - tools = 主 agent 的 tools schema
+        - messages = 主对话全部 messages + 摘要指令
+        - cache 命中率预期 80-95%
+
+        未传入时（向后兼容）：
+        - system prompt = COMPACT_SYSTEM_PROMPT（短）
+        - tools = None
+        - messages = 仅 2 条（system + prompt）
+        - cache 命中率 0%
         """
         start = time.time()
         tokens_before = self.token_counter.count_messages(messages)
@@ -244,7 +276,12 @@ class CompactOrchestrator:
             )
 
             # 2-3. 生成摘要（含 PTL 防御）
-            summary, ptl_retries = self._generate_summary_with_ptl(preprocessed)
+            summary, ptl_retries = self._generate_summary_with_ptl(
+                preprocessed,
+                parent_system=parent_system,
+                parent_tools=parent_tools,
+                parent_messages=messages,
+            )
 
             if not summary:
                 raise ValueError("LLM 返回空摘要")
@@ -373,7 +410,11 @@ class CompactOrchestrator:
     # ── 摘要生成（含 PTL 防御）──────────────────────────────────
 
     def _generate_summary_with_ptl(
-        self, messages: list[dict]
+        self,
+        messages: list[dict],
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
     ) -> tuple[str, int]:
         """
         生成摘要，含 PTL（Prompt-Too-Long）防御
@@ -382,15 +423,27 @@ class CompactOrchestrator:
         逐层截断最旧的消息分组，最多重试 MAX_PTL_RETRIES 次。
 
         参考：Claude Code compact.ts 的 PTL retry loop
+
+        Fork 模式：
+        parent_system/parent_tools/parent_messages 传入时，
+        LLM 调用复用主 agent 的 cache-key params，
+        messages = [...parent_messages, summaryRequest]，
+        仿照 Claude Code runForkedAgent。
         """
         to_summarize = messages
         last_error = ""
 
         for attempt in range(MAX_PTL_RETRIES + 1):
-            conversation_text = self._messages_to_text(to_summarize)
-            prompt = COMPACT_USER_PROMPT_TEMPLATE.format(
-                conversation=conversation_text
-            )
+            # Fork 模式：parent_messages 已包含完整对话，不需要重复塞文本
+            # 仿照 Claude Code compact.ts 的 summaryRequest：
+            # 只发一条简短的摘要指令，LLM 从上下文 messages 中读取对话
+            if parent_system is not None and parent_messages is not None:
+                prompt = COMPACT_FORK_PROMPT
+            else:
+                conversation_text = self._messages_to_text(to_summarize)
+                prompt = COMPACT_USER_PROMPT_TEMPLATE.format(
+                    conversation=conversation_text
+                )
 
             # ── DEBUG: 每轮 LLM 调用起点 ────────────────────────────
             logger.debug(
@@ -403,7 +456,12 @@ class CompactOrchestrator:
             )
 
             try:
-                summary, raw_text = self._call_llm_for_summary(prompt)
+                summary, raw_text = self._call_llm_for_summary(
+                    prompt,
+                    parent_system=parent_system,
+                    parent_tools=parent_tools,
+                    parent_messages=parent_messages,
+                )
                 if summary:
                     # ── DEBUG: 提取成功 ─────────────────────────────
                     logger.debug(
@@ -463,23 +521,66 @@ class CompactOrchestrator:
             f"PTL defense exhausted after {MAX_PTL_RETRIES} retries: {last_error}"
         )
 
-    def _call_llm_for_summary(self, prompt: str) -> tuple[str, str]:
+    def _call_llm_for_summary(
+        self,
+        prompt: str,
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
+    ) -> tuple[str, str]:
         """
         调用 LLM 生成摘要
 
         LLMRouter.chat() 返回同步生成器（StreamChunk），
         需要消费生成器收集文本。
 
+        Fork 模式（仿照 Claude Code runForkedAgent）：
+        当 parent_system + parent_messages 传入时：
+        - messages = [主对话 messages...] + [摘要指令 user message]
+        - system = parent_system（字节级一致，命中 prompt cache）
+        - tools = parent_tools（字节级一致，命中 prompt cache）
+        - cache 命中率预期 80-95%
+
+        未传入时（向后兼容）：
+        - messages = [COMPACT_SYSTEM_PROMPT, prompt]
+        - tools = None
+        - cache 命中率 0%
+
         Returns:
             (extracted_summary, raw_llm_output)
         """
-        chunks = self.llm.chat(
-            messages=[
-                {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            tools=None,  # 摘要不允许工具调用
-        )
+        use_fork = parent_system is not None and parent_messages is not None
+
+        if use_fork:
+            # ── Fork 模式 ──────────────────────────────────
+            # 仿照 Claude Code forkedAgent.ts:524
+            # initialMessages = [...forkContextMessages, ...promptMessages]
+            forked_messages = list(parent_messages) + [
+                {"role": "user", "content": prompt}
+            ]
+
+            logger.info(
+                f"🔀 [Fork Compact] Using parent cache: "
+                f"system={len(parent_system)} chars, "
+                f"tools={len(parent_tools) if parent_tools else 0}, "
+                f"parent_msgs={len(parent_messages)}, "
+                f"total_msgs={len(forked_messages)}"
+            )
+
+            chunks = self.llm.chat(
+                messages=forked_messages,
+                tools=parent_tools,
+                system_prompt_override=parent_system,
+            )
+        else:
+            # ── 原模式（向后兼容）──────────────────────────
+            chunks = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+            )
 
         full_text = ""
         for chunk in chunks:

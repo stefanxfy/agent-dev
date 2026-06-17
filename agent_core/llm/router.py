@@ -207,6 +207,7 @@ class LLMRouter:
         self,
         messages: list[dict],
         tools: Optional[list[dict]] = None,
+        system_prompt_override: Optional[str] = None,
     ) -> Generator[StreamChunk, None, None]:
         """
         统一 chat 接口，返回 StreamChunk 生成器（同步）。
@@ -215,24 +216,46 @@ class LLMRouter:
         特殊处理 system message：
         - Anthropic: 提取 system 作为顶层参数
         - OpenAI/Zhipu: 保留在 messages 中
+        
+        Args:
+            messages: 对话消息列表
+            tools: 工具 schema 列表
+            system_prompt_override: Fork 模式下覆盖 system prompt。
+                仿照 Claude Code createCacheSafeParams，Fork Agent 必须
+                使用主 agent 的 system prompt 字节才能命中 prompt cache。
+                传入时，忽略 messages 中的 system message，用此值替代。
         """
         provider = self.config.provider.value if isinstance(self.config.provider, Enum) else self.config.provider
         
-        # 提取 system message（如果有）
-        system_message = None
+        # 提取 system message
+        # Fork 模式：system_prompt_override 优先（保证字节级一致）
+        system_message = system_prompt_override
         filtered_messages = []
         for m in messages:
             if m.get("role") == "system":
-                system_message = m.get("content", "")
+                if system_prompt_override is None:
+                    # 非 Fork 模式：从 messages 中提取 system
+                    system_message = m.get("content", "")
+                # Fork 模式：跳过 messages 中的 system（用 override）
             else:
                 filtered_messages.append(m)
         
         if provider == "anthropic":
             yield from self._chat_anthropic(filtered_messages, tools, system_message)
         elif provider == "openai":
-            yield from self._chat_openai(messages, tools)  # OpenAI 保留 system
+            # OpenAI/Zhipu 保留 system 在 messages 中
+            # Fork 模式：需要用 override 替换/注入 system
+            final_messages = messages
+            if system_prompt_override is not None:
+                final_messages = [{"role": "system", "content": system_prompt_override}]
+                final_messages.extend(filtered_messages)
+            yield from self._chat_openai(final_messages, tools)
         elif provider == "zhipu":
-            yield from self._chat_zhipu(messages, tools)  # Zhipu 保留 system
+            final_messages = messages
+            if system_prompt_override is not None:
+                final_messages = [{"role": "system", "content": system_prompt_override}]
+                final_messages.extend(filtered_messages)
+            yield from self._chat_zhipu(final_messages, tools)
         else:
             raise ValueError(f"不支持的厂商: {self.config.provider}")
 
