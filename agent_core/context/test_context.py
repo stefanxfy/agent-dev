@@ -1099,13 +1099,13 @@ class TestImageDocumentTokenEstimation:
 # ── Preserved Head 测试（连续性优先）──────────────────────────
 
 class TestPreservedHeadBuilder:
-    """preserved head 配对 + max_turns 硬停，保证对话连续性
+    """preserved head 配对 + max_turns 硬停 + max_total_tokens 硬停
 
-    设计原则（用户最终方案）：
+    设计原则（用户 21:12 确认的 v4 — 严格执行）：
     1. 配对：user+assistant 配对成 turn，不拆散
     2. max_turns 硬停：达到 N turn 立即停止
-    3. max_total_tokens 软限制：超 budget 不停（连续性优先）
-    4. 不丢弃 turn：保证 preserved head 是连续时段
+    3. max_total_tokens 硬停：累计超 budget → 这个 turn 不保留 + 停止
+    4. 第一个 turn 总是包含：避免空 head
     """
 
     def test_pair_user_assistant_into_turns(self):
@@ -1167,8 +1167,8 @@ class TestPreservedHeadBuilder:
         assert result[0]["content"] == "u2"
         assert result[-1]["content"] == "a4"
 
-    def test_max_total_tokens_is_soft_limit(self):
-        """max_total_tokens 软限制：超 budget 不停（连续性优先）"""
+    def test_max_total_tokens_is_hard_limit(self):
+        """max_total_tokens 硬限制：超 budget 这个 turn 不加 + 停止（v4）"""
         # 4 turn, 每个 ~980 tok
         msgs = []
         for i in range(4):
@@ -1176,16 +1176,26 @@ class TestPreservedHeadBuilder:
             msgs.append({"role": "assistant", "content": f"a{i} " + "x" * 700})
         result = _build_preserved_head(
             non_system=msgs,
-            max_total_tokens=2000,  # 软限制（超了也继续）
+            max_total_tokens=2000,  # 硬限制：超了就 stop
             max_turns=4,
         )
-        # 4 turn × 2 = 8 条全保留（超 budget）
-        assert len(result) == 8
-        assert "u0" in result[0]["content"]
+        # 从后往前：turn3 (~980 tok) 加 → total=980 → turn2 (~980 tok) 加 → total=1960 ok
+        # 再 turn1 (~980 tok) → total=2940 > 2000 → break
+        # 实际：2 turn 保留，4 条
+        # 注：调参后 turn1 是第一个 turn（边界 case），但 selected_turns 已非空，所以 break
+        # 验证 budget 严格不超
+        total_chars = sum(len(str(m.get("content", ""))) for m in result)
+        # token = chars * 0.7 + overhead，每个 turn ~ (700+2)*2 * 0.7 + 8 = 987
+        # budget 2000 → 最多 2 turn (~1974), 第 3 个 turn 会超
+        assert total_chars > 0
+        assert len(result) == 4  # 2 turn
+        assert "u2" in result[0]["content"]
         assert "a3" in result[-1]["content"]
+        # turn0/turn1 不在
+        assert not any("u0" in str(m.get("content", "")) or "a0" in str(m.get("content", "")) for m in result)
 
-    def test_oversized_turn_kept_for_continuity(self):
-        """核心：超大 turn 保留（连续性优先），budget 会被超"""
+    def test_oversized_turn_excluded_by_budget(self):
+        """核心：超大 turn 不进 preserved head（v4 严格执行 budget）"""
         flood = "x" * 13187
         msgs = [
             {"role": "user", "content": "turn1 user"},
@@ -1202,21 +1212,19 @@ class TestPreservedHeadBuilder:
             max_total_tokens=4000,
             max_turns=3,
         )
-        # max_turns=3 硬限 → 取最近 3 turn：turn2, turn3(灌水), turn4
-        # 连续：3 turn 连续包含
-        assert len(result) == 6
-        # 保留的是 turn2/turn3/turn4（连续）
-        assert "turn2 user" in str(result[0]["content"])
-        assert "turn2 assistant" in str(result[1]["content"])
-        assert "turn3 灌水 user" in str(result[2]["content"])
-        assert "x" in str(result[3]["content"])  # 灌水保留
-        assert "turn4 user" in str(result[4]["content"])
-        assert "turn4 assistant" in str(result[5]["content"])
-        # turn1 不在
+        # 从后往前：turn4 (小) → total=小 → 加
+        # turn3 (灌水超大) → total + 灌水 > 4000 → break（selected_turns 非空）
+        # 期望：保留 turn4 = 2 条
+        assert len(result) == 2
+        assert "turn4 user" in result[0]["content"]
+        assert "turn4 assistant" in result[1]["content"]
+        # turn1/turn2/turn3 都不在（灌水 turn 也不在）
         assert not any("turn1" in str(m.get("content", "")) for m in result)
-        # budget 会被超（软限制）
-        total = sum(len(str(m.get("content", ""))) for m in result)
-        assert total > 4000
+        assert not any("turn2" in str(m.get("content", "")) for m in result)
+        assert not any("turn3" in str(m.get("content", "")) for m in result)
+        # budget 严格不超
+        total = sum(int(len(str(m.get("content", ""))) * 0.7) + 4 for m in result)
+        assert total <= 4000
 
     def test_continuity_no_gaps(self):
         """连续性：保留的 turn 在原消息列表中必须相邻（无 gap）"""
@@ -1255,8 +1263,8 @@ class TestPreservedHeadBuilder:
         assert len(result) == 3
         assert "orphan" in str(result[0]["content"])
 
-    def test_compacted_uses_continuity_strategy(self):
-        """端到端：_build_compacted_messages 用连续性策略"""
+    def test_compacted_uses_budget_strategy(self):
+        """端到端：_build_compacted_messages 用 budget 硬限制（v4）"""
         flood = "灌水 " * 3000
         messages = [
             {"role": "system", "content": "You are helpful"},
@@ -1278,11 +1286,14 @@ class TestPreservedHeadBuilder:
         )
         assert compacted[0]["role"] == "system"
         assert compacted[1]["role"] == "user"
-        # 连续性：3 turn 都保留（含 turn2 灌水）
-        assert len(recent) == 6
-        assert "turn1" in str(recent[0]["content"])
-        assert "turn1" in str(recent[1]["content"])
-        assert "turn2" in str(recent[2]["content"])
-        assert "灌水" in str(recent[3]["content"])
-        assert "turn3" in str(recent[4]["content"])
-        assert "turn3" in str(recent[5]["content"])
+        # v4 budget 硬限制：turn3 (最后 1 turn) 保留，turn2 灌水不进
+        # 注：实际看 _build_compacted_messages 默认 max_total_tokens=4000
+        # turn3 小 → 加；turn2 灌水超大 → 加了会超 → break（selected_turns 非空）
+        # 期望：recent = [turn3 user, turn3 assistant] = 2 条
+        assert len(recent) == 2
+        assert "turn3" in str(recent[0]["content"])
+        assert "turn3" in str(recent[1]["content"])
+        # 灌水不在
+        assert not any("灌水" in str(m.get("content", "")) for m in recent)
+        assert not any("turn1" in str(m.get("content", "")) for m in recent)
+        assert not any("turn2" in str(m.get("content", "")) for m in recent)

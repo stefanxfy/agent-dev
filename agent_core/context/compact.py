@@ -247,29 +247,31 @@ def _build_preserved_head(
     max_turns: int = 3,
 ) -> list[dict]:
     """
-    构建 preserved head：配对 + max_turns 硬停，保证对话连续性
+    构建 preserved head：配对 + max_turns 硬停 + max_total_tokens 硬停
 
-    设计原则（用户提议的 v3）：
+    设计原则（用户 21:12 确认的 v4 — 严格执行）：
     1. **配对**：user+assistant 配对成 turn，不拆散
     2. **max_turns 硬停**：达到 N 对 turn 立即停止
-    3. **max_total_tokens 软限制**：仅 logging，不停止
-       - 原因：如果 budget 硬停，““灌水 turn 在中间”” 场景会让上下文变孤立
-       - 例：4 turn 中 turn3 灌水 → 硬停得 [turn4] （孤立）
-       - 软限制得 [turn2, turn3, turn4] （连续）
-    4. **不丢弃 turn**：保证 preserved head 是连续时段
+    3. **max_total_tokens 硬停**：累计 token 超 budget → 这个 turn 不保留 + 停止
+       - 灌水 turn 会让 preserved head 提前到顶，但**严格不超 budget**
+       - LLM 看不到完整最近对话没关系，**不能让它看灌水**
+    4. **第一个 turn 总是包含**（边界 case）：避免 preserved head 完全为空
+       - 极端情况：单 turn 超大 → 仍保留这一个（保证非空）
 
-    为什么不用 MAX_TURN_TOKENS 丢弃超大 turn？
-    - 丢弃超大 turn 会让前后 turn 出现 “洞”（不连续）
-    - 例如：turn1→turn2(灌水)→turn3，drop turn2 得 [turn1, turn3]（中间缺一段）
+    为什么不用 drop 超大 turn？
+    - 不需要"整 turn 丢弃"分支。max_total_tokens 硬停 + 第一个 turn 例外
+      已经能处理所有场景：
+        * 中间 turn 灌水 → 后面的 turn 不再加（preserved head 可能 1 turn）
+        * 第一个 turn 灌水 → 仍保留这一个（避免空 head）
+    - 删 MAX_TURN_TOKENS 常量简化逻辑
 
     迭代顺序：从后往前（最近的优先）
-    - max_turns 限制：已经有 N turn → 停
-    - max_total_tokens 仅记录超 budget 情况（连续性优先）
-    - 单 turn 超大：依然包含（保证最近几个 turn 是连续的）
+    - 任一硬停条件达到 → break
+    - 第一个 turn 总是包含（即使超大）
 
     Args:
         non_system: 非 system 消息列表（按时间正序）
-        max_total_tokens: preserved head 总 token 预算（软限制）
+        max_total_tokens: preserved head 总 token 预算（**硬限制**）
         max_turns: 最多保留几对（turn = user + assistant），硬限制
 
     Returns:
@@ -281,8 +283,10 @@ def _build_preserved_head(
     # 1. 配对
     turns = _pair_messages_to_turns(non_system)
 
-    # 2. 从后往前选 turn，直到 max_turns 硬停
-    # max_total_tokens 是软限制：超了也继续（连续性优先）
+    # 2. 从后往前选 turn，任一硬停条件达到即停
+    # - max_turns 硬停：turn 数到 N
+    # - max_total_tokens 硬停：累计超 budget 就不加这个 turn（且停止）
+    # - 第一个 turn 例外：避免空 head
     selected_turns = []
     total = 0
 
@@ -293,26 +297,22 @@ def _build_preserved_head(
         if len(selected_turns) >= max_turns:
             break
 
-        # 总是包含（保证连续性）
+        # 硬限制: 累计超 budget（第一个 turn 例外，避免空 head）
+        if selected_turns and total + turn_tokens > max_total_tokens:
+            break
+
+        # 通过所有硬停检查 → 包含
         selected_turns.insert(0, turn)
         total += turn_tokens
 
-    # 3. 软限制检查：超 budget 仅记录，不拆 turn
-    if total > max_total_tokens and selected_turns:
-        logger.debug(
-            f"📦 [Preserved Head] over budget (soft): "
-            f"{total} > {max_total_tokens} tok, "
-            f"keep all for continuity ({len(selected_turns)} turn)"
-        )
-
-    # 4. 展平
+    # 3. 展平
     result = [m for turn in selected_turns for m in turn]
 
     msg_count = len(result)
     logger.debug(
         f"📦 [Preserved Head] 选 {len(selected_turns)} turn / "
         f"{msg_count} msg, ~{total} tok, "
-        f"hard_cap={max_turns}turns / soft_budget={max_total_tokens}tok"
+        f"hard_cap={max_turns}turns / hard_budget={max_total_tokens}tok"
     )
     return result
 
