@@ -109,10 +109,18 @@ class UsageStats:
     input_tokens: int = 0
     output_tokens: int = 0
     thinking_tokens: int = 0
+    cached_tokens: int = 0  # 从 prompt cache 命中的 token 数（Fork 压缩验证关键指标）
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens + self.thinking_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """Cache 命中率（cached_tokens / input_tokens），input=0 返回 0"""
+        if self.input_tokens <= 0:
+            return 0.0
+        return self.cached_tokens / self.input_tokens
 
     @classmethod
     def from_chunk_usage(cls, usage_obj) -> "UsageStats":
@@ -120,9 +128,11 @@ class UsageStats:
         从不同 LLM provider 的 chunk.usage 对象提取统计，自动适配字段名。
 
         支持的格式：
-        - Anthropic:     input_tokens, output_tokens, thinking_tokens
+        - Anthropic:     input_tokens, output_tokens, thinking_tokens,
+                         cache_creation_input_tokens, cache_read_input_tokens
         - OpenAI/GLM:    prompt_tokens, completion_tokens,
-                         completion_tokens_details.reasoning_tokens
+                         completion_tokens_details.reasoning_tokens,
+                         prompt_tokens_details.cached_tokens
         """
         if usage_obj is None:
             return cls()
@@ -139,10 +149,33 @@ class UsageStats:
                 usage_obj, "completion_tokens_details", "reasoning_tokens"
             )
 
+        # cached_tokens（prompt cache 命中数）
+        # Anthropic: cache_read_input_tokens（直接字段）
+        # OpenAI/GLM: prompt_tokens_details.cached_tokens（嵌套字段）
+        cached_tokens = 0
+        # Anthropic 优先
+        anthropic_cache_read = _get_int(usage_obj, "cache_read_input_tokens")
+        if anthropic_cache_read:
+            cached_tokens = anthropic_cache_read
+        else:
+            # GLM/OpenAI: prompt_tokens_details.cached_tokens
+            # 可能是 Pydantic 对象也可能是 dict，统一处理
+            ptd = getattr(usage_obj, "prompt_tokens_details", None)
+            if ptd is None:
+                # dict fallback
+                if isinstance(usage_obj, dict):
+                    ptd = usage_obj.get("prompt_tokens_details")
+            if ptd is not None:
+                if hasattr(ptd, "cached_tokens"):
+                    cached_tokens = ptd.cached_tokens or 0
+                elif isinstance(ptd, dict):
+                    cached_tokens = ptd.get("cached_tokens", 0) or 0
+
         return cls(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             thinking_tokens=thinking_tokens,
+            cached_tokens=cached_tokens,
         )
 
     def summary(self, provider: str = "") -> str:
@@ -150,6 +183,8 @@ class UsageStats:
         parts = [f"in={self.input_tokens:,}", f"out={self.output_tokens:,}"]
         if self.thinking_tokens:
             parts.append(f"think={self.thinking_tokens:,}")
+        if self.cached_tokens:
+            parts.append(f"cached={self.cached_tokens:,} ({self.cache_hit_rate*100:.1f}%)")
         parts.append(f"total={self.total_tokens:,}")
         if provider:
             return f"[{provider}] " + " · ".join(parts)

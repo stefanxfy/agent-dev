@@ -318,14 +318,12 @@ class CompactOrchestrator:
                 parent_tools=parent_tools,
                 parent_messages=parent_messages,
             )
-            cached = 0
-            if usage_stats:
-                ptd = getattr(usage_stats, 'prompt_tokens_details', None)
-                if isinstance(ptd, dict):
-                    cached = ptd.get('cached_tokens', 0)
+            cached = usage_stats.cached_tokens if usage_stats else 0
+            input_tok = usage_stats.input_tokens if usage_stats else 0
+            hit_pct = (cached / max(input_tok, 1)) * 100
             logger.debug(
-                f"🔧 [Compact] usage_stats: input={usage_stats.input_tokens if usage_stats else 'N/A'}, "
-                f"cached={cached}"
+                f"🔧 [Compact] usage_stats: input={input_tok if usage_stats else 'N/A'}, "
+                f"cached={cached} ({hit_pct:.1f}%)"
             )
 
             if not summary:
