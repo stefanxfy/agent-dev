@@ -169,6 +169,7 @@ class CompactionResult:
     error: Optional[str] = None
     compact_time_ms: float = 0
     ptl_retries: int = 0
+    usage_stats: Optional[UsageStats] = None
 
     @property
     def tokens_freed(self) -> int:
@@ -228,6 +229,7 @@ class CompactOrchestrator:
         messages: list[dict],
         parent_system: Optional[str] = None,
         parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
     ) -> CompactionResult:
         """
         执行压缩
@@ -276,11 +278,15 @@ class CompactOrchestrator:
             )
 
             # 2-3. 生成摘要（含 PTL 防御）
-            summary, ptl_retries = self._generate_summary_with_ptl(
+            summary, ptl_retries, usage_stats = self._generate_summary_with_ptl(
                 preprocessed,
                 parent_system=parent_system,
                 parent_tools=parent_tools,
-                parent_messages=messages,
+                parent_messages=parent_messages,
+            )
+            logger.debug(
+                f"🔧 [Compact] usage_stats: input={usage_stats.input_tokens if usage_stats else 'N/A'}, "
+                f"cached={usage_stats.prompt_tokens_details.get('cached_tokens', 0) if usage_stats and usage_stats.prompt_tokens_details else 'N/A'}"
             )
 
             if not summary:
@@ -313,6 +319,7 @@ class CompactOrchestrator:
                 tokens_after=tokens_after,
                 compact_time_ms=elapsed,
                 ptl_retries=ptl_retries,
+                usage_stats=usage_stats,
             )
 
         except Exception as e:
@@ -456,7 +463,7 @@ class CompactOrchestrator:
             )
 
             try:
-                summary, raw_text = self._call_llm_for_summary(
+                summary, raw_text, usage_stats = self._call_llm_for_summary(
                     prompt,
                     parent_system=parent_system,
                     parent_tools=parent_tools,
@@ -472,7 +479,7 @@ class CompactOrchestrator:
                         f"  └─ Extracted summary ({len(summary)} chars):\n"
                         f"{_truncate(summary, 500)}"
                     )
-                    return summary, attempt
+                    return summary, attempt, usage_stats
 
                 # 空响应，可能是 LLM 异常
                 last_error = "LLM returned empty summary"
@@ -583,15 +590,18 @@ class CompactOrchestrator:
             )
 
         full_text = ""
+        last_usage = None
         for chunk in chunks:
             if chunk.text_delta:
                 full_text += chunk.text_delta.text
-            # 忽略 thinking/usage/tool_call chunks
+            if chunk.usage:
+                last_usage = chunk.usage
+            # 忽略 thinking/tool_call chunks
 
         summary = self._extract_summary(full_text)
 
 
-        return summary, full_text
+        return summary, full_text, last_usage
 
     # ── 辅助方法 ────────────────────────────────────────────────
 

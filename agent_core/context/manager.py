@@ -84,6 +84,7 @@ class ContextManager:
         messages: list[dict],
         parent_system: Optional[str] = None,
         parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
     ) -> tuple[list[dict], Optional[CompactionResult]]:
         """
         检查并在需要时执行压缩
@@ -105,6 +106,7 @@ class ContextManager:
             messages,
             parent_system=parent_system,
             parent_tools=parent_tools,
+            parent_messages=parent_messages,
         )
 
         if result.success:
@@ -122,6 +124,7 @@ class ContextManager:
         messages: list[dict],
         parent_system: Optional[str] = None,
         parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
     ) -> CompactionResult:
         """
         强制压缩（忽略预算检查）
@@ -133,6 +136,7 @@ class ContextManager:
             messages,
             parent_system=parent_system,
             parent_tools=parent_tools,
+            parent_messages=parent_messages,
         )
 
         if result.success:
