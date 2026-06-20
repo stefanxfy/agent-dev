@@ -22,28 +22,82 @@ from .types import (
 from .config import MemoryConfig
 from .path_validator import MemoryPathValidator, PathSecurityError
 
-# M1 已有但属 v1 历史实现（保留调用方兼容，不在 M1 验收范围）
+# M2 已就绪（双通道脊柱）
+from .meta_db import MetaDB, MetaDBError
+from .ipc_lock import IPCLock, LockBusy, LockStale, make_daily_lock, make_extract_lock
+from .memory_store import (
+    MemoryStore,
+    MemoryStoreError,
+    MemoryExistsError,
+    compute_item_hash,
+)
+from .dual_channel_writer import (
+    DualChannelWriter,
+    DualChannelError,
+    ExtractionInProgressError,
+    ExtractionCandidate,
+    MockVectorStore,
+    TurnMessage,
+)
+from .memory_editor import (
+    MemoryEditor,
+    MemoryEditError,
+    SecretDetectedError,
+    InjectionDetectedError,
+    EditPreconditionError,
+    sanitize,
+    scan_secrets,
+)
+
+# v1 历史实现（保留兼容）
 from .daily import DailyLogger
 
-# M2+ 待实现 —— 暂不导入，避免 M1 测试 fail
-# from .memory_store import MemoryStore
-# from .dual_channel_writer import DualChannelWriter
+# M3+ 待实现 —— 暂不导入，避免 M2 测试 fail
 # from .retriever import MemoryRetriever
 # from .distiller import MemoryDistiller
 # from .scheduler import DistillationScheduler
 
 __all__ = [
-    # types
+    # M1: types
     "MemoryType",
     "validate_type",
     "validate_frontmatter",
     "validate_body",
     "CURRENT_SCHEMA_VERSION",
-    # config
+    # M1: config
     "MemoryConfig",
-    # path_validator
+    # M1: path
     "MemoryPathValidator",
     "PathSecurityError",
+    # M2: meta_db
+    "MetaDB",
+    "MetaDBError",
+    # M2: ipc_lock
+    "IPCLock",
+    "LockBusy",
+    "LockStale",
+    "make_daily_lock",
+    "make_extract_lock",
+    # M2: memory_store
+    "MemoryStore",
+    "MemoryStoreError",
+    "MemoryExistsError",
+    "compute_item_hash",
+    # M2: dual_channel_writer
+    "DualChannelWriter",
+    "DualChannelError",
+    "ExtractionInProgressError",
+    "ExtractionCandidate",
+    "MockVectorStore",
+    "TurnMessage",
+    # M2: memory_editor
+    "MemoryEditor",
+    "MemoryEditError",
+    "SecretDetectedError",
+    "InjectionDetectedError",
+    "EditPreconditionError",
+    "sanitize",
+    "scan_secrets",
     # v1 legacy
     "DailyLogger",
 ]
