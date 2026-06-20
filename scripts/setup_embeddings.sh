@@ -4,6 +4,8 @@
 #   - 已下载会跳过,安全可重跑
 #   - 设 SKIP_DOWNLOAD=1 仅验证(不下载)
 #   - 设 CUSTOM_MODEL_DIR=/path/bge-m3 用本地模型
+#   - 国内推荐: HF_ENDPOINT=https://hf-mirror.com bash scripts/setup_embeddings.sh
+#   - 也可: HF_HUB_DOWNLOAD_TIMEOUT=600 加大超时(默认 10s 对 2.3GB 不够)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -59,6 +61,13 @@ elif [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then
 else
     log "开始下载 bge-m3 (~2.3GB,可能 5-30 分钟,看网络)"
     log "    进度条会直接打印,无 --quiet"
+    # 解决 huggingface-hub 默认 timeout=10s 太小的问题
+    # 国内建议设 HF_ENDPOINT=https://hf-mirror.com 镜像
+    export HF_HUB_DOWNLOAD_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-300}"
+    log "    HF_HUB_DOWNLOAD_TIMEOUT=${HF_HUB_DOWNLOAD_TIMEOUT}s"
+    if [ -n "${HF_ENDPOINT:-}" ]; then
+        log "    HF_ENDPOINT=${HF_ENDPOINT}"
+    fi
     # 3-way fallback: hf (新) → huggingface-cli (旧) → Python API (兜底)
     # 注: huggingface-hub 1.20+ 移除了 cli extra, -m huggingface_hub 失效
     download_ok=0
