@@ -106,7 +106,7 @@ class RetrievalReport:
 # ──────────────────────────────────────────────────────────────────
 
 # retriever 期望的 vector_store 接口
-# MockVectorStore 没有 query(),所以 retriever 在 mock 上走 keyword 模式
+# ChromaVectorStore 必须实现 query()(见 chroma_store.py)
 class VectorSearchable(Protocol):
     """retriever 用的 vector 接口"""
     def add(self, doc: dict) -> None: ...

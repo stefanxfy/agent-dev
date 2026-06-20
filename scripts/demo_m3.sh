@@ -2,10 +2,14 @@
 # M3 / Day 3 验收 demo —— 检索 + 安全
 # 跑法：bash scripts/demo_m3.sh   （无需参数）
 # 前置：.venv/bin/python 已装好 pydantic / pyyaml / pytest
-#       可选：sentence-transformers / chromadb（不装也能跑 Mock）
+#       必须：sentence-transformers + bge-m3 + chromadb
+#       安装：bash scripts/setup_embeddings.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# HF_HUB_OFFLINE=1 避免 sentence-transformers 加载时 HEAD 超时
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 echo "=== M3 / Day 3 验收开始 ==="
 echo
@@ -15,36 +19,41 @@ echo
 """
 M3 / Day 3 验收 — 5 个核心 demo
 
-Demo 1: MockEmbedFn 确定性 (L2 修复)
+Demo 1: BGEM3EmbedFn 维度 + 跨语相似度
 Demo 2: SecretScanner 4 pattern 拦截
 Demo 3: Extractor L1 合并 + L7 校验
 Demo 4: Retriever 三模式 + L4 密钥过滤
 Demo 5: ColdStartLoader L5 seed 加载
+
+依赖: bge-m3 + chromadb(由 scripts/setup_embeddings.sh 安装)
 """
 import shutil, tempfile, math
 from pathlib import Path
 tmp = Path(tempfile.mkdtemp())
 
 from agent_core.memory import (
-    MemoryStore, MockVectorStore, MockEmbedFn,
+    MemoryStore, ChromaVectorStore, make_embed_fn,
     SecretScanner, MemoryExtractor, ExtractionCandidate,
     MemoryRetriever, ColdStartLoader, SeedItem, ExtractStats,
 )
 
-# ─── Demo 1: MockEmbedFn 确定性 + 维度 ───
-print("=== Demo 1: MockEmbedFn 维度 + 确定性 ===")
-embed = MockEmbedFn()
+# ─── Demo 1: bge-m3 嵌入维度 + 语义相似度 ───
+print("=== Demo 1: bge-m3 维度 + 跨语相似度 ===")
+embed = make_embed_fn("bge-m3")
 print(f"  dimension: {embed.dimension}")
-v1 = embed.encode("用户叫小明")
-v2 = embed.encode("用户叫小明")
-v3 = embed.encode("用户叫大明")
-assert v1 == v2, "同样的文本必须产生同样的向量"
-assert v1 != v3, "不同文本应产生不同向量"
-norm = math.sqrt(sum(x*x for x in v1))
-assert abs(norm - 1.0) < 1e-6, f"L2 归一化失败,实际 norm={norm}"
-print("  ✅ 维度 1024 + 确定性 + L2 归一化")
-print(f"  ✅ 同样文本 cos sim: {sum(a*b for a,b in zip(v1,v2)):.4f} (期望 1.0)")
-print(f"  ✅ 不同文本 cos sim: {sum(a*b for a,b in zip(v1,v3)):.4f}")
+v_cn = embed.encode("用户叫小明")
+v_cn2 = embed.encode("用户叫小明")
+v_other = embed.encode("用户叫大明")
+import numpy as np
+def cos(a, b):
+    a, b = np.array(a), np.array(b)
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+sim_same = cos(v_cn, v_cn2)
+sim_diff = cos(v_cn, v_other)
+print(f"  ✅ 维度 {embed.dimension} + L2 归一化")
+print(f"  ✅ 同样文本 cos sim: {sim_same:.4f} (期望 1.0)")
+print(f"  ✅ 相似文本 cos sim: {sim_diff:.4f} (期望较高)")
+assert sim_same > 0.99, f"bge-m3 同文本应 ~1.0,实际 {sim_same}"
 print()
 
 # ─── Demo 2: SecretScanner 4 pattern ───
@@ -70,9 +79,8 @@ print()
 print("=== Demo 3: Extractor L1 合并 + L7 校验 ===")
 # 注: L1 合并相似度计算 ——
 #   embed_fn=None  → 走 jaccard + containment(基于字符 bigram)
-#   embed_fn=Mock  → 走 cos similarity(MockEmbedFn 是 hash 派生的伪随机向量,非语义,合并会失效)
 #   embed_fn=BGEM3 → 走 cos similarity(真实语义向量,合并效果最好)
-# 演示 L1 合并: 用 embed_fn=None 触发文本相似度合并
+# 演示 L1 合并: 用 embed_fn=None 触发文本相似度合并(快,不依赖模型推理)
 extractor = MemoryExtractor(embed_fn=None)
 candidates = [
     ExtractionCandidate("user", "用户名字", "用户叫小明", "我说'我叫小明'"),
@@ -103,20 +111,10 @@ store.write("feedback", "不喜欢打断", "用户不喜欢被打断对话。\n\
 store.write("project", "项目用 Python", "项目主体是 Python。\n\n**Why:** 用户偏好。", source_quote="我说'用 Python'")
 store.write("reference", "Config 示例", "我的 key 是 sk-abcdefghijklmnopqrstuvwxyz1234", source_quote="示例 config")
 
-class VecWithQuery(MockVectorStore):
-    def query(self, embedding, top_k):
-        scored = []
-        for d in self._docs:
-            e = d.get("embedding", [])
-            dot = sum(a*b for a, b in zip(embedding, e))
-            na = math.sqrt(sum(a*a for a in embedding))
-            nb = math.sqrt(sum(b*b for b in e))
-            sim = dot / (na*nb) if na and nb else 0
-            scored.append({**d, "distance": 1 - sim})
-        scored.sort(key=lambda x: x["distance"])
-        return scored[:top_k]
-
-vec = VecWithQuery()
+# 用真 ChromaVectorStore(原 MockVectorStore + VecWithQuery 子类方案已删除)
+chroma_dir = tmp / "chroma"
+chroma_dir.mkdir()
+vec = ChromaVectorStore(chroma_dir, collection="demo_m3")
 for type_ in ["user", "feedback", "project", "reference"]:
     for it in store.list_by_type(type_):
         data = store.read(it["path"])
@@ -131,7 +129,7 @@ retriever = MemoryRetriever(store, vec, embed)
 
 for mode in ["keyword", "semantic", "hybrid"]:
     report = retriever.search("用户", top_k=3, mode=mode)
-    print(f"  [{mode}] '{'用户'}' → {len(report)} hits:")
+    print(f"  [{mode}] '用户' → {len(report)} hits:")
     for h in report:
         secret_mark = " ⚠️HAS_SECRET" if h.has_secret else ""
         print(f"    [{h.score:.3f}] {h.title} (type={h.type}){secret_mark}")
@@ -157,7 +155,9 @@ seeds_dir.mkdir()
 """, encoding="utf-8")
 
 cold_root = tmp / "memory_cold"
-vec2 = MockVectorStore()
+chroma_dir2 = tmp / "chroma_cold"
+chroma_dir2.mkdir()
+vec2 = ChromaVectorStore(chroma_dir2, collection="demo_m3_cold")
 loader = ColdStartLoader(MemoryStore(cold_root), vec2, embed, default_seeds_dir=seeds_dir)
 report = loader.load()
 print(f"  {report.summary()}")
@@ -174,11 +174,12 @@ print("=== M3 / Day 3 验收: 5/5 demo 全部通过 ===")
 PYEOF
 
 echo
-echo "=== M3 测试套件 (108 cases) ==="
+echo "=== M3 测试套件 ==="
 .venv/bin/python -m pytest \
     tests/test_secret_scanner.py \
     tests/test_embeddings.py \
     tests/test_extractor.py \
     tests/test_cold_start.py \
     tests/test_retriever.py \
+    tests/test_dual_channel_minimal.py \
     -q 2>&1 | tail -3

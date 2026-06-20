@@ -1,33 +1,25 @@
 """
 嵌入函数适配层（v2.1 §九.1）
 
-M3 / Day 3 — L2 修复
+M3 / Day 3 —— 生产用嵌入函数
 
 设计要点：
 1. **embed_fn 注入式**：retriever 通过 Protocol 接收嵌入函数,不耦合具体实现
-2. **Lazy loading**：sentence-transformers / bge-m3 仅在首次调用时加载
-   - M3 开发期无需下载 2.3GB 模型,使用 MockEmbedFn
-   - 生产环境切换到 BGEM3EmbedFn
-3. **MockEmbedFn**：基于 SHA-256 hash 的确定性 1024 维向量
-   - 同样的文本永远产生同样的向量（便于单测 + 调试）
-   - 维度与 bge-m3 一致（1024），保持切换无感
-4. **fallback 链**：
-   BGEM3EmbedFn → MiniLMEmbedFn → MockEmbedFn（按优先级）
-   任意一个失败,降级到下一个
-5. **不引入新依赖**：sentence-transformers / chromadb 都是设计要求的依赖
+2. **Lazy loading**：BGEM3EmbedFn 仅在首次 encode() 时加载模型（节省启动时间）
+3. **失败显式**：model 加载/推理失败时直接 raise EmbeddingError,不静默降级
+   - 项目非 demo:bge-m3 / MiniLM 任何失败必须让 caller 知道
+   - 没有 Mock 兜底,系统不能"看起来在跑但实际语义检索是垃圾"
+4. **不引入新依赖**：sentence-transformers 是设计要求的依赖
 
-切换方法：
-  - 环境变量：MEMORY_EMBED_PROVIDER=real|mock|auto（默认 auto）
-  - 代码：MemoryConfig(embed_provider="mock")  # 强制 Mock
+切换方法:
+  - 环境变量:MEMORY_EMBED_PROVIDER=auto|bge-m3|minilm(默认 auto)
+  - 代码:make_embed_fn("bge-m3")
 
 注: bge-m3 实际维度是 **1024**(官方发布规格,基于 XLM-RoBERTa-large)
-    之前 mock 设计成 568 是错的(推测值,无来源),现统一为 1024
 """
 
 from __future__ import annotations
 
-import hashlib
-import math
 import os
 import threading
 from typing import Optional, Protocol, runtime_checkable
@@ -53,10 +45,10 @@ class EmbedFn(Protocol):
     """
     嵌入函数接口（retriever 依赖此抽象）
 
-    实现要求：
-    - encode(text) → 1024 维 list[float]（与 bge-m3 对齐）
-    - 同样的 text 必须产生同样的向量（确定性）
-    - normalize_embeddings=True （cosine similarity 友好）
+    实现要求:
+    - encode(text) → 1024 维 list[float](bge-m3 默认,与其他实现对齐需重新建 collection)
+    - 同样的 text 必须产生同样的向量(确定性)
+    - normalize_embeddings=True (cosine similarity 友好)
     """
     dimension: int
 
@@ -64,77 +56,19 @@ class EmbedFn(Protocol):
 
 
 # ──────────────────────────────────────────────────────────────────
-# MockEmbedFn（开发 / 单测用）
-# ──────────────────────────────────────────────────────────────────
-
-class MockEmbedFn:
-    """
-    基于 SHA-256 hash 的确定性嵌入函数
-
-    - 同样的 text → 同样的 1024 维向量
-    - 不同 text 的向量是"伪随机"的(均匀分布)
-    - L2 归一化(cosine friendly)
-    - **不是语义向量**，仅用于：
-      * 单测(确定性)
-      * 开发机无 bge-m3 时
-      * CI 环境
-
-    用法：
-        embed = MockEmbedFn()
-        vec = embed.encode("我叫小明")  # 长度 1024,float
-    """
-
-    dimension = 1024
-
-    def encode(self, text: str) -> list[float]:
-        # 1. 扩展到足够长的 hash（SHA-256 输出 32 字节 = 256 bit）
-        #    1024 维需要 1024 * 4 = 4096 字节 = 1024 个 uint32
-        #    (SHA-256 每次产出 32 字节,迭代 4096/32 = 128 次)
-        #    用 SHAKE-256 风格的迭代 hash
-        needed_bytes = self.dimension * 4  # 4 bytes per float
-        seed = hashlib.sha256(text.encode("utf-8")).digest()
-
-        # 链式扩展:每次 hash(seed + counter)产生新 32 字节
-        chunks = []
-        counter = 0
-        while len(b"".join(chunks)) < needed_bytes:
-            chunk = hashlib.sha256(seed + counter.to_bytes(4, "little")).digest()
-            chunks.append(chunk)
-            counter += 1
-        raw = b"".join(chunks)[:needed_bytes]
-
-        # 2. 转换为 float (-1, 1)
-        import struct
-        vec = []
-        for i in range(self.dimension):
-            # 4 bytes → uint32 → (0, 1) → (-1, 1)
-            u = struct.unpack("<I", raw[i*4:(i+1)*4])[0]
-            vec.append((u / 0xFFFFFFFF) * 2 - 1)
-
-        # 3. L2 归一化
-        norm = math.sqrt(sum(x*x for x in vec))
-        if norm > 0:
-            vec = [x / norm for x in vec]
-        return vec
-
-    def encode_batch(self, texts: list[str]) -> list[list[float]]:
-        return [self.encode(t) for t in texts]
-
-
-# ──────────────────────────────────────────────────────────────────
-# BGEM3EmbedFn（生产用，lazy load）
+# BGEM3EmbedFn(生产用,默认)
 # ──────────────────────────────────────────────────────────────────
 
 class BGEM3EmbedFn:
     """
-    BAAI/bge-m3 嵌入函数（生产用）
+    BAAI/bge-m3 嵌入函数(生产默认)
 
-    - Lazy load：首次 encode() 才加载模型（节省启动时间）
-    - 自动用本地 HF cache（~/.cache/huggingface/hub/）
-    - L2 归一化
-    - 失败 fallback 到 MockEmbedFn（不阻塞系统）
+    - Lazy load:首次 encode() 才加载模型(节省启动时间)
+    - 自动用本地 HF cache(~/.cache/huggingface/hub/)
+    - L2 归一化(cosine friendly)
+    - 加载失败立即 raise EmbeddingError,不静默
 
-    模型加载：
+    模型加载:
       sentence_transformers.SentenceTransformer('BAAI/bge-m3')
       # 首次自动下载 ~2.3GB, 之后从 cache 加载 (~5-10s)
     """
@@ -148,7 +82,7 @@ class BGEM3EmbedFn:
         self._load_error: Optional[Exception] = None
 
     def _ensure_loaded(self):
-        """线程安全的 lazy load（首次调用时执行）"""
+        """线程安全的 lazy load(首次调用时执行)"""
         if self._model is not None:
             return
         with self._lock:
@@ -160,7 +94,8 @@ class BGEM3EmbedFn:
             except Exception as e:
                 self._load_error = e
                 raise EmbeddingError(
-                    f"加载嵌入模型 {self.model_name} 失败: {e}",
+                    f"加载嵌入模型 {self.model_name} 失败: {e}。"
+                    f"运行 bash scripts/setup_embeddings.sh 安装模型,或检查 HF cache",
                     cause=e,
                 )
 
@@ -177,16 +112,17 @@ class BGEM3EmbedFn:
 
 
 # ──────────────────────────────────────────────────────────────────
-# MiniLMEmbedFn（轻量 fallback,英文场景）
+# MiniLMEmbedFn(英文轻量 fallback)
 # ──────────────────────────────────────────────────────────────────
 
 class MiniLMEmbedFn:
     """
-    all-MiniLM-L6-v2 嵌入函数（轻量 fallback）
+    all-MiniLM-L6-v2 嵌入函数(英文轻量)
 
-    - 80MB 模型（vs bge-m3 的 2.3GB）
-    - 仅英文可用，中文质量差
-    - 维度 384（与 bge-m3 不一致！retriever 需重新初始化 collection）
+    - 80MB 模型(vs bge-m3 的 2.3GB)
+    - 仅英文可用,中文质量差
+    - 维度 384(与 bge-m3 不一致!retriever 需重新初始化 collection)
+    - 加载失败立即 raise EmbeddingError
     """
 
     dimension = 384
@@ -223,7 +159,7 @@ class MiniLMEmbedFn:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Factory
+# Factory(无 Mock 兜底,失败显式 raise)
 # ──────────────────────────────────────────────────────────────────
 
 def make_embed_fn(
@@ -231,30 +167,30 @@ def make_embed_fn(
     model_name: Optional[str] = None,
 ) -> EmbedFn:
     """
-    工厂函数（按 provider 选择实现）
+    工厂函数(按 provider 选择实现)
 
     Args:
         provider:
-            - "auto":   先试 bge-m3 → MiniLM → Mock
-            - "bge-m3": 强制 BGEM3EmbedFn（生产）
-            - "minilm": 强制 MiniLMEmbedFn（英文轻量）
-            - "mock":   强制 MockEmbedFn（开发 / 单测）
+            - "auto":   默认 → bge-m3(失败立即 raise,不静默降级)
+            - "bge-m3": 强制 BGEM3EmbedFn(生产)
+            - "minilm": 强制 MiniLMEmbedFn(英文轻量)
             - "real":   别名 = bge-m3
-        model_name: 覆盖默认模型名（可选）
+        model_name: 覆盖默认模型名(可选)
 
     Returns:
         EmbedFn 实例
 
+    Raises:
+        EmbeddingError: 模型加载失败时(不是静默 fallback)
+        ValueError: provider 未知
+
     Examples:
-        embed = make_embed_fn()                    # auto, 优先 bge-m3
-        embed = make_embed_fn("mock")              # 单测
+        embed = make_embed_fn()                    # auto, bge-m3
+        embed = make_embed_fn("bge-m3")            # 显式
+        embed = make_embed_fn("minilm")            # 英文轻量
         embed = make_embed_fn("auto", model_name="BAAI/bge-small-zh-v1.5")
     """
     provider = provider.lower()
-
-    # 显式 Mock：直接返回
-    if provider == "mock":
-        return MockEmbedFn()
 
     # MiniLM 强制
     if provider == "minilm":
@@ -264,33 +200,25 @@ def make_embed_fn(
     if provider in ("bge-m3", "real"):
         return BGEM3EmbedFn(model_name or "BAAI/bge-m3")
 
-    # auto: 优先级链
-    # 1) 尝试 BGEM3EmbedFn（如果模型已在 cache 或可下载）
-    # 2) 失败 → MiniLMEmbedFn
-    # 3) 再失败 → MockEmbedFn（保证系统总能跑）
+    # auto: 默认走 bge-m3,失败立即 raise
     if provider == "auto":
-        # 检查 env 是否强制 Mock
+        # 兼容旧 env(MEMORY_EMBED_PROVIDER=mock 已废弃,但允许显式走 minilm)
         env_force = os.environ.get("MEMORY_EMBED_PROVIDER", "").lower()
-        if env_force == "mock":
-            return MockEmbedFn()
-
-        try:
+        if env_force == "minilm":
+            return MiniLMEmbedFn("all-MiniLM-L6-v2")
+        if env_force == "bge-m3":
             return BGEM3EmbedFn(model_name or "BAAI/bge-m3")
-        except EmbeddingError:
-            try:
-                return MiniLMEmbedFn("all-MiniLM-L6-v2")
-            except EmbeddingError:
-                return MockEmbedFn()
+        # 默认/auto → bge-m3,加载失败立即 raise
+        return BGEM3EmbedFn(model_name or "BAAI/bge-m3")
 
     raise ValueError(
         f"未知 embed provider: {provider!r}，"
-        f"必须为 auto/mock/real/bge-m3/minilm 之一"
+        f"必须为 auto/real/bge-m3/minilm 之一(已移除 mock 选项)"
     )
 
 
 __all__ = [
     "EmbedFn",
-    "MockEmbedFn",
     "BGEM3EmbedFn",
     "MiniLMEmbedFn",
     "make_embed_fn",

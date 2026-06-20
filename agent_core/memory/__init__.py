@@ -36,7 +36,6 @@ from .dual_channel_writer import (
     DualChannelError,
     ExtractionInProgressError,
     ExtractionCandidate,
-    MockVectorStore,
     TurnMessage,
 )
 from .memory_editor import (
@@ -52,11 +51,15 @@ from .memory_editor import (
 # M3: 检索 + 安全
 from .embeddings import (
     EmbedFn,
-    MockEmbedFn,
     BGEM3EmbedFn,
     MiniLMEmbedFn,
     make_embed_fn,
     EmbeddingError,
+)
+from .chroma_store import (
+    ChromaVectorStore,
+    ChromaStoreError,
+    make_chroma_store,
 )
 from .secret_scanner import (
     SecretScanner,
@@ -120,7 +123,6 @@ __all__ = [
     "DualChannelError",
     "ExtractionInProgressError",
     "ExtractionCandidate",
-    "MockVectorStore",
     "TurnMessage",
     # M2: memory_editor
     "MemoryEditor",
@@ -132,11 +134,14 @@ __all__ = [
     "scan_secrets",
     # M3: embeddings
     "EmbedFn",
-    "MockEmbedFn",
     "BGEM3EmbedFn",
     "MiniLMEmbedFn",
     "make_embed_fn",
     "EmbeddingError",
+    # M3: vector store
+    "ChromaVectorStore",
+    "ChromaStoreError",
+    "make_chroma_store",
     # M3: secret_scanner
     "SecretScanner",
     "SecretHit",

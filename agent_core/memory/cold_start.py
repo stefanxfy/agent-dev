@@ -305,18 +305,22 @@ class ColdStartLoader:
         try:
             text_for_emb = f"{item.title}\n{item.body}"
             embedding = self.embed_fn.encode(text_for_emb)
+            # ChromaDB metadata 约束:list 值不能为空
+            #   tags=[] 会让 upsert 报 ValueError,过滤掉空 list 即可
+            metadata = {
+                "type": item.type,
+                "title": item.title,
+                "importance": item.importance,
+                "source": item.source,
+            }
+            if item.tags:   # 非空才加 tags 字段
+                metadata["tags"] = item.tags
             # VectorStoreProtocol.add(doc: dict) — 统一字典格式
-            # Mock / Chroma / 任意实现都可解
+            # 由 ChromaVectorStore 实现(见 chroma_store.py)
             self.vector_store.add({
                 "id": item_hash,
                 "embedding": embedding,
-                "metadata": {
-                    "type": item.type,
-                    "title": item.title,
-                    "tags": item.tags,
-                    "importance": item.importance,
-                    "source": item.source,
-                },
+                "metadata": metadata,
                 "document": text_for_emb,
             })
         except Exception as e:

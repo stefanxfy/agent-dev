@@ -11,6 +11,10 @@ M2 / Day 2 测试 —— 双通道写入器 + 元数据 + 路径 + 编辑器
 - 场景 4: 通道 B 提取中途崩溃 → 重启幂等恢复
 
 总: 7 个核心 case（plan 要求 5 smoke + 2 场景）
+
+依赖:
+- chromadb(ChromaVectorStore)
+- bge-m3 / sentence-transformers(真嵌入)
 """
 
 from __future__ import annotations
@@ -32,9 +36,10 @@ from agent_core.memory import (
     MemoryEditor,
     MemoryStore,
     MetaDB,
-    MockVectorStore,
+    ChromaVectorStore,
     SecretDetectedError,
     TurnMessage,
+    make_embed_fn,
     compute_item_hash,
 )
 
@@ -45,24 +50,30 @@ from agent_core.memory import (
 
 @pytest.fixture
 def tmp_workspace(tmp_path):
-    """完整 workspace: memory_root + meta.db 路径"""
+    """完整 workspace: memory_root + meta.db 路径 + chroma_dir"""
     memory_root = tmp_path / "memory"
     memory_root.mkdir()
     meta_db_path = tmp_path / "meta.db"
+    chroma_dir = tmp_path / "chroma"
+    chroma_dir.mkdir()
     return {
         "memory_root": memory_root,
         "meta_db_path": str(meta_db_path),
+        "chroma_dir": chroma_dir,
         "logs_dir": tmp_path / "logs",
     }
 
 
 @pytest.fixture
-def writer(tmp_workspace):
+def writer(tmp_workspace, tmp_path):
     """默认 writer（用于单测）"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = MockVectorStore()
-    w = DualChannelWriter("s1", db, store, vec)
+    vec = ChromaVectorStore(
+        tmp_workspace["chroma_dir"], collection=f"dualch_{tmp_path.name}",
+    )
+    embed = make_embed_fn("bge-m3")
+    w = DualChannelWriter("s1", db, store, vec, embed)
     yield w
     w.shutdown(timeout=5)
 
@@ -97,16 +108,19 @@ def test_cursor_persists_across_restart(tmp_workspace):
     """A3: cursor 持久化到 SQLite，重启后恢复"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = MockVectorStore()
+    vec = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="restart_test")
+    embed = make_embed_fn("bge-m3")
 
-    w1 = DualChannelWriter("s1", db, store, vec)
+    w1 = DualChannelWriter("s1", db, store, vec, embed)
     w1.channel_a_inline_write("a", "A", turn_index=0)
     w1.channel_a_inline_write("b", "B", turn_index=1)
     assert w1.daily_cursor == 1
     w1.shutdown(timeout=5)
 
-    # 重启：新建 writer，加载 cursor
-    w2 = DualChannelWriter("s1", db, store, vec)
+    # 重启：新建 writer,重新构造 vec + embed(指向同一 chroma path)
+    vec2 = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="restart_test")
+    embed2 = make_embed_fn("bge-m3")
+    w2 = DualChannelWriter("s1", db, store, vec2, embed2)
     assert w2.daily_cursor == 1, "cursor 未持久化"
     # 写 turn 2 应正常推进
     w2.channel_a_inline_write("c", "C", turn_index=2)
@@ -269,8 +283,11 @@ def test_concurrent_channel_a_no_overwrite(tmp_workspace):
     """§4.5.1 场景 1: 进程内双线程同时调 channel_a → 两段都写,无覆盖"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = MockVectorStore()
-    w = DualChannelWriter("s1", db, store, vec)
+    vec = ChromaVectorStore(
+        tmp_workspace["chroma_dir"], collection="concurrent_test",
+    )
+    embed = make_embed_fn("bge-m3")
+    w = DualChannelWriter("s1", db, store, vec, embed)
 
     results = []
     barrier = threading.Barrier(2)
@@ -304,10 +321,11 @@ def test_channel_b_crash_resume_continues(tmp_workspace):
     """§4.5.1 场景 4: B 提取中途崩溃 → cursor 不推进,重启后幂等恢复"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = MockVectorStore()
+    vec = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="crash_test")
+    embed = make_embed_fn("bge-m3")
 
     # 1. A 写 turn 0
-    w1 = DualChannelWriter("s1", db, store, vec)
+    w1 = DualChannelWriter("s1", db, store, vec, embed)
     w1.channel_a_inline_write("我叫小明", "已记", turn_index=0)
     assert w1.daily_cursor == 0
 
@@ -315,7 +333,11 @@ def test_channel_b_crash_resume_continues(tmp_workspace):
     from agent_core.exceptions import AgentError
     def crashing_extractor(messages):
         # 半写一条 candidate 到 vector,然后崩溃
-        vec.add({"partial": True})
+        # ChromaVectorStore 需要完整 doc 字段,这里模拟"半写"用不合规 doc
+        try:
+            vec.add({"partial": True})  # 缺 embedding → ChromaStoreError
+        except Exception:
+            pass  # 半写失败不影响测试目标
         raise AgentError("simulated crash in LLM call")
 
     future = w1.channel_b_background_extract(
@@ -328,11 +350,13 @@ def test_channel_b_crash_resume_continues(tmp_workspace):
     # shutdown（确认 future 已 done）
     w1.shutdown(timeout=5)
 
-    # 3. 验证: extract_cursor 没推进（不变量 #4）,vector 有半条
+    # 3. 验证: extract_cursor 没推进（不变量 #4）
     assert w1.extract_cursor == 0, "extract_cursor 不应在失败时推进"
 
     # 4. 重启模拟: 新 writer,加载 cursor
-    w2 = DualChannelWriter("s1", db, store, vec)
+    vec2 = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="crash_test")
+    embed2 = make_embed_fn("bge-m3")
+    w2 = DualChannelWriter("s1", db, store, vec2, embed2)
     assert w2.daily_cursor == 0
     assert w2.extract_cursor == 0  # 持久化正确
 

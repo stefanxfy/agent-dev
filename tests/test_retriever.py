@@ -9,11 +9,14 @@ M3 / Day 3 测试 —— MemoryRetriever (三模式 + L4 密钥过滤)
 - 空查询 / 空库
 - get_by_hash
 - 边界: 词汇表
+
+依赖:
+- chromadb(ChromaVectorStore)
+- bge-m3 / sentence-transformers(真嵌入;HF cache 必须有模型)
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 import pytest
@@ -25,8 +28,8 @@ from agent_core.memory import (
     RetrievalMode,
     RetrievalError,
     MemoryStore,
-    MockVectorStore,
-    MockEmbedFn,
+    ChromaVectorStore,
+    make_embed_fn,
     SecretScanner,
     MemoryConfig,
 )
@@ -36,28 +39,15 @@ from agent_core.memory import (
 # Fixtures
 # ──────────────────────────────────────────────────────────────────
 
-class VectorWithQuery(MockVectorStore):
-    """扩展 MockVectorStore 添加 query()"""
-    def query(self, embedding, top_k):
-        scored = []
-        for d in self._docs:
-            e = d.get("embedding", [])
-            dot = sum(a * b for a, b in zip(embedding, e))
-            na = math.sqrt(sum(a * a for a in embedding))
-            nb = math.sqrt(sum(b * b for b in e))
-            sim = dot / (na * nb) if na and nb else 0.0
-            scored.append({**d, "distance": 1.0 - sim})
-        scored.sort(key=lambda x: x["distance"])
-        return scored[:top_k]
-
-
 @pytest.fixture
 def workspace(tmp_path):
     memory_root = tmp_path / "memory"
     memory_root.mkdir()
+    chroma_dir = tmp_path / "chroma"
+    chroma_dir.mkdir()
     store = MemoryStore(memory_root)
-    vec = VectorWithQuery()
-    embed = MockEmbedFn()
+    vec = ChromaVectorStore(chroma_dir, collection=f"retriever_{tmp_path.name}")
+    embed = make_embed_fn("bge-m3")
     config = MemoryConfig()
     return {"store": store, "vec": vec, "embed": embed, "config": config}
 
@@ -201,8 +191,10 @@ class TestSecretFilter:
             source_quote="示例 config"
         )
 
-        vec = VectorWithQuery()
-        embed = MockEmbedFn()
+        chroma_dir = tmp_path / "chroma_l4"
+        chroma_dir.mkdir()
+        vec = ChromaVectorStore(chroma_dir, collection="l4_test")
+        embed = make_embed_fn("bge-m3")
         for it in store.list_by_type("reference"):
             data = store.read(it["path"])
             text = f"{data['frontmatter'].get('title','')}\n{data['body']}"
@@ -278,18 +270,39 @@ class TestReport:
 
 class TestSemanticFallback:
 
-    def test_semantic_falls_back_to_keyword(self, tmp_path):
-        """vector_store 无 query() 时,semantic 模式降级到 keyword"""
+    def test_hybrid_uses_keyword_when_vec_empty(self, tmp_path):
+        """hybrid 模式:vec 空时仍能用 keyword 命中(融合自动接管)"""
         memory_root = tmp_path / "memory"
         memory_root.mkdir()
+        chroma_dir = tmp_path / "chroma_empty"
+        chroma_dir.mkdir()
         store = MemoryStore(memory_root)
         store.write("user", "用户", "用户叫小明", source_quote="q")
 
-        # 普通 MockVectorStore (无 query())
-        vec = MockVectorStore()
-        embed = MockEmbedFn()
+        # 空 ChromaVectorStore(没 add 任何东西)
+        vec = ChromaVectorStore(chroma_dir, collection="empty_test")
+        embed = make_embed_fn("bge-m3")
 
         retriever = MemoryRetriever(store, vec, embed)
-        # semantic 模式应降级(不崩溃)
+        # hybrid 模式:vec 空,semantic 返 [],但 keyword 会命中
+        report = retriever.search("用户", top_k=1, mode="hybrid")
+        assert len(report) >= 1
+        # hit 应来自 keyword 分支
+        assert "keyword" in report[0].breakdown
+
+    def test_semantic_returns_empty_when_vec_empty(self, tmp_path):
+        """semantic 模式:vec 空时返空(不静默降级)"""
+        memory_root = tmp_path / "memory"
+        memory_root.mkdir()
+        chroma_dir = tmp_path / "chroma_empty2"
+        chroma_dir.mkdir()
+        store = MemoryStore(memory_root)
+        store.write("user", "用户", "用户叫小明", source_quote="q")
+
+        vec = ChromaVectorStore(chroma_dir, collection="empty_test2")
+        embed = make_embed_fn("bge-m3")
+        retriever = MemoryRetriever(store, vec, embed)
+
+        # 纯 semantic:vec 空 → 空报告(降级只在 hybrid 模式自动发生)
         report = retriever.search("用户", top_k=1, mode="semantic")
-        assert len(report) >= 0  # 不崩溃
+        assert len(report) == 0   # semantic 模式不主动融合 keyword

@@ -9,6 +9,9 @@ M3 / Day 3 测试 —— MemoryExtractor (L1 合并)
 - 完全相同 body 去重
 - 边界: 空列表 / 全部非法 / 全空 body
 - 截断: 超过 50 条
+
+依赖:
+- bge-m3 / sentence-transformers(真嵌入,TestEmbedMerge 用)
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ from agent_core.memory import (
     MemoryExtractor,
     ExtractStats,
     ExtractionCandidate,
-    MockEmbedFn,
+    make_embed_fn,
     CandidateRejected,
 )
 
@@ -196,18 +199,16 @@ class TestL1Merge:
 class TestEmbedMerge:
 
     def test_with_embed_fn_uses_cos(self):
-        """用 embed_fn 时,合并用 cos similarity"""
-        embed = MockEmbedFn()
+        """用 embed_fn 时,合并用 cos similarity(真 bge-m3 中文相似合并)"""
+        embed = make_embed_fn("bge-m3")
         ex = MemoryExtractor(embed_fn=embed)
         c1 = ExtractionCandidate("user", "用户", "用户叫小明", "我说'我叫小明'")
-        c2 = ExtractionCandidate("user", "用户", "用户名叫小明", "我说'我叫小明'")
+        c2 = ExtractionCandidate("user", "用户", "用户名叫小明,今年 25 岁", "我说'我叫小明,25 岁'")
         stats = ExtractStats()
         result = ex.process([c1, c2], stats=stats)
-        # MockEmbedFn 输出完全不同的向量(因为是基于 hash 的),
-        # 实际不会触发 cos 高相似合并
-        # 此处只验证: 不崩溃 + 返回有效结果
-        assert isinstance(result, list)
+        # bge-m3 语义相似:合并 → 1 条
         assert stats.input_count == 2
+        assert len(result) <= 1   # 高相似应合并成 1 条
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -29,9 +29,9 @@ M2 / Day 2 — A3+A4+A5+A9+A10 五项审查修复一次到位
 - #3 通道 A 只写 daily log，不调 LLM
 - #4 通道 B 推进 extract_cursor 前必须成功写入
 
-已知限制（M2 阶段）:
-- vector_store 通过 Mock 接入（M3 才正式实现 ChromaDB）
-- _do_extract 是 LLM 提取的实际逻辑（M3 才接 LLM router）
+已知限制:
+- vector_store 必须是 ChromaVectorStore 实现(见 agent_core.memory.chroma_store)
+- _do_extract 是 LLM 提取的实际逻辑(M3 接 LLM router)
 """
 
 from __future__ import annotations
@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, Union
 
 from agent_core.exceptions import AgentError
+from agent_core.memory.embeddings import EmbedFn
 from agent_core.memory.ipc_lock import IPCLock, LockBusy, make_daily_lock, make_extract_lock
 from agent_core.memory.memory_store import (
     MemoryStore,
@@ -96,26 +97,16 @@ class ExtractionCandidate:
 
 
 class VectorStoreProtocol(Protocol):
-    """vector_store 接口（M3 实现，本阶段 Mock 即可）"""
+    """vector_store 接口(必须由 ChromaVectorStore 实现,见 chroma_store.py)
+
+    字段约定 add(doc: dict):
+        - id:        str 唯一标识(item_hash)
+        - embedding: list[float] 向量(维度由 embed_fn 决定)
+        - metadata:  dict (type/title/tags/...)
+        - document:  str 原始文本(可选)
+    """
     def add(self, doc: dict[str, Any]) -> None: ...
     def count(self) -> int: ...
-
-
-class MockVectorStore:
-    """M2 阶段 Mock（用于测试 + 单元冒烟）"""
-    def __init__(self):
-        self._docs: list[dict] = []
-        self._lock = threading.Lock()
-
-    def add(self, doc: dict) -> None:
-        with self._lock:
-            self._docs.append(doc)
-
-    def count(self) -> int:
-        return len(self._docs)
-
-    def all(self) -> list[dict]:
-        return list(self._docs)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -124,23 +115,23 @@ class MockVectorStore:
 
 class DualChannelWriter:
     """
-    双通道写入器（v2.1 §4.1）
+    双通道写入器(v2.1 §4.1)
 
     用法:
         db = MetaDB(":memory:")
         store = MemoryStore(Path("/tmp/memory"))
-        vec = MockVectorStore()
-        w = DualChannelWriter("s1", db, store, vec)
+        vec, embed = make_chroma_store("/tmp/chroma")  # ChromaVectorStore + bge-m3
+        w = DualChannelWriter("s1", db, store, vec, embed)
 
         # 通道 A: 内联写 daily log
         w.channel_a_inline_write("记住我叫小明", "已记", turn_index=0)
 
-        # 通道 B: 后台提取（异步）
+        # 通道 B: 后台提取(异步)
         w.channel_b_background_extract([TurnMessage(0, "我叫小明", "已记")])
         w.shutdown(timeout=30)
 
-        # 重启恢复（A3）
-        w2 = DualChannelWriter("s1", db, store, vec)
+        # 重启恢复(A3)
+        w2 = DualChannelWriter("s1", db, store, vec, embed)
         assert w2.daily_cursor == 0
     """
 
@@ -150,6 +141,7 @@ class DualChannelWriter:
         meta_db: MetaDB,
         memory_store: MemoryStore,
         vector_store: VectorStoreProtocol,
+        embed_fn: EmbedFn,
         *,
         extraction_timeout_seconds: int = 60,
         executor_workers: int = 2,
@@ -158,6 +150,14 @@ class DualChannelWriter:
         self.meta_db = meta_db
         self.memory_store = memory_store
         self.vector_store = vector_store
+        # embed_fn 必须非 None:channel B 写入 vector_store 需要先编码
+        # 失败时立即 EmbeddingError,不静默(不再有 Mock 兜底)
+        if embed_fn is None:
+            raise DualChannelError(
+                "DualChannelWriter 必须传入 embed_fn(用于向量化 memory)。"
+                "用 make_embed_fn() 构造 bge-m3 实例。"
+            )
+        self.embed_fn = embed_fn
 
         # A3: cursor 从 MetaDB 加载
         self.daily_cursor: int = meta_db.get_cursor(session_id, "daily")
@@ -263,7 +263,7 @@ class DualChannelWriter:
 
         Args:
             messages: 要处理的 turn 列表（通常 [extract_cursor+1, daily_cursor]）
-            llm_extractor: LLM 提取函数（M3 接 router；M2 用 None → Mock 空列表）
+            llm_extractor: LLM 提取函数(M3 接 router;不传则用空列表占位)
 
         Returns:
             Future（调用方 shutdown(timeout=) 等完成）
@@ -282,7 +282,7 @@ class DualChannelWriter:
         future = self._executor.submit(
             self._do_channel_b_extract,
             messages,
-            llm_extractor or (lambda _msgs: []),  # 默认 Mock
+            llm_extractor or (lambda _msgs: []),  # 默认空列表
         )
         self._inflight.add(future)
         future.add_done_callback(self._on_extract_done)
@@ -332,12 +332,27 @@ class DualChannelWriter:
                             source_quote=cand.source_quote,
                             tags=cand.tags,
                         )
-                        # 4. 写 vector store
+                        # 4. 写 vector store —— 必须含 embedding(ChromaVectorStore 强制)
+                        #    计算 embedding 失败 → 整个 candidate 失败,MemoryStore 已写不撤回
+                        #    (caller 可通过 cold_start 重新向量化,见 cold_start.py M5 重索引逻辑)
+                        try:
+                            text_for_emb = f"{cand.title}\n{cand.body}"
+                            embedding = self.embed_fn.encode(text_for_emb)
+                        except Exception as enc_err:
+                            raise DualChannelError(
+                                f"向量化失败(candidate={cand.title}): {enc_err}",
+                                cause=enc_err,
+                            )
                         self.vector_store.add({
-                            "hash": item_hash,
-                            "type": cand.type,
-                            "body": cand.body,
-                            "session_id": self.session_id,
+                            "id": item_hash,
+                            "embedding": embedding,
+                            "metadata": {
+                                "type": cand.type,
+                                "title": cand.title,
+                                "tags": cand.tags,
+                                "session_id": self.session_id,
+                            },
+                            "document": text_for_emb,
                         })
                         written += 1
                     except MemoryStoreError as e:
@@ -441,6 +456,5 @@ __all__ = [
     "ExtractionInProgressError",
     "TurnMessage",
     "ExtractionCandidate",
-    "MockVectorStore",
     "VectorStoreProtocol",
 ]

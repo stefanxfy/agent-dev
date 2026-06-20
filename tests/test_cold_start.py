@@ -8,6 +8,10 @@ M3 / Day 3 测试 —— ColdStartLoader (L5 seed 加载)
 - 类型校验失败处理
 - 文件解析失败处理
 - 报告统计
+
+依赖:
+- chromadb(ChromaVectorStore)
+- bge-m3 / sentence-transformers(真嵌入;HF cache 必须有模型)
 """
 
 from __future__ import annotations
@@ -23,8 +27,8 @@ from agent_core.memory import (
     ColdStartReport,
     ColdStartError,
     MemoryStore,
-    MockVectorStore,
-    MockEmbedFn,
+    ChromaVectorStore,
+    make_embed_fn,
 )
 
 
@@ -39,11 +43,14 @@ def workspace(tmp_path):
     memory_root.mkdir()
     seeds_dir = tmp_path / "seeds"
     seeds_dir.mkdir()
+    chroma_dir = tmp_path / "chroma"
+    chroma_dir.mkdir()
     return {
         "memory_root": memory_root,
         "seeds_dir": seeds_dir,
-        "vec": MockVectorStore(),
-        "embed": MockEmbedFn(),
+        "chroma_dir": chroma_dir,
+        "vec": ChromaVectorStore(chroma_dir, collection=f"coldstart_{tmp_path.name}"),
+        "embed": make_embed_fn("bge-m3"),
     }
 
 
@@ -189,11 +196,12 @@ class TestErrorHandling:
         """seeds 目录不存在不报错,只是空报告"""
         memory_root = tmp_path / "memory"
         memory_root.mkdir()
-        # 不创建 seeds 目录
+        chroma_dir = tmp_path / "chroma"
+        chroma_dir.mkdir()
         loader = ColdStartLoader(
             MemoryStore(memory_root),
-            MockVectorStore(),
-            MockEmbedFn(),
+            ChromaVectorStore(chroma_dir, collection=f"missing_{tmp_path.name}"),
+            make_embed_fn("bge-m3"),
             default_seeds_dir=tmp_path / "nonexistent",
         )
         report = loader.load()
