@@ -46,10 +46,11 @@ def workspace(tmp_path):
     chroma_dir = tmp_path / "chroma"
     chroma_dir.mkdir()
     store = MemoryStore(memory_root)
-    vec = ChromaVectorStore(chroma_dir, collection=f"retriever_{tmp_path.name}")
-    embed = make_embed_fn("bge-m3")
     config = MemoryConfig()
-    return {"store": store, "vec": vec, "embed": embed, "config": config}
+    embed = make_embed_fn("bge-m3")
+    # 用 with 块自动 close chroma client,防 fd 泄漏
+    with ChromaVectorStore(chroma_dir, collection=f"retriever_{tmp_path.name}") as vec:
+        yield {"store": store, "vec": vec, "embed": embed, "config": config}
 
 
 @pytest.fixture
@@ -193,24 +194,24 @@ class TestSecretFilter:
 
         chroma_dir = tmp_path / "chroma_l4"
         chroma_dir.mkdir()
-        vec = ChromaVectorStore(chroma_dir, collection="l4_test")
-        embed = make_embed_fn("bge-m3")
-        for it in store.list_by_type("reference"):
-            data = store.read(it["path"])
-            text = f"{data['frontmatter'].get('title','')}\n{data['body']}"
-            vec.add({
-                "id": it["hash"],
-                "embedding": embed.encode(text),
-                "metadata": {"type": "reference", "title": it["title"]},
-                "document": text,
-            })
+        with ChromaVectorStore(chroma_dir, collection="l4_test") as vec:
+            embed = make_embed_fn("bge-m3")
+            for it in store.list_by_type("reference"):
+                data = store.read(it["path"])
+                text = f"{data['frontmatter'].get('title','')}\n{data['body']}"
+                vec.add({
+                    "id": it["hash"],
+                    "embedding": embed.encode(text),
+                    "metadata": {"type": "reference", "title": it["title"]},
+                    "document": text,
+                })
 
-        retriever = MemoryRetriever(store, vec, embed)
-        report = retriever.search("config", top_k=5, mode="keyword")
-        # 找到含 secret 的 hit
-        secret_hit = next((h for h in report if h.has_secret), None)
-        assert secret_hit is not None
-        assert "sk-" in secret_hit.body
+            retriever = MemoryRetriever(store, vec, embed)
+            report = retriever.search("config", top_k=5, mode="keyword")
+            # 找到含 secret 的 hit
+            secret_hit = next((h for h in report if h.has_secret), None)
+            assert secret_hit is not None
+            assert "sk-" in secret_hit.body
 
     def test_clean_hit_not_marked(self, retriever):
         report = retriever.search("用户", top_k=3, mode="keyword")
@@ -280,15 +281,14 @@ class TestSemanticFallback:
         store.write("user", "用户", "用户叫小明", source_quote="q")
 
         # 空 ChromaVectorStore(没 add 任何东西)
-        vec = ChromaVectorStore(chroma_dir, collection="empty_test")
-        embed = make_embed_fn("bge-m3")
-
-        retriever = MemoryRetriever(store, vec, embed)
-        # hybrid 模式:vec 空,semantic 返 [],但 keyword 会命中
-        report = retriever.search("用户", top_k=1, mode="hybrid")
-        assert len(report) >= 1
-        # hit 应来自 keyword 分支
-        assert "keyword" in report[0].breakdown
+        with ChromaVectorStore(chroma_dir, collection="empty_test") as vec:
+            embed = make_embed_fn("bge-m3")
+            retriever = MemoryRetriever(store, vec, embed)
+            # hybrid 模式:vec 空,semantic 返 [],但 keyword 会命中
+            report = retriever.search("用户", top_k=1, mode="hybrid")
+            assert len(report) >= 1
+            # hit 应来自 keyword 分支
+            assert "keyword" in report[0].breakdown
 
     def test_semantic_returns_empty_when_vec_empty(self, tmp_path):
         """semantic 模式:vec 空时返空(不静默降级)"""
@@ -299,10 +299,10 @@ class TestSemanticFallback:
         store = MemoryStore(memory_root)
         store.write("user", "用户", "用户叫小明", source_quote="q")
 
-        vec = ChromaVectorStore(chroma_dir, collection="empty_test2")
-        embed = make_embed_fn("bge-m3")
-        retriever = MemoryRetriever(store, vec, embed)
+        with ChromaVectorStore(chroma_dir, collection="empty_test2") as vec:
+            embed = make_embed_fn("bge-m3")
+            retriever = MemoryRetriever(store, vec, embed)
 
-        # 纯 semantic:vec 空 → 空报告(降级只在 hybrid 模式自动发生)
-        report = retriever.search("用户", top_k=1, mode="semantic")
-        assert len(report) == 0   # semantic 模式不主动融合 keyword
+            # 纯 semantic:vec 空 → 空报告(降级只在 hybrid 模式自动发生)
+            report = retriever.search("用户", top_k=1, mode="semantic")
+            assert len(report) == 0   # semantic 模式不主动融合 keyword

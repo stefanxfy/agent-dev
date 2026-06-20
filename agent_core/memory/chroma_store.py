@@ -112,6 +112,33 @@ class ChromaVectorStore:
     # 内部:获取/创建 collection
     # ──────────────────────────────────────────────
 
+    def close(self) -> None:
+        """显式关闭 client(释放 fd)
+
+        单测 fixture 必须调用,否则 100+ 测试累积 fd 触发
+        OSError: [Errno 24] Too many open files
+
+        也支持 with 块:
+            with ChromaVectorStore(...) as vec:
+                vec.add(...)
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.reset()  # close 所有 collection handles
+        except Exception:
+            pass
+        # PersistentClient 没有 close,但 reset + 删引用让 GC 回收
+        self._client = None
+        self._collection = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
     def _try_existing_collection(self):
         """构造时尝试复用已存在的 collection(持久化场景)"""
         try:

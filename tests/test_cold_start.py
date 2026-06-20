@@ -45,13 +45,15 @@ def workspace(tmp_path):
     seeds_dir.mkdir()
     chroma_dir = tmp_path / "chroma"
     chroma_dir.mkdir()
-    return {
-        "memory_root": memory_root,
-        "seeds_dir": seeds_dir,
-        "chroma_dir": chroma_dir,
-        "vec": ChromaVectorStore(chroma_dir, collection=f"coldstart_{tmp_path.name}"),
-        "embed": make_embed_fn("bge-m3"),
-    }
+    # 用 with 块,fixture 退出时自动 close chroma client,防 fd 泄漏
+    with ChromaVectorStore(chroma_dir, collection=f"coldstart_{tmp_path.name}") as vec:
+        yield {
+            "memory_root": memory_root,
+            "seeds_dir": seeds_dir,
+            "chroma_dir": chroma_dir,
+            "vec": vec,
+            "embed": make_embed_fn("bge-m3"),
+        }
 
 
 @pytest.fixture
@@ -198,15 +200,17 @@ class TestErrorHandling:
         memory_root.mkdir()
         chroma_dir = tmp_path / "chroma"
         chroma_dir.mkdir()
-        loader = ColdStartLoader(
-            MemoryStore(memory_root),
-            ChromaVectorStore(chroma_dir, collection=f"missing_{tmp_path.name}"),
-            make_embed_fn("bge-m3"),
-            default_seeds_dir=tmp_path / "nonexistent",
-        )
-        report = loader.load()
-        assert report.loaded == 0
-        assert report.total == 0
+        # 用 with 块自动 close chroma client
+        with ChromaVectorStore(chroma_dir, collection=f"missing_{tmp_path.name}") as vec:
+            loader = ColdStartLoader(
+                MemoryStore(memory_root),
+                vec,
+                make_embed_fn("bge-m3"),
+                default_seeds_dir=tmp_path / "nonexistent",
+            )
+            report = loader.load()
+            assert report.loaded == 0
+            assert report.total == 0
 
     def test_invalid_yaml_recorded_as_failure(self, loader, workspace):
         (workspace["seeds_dir"] / "bad.yaml").write_text("""

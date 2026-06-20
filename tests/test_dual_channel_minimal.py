@@ -66,16 +66,17 @@ def tmp_workspace(tmp_path):
 
 @pytest.fixture
 def writer(tmp_workspace, tmp_path):
-    """默认 writer（用于单测）"""
+    """默认 writer(用于单测)"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = ChromaVectorStore(
+    with ChromaVectorStore(
         tmp_workspace["chroma_dir"], collection=f"dualch_{tmp_path.name}",
-    )
-    embed = make_embed_fn("bge-m3")
-    w = DualChannelWriter("s1", db, store, vec, embed)
-    yield w
-    w.shutdown(timeout=5)
+    ) as vec:
+        embed = make_embed_fn("bge-m3")
+        w = DualChannelWriter("s1", db, store, vec, embed)
+        yield w
+        w.shutdown(timeout=5)
+        vec.close()  # 显式 close 防 fd 泄漏(with 块也会 close,冗余保险)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -108,23 +109,24 @@ def test_cursor_persists_across_restart(tmp_workspace):
     """A3: cursor 持久化到 SQLite，重启后恢复"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="restart_test")
-    embed = make_embed_fn("bge-m3")
 
-    w1 = DualChannelWriter("s1", db, store, vec, embed)
-    w1.channel_a_inline_write("a", "A", turn_index=0)
-    w1.channel_a_inline_write("b", "B", turn_index=1)
-    assert w1.daily_cursor == 1
-    w1.shutdown(timeout=5)
+    with ChromaVectorStore(tmp_workspace["chroma_dir"], collection="restart_test") as vec:
+        embed = make_embed_fn("bge-m3")
+        w1 = DualChannelWriter("s1", db, store, vec, embed)
+        w1.channel_a_inline_write("a", "A", turn_index=0)
+        w1.channel_a_inline_write("b", "B", turn_index=1)
+        assert w1.daily_cursor == 1
+        w1.shutdown(timeout=5)
 
-    # 重启：新建 writer,重新构造 vec + embed(指向同一 chroma path)
-    vec2 = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="restart_test")
-    embed2 = make_embed_fn("bge-m3")
-    w2 = DualChannelWriter("s1", db, store, vec2, embed2)
-    assert w2.daily_cursor == 1, "cursor 未持久化"
-    # 写 turn 2 应正常推进
-    w2.channel_a_inline_write("c", "C", turn_index=2)
-    assert w2.daily_cursor == 2
+    # 重启:新建 writer,重新构造 vec + embed(指向同一 chroma path)
+    with ChromaVectorStore(tmp_workspace["chroma_dir"], collection="restart_test") as vec2:
+        embed2 = make_embed_fn("bge-m3")
+        w2 = DualChannelWriter("s1", db, store, vec2, embed2)
+        assert w2.daily_cursor == 1, "cursor 未持久化"
+        # 写 turn 2 应正常推进
+        w2.channel_a_inline_write("c", "C", turn_index=2)
+        assert w2.daily_cursor == 2
+        w2.shutdown(timeout=5)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -283,34 +285,34 @@ def test_concurrent_channel_a_no_overwrite(tmp_workspace):
     """§4.5.1 场景 1: 进程内双线程同时调 channel_a → 两段都写,无覆盖"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = ChromaVectorStore(
+    with ChromaVectorStore(
         tmp_workspace["chroma_dir"], collection="concurrent_test",
-    )
-    embed = make_embed_fn("bge-m3")
-    w = DualChannelWriter("s1", db, store, vec, embed)
+    ) as vec:
+        embed = make_embed_fn("bge-m3")
+        w = DualChannelWriter("s1", db, store, vec, embed)
 
-    results = []
-    barrier = threading.Barrier(2)
+        results = []
+        barrier = threading.Barrier(2)
 
-    def write_turn(idx: int, msg: str):
-        barrier.wait()  # 对齐两线程
-        try:
-            w.channel_a_inline_write(msg, f"resp{idx}", turn_index=idx)
-            results.append((idx, "ok"))
-        except Exception as e:
-            results.append((idx, str(e)))
+        def write_turn(idx: int, msg: str):
+            barrier.wait()  # 对齐两线程
+            try:
+                w.channel_a_inline_write(msg, f"resp{idx}", turn_index=idx)
+                results.append((idx, "ok"))
+            except Exception as e:
+                results.append((idx, str(e)))
 
-    t1 = threading.Thread(target=write_turn, args=(0, "msg-A",))
-    t2 = threading.Thread(target=write_turn, args=(1, "msg-B",))
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+        t1 = threading.Thread(target=write_turn, args=(0, "msg-A",))
+        t2 = threading.Thread(target=write_turn, args=(1, "msg-B",))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
 
-    # 验证：两段都成功（不同 turn_index）
-    success = [r for r in results if r[1] == "ok"]
-    assert len(success) == 2
-    # daily_cursor 应推进到 max
-    assert w.daily_cursor == 1
-    w.shutdown(timeout=5)
+        # 验证:两段都成功(不同 turn_index)
+        success = [r for r in results if r[1] == "ok"]
+        assert len(success) == 2
+        # daily_cursor 应推进到 max
+        assert w.daily_cursor == 1
+        w.shutdown(timeout=5)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -321,70 +323,72 @@ def test_channel_b_crash_resume_continues(tmp_workspace):
     """§4.5.1 场景 4: B 提取中途崩溃 → cursor 不推进,重启后幂等恢复"""
     db = MetaDB(tmp_workspace["meta_db_path"])
     store = MemoryStore(tmp_workspace["memory_root"])
-    vec = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="crash_test")
-    embed = make_embed_fn("bge-m3")
 
-    # 1. A 写 turn 0
-    w1 = DualChannelWriter("s1", db, store, vec, embed)
-    w1.channel_a_inline_write("我叫小明", "已记", turn_index=0)
-    assert w1.daily_cursor == 0
+    # Phase 1: 触发 crash,验证 cursor 不推进
+    with ChromaVectorStore(tmp_workspace["chroma_dir"], collection="crash_test") as vec:
+        embed = make_embed_fn("bge-m3")
+        # 1. A 写 turn 0
+        w1 = DualChannelWriter("s1", db, store, vec, embed)
+        w1.channel_a_inline_write("我叫小明", "已记", turn_index=0)
+        assert w1.daily_cursor == 0
 
-    # 2. 触发 B,但 mock extractor 在 vector.add 后崩（模拟半写）
-    from agent_core.exceptions import AgentError
-    def crashing_extractor(messages):
-        # 半写一条 candidate 到 vector,然后崩溃
-        # ChromaVectorStore 需要完整 doc 字段,这里模拟"半写"用不合规 doc
-        try:
-            vec.add({"partial": True})  # 缺 embedding → ChromaStoreError
-        except Exception:
-            pass  # 半写失败不影响测试目标
-        raise AgentError("simulated crash in LLM call")
+        # 2. 触发 B,但 mock extractor 在 vector.add 后崩(模拟半写)
+        from agent_core.exceptions import AgentError
+        def crashing_extractor(messages):
+            # 半写一条 candidate 到 vector,然后崩溃
+            # ChromaVectorStore 需要完整 doc 字段,这里模拟"半写"用不合规 doc
+            try:
+                vec.add({"partial": True})  # 缺 embedding → ChromaStoreError
+            except Exception:
+                pass  # 半写失败不影响测试目标
+            raise AgentError("simulated crash in LLM call")
 
-    future = w1.channel_b_background_extract(
-        [TurnMessage(0, "我叫小明", "已记")],
-        llm_extractor=crashing_extractor,
-    )
-    # 等崩溃完成（Future 会捕获异常,我们要看 extract_cursor 没推进）
-    with pytest.raises(Exception, match="simulated crash|channel B extract 失败"):
-        future.result(timeout=10)
-    # shutdown（确认 future 已 done）
-    w1.shutdown(timeout=5)
+        future = w1.channel_b_background_extract(
+            [TurnMessage(0, "我叫小明", "已记")],
+            llm_extractor=crashing_extractor,
+        )
+        # 等崩溃完成(Future 会捕获异常,我们要看 extract_cursor 没推进)
+        with pytest.raises(Exception, match="simulated crash|channel B extract 失败"):
+            future.result(timeout=10)
+        # shutdown(确认 future 已 done)
+        w1.shutdown(timeout=5)
 
-    # 3. 验证: extract_cursor 没推进（不变量 #4）
-    assert w1.extract_cursor == 0, "extract_cursor 不应在失败时推进"
+        # 3. 验证: extract_cursor 没推进(不变量 #4)
+        assert w1.extract_cursor == 0, "extract_cursor 不应在失败时推进"
 
-    # 4. 重启模拟: 新 writer,加载 cursor
-    vec2 = ChromaVectorStore(tmp_workspace["chroma_dir"], collection="crash_test")
-    embed2 = make_embed_fn("bge-m3")
-    w2 = DualChannelWriter("s1", db, store, vec2, embed2)
-    assert w2.daily_cursor == 0
-    assert w2.extract_cursor == 0  # 持久化正确
+    # Phase 2: 重启 + 正常 extract
+    with ChromaVectorStore(tmp_workspace["chroma_dir"], collection="crash_test") as vec2:
+        embed2 = make_embed_fn("bge-m3")
+        # 4. 重启模拟: 新 writer,加载 cursor
+        w2 = DualChannelWriter("s1", db, store, vec2, embed2)
+        assert w2.daily_cursor == 0
+        assert w2.extract_cursor == 0  # 持久化正确
 
-    # 5. 再触发一次 B（用正常 extractor）
-    def normal_extractor(messages):
-        return [
-            ExtractionCandidate(
-                type="user",
-                title="用户名字",
-                body="用户叫小明",
-                source_quote="我说'我叫小明'",
-                tags=["identity"],
-            )
-        ]
+        # 5. 再触发一次 B(用正常 extractor)
+        def normal_extractor(messages):
+            return [
+                ExtractionCandidate(
+                    type="user",
+                    title="用户名字",
+                    body="用户叫小明",
+                    source_quote="我说'我叫小明'",
+                    tags=["identity"],
+                )
+            ]
 
-    future2 = w2.channel_b_background_extract(
-        [TurnMessage(0, "我叫小明", "已记")],
-        llm_extractor=normal_extractor,
-    )
-    result = future2.result(timeout=10)
-    w2.shutdown(timeout=5)
+        future2 = w2.channel_b_background_extract(
+            [TurnMessage(0, "我叫小明", "已记")],
+            llm_extractor=normal_extractor,
+        )
+        result = future2.result(timeout=10)
+        w2.shutdown(timeout=5)
 
-    # 6. 验证: extract_cursor 推进 + file 写入
-    #    extract_cursor 是 "下一个待处理 turn"，提取完 turn 0 后 = 1
-    assert w2.extract_cursor == 1
-    # MemoryStore 应有 1 条
-    user_items = w2.memory_store.list_by_type("user")
-    assert len(user_items) == 1
+        # 6. 验证: extract_cursor 推进 + file 写入
+        #    extract_cursor 是 "下一个待处理 turn"，提取完 turn 0 后 = 1
+        assert w2.extract_cursor == 1
+        # MemoryStore 应有 1 条
+        user_items = w2.memory_store.list_by_type("user")
+        assert len(user_items) == 1
 
 
 # ──────────────────────────────────────────────────────────────────
