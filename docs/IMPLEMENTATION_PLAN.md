@@ -206,35 +206,76 @@ class DualChannelWriter:
 
 **验收 demo**:
 ```bash
-# 1. 基础写入
-python -c "
-from agent_core.memory import *
-w = DualChannelWriter('demo_s1', MetaDB(':memory:'), MemoryStore('/tmp/demo/'))
-w.channel_a_inline_write('记住我叫小明', '已记', 0)
+# ⚠️ 所有 demo 必须用 .venv/bin/python —— pyyaml / pydantic 等依赖装在 venv 里
+# 一次性脚本（4 个 demo 串在一起跑）
+
+.venv/bin/python <<'PYEOF'
+import shutil, tempfile
+from pathlib import Path
+tmp = Path(tempfile.mkdtemp())
+memory_root = tmp / "memory"
+meta_db_path = str(tmp / "meta.db")
+
+from agent_core.memory import (
+    DualChannelWriter, MetaDB, MemoryStore, MockVectorStore,
+    TurnMessage, ExtractionCandidate,
+)
+
+# === Demo 1: 基础写入（注意：vector_store 是必填位置参数）===
+db = MetaDB(meta_db_path)
+store = MemoryStore(memory_root)
+vec = MockVectorStore()
+w = DualChannelWriter('demo_s1', db, store, vec)
+w.channel_a_inline_write('记住我叫小明', '已记', turn_index=0)
 assert w.daily_cursor == 0
-print('✅ channel A wrote')
-"
+print('✅ Demo 1: channel A wrote')
 
-# 2. 重启恢复 (A3)
-python -c "
-from agent_core.memory import *
-db = MetaDB('/tmp/demo_meta.db')
-w1 = DualChannelWriter('demo_s1', db, ...)
-w1.channel_a_inline_write('msg1', 'resp1', 1)
-del w1
-w2 = DualChannelWriter('demo_s1', db, ...)  # 重新加载
-assert w2.daily_cursor == 1
-print('✅ cursor persisted across restart')
-"
+# === Demo 2: 重启恢复 (A3) —— 必须用磁盘 MetaDB（:memory: 不能跨重启）===
+w.shutdown(timeout=5)
+db2 = MetaDB(meta_db_path)
+store2 = MemoryStore(memory_root)
+vec2 = MockVectorStore()
+w2 = DualChannelWriter('demo_s1', db2, store2, vec2)
+assert w2.daily_cursor == 0  # 从磁盘恢复
+print('✅ Demo 2: cursor persisted across restart')
 
-# 3. 并发 (场景 1)
-pytest tests/test_dual_channel_concurrent.py::test_concurrent_writes -v
-# Expected: PASSED
+# === Demo 3: 通道 B 后台提取 ===
+def my_extractor(msgs):
+    return [ExtractionCandidate(
+        type='user', title='用户名字', body='用户叫小明',
+        source_quote="我说'我叫小明'", tags=['identity']
+    )]
+w2.channel_a_inline_write('我叫小明', '好的', turn_index=1)
+future = w2.channel_b_background_extract(
+    [TurnMessage(0, '我叫小明', '好的'), TurnMessage(1, '我叫小明', '好的')],
+    llm_extractor=my_extractor,
+)
+result = future.result(timeout=10)
+assert result['written'] == 1
+print(f"✅ Demo 3: channel B extracted {result}")
 
-# 4. 崩溃恢复 (场景 4)
-pytest tests/test_dual_channel_concurrent.py::test_crash_resume_continues -v
-# Expected: PASSED
+# === Demo 4: 崩溃恢复（场景 4）—— 重启后 extract_cursor 仍正确 ===
+w2.shutdown(timeout=5)
+w3 = DualChannelWriter('demo_s1', db2, store2, vec2)
+assert w3.extract_cursor == 2  # turn 0 + 1 都已提取
+items = w3.memory_store.list_by_type('user')
+assert len(items) == 1
+print(f'✅ Demo 4: crash recovery — extract_cursor={w3.extract_cursor}, files={len(items)}')
+
+w3.shutdown(timeout=5)
+shutil.rmtree(tmp, ignore_errors=True)
+print('\n=== M2 / Day 2 验收: 4/4 demo 全部通过 ===')
+PYEOF
+
+# 并发 + 崩溃恢复场景 1/4 的 pytest 验收（plan 标注）
+.venv/bin/python -m pytest tests/test_dual_channel_minimal.py::test_concurrent_channel_a_no_overwrite tests/test_dual_channel_minimal.py::test_channel_b_crash_resume_continues -v
+# Expected: 2 passed
 ```
+
+> **API 说明**(对比 v1 sketch):
+> - `DualChannelWriter(session_id, meta_db, memory_store, vector_store, *, ...)` — `vector_store` 是必填位置参数（v1 sketch 漏了）
+> - `MetaDB(':memory:')` 仅供单进程测试用；跨重启验证必须用磁盘路径 `MetaDB('/path/to/meta.db')`
+> - `.shutdown(timeout=30)` 是 M2 推荐的优雅退出方式（M9/A9）
 
 **人验收** (15 min):
 - 跑 4 个 demo → 全 ✅
@@ -267,7 +308,7 @@ pytest tests/test_dual_channel_concurrent.py::test_crash_resume_continues -v
 **验收 demo**:
 ```bash
 # 1. 三模式切换
-python -c "
+.venv/bin/python -c "
 import agent_core.memory as m
 r = m.Retriever(mode='hybrid')
 results = r.search('学习风格', top_k=3)
@@ -278,7 +319,7 @@ print(f'file-only returned {len(r2.search(\"学习风格\", top_k=3))}')
 
 # 2. 冷启动
 rm -rf ~/.agent_data/memory/  # 清空
-python -c "
+.venv/bin/python -c "
 from agent_core.memory import bootstrap
 bootstrap.ensure_seeded()
 import os
@@ -287,7 +328,7 @@ print('✅ seed loaded')
 "
 
 # 3. SecretScanner
-python -c "
+.venv/bin/python -c "
 from agent_core.memory.secret_scanner import SecretScanner
 s = SecretScanner()
 findings = s.scan('我的 API key 是 sk-1234567890abcdefghij')
@@ -296,7 +337,7 @@ print('✅ secret detected')
 "
 
 # 4. Token budget
-python -c "
+.venv/bin/python -c "
 from agent_core.memory.retriever import Retriever
 r = Retriever(mode='file', max_injection_tokens=2000)
 ctx = r.build_context(['x' * 8000] * 5)  # 40KB 输入
@@ -333,7 +374,7 @@ pytest tests/test_extractor.py::test_merged_call -v
 **验收 demo**:
 ```bash
 # 1. 触发压缩
-python -c "
+.venv/bin/python -c "
 from agent_core.memory.sm_layer import SessionMemoryLayer
 sm = SessionMemoryLayer('demo_s2')
 # 模拟 10K tokens 的对话
@@ -407,7 +448,7 @@ pytest tests/test_distiller.py::test_lock_atomic -v
 pytest tests/test_distiller.py::test_failure_rolls_back_mtime -v
 
 # 3. JSON envelope 校验
-python -c "
+.venv/bin/python -c "
 from agent_core.memory.distiller import DistillationScheduler
 s = DistillationScheduler()
 # 写一个 fake 锁
@@ -461,7 +502,7 @@ print('✅ garbage rejected')
 **验收 demo**:
 ```bash
 # 1. 调度器触发
-python -c "
+.venv/bin/python -c "
 from agent_core.memory.scheduler import DistillationScheduler
 s = DistillationScheduler()
 # 模拟 5 个 session
@@ -473,7 +514,7 @@ print('✅ should_distill returned True')
 "
 
 # 2. OTel span
-python -c "
+.venv/bin/python -c "
 from agent_core.memory.tracing import tracer
 with tracer.start_as_current_span('memory.extract') as span:
     span.set_attribute('memory.candidates', 3)
@@ -510,7 +551,7 @@ pytest tests/test_dual_channel_concurrent.py -v
 **验收 demo**:
 ```bash
 # 1. 端到端 turn
-python -c "
+.venv/bin/python -c "
 from langgraph_agent.agent import Agent
 a = Agent(memory_enabled=True)
 r = a.run('记住我叫小明')
@@ -521,7 +562,7 @@ print('✅ end-to-end works')
 "
 
 # 2. Schema migration
-python -c "
+.venv/bin/python -c "
 from agent_core.memory.migration import migrate_file
 import tempfile, pathlib
 with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
