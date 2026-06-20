@@ -49,13 +49,45 @@ from .memory_editor import (
     scan_secrets,
 )
 
+# M3: 检索 + 安全
+from .embeddings import (
+    EmbedFn,
+    MockEmbedFn,
+    BGEM3EmbedFn,
+    MiniLMEmbedFn,
+    make_embed_fn,
+    EmbeddingError,
+)
+from .secret_scanner import (
+    SecretScanner,
+    SecretHit,
+    ScanResult,
+    get_default_scanner,
+    scan_text,
+    assert_clean,
+)
+from .cold_start import (
+    ColdStartLoader,
+    SeedItem,
+    ColdStartReport,
+    ColdStartError,
+)
+from .retriever import (
+    MemoryRetriever,
+    MemoryHit,
+    RetrievalReport,
+    RetrievalMode,
+    RetrievalError,
+)
+from .extractor import (
+    MemoryExtractor,
+    ExtractStats,
+    ExtractorError,
+    CandidateRejected,
+)
+
 # v1 历史实现（保留兼容）
 from .daily import DailyLogger
-
-# M3+ 待实现 —— 暂不导入，避免 M2 测试 fail
-# from .retriever import MemoryRetriever
-# from .distiller import MemoryDistiller
-# from .scheduler import DistillationScheduler
 
 __all__ = [
     # M1: types
@@ -98,6 +130,36 @@ __all__ = [
     "EditPreconditionError",
     "sanitize",
     "scan_secrets",
+    # M3: embeddings
+    "EmbedFn",
+    "MockEmbedFn",
+    "BGEM3EmbedFn",
+    "MiniLMEmbedFn",
+    "make_embed_fn",
+    "EmbeddingError",
+    # M3: secret_scanner
+    "SecretScanner",
+    "SecretHit",
+    "ScanResult",
+    "get_default_scanner",
+    "scan_text",
+    "assert_clean",
+    # M3: cold_start
+    "ColdStartLoader",
+    "SeedItem",
+    "ColdStartReport",
+    "ColdStartError",
+    # M3: retriever
+    "MemoryRetriever",
+    "MemoryHit",
+    "RetrievalReport",
+    "RetrievalMode",
+    "RetrievalError",
+    # M3: extractor
+    "MemoryExtractor",
+    "ExtractStats",
+    "ExtractorError",
+    "CandidateRejected",
     # v1 legacy
     "DailyLogger",
 ]
