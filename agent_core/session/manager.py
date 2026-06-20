@@ -492,7 +492,7 @@ class SessionManager:
 
         self._title_state = TitleState.NEED_TITLE
 
-    def _on_user_message(self, text: str) -> None:
+    def _on_user_message(self, text) -> None:
         """每条用户消息调用，决定是否触发标题生成
 
         触发策略（参考 Claude Code sessionTitle.ts）：
@@ -500,10 +500,54 @@ class SessionManager:
         - 第3条消息：用完整对话重新生成（覆盖第1条的粗略标题）
         - 第4条起：不再生成
         - 用户手动改名后：永久阻止自动生成
+
+        P2-8 修复：防御 tool_result 作为首条消息
+        - 实际场景：用户可能从断点恢复，第一条 user message 包含 tool_result
+        - 旧实现会把整个 tool_result 文本当作标题语料，生成垃圾标题
+        - 修复：识别 tool_result 格式 → 不触发标题生成（标记为 AI_SET
+          但不实际生成内容，等下一条"真正的"用户消息覆盖）
+
+        Args:
+            text: 字符串或 list（content blocks）。list 时为防御场景。
         """
         # 守卫：用户改过或已锁定 → 永不自动生成
         if self._title_state in (TitleState.USER_SET, TitleState.FINALIZED):
             return
+
+        # P2-8 修复：tool_result 作为第一条 user message → 不生成标题
+        # 场景：resume 后的第一条 user message 是 tool_result（Claude Code 风格）
+        if isinstance(text, list):
+            # 检查是否全是 tool_result
+            all_tool_results = all(
+                isinstance(item, dict) and item.get("type") == "tool_result"
+                for item in text
+                if item is not None
+            )
+            if all_tool_results and text:
+                logger.info(
+                    "🛡️ [Title Guard] 第一条 user message 全是 tool_result，"
+                    "跳过标题生成"
+                )
+                # 计数器 + 1 但不触发生成；标记为 AI_SET 表示"已尝试过"
+                # 这样第3条时不会再次触发（但第2条如果是非 tool_result 会触发）
+                self._user_msg_count += 1
+                # 不进入 AI_PENDING，避免 fire-and-forget 用 tool_result 生成垃圾标题
+                if self._title_state == TitleState.NEED_TITLE:
+                    self._title_state = TitleState.AI_SET  # 视为"已生成"但占位
+                return
+
+        # 字符串场景：检测是否包含 tool_result 字面量（防御性）
+        if isinstance(text, str) and text.lstrip().startswith("[{"):
+            # 可能是 JSON 列表字符串（极少见）→ 跳过
+            if '"type": "tool_result"' in text:
+                logger.info(
+                    "🛡️ [Title Guard] 第一条 user message 含 tool_result JSON，"
+                    "跳过标题生成"
+                )
+                self._user_msg_count += 1
+                if self._title_state == TitleState.NEED_TITLE:
+                    self._title_state = TitleState.AI_SET
+                return
 
         self._user_msg_count += 1
         count = self._user_msg_count
@@ -779,12 +823,42 @@ class SessionManager:
         3. agent-name
         4. mode
 
-        只 re-append: custom-title, tag, agent-name, mode
+        P0-3 修复：去重守卫
+        - 每次都全量 re-append 会让 JSONL 越来越长（用户改一次 mode = 多 4 条 entry）
+        - 改为：先扫 tail 64KB，收集已有 (type, value) 集合，再 append 缺失的
+        - dedup 键：custom-title → customTitle; tag → tag; agent-name → agentName; mode → mode
         """
-        timestamp = datetime.now().isoformat()
-        reappend_order = []  # 按写入顺序收集
+        # 1. 收集 tail 中已有的元数据 (type, value) 集合
+        existing: set[tuple[str, str]] = set()
+        try:
+            tail_entries = self.storage.read_tail(kb=64)
+        except Exception:
+            tail_entries = []
 
-        if self.metadata.title:
+        for entry in tail_entries:
+            t = entry.get("type")
+            if t == "custom-title":
+                v = entry.get("customTitle") or entry.get("title")
+                if v:
+                    existing.add(("custom-title", v))
+            elif t == "tag":
+                v = entry.get("tag")
+                if v:
+                    existing.add(("tag", v))
+            elif t == "agent-name":
+                v = entry.get("agentName")
+                if v:
+                    existing.add(("agent-name", v))
+            elif t == "mode":
+                v = entry.get("mode")
+                if v:
+                    existing.add(("mode", v))
+
+        # 2. 按写入顺序收集待追加（已存在则跳过）
+        timestamp = datetime.now().isoformat()
+        reappend_order: list[dict] = []
+
+        if self.metadata.title and ("custom-title", self.metadata.title) not in existing:
             reappend_order.append({
                 "uuid": str(uuid.uuid4()),
                 "parentUuid": None,
@@ -795,6 +869,8 @@ class SessionManager:
             })
 
         for tag in self.metadata.tags:
+            if ("tag", tag) in existing:
+                continue
             reappend_order.append({
                 "uuid": str(uuid.uuid4()),
                 "parentUuid": None,
@@ -804,23 +880,28 @@ class SessionManager:
                 "timestamp": timestamp,
             })
 
-        reappend_order.append({
-            "uuid": str(uuid.uuid4()),
-            "parentUuid": None,
-            "sessionId": self.session_id,
-            "type": "agent-name",
-            "agentName": self.metadata.agent_name,
-            "timestamp": timestamp,
-        })
+        if ("agent-name", self.metadata.agent_name) not in existing:
+            reappend_order.append({
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": None,
+                "sessionId": self.session_id,
+                "type": "agent-name",
+                "agentName": self.metadata.agent_name,
+                "timestamp": timestamp,
+            })
 
-        reappend_order.append({
-            "uuid": str(uuid.uuid4()),
-            "parentUuid": None,
-            "sessionId": self.session_id,
-            "type": "mode",
-            "mode": self.metadata.mode,
-            "timestamp": timestamp,
-        })
+        if ("mode", self.metadata.mode) not in existing:
+            reappend_order.append({
+                "uuid": str(uuid.uuid4()),
+                "parentUuid": None,
+                "sessionId": self.session_id,
+                "type": "mode",
+                "mode": self.metadata.mode,
+                "timestamp": timestamp,
+            })
+
+        if not reappend_order:
+            return  # 全部已存在，无需写入
 
         for entry in reappend_order:
             self.storage.append_raw_entry(entry)

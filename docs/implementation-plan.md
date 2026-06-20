@@ -33,7 +33,7 @@
 | 熔断保护 | 📋 | 连续 3 次失败停止压缩 |
 | verbatim quotes 防漂移 | 📋 | 用户消息逐字引用 |
 
-**不实现**：PromptCacheManager（GLM 不支持 `cache_control`）、StateKeeper（无 FileRead/Plan/MCP）、MessageStore（SessionStorage 已有）、Forked Agent（依赖 `cache_control`）。
+**不实现**：PromptCacheManager（GLM 不支持 `cache_control`）、StateKeeper（无 FileRead/Plan/MCP）、MessageStore（SessionStorage 已有）。
 
 ### 记忆系统 — 🔮 远期
 
@@ -159,19 +159,6 @@ TRUNCATE_RATIO = 0.2
 COMPACT_THRESHOLD_RATIO = 0.0625  # 剩余 ≤ 6.25% 时触发
 PRESERVED_HEAD_MESSAGES = 6       # 压缩后保留最近 6 条原始消息
 ```
-
----
-
-## 六、已删除的模块及原因
-
-| 模块 | v2.0 中的描述 | 删除原因 |
-|------|-------------|---------|
-| PromptCacheManager | Cache key 管理 + TTL 策略 | `cache_control` 是 Anthropic API 专有参数，GLM 不支持。应用层无法管理服务端缓存。 |
-| StateKeeper | FileRead/Plan/MCP/DeferredTool 追踪 | agent-dev 没有文件读取工具、没有 Plan 系统、没有 MCP 工具协议。 |
-| MessageStore | 消息存储 + 分层保留 | 与已有 SessionStorage 功能重叠，两套存储并行导致数据不一致。 |
-| Forked Agent | 共享父对话缓存前缀做压缩 | 依赖 `cache_control` 定位缓存边界，GLM 场景下无意义。 |
-| 记忆系统 | 四类记忆分级 + autoDream | 从当前计划中移除，远期再做。 |
-| 外部持久化 | CCR 远程同步 | 过度设计，当前不需要。 |
 
 ---
 

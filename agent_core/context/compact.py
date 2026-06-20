@@ -83,6 +83,92 @@ TOOL_RESULT_TRUNCATE_CHARS = 8000
 # 压缩请求最大输出 tokens
 COMPACT_MAX_OUTPUT_TOKENS = 4096
 
+# P1-5 修复：摘要质量底线（语义退化防御）
+# - 字符数下限：少于这个数说明模型只是"敷衍了事"
+# - 重复比例上限：超过这个数说明是"复读机"产物
+# - 模板泄漏字符串：禁止出现的字面量（说明模型在复读 prompt）
+SUMMARY_MIN_CHARS = 200
+SUMMARY_MAX_REPEAT_RATIO = 0.3  # 同一行/段重复率上限
+SUMMARY_FORBIDDEN_PHRASES = (
+    "Your task is to create",
+    "Respond with TEXT ONLY",
+    "create a detailed summary",
+    "you MUST create the summary",
+    "[truncated]",
+    "...",
+)
+
+
+def _is_summary_quality_ok(summary: str, original_messages: list[dict]) -> tuple[bool, str]:
+    """
+    P1-5 修复：摘要质量检查
+
+    防御 LLM 语义退化（API 200 但内容是"敷衍""复读""模板泄漏"）。
+    与熔断器配合：质量不达标 → 等同失败 → 计入连续失败次数。
+
+    检查项：
+    1. 字符数 >= SUMMARY_MIN_CHARS
+    2. 不包含模板泄漏字符串（说明模型在复读 prompt）
+    3. 重复行/段比例 <= SUMMARY_MAX_REPEAT_RATIO
+    4. 与原始消息的 token 比 >= 5%（极度压缩到 < 5% 也视为退化）
+
+    Args:
+        summary: LLM 返回的摘要
+        original_messages: 压缩前的原始消息列表
+
+    Returns:
+        (is_ok, reason)
+    """
+    if not summary or not summary.strip():
+        return False, "summary 为空"
+
+    stripped = summary.strip()
+
+    # 1. 字符数下限
+    if len(stripped) < SUMMARY_MIN_CHARS:
+        return False, f"summary 过短 ({len(stripped)} < {SUMMARY_MIN_CHARS})"
+
+    # 2. 模板泄漏检查
+    lowered = stripped.lower()
+    for phrase in SUMMARY_FORBIDDEN_PHRASES:
+        if phrase.lower() in lowered:
+            return False, f"summary 含模板泄漏: {phrase!r}"
+
+    # 3. 重复行检查
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if lines:
+        from collections import Counter
+        line_counts = Counter(lines)
+        most_common_line, most_common_count = line_counts.most_common(1)[0]
+        # 同一行出现 >= 3 次且占总数 30% 以上 → 复读
+        if most_common_count >= 3 and most_common_count / len(lines) > SUMMARY_MAX_REPEAT_RATIO:
+            return False, (
+                f"summary 复读: {most_common_line[:30]!r} "
+                f"出现 {most_common_count} 次"
+            )
+
+    # 4. 极度压缩比检查（与原消息 token 数对比）
+    if original_messages:
+        try:
+            from .tokenizer import estimate_tokens
+            summary_tokens = estimate_tokens(stripped)
+            orig_tokens = sum(
+                estimate_tokens(str(m.get("content", ""))) for m in original_messages
+            )
+            if orig_tokens > 0:
+                ratio = summary_tokens / orig_tokens
+                # 极度压缩（< 2%）：丢掉太多内容
+                if ratio < 0.02:
+                    return False, (
+                        f"summary 极度压缩: {summary_tokens} / {orig_tokens} "
+                        f"= {ratio:.2%} < 2%"
+                    )
+        except Exception:
+            # 估算失败不阻塞质量检查
+            pass
+
+    return True, "ok"
+
 
 # ── 压缩 Prompt ─────────────────────────────────────────────────
 
@@ -249,25 +335,25 @@ def _build_preserved_head(
     """
     构建 preserved head：配对 + max_turns 硬停 + max_total_tokens 硬停
 
-    设计原则（用户 21:12 确认的 v4 — 严格执行）：
+    设计原则（v4.1 — P1-2 修复，无任何 turn 例外）：
     1. **配对**：user+assistant 配对成 turn，不拆散
     2. **max_turns 硬停**：达到 N 对 turn 立即停止
     3. **max_total_tokens 硬停**：累计 token 超 budget → 这个 turn 不保留 + 停止
-       - 灌水 turn 会让 preserved head 提前到顶，但**严格不超 budget**
-       - LLM 看不到完整最近对话没关系，**不能让它看灌水**
-    4. **第一个 turn 总是包含**（边界 case）：避免 preserved head 完全为空
-       - 极端情况：单 turn 超大 → 仍保留这一个（保证非空）
+       - **不区分第一个 turn**（用户指令：不做任何截断，
+         如果第一个 turn 就超 budget → 整条不保留）
+       - 极端情况：第一个 turn 单条超 budget → preserved head 为空
+         (接受此退化，summary 已包含必要上下文)
+    4. **不截断 turn**：超 budget 的 turn 整体不加入，不做 partial 截取
+       - partial 截取会让 user/assistant 失去配对语义
 
-    为什么不用 drop 超大 turn？
-    - 不需要"整 turn 丢弃"分支。max_total_tokens 硬停 + 第一个 turn 例外
-      已经能处理所有场景：
-        * 中间 turn 灌水 → 后面的 turn 不再加（preserved head 可能 1 turn）
-        * 第一个 turn 灌水 → 仍保留这一个（避免空 head）
-    - 删 MAX_TURN_TOKENS 常量简化逻辑
+    为什么不做任何截断？
+    - 任何"截断超大 turn"分支都意味着放弃语义完整性
+    - "第一个 turn 例外"是反模式：让单 turn 灌水绕过所有防御
+    - 退化行为（preserved head 为空）由 summary 兜底，可接受
 
     迭代顺序：从后往前（最近的优先）
     - 任一硬停条件达到 → break
-    - 第一个 turn 总是包含（即使超大）
+    - 不再保留"第一个 turn 例外"分支
 
     Args:
         non_system: 非 system 消息列表（按时间正序）
@@ -275,7 +361,7 @@ def _build_preserved_head(
         max_turns: 最多保留几对（turn = user + assistant），硬限制
 
     Returns:
-        保留的消息列表（时间正序，连续）
+        保留的消息列表（时间正序，连续）。可能为空。
     """
     if not non_system:
         return []
@@ -286,7 +372,7 @@ def _build_preserved_head(
     # 2. 从后往前选 turn，任一硬停条件达到即停
     # - max_turns 硬停：turn 数到 N
     # - max_total_tokens 硬停：累计超 budget 就不加这个 turn（且停止）
-    # - 第一个 turn 例外：避免空 head
+    #   P1-2 修复：取消 "first turn exception"，统一硬停
     selected_turns = []
     total = 0
 
@@ -297,8 +383,9 @@ def _build_preserved_head(
         if len(selected_turns) >= max_turns:
             break
 
-        # 硬限制: 累计超 budget（第一个 turn 例外，避免空 head）
-        if selected_turns and total + turn_tokens > max_total_tokens:
+        # 硬限制: 累计超 budget（含第一个 turn，不做任何例外 / 截断）
+        #   第一个 turn 也必须遵守 budget。超 budget → 整 turn 跳过 + 停止
+        if total + turn_tokens > max_total_tokens:
             break
 
         # 通过所有硬停检查 → 包含
@@ -496,6 +583,17 @@ class CompactOrchestrator:
 
             if not summary:
                 raise ValueError("LLM 返回空摘要")
+
+            # P1-5 修复：摘要质量检查（防御语义退化）
+            # 失败的摘要视为"压缩失败" → 计入熔断器失败计数
+            quality_ok, quality_reason = _is_summary_quality_ok(summary, messages)
+            if not quality_ok:
+                logger.warning(
+                    f"⚠️ [Compact Quality FAIL] {quality_reason}, "
+                    f"summary_len={len(summary)}, "
+                    f"messages={len(messages)}"
+                )
+                raise ValueError(f"摘要质量不达标: {quality_reason}")
 
             # 4. 组装压缩后消息
             compacted, recent = self._build_compacted_messages(summary, messages)

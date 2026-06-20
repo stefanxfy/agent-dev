@@ -91,8 +91,11 @@ def test_baseline_restored_from_jsonl_usage(tmp_data_dir):
     # 验证增量估算输出 = baseline + 新增 1 条(A2) 的估算
     # 刷新后 messages=4, baseline_msg_count=3, 增量算 msgs[3:] = A2
     state = agent.context_manager.budget.compute_budget_state(agent.messages)
-    # A2 = "A2" 两个字符 → SimpleTokenCounter 估算 ≈ 10 tokens (role overhead)
-    assert state.used_tokens == 33400 + 10  # baseline + A2 overhead
+    # A2 msg tokens 取决于 tokenizer（tiktoken: 7, 启发式: 10）
+    a2_tokens = agent.context_manager.token_counter.count_messages(
+        [m for m in agent.messages if m.get("content") == "A2"]
+    )
+    assert state.used_tokens == 33400 + a2_tokens  # baseline + A2 估算
     print(f'✅ 测试 2 通过：F5 后 baseline=33,400 (API 真实)，used_tokens={state.used_tokens:,}')
 
 

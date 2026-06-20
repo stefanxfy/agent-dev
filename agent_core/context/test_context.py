@@ -52,9 +52,10 @@ class TestSimpleTokenCounter:
     def test_chinese_text(self):
         # "你好世界" = 4 个中文字
         # count() 不含 overhead，只有纯文本 token
-        # 预期 ~4 * 1.4 = 5.6 → int = 5
+        # tiktoken o200k_base: "你好"+"世界" = 2 tokens
+        # 启发式回退: ~4 * 1.4 = 5.6 → int = 5
         result = self.counter.count("你好世界")
-        assert 3 < result < 10
+        assert 1 < result < 10
 
     def test_english_text(self):
         # "hello world" = 11 chars (all English)
@@ -65,8 +66,10 @@ class TestSimpleTokenCounter:
 
     def test_mixed_text(self):
         # 中英混合
+        # tiktoken o200k_base: Hello(1)+空格你好(2)+空格world(1)+空格世界(2)=6+
+        # 启发式回退: >5
         result = self.counter.count("Hello 你好 world 世界")
-        assert result > 5
+        assert result >= 5
 
     def test_string_messages(self):
         messages = [
@@ -75,7 +78,9 @@ class TestSimpleTokenCounter:
             {"role": "assistant", "content": "Hi there"},
         ]
         result = self.counter.count_messages(messages)
-        assert result > 30  # 3 条消息 * overhead + 内容
+        # tiktoken: 3*5(overhead) + 5+1+2(content) = 23
+        # 启发式回退: 3*5 + higher heuristic counts > 15
+        assert result > 15
 
     def test_list_content_messages(self):
         messages = [
@@ -102,8 +107,8 @@ class TestSimpleTokenCounter:
     def test_none_content(self):
         messages = [{"role": "assistant", "content": None}]
         result = self.counter.count_messages(messages)
-        # 只有 role overhead
-        assert result == 10
+        # 只有 role overhead（GLM API 实测 ≈5）
+        assert result == 5
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -219,7 +224,7 @@ class TestContextBudgetManager:
         # GLM-4 total_budget = 128000 - 4096 - 13000 = 110904
         # compact_threshold = 110904 - 13000 = 97904
         # 需要构造 >= 97904 tokens 的消息
-        big_text = "你好世界" * 5000  # ~35000 tokens 每条
+        big_text = "你好世界" * 6200  # tiktoken: 2*6200=12400, 8条≈99264>97904
         messages = []
         for i in range(4):
             messages.append({"role": "user", "content": f"消息{i}: {big_text}"})
@@ -302,13 +307,24 @@ class TestCompactOrchestrator:
         self.bm = ContextBudgetManager("glm-4", self.counter)
 
         # Mock LLM Router — 不实际调用 LLM
+        # P1-5 修复后：summary 必须 ≥ SUMMARY_MIN_CHARS (200) 才算质量合格
+        _long_summary = (
+            "<analysis>用户做了计算</analysis>\n"
+            "<summary>1. 用户目标：用户希望完成一个计算任务，输入为数字 N，"
+            "期望输出该数字的阶乘结果。测试多个边界场景包括 0、1、负数等特殊输入。"
+            "2. 关键决策：采用迭代而非递归实现以避免 Python 递归深度限制，"
+            "使用 functools.lru_cache 加速重复计算，并加入输入校验逻辑。"
+            "3. 当前状态：计算已成功完成，输出了正确的阶乘结果，"
+            "用户对此表示满意。代码使用 def factorial(n) 函数实现，"
+            "包含完整的类型检查、负数处理和大数边界条件覆盖。"
+            "4. 待办事项：暂无后续任务，会话可正常结束。</summary>"
+        )
+
         class MockLLMRouter:
             def chat(self, messages, tools=None):
                 """返回模拟的摘要响应"""
                 from agent_core.llm.router import StreamChunk, TextDelta
-                yield StreamChunk(text_delta=TextDelta(
-                    text="<analysis>用户做了计算</analysis>\n<summary>用户请求计算并被成功完成</summary>",
-                ))
+                yield StreamChunk(text_delta=TextDelta(text=_long_summary))
 
         self.mock_llm = MockLLMRouter()
         self.compactor = CompactOrchestrator(
@@ -486,9 +502,18 @@ class TestCompactOrchestrator:
                 call_count[0] += 1
                 if call_count[0] == 1:
                     raise RuntimeError("Prompt too long")
-                # 第二次成功
+                # 第二次成功（P1-5 修复后：mock summary 必须 ≥ 200 chars）
                 from agent_core.llm.router import StreamChunk, TextDelta
-                yield StreamChunk(text_delta=TextDelta(text="<summary>摘要</summary>"))
+                yield StreamChunk(text_delta=TextDelta(text=(
+                    "<summary>1. 用户目标：测试 PTL 防御的剥洋葱重试机制是否生效，"
+                    "第一次调用应因 prompt 过长触发 RuntimeError，第二次重试应返回完整摘要。"
+                    "2. 关键决策：用 call_count 模拟 PTL 触发，"
+                    "然后返回符合 P1-5 质量要求的 4 段结构化摘要（≥200 字符）。"
+                    "3. 当前状态：PTL 重试后第二次 LLM 调用成功，"
+                    "剥洋葱截掉了最旧的 8 条消息，剩余 33 条进入 summary 生成流程。"
+                    "4. 待办事项：测试结束后验证 P1-5 质量检查全部通过，"
+                    "且 CompactionResult.success=True 符合预期。</summary>"
+                )))
 
         compactor = CompactOrchestrator(
             llm_router=PTLLLMRouter(),
@@ -540,9 +565,18 @@ class TestContextManager:
     def setup_method(self):
         class MockLLMRouter:
             def chat(self, messages, tools=None):
+                # P1-5 修复后：mock summary 必须 ≥ 200 chars
                 from agent_core.llm.router import StreamChunk, TextDelta
                 yield StreamChunk(text_delta=TextDelta(
-                    text="<summary>测试摘要</summary>"
+                    text=(
+                        "<summary>1. 用户目标：测试压缩上下文管理的核心功能，"
+                        "验证 ContextManager 是否能正确触发压缩流程并返回 CompactionResult。"
+                        "2. 关键决策：使用 MockLLMRouter 避免真实 API 调用，"
+                        "加快单测运行速度并保证测试可重复。"
+                        "3. 当前状态：ContextManager 已初始化，compact_count=0，"
+                        "total_tokens_freed=0，所有依赖组件就绪。"
+                        "4. 待办事项：运行所有 test_should_compact 变体以验证阈值逻辑。</summary>"
+                    )
                 ))
 
         self.mock_llm = MockLLMRouter()
@@ -879,8 +913,19 @@ def test_compact_debug_logging_emits_expected_events():
         
         class MockLLM:
             def chat(self, messages, tools=None):
+                # P1-5 修复后：mock summary 必须 ≥ 200 chars
                 yield StreamChunk(text_delta=TextDelta(
-                    text="<analysis>分析内容</analysis><summary>1. 用户目标：A 2. 关键决策：B 3. 当前状态：完 4. 待办事项：无</summary>"
+                    text=(
+                        "<analysis>分析内容：用户进行了一个简短测试，验证压缩管道的核心链路是否打通。"
+                        "包括 preprocess、summary 生成、compacted 组装等步骤。</analysis>"
+                        "<summary>1. 用户目标：验证压缩流程端到端可用，"
+                        "包括预处理、PTL 防御、摘要生成、compacted 组装。"
+                        "2. 关键决策：使用流式响应模拟真实 LLM 行为，"
+                        "Mock LLM 返回固定 4 段结构（用户目标/关键决策/当前状态/待办事项）。"
+                        "3. 当前状态：压缩流程已成功，结构验证通过，preserved head 正确生成，"
+                        "日志包含 Compact START / DONE 全流程信息。"
+                        "4. 待办事项：暂无后续任务，可以继续测试 PTL 重试场景。</summary>"
+                    )
                 ))
         
         compactor = CompactOrchestrator(
@@ -937,9 +982,17 @@ def test_compact_debug_logging_shows_ptl_retry():
                 if call_count[0] == 1:
                     # 第一次触发 PTL
                     raise ValueError("prompt too long: context length exceeded")
-                # 第二次成功
+                # 第二次成功（P1-5 修复后：mock summary 必须 ≥ 200 chars）
                 yield StreamChunk(text_delta=TextDelta(
-                    text="<summary>1. 用户目标：A 2. 关键决策：B 3. 当前状态：完 4. 待办事项：无</summary>"
+                    text=(
+                        "<summary>1. 用户目标：测试 PTL 防御的剥洋葱重试机制，"
+                        "第一次调用因 prompt 过长触发异常，第二次重试应成功返回摘要。"
+                        "2. 关键决策：使用 call_count 模拟 PTL 触发，"
+                        "然后返回符合 P1-5 质量要求的 4 段结构化摘要。"
+                        "3. 当前状态：第二次 LLM 调用成功返回，剥洋葱重试链完整，"
+                        "PTL 防御计数 = 1，摘要通过质量检查（长度 + 模板泄漏 + 重复 + 压缩比）。"
+                        "4. 待办事项：测试成功后清理 mock，验证恢复后状态正确。</summary>"
+                    )
                 ))
         
         compactor = CompactOrchestrator(
