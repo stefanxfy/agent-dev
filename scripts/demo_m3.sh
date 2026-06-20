@@ -42,7 +42,7 @@ assert v1 == v2, "同样的文本必须产生同样的向量"
 assert v1 != v3, "不同文本应产生不同向量"
 norm = math.sqrt(sum(x*x for x in v1))
 assert abs(norm - 1.0) < 1e-6, f"L2 归一化失败,实际 norm={norm}"
-print("  ✅ 维度 568 + 确定性 + L2 归一化")
+print("  ✅ 维度 1024 + 确定性 + L2 归一化")
 print(f"  ✅ 同样文本 cos sim: {sum(a*b for a,b in zip(v1,v2)):.4f} (期望 1.0)")
 print(f"  ✅ 不同文本 cos sim: {sum(a*b for a,b in zip(v1,v3)):.4f}")
 print()

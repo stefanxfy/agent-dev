@@ -46,15 +46,52 @@ MODEL_DIR_BASENAME="models--${MODEL_ID//\//--}"
 CACHED_PATH="$HF_CACHE/$MODEL_DIR_BASENAME"
 LOCAL_MODEL_PATH="${CUSTOM_MODEL_DIR:-}"
 
+# 注: zsh + set -u 在某些边界场景会误报 unbound, 用 ${VAR:-} 防御
+#     CACHED_PATH 始终已赋值,这里只为兼容 zsh 严格模式
+
+# bge-m3 必装文件清单（推理必需，不含 imgs/ 与 Mac .DS_Store）
+# 注：imgs/ 是 README 配图，不需要；.DS_Store 是 Mac 噪声，镜像常 403
+REQUIRED_BGE_M3_FILES=(
+    "config.json"
+    "config_sentence_transformers.json"
+    "modules.json"
+    "sentence_bert_config.json"
+    "special_tokens_map.json"
+    "tokenizer.json"
+    "tokenizer_config.json"
+    "vocab.txt"
+    "sentencepiece.bpe.model"
+    "pytorch_model.bin"
+    "colbert_linear.pt"
+    "sparse_linear.pt"
+    "1_Pooling/config.json"
+)
+EXCLUDE_PATTERNS=(
+    "*.DS_Store"
+    "imgs/*"
+    "*.jpg"
+    "*.webp"
+)
+
 log ""
 log "=== 2. 检查 bge-m3 模型缓存 ==="
-if [ -n "$LOCAL_MODEL_PATH" ] && [ -d "$LOCAL_MODEL_PATH" ]; then
+if [ -n "${LOCAL_MODEL_PATH:-}" ] && [ -d "$LOCAL_MODEL_PATH" ]; then
     log "✅ 使用本地模型: $LOCAL_MODEL_PATH"
     USE_PATH="$LOCAL_MODEL_PATH"
-elif [ -d "$CACHED_PATH" ]; then
-    log "✅ HF cache 已存在: $CACHED_PATH"
-    log "   跳过下载（如想强制重新下载: rm -rf $CACHED_PATH）"
-    USE_PATH="$MODEL_ID"
+elif [ -d "${CACHED_PATH:-}" ]; then
+    # 检查是否完整(看 pytorch_model.bin 是否存在,这是 2.3GB 的主模型)
+    # 若不完整, 走下载流程重下缺失文件
+    snapshot_dir=$(find "$CACHED_PATH/snapshots" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    if [ -n "$snapshot_dir" ] && [ -f "$snapshot_dir/pytorch_model.bin" ]; then
+        # 注: bash 3.2.57 (macOS 系统 bash) + set -u 在 $VAR 后跟中文标点时会误报
+        #     用 ${VAR:-} 防御; 实际值已确定
+        log "✅ HF cache 已存在且完整: ${CACHED_PATH:-}"
+        log "   跳过下载（如想强制重新下载: rm -rf ${CACHED_PATH:-}）"
+        USE_PATH="$MODEL_ID"
+    else
+        log "⚠️  HF cache 存在但 pytorch_model.bin 缺失,需要补充下载"
+        USE_PATH=""
+    fi
 elif [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then
     warn "SKIP_DOWNLOAD=1 但 cache 不存在,跳过"
     USE_PATH=""
@@ -70,24 +107,35 @@ else
     fi
     # 3-way fallback: hf (新) → huggingface-cli (旧) → Python API (兜底)
     # 注: huggingface-hub 1.20+ 移除了 cli extra, -m huggingface_hub 失效
+    # 排除 imgs/* 和 Mac .DS_Store(国内镜像常 403,非推理必需)
+    EXCLUDE_ARGS=()
+    for pat in "${EXCLUDE_PATTERNS[@]}"; do
+        EXCLUDE_ARGS+=(--exclude "$pat")
+    done
     download_ok=0
     if [ -x ".venv/bin/hf" ]; then
         log "    使用 hf CLI (新)"
-        if .venv/bin/hf download "$MODEL_ID"; then
+        if .venv/bin/hf download "$MODEL_ID" "${EXCLUDE_ARGS[@]}"; then
             download_ok=1
         fi
     elif [ -x ".venv/bin/huggingface-cli" ]; then
         log "    使用 huggingface-cli (旧)"
-        if .venv/bin/huggingface-cli download "$MODEL_ID"; then
+        if .venv/bin/huggingface-cli download "$MODEL_ID" "${EXCLUDE_ARGS[@]}"; then
             download_ok=1
         fi
     else
         log "    使用 Python API 兜底"
+        # Python 用 ignore_patterns 替代 --exclude
+        IGNORE_PY=$(printf "'%s'," "${EXCLUDE_PATTERNS[@]}")
         if .venv/bin/python <<PYEOF
 from huggingface_hub import snapshot_download
 import sys
 try:
-    snapshot_download("$MODEL_ID", max_workers=4)
+    snapshot_download(
+        "$MODEL_ID",
+        max_workers=4,
+        ignore_patterns=[${IGNORE_PY%,}],
+    )
     sys.exit(0)
 except Exception as e:
     print(f"[ERROR] {e}", file=sys.stderr)
@@ -111,8 +159,16 @@ log "=== 3. 验证 bge-m3 嵌入 ==="
 if [ -z "$USE_PATH" ]; then
     warn "USE_PATH 为空,跳过 bge-m3 验证"
 else
+    # 关键: HF_HUB_OFFLINE=1 让 sentence-transformers 跳过 HEAD 验证
+    #  不然它会发请求到 huggingface.co 查 adapter_config.json,卡 1-2 分钟
+    if [ -d "${CACHED_PATH:-}" ]; then
+        export HF_HUB_OFFLINE=1
+        log "    HF_HUB_OFFLINE=1(用本地 cache,不发网络请求)"
+    fi
     .venv/bin/python <<PYEOF
-import time, sys
+import time, sys, os
+# 双保险: Python 层也设
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 try:
     from sentence_transformers import SentenceTransformer
 except ImportError:
@@ -128,10 +184,10 @@ load_t = time.time() - t0
 
 dim = model.get_sentence_embedding_dimension()
 print(f"  ✅ 加载耗时: {load_t:.1f}s")
-print(f"  ✅ 输出维度: {dim} (期望 568)")
+print(f"  ✅ 输出维度: {dim} (期望 1024)")
 
-if dim != 568:
-    print(f"[ERROR] 维度不匹配,期望 568 实际 {dim}", file=sys.stderr); sys.exit(1)
+if dim != 1024:
+    print(f"[ERROR] 维度不匹配,期望 1024 实际 {dim}", file=sys.stderr); sys.exit(1)
 
 # 编码测试
 texts = ["我叫小明", "I love Python", "用户喜欢使用中文"]
@@ -171,21 +227,21 @@ except ImportError:
 print(f"启动 ChromaDB 持久化客户端: {tmp}")
 client = chromadb.PersistentClient(path=tmp)
 
-# 创建 collection,显式指定 dimension=568
-print("创建 collection (dimension=568)")
-collection = client.create_collection("test", dimension=568) if hasattr(client, 'create_collection') and 'dimension' in client.create_collection.__code__.co_varnames else client.create_collection("test")
+# 创建 collection,显式指定 dimension=1024
+print("创建 collection (dimension=1024)")
+collection = client.create_collection("test", dimension=1024) if hasattr(client, 'create_collection') and 'dimension' in client.create_collection.__code__.co_varnames else client.create_collection("test")
 
 # 注意:新版 chromadb 的 create_collection 不接 dimension 参数
 # 需要在 add 时保证 embedding 维度正确
 print("添加 3 条向量 (模拟 bge-m3 输出)")
 collection.add(
     ids=["1", "2", "3"],
-    embeddings=[[0.1] * 568, [0.2] * 568, [0.9] * 568],
+    embeddings=[[0.1] * 1024, [0.2] * 1024, [0.9] * 1024],
     documents=["我叫小明", "I love Python", "random noise"],
 )
 
 print("查询 top-2:")
-results = collection.query(query_embeddings=[[0.15] * 568], n_results=2)
+results = collection.query(query_embeddings=[[0.15] * 1024], n_results=2)
 print(f"  ✅ ids: {results['ids'][0]}")
 print(f"  ✅ distances: {results['distances'][0]}")
 print(f"  ✅ 第一条 doc: {results['documents'][0][0]}")

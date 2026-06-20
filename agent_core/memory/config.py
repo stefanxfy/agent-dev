@@ -180,7 +180,7 @@ class MemoryConfig(BaseModel):
     enabled: bool = Field(default=True, description="总开关")
     embed_model: str = Field(
         default="BAAI/bge-m3",
-        description="嵌入模型（v2.1 §九.1 推荐 bge-m3 多语言 568-dim）",
+        description="嵌入模型（v2.1 §九.1 推荐 bge-m3 多语言 1024-dim）",
     )
 
     # ── 入口 ──

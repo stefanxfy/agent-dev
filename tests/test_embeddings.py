@@ -31,13 +31,13 @@ class TestMockEmbedFn:
 
     def test_dimension(self):
         e = MockEmbedFn()
-        assert e.dimension == 568
+        assert e.dimension == 1024
 
     def test_returns_list_of_float(self):
         e = MockEmbedFn()
         v = e.encode("hello")
         assert isinstance(v, list)
-        assert len(v) == 568
+        assert len(v) == 1024
         assert all(isinstance(x, float) for x in v)
 
     def test_deterministic(self):
@@ -65,7 +65,7 @@ class TestMockEmbedFn:
         vs = e.encode_batch(["a", "b", "c"])
         assert len(vs) == 3
         for v in vs:
-            assert len(v) == 568
+            assert len(v) == 1024
 
     def test_satisfies_protocol(self):
         """MockEmbedFn 应该满足 EmbedFn 协议"""
@@ -82,7 +82,7 @@ class TestBGEM3EmbedFn:
     def test_dimension_constant(self):
         """不需要真加载,验证 dimension 常量"""
         e = BGEM3EmbedFn()
-        assert e.dimension == 568
+        assert e.dimension == 1024
 
     def test_lazy_no_load_on_init(self):
         """__init__ 不应触发模型加载"""
@@ -201,4 +201,4 @@ class TestFactory:
 
     def test_custom_model_name(self):
         e = make_embed_fn("mock", model_name="custom")
-        assert e.dimension == 568  # Mock 不看 model_name
+        assert e.dimension == 1024  # Mock 不看 model_name

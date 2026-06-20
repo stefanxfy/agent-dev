@@ -8,9 +8,9 @@ M3 / Day 3 — L2 修复
 2. **Lazy loading**：sentence-transformers / bge-m3 仅在首次调用时加载
    - M3 开发期无需下载 2.3GB 模型,使用 MockEmbedFn
    - 生产环境切换到 BGEM3EmbedFn
-3. **MockEmbedFn**：基于 SHA-256 hash 的确定性 568 维向量
+3. **MockEmbedFn**：基于 SHA-256 hash 的确定性 1024 维向量
    - 同样的文本永远产生同样的向量（便于单测 + 调试）
-   - 维度与 bge-m3 一致（568），保持切换无感
+   - 维度与 bge-m3 一致（1024），保持切换无感
 4. **fallback 链**：
    BGEM3EmbedFn → MiniLMEmbedFn → MockEmbedFn（按优先级）
    任意一个失败,降级到下一个
@@ -19,6 +19,9 @@ M3 / Day 3 — L2 修复
 切换方法：
   - 环境变量：MEMORY_EMBED_PROVIDER=real|mock|auto（默认 auto）
   - 代码：MemoryConfig(embed_provider="mock")  # 强制 Mock
+
+注: bge-m3 实际维度是 **1024**(官方发布规格,基于 XLM-RoBERTa-large)
+    之前 mock 设计成 568 是错的(推测值,无来源),现统一为 1024
 """
 
 from __future__ import annotations
@@ -51,7 +54,7 @@ class EmbedFn(Protocol):
     嵌入函数接口（retriever 依赖此抽象）
 
     实现要求：
-    - encode(text) → 568 维 list[float]（与 bge-m3 对齐）
+    - encode(text) → 1024 维 list[float]（与 bge-m3 对齐）
     - 同样的 text 必须产生同样的向量（确定性）
     - normalize_embeddings=True （cosine similarity 友好）
     """
@@ -68,7 +71,7 @@ class MockEmbedFn:
     """
     基于 SHA-256 hash 的确定性嵌入函数
 
-    - 同样的 text → 同样的 568 维向量
+    - 同样的 text → 同样的 1024 维向量
     - 不同 text 的向量是"伪随机"的(均匀分布)
     - L2 归一化(cosine friendly)
     - **不是语义向量**，仅用于：
@@ -78,14 +81,15 @@ class MockEmbedFn:
 
     用法：
         embed = MockEmbedFn()
-        vec = embed.encode("我叫小明")  # 长度 568,float
+        vec = embed.encode("我叫小明")  # 长度 1024,float
     """
 
-    dimension = 568
+    dimension = 1024
 
     def encode(self, text: str) -> list[float]:
         # 1. 扩展到足够长的 hash（SHA-256 输出 32 字节 = 256 bit）
-        #    568 维需要 568 * 4 = 2272 字节 = 568 个 uint32
+        #    1024 维需要 1024 * 4 = 4096 字节 = 1024 个 uint32
+        #    (SHA-256 每次产出 32 字节,迭代 4096/32 = 128 次)
         #    用 SHAKE-256 风格的迭代 hash
         needed_bytes = self.dimension * 4  # 4 bytes per float
         seed = hashlib.sha256(text.encode("utf-8")).digest()
@@ -135,7 +139,7 @@ class BGEM3EmbedFn:
       # 首次自动下载 ~2.3GB, 之后从 cache 加载 (~5-10s)
     """
 
-    dimension = 568
+    dimension = 1024
 
     def __init__(self, model_name: str = "BAAI/bge-m3"):
         self.model_name = model_name
