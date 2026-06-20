@@ -29,7 +29,7 @@ log "=== 1. 安装 Python 依赖 (sentence-transformers + chromadb) ==="
 log "    注:chromadb ~80MB,sentence-transformers ~50MB,会显示下载进度"
 uv pip install --python "$VENV_PY" \
     "sentence-transformers>=2.2.0" \
-    "huggingface_hub[cli]" \
+    "huggingface_hub>=0.20.0" \
     "chromadb>=0.4.0" \
     "rich" || err "依赖安装失败"
 
@@ -59,7 +59,36 @@ elif [ "${SKIP_DOWNLOAD:-0}" = "1" ]; then
 else
     log "开始下载 bge-m3 (~2.3GB,可能 5-30 分钟,看网络)"
     log "    进度条会直接打印,无 --quiet"
-    if .venv/bin/python -m huggingface_hub download "$MODEL_ID"; then
+    # 3-way fallback: hf (新) → huggingface-cli (旧) → Python API (兜底)
+    # 注: huggingface-hub 1.20+ 移除了 cli extra, -m huggingface_hub 失效
+    download_ok=0
+    if [ -x ".venv/bin/hf" ]; then
+        log "    使用 hf CLI (新)"
+        if .venv/bin/hf download "$MODEL_ID"; then
+            download_ok=1
+        fi
+    elif [ -x ".venv/bin/huggingface-cli" ]; then
+        log "    使用 huggingface-cli (旧)"
+        if .venv/bin/huggingface-cli download "$MODEL_ID"; then
+            download_ok=1
+        fi
+    else
+        log "    使用 Python API 兜底"
+        if .venv/bin/python <<PYEOF
+from huggingface_hub import snapshot_download
+import sys
+try:
+    snapshot_download("$MODEL_ID", max_workers=4)
+    sys.exit(0)
+except Exception as e:
+    print(f"[ERROR] {e}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+        then
+            download_ok=1
+        fi
+    fi
+    if [ $download_ok -eq 1 ]; then
         log "✅ 下载完成: $CACHED_PATH"
     else
         err "下载失败,检查网络 / HF_ENDPOINT 镜像"
