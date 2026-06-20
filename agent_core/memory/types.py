@@ -113,6 +113,8 @@ _REQUIRED_FRONTMATTER: frozenset[str] = frozenset({
 # 选填字段清单
 _OPTIONAL_FRONTMATTER: frozenset[str] = frozenset({
     "updated_at", "tags", "source",
+    "importance",            # M3: 1-10 重要性(MemoryStore 透传,cold_start 用)
+    "seed_origin",           # M3: 原始来源标识(区分 user_input/manual/seed)
 })
 
 # 哪些类型必须含 **Why:** 段落（v2.1 §4.5 #7 不变量）

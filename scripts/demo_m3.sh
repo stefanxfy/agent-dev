@@ -68,13 +68,18 @@ print()
 
 # ─── Demo 3: Extractor L1 + L7 ───
 print("=== Demo 3: Extractor L1 合并 + L7 校验 ===")
-extractor = MemoryExtractor(embed_fn=embed)
+# 注: L1 合并相似度计算 ——
+#   embed_fn=None  → 走 jaccard + containment(基于字符 bigram)
+#   embed_fn=Mock  → 走 cos similarity(MockEmbedFn 是 hash 派生的伪随机向量,非语义,合并会失效)
+#   embed_fn=BGEM3 → 走 cos similarity(真实语义向量,合并效果最好)
+# 演示 L1 合并: 用 embed_fn=None 触发文本相似度合并
+extractor = MemoryExtractor(embed_fn=None)
 candidates = [
     ExtractionCandidate("user", "用户名字", "用户叫小明", "我说'我叫小明'"),
-    ExtractionCandidate("user", "用户名字2", "用户名叫小明,今年25岁", "我说'我叫小明'"),  # 相似
+    ExtractionCandidate("user", "用户名字2", "用户名叫小明,今年25岁", "我说'我叫小明'"),  # 与上条高相似 → 应合并
     ExtractionCandidate("user", "user key", "api_key = mySecretValue_ABCDEF1234567890", "我贴了 key"),  # secret
     ExtractionCandidate("feedback", "不喜欢打断", "用户不喜欢被打断。\n\n**Why:** 打断导致思路中断。", "我说'别打断'"),
-    ExtractionCandidate("invalid", "x", "y", ""),  # source_quote 空
+    ExtractionCandidate("invalid", "x", "y", ""),  # source_quote 空 → L7 拒
     ExtractionCandidate("user", "独立条目", "完全独立的内容,与其他无关", "另一句原话"),
 ]
 stats = ExtractStats()
