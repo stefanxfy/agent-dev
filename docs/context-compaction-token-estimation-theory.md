@@ -330,6 +330,8 @@ export function tokenCountWithEstimation(
 **文件**：`agent_core/context/tokenizer.py`
 
 > **2026-06-18 升级至 v2**：集成 tiktoken o200k_base 精确计数（主路径），启发式扩展为 5 类字符独立统计。中文偏差从 +210~290% 降至 ±15%。
+>
+> ⚠️ **2026-06-20 实测发现 v4 校准数据方向错误**：tiktoken 对 GLM-4-Flash 是**低估**（不是 doc 之前写的"GLM 比 tiktoken 多 27%"）。详见 §5.3 已知问题。
 
 ```python
 class SimpleTokenCounter:
@@ -398,6 +400,78 @@ GLM-4-flash delta method —— 发送单条 controlled message，API 返回 `pr
 | 变长数字串 | 0.56 | -61% | <5% | -20% |
 | 单字重复 | 0.33 | -24% | <5% | +36% |
 - 工具调用/结果:固定开销 + 内容粗估
+
+### 5.3 ⚠️ 已知问题:tiktoken vs GLM 实际计费偏差(待修复)
+
+**发现日期**: 2026-06-20
+**状态**: 已记录,**生产环境已知偏差未修复**,待后续 sprint 处理
+**影响范围**: `SimpleTokenCounter.count()` / `count_messages()` / `ContextBudgetManager._estimate_used_tokens()`
+
+#### 5.3.1 问题描述
+
+v4 commit (`448bb1d`) 的校准数据基于猜测/单点测量,经 2026-06-20 真实 API 对比**方向和数值都错了**:
+
+| 描述 | tiktoken o200k_base | **GLM-4-Flash 实际** | 偏差 |
+|------|-------------------:|---------------------:|-----:|
+| `你好世界`(4 字) | 2 | **7** | **-71.4%** |
+| `你好世界`×10 | 20 | **25** | -20.0% |
+| `你好世界`×100 | 200 | **205** | -2.4% |
+| `Hello world`(11 字符) | 2 | **7** | **-71.4%** |
+| `Hello world`×10 | 21 | **26** | -19.2% |
+| 普通中文 24 字 | 12 | **15** | -20.0% |
+| 英文 sentence | 9 | **14** | -35.7% |
+
+#### 5.3.2 doc 之前写的(错的)
+
+| 文本类型 | 旧启发式(v1) | 当时写的新 tiktoken(v2) |
+|---------|------------|---------------------|
+| 中文对话 | +236% | **+27%** (实际是 -71% ~ -20%) |
+| 中文技术 | +290% | **+40%** (实际方向相反) |
+| 英文日常 | ~0% | **<5%** (实际 -19% ~ -71%) |
+
+**错误本质**:v4 校准时假设 "GLM tokenizer 比 tiktoken 用更多 token"(方向 +27%),实测是反的——**tiktoken 比 GLM 用更少 token**(GLM 把 "你好世界" 当 7 个独立字 token,tiktoken 用 BPE 合并成 2)。
+
+#### 5.3.3 影响
+
+- **短文本严重低估**(4 字偏差 71%,11 字符偏差 71%)
+- **长文本偏差收敛**(`你好世界`×100 仅 -2.4%,因为边界开销摊薄)
+- **生产后果**:
+  - `ContextBudgetManager` 用 tiktoken 算 budget → 实际 GLM 计费**更高** → 压缩触发**延后**(撑爆风险)或**早触发**(浪费)
+  - `test_should_compact_when_near_limit` 等 3 个测试失败:`"你好世界" * 6200` tiktoken 算 11160,GLM 实际 ~13950
+- **启发式 0.45 系数**:比 tiktoken 更糟,4 字算 1.8→1,与 GLM 实际 7 差 7 倍
+
+#### 5.3.4 修复方向(待选)
+
+| 选项 | 改动 | 准确度 | 启动成本 |
+|------|------|--------|----------|
+| A. 校准常量 | 把 `_FALLBACK_CHINESE_RATIO` 调到 ~1.75,tiktoken 后处理 ×1.5 补偿短文本 | ±30% | 0 |
+| B. 运行时校准 | 启动时发一次空请求,记录 `prompt_tokens` 作为固定开销基线 | ±5% | ~3s |
+| C. 接受误差 + 文档化 | 标注 "tiktoken 对 GLM-4 短文本偏差 ±70%,生产仅适合长文本预算估算" | — | 0 |
+| D. 智谱官方 tokenizer | 调研 GLM SDK 是否有 tokenizer 端点(类似 tiktoken) | ±5% | 待调研 |
+
+**推荐**: 短期 A,中期 D。
+
+#### 5.3.5 相关代码位置
+
+- `agent_core/context/tokenizer.py` — SimpleTokenCounter(主路径 + 启发式回退)
+- `agent_core/context/test_context.py` — 3 个失败的测试需要校准期望:
+  - `TestSimpleTokenCounter.test_chinese_text`(期望 `1 < result`,实测 2)
+  - `TestSimpleTokenCounter.test_mixed_text`(期望 `>= 5`,实测 ?)
+  - `TestContextBudgetManager.test_should_compact_when_near_limit`(阈值算错)
+- `scripts/glm_cache_abtest_results.json` — 历史 AB 测试数据,tokenizer 偏差未涵盖
+- 测试脚本可重现:`/tmp/glm_tokenizer_check.py`
+
+#### 5.3.6 重现步骤
+
+```bash
+# 1. 装 tiktoken
+uv pip install --python .venv/bin/python tiktoken
+
+# 2. 跑对比脚本
+.venv/bin/python /tmp/glm_tokenizer_check.py
+
+# 需要 .env 里 ZHIPU_API_KEY
+```
 
 ### 5.2 `ContextBudgetManager`:增量估算 + 阈值判断
 
