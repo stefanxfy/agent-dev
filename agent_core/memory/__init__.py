@@ -89,6 +89,15 @@ from .extractor import (
     CandidateRejected,
 )
 
+# M4: L3 会话内压缩
+from .sm_layer import (
+    SessionMemoryLayer,
+    SessionMemoryError,
+    CompactDecision,
+    CompactResult,
+    TurnContext,
+)
+
 # v1 历史实现（保留兼容）
 from .daily import DailyLogger
 
@@ -165,6 +174,12 @@ __all__ = [
     "ExtractStats",
     "ExtractorError",
     "CandidateRejected",
+    # M4: L3 会话内压缩
+    "SessionMemoryLayer",
+    "SessionMemoryError",
+    "CompactDecision",
+    "CompactResult",
+    "TurnContext",
     # v1 legacy
     "DailyLogger",
 ]

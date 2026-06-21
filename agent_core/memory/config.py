@@ -136,6 +136,53 @@ class PathsConfig(BaseModel):
         return v.expanduser()
 
 
+class CompactConfig(BaseModel):
+    """
+    会话内压缩配置（§4.3 + §4.4 L3）
+
+    L3 = SessionMemoryLayer:会话内滚动摘要(零 LLM 快路径)
+    触发条件 + 5 条回退条件
+
+    v2.1 §4.4 — 与 Claude Code `shouldUseSessionMemoryCompaction` 一一对应
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    # 总开关(feature gate,对应 §4.4 回退条件 1)
+    enabled: bool = Field(default=True, description="L3 会话内压缩总开关")
+
+    # 触发阈值(§4.3 + Day 4 plan)
+    sm_token_threshold: int = Field(
+        default=10000, ge=1000, le=200000,
+        description="触发压缩的 token 数阈值(token > 此值触发)",
+    )
+    tool_count_threshold: int = Field(
+        default=10, ge=1, le=100,
+        description="触发压缩的工具调用次数阈值(tool > 此值触发)",
+    )
+
+    # SM 文件大小控制(对应 §4.4 回退条件 3)
+    max_sm_tokens_for_compact: int = Field(
+        default=8000, ge=500, le=50000,
+        description="SM 文件过大阈值(超过走传统 LLM 压缩)",
+    )
+    max_per_section_chars: int = Field(
+        default=8000, ge=500, le=50000,
+        description="compact 时每个 section 截断字符数",
+    )
+
+    # extraction 等待超时(对应 §4.4 回退条件 4)
+    extraction_wait_timeout_ms: int = Field(
+        default=15000, ge=1000, le=120000,
+        description="extraction 在跑时的等待超时(ms)",
+    )
+
+    # 预估压缩后仍超阈值比例(对应 §4.4 回退条件 5)
+    sm_insufficient_buffer_ratio: float = Field(
+        default=0.95, ge=0.5, le=1.0,
+        description="SM-compact 后预估 / 阈值 > 此值 → 走传统(默认 0.95,留 5% 余量)",
+    )
+
+
 class SafetyConfig(BaseModel):
     """
     安全策略（§14 安全模型）
@@ -175,6 +222,7 @@ class MemoryConfig(BaseModel):
     distillation: DistillationConfig = Field(default_factory=DistillationConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    compact: CompactConfig = Field(default_factory=CompactConfig)
 
     # 全局开关
     enabled: bool = Field(default=True, description="总开关")
@@ -216,7 +264,7 @@ class MemoryConfig(BaseModel):
                 continue
             # 嵌套字段
             section, field = parts[0], "__".join(parts[1:])
-            if section in ("retrieval", "distillation", "paths", "safety"):
+            if section in ("retrieval", "distillation", "paths", "safety", "compact"):
                 data.setdefault(section, {})[field] = _coerce_env_value(v)
         return cls.model_validate(data)
 
