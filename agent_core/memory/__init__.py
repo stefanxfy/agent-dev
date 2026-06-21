@@ -119,6 +119,19 @@ from .migration import (
     migrate_all,
 )
 
+# M8: A6 Data Lifecycle (上线运维)
+from .lifecycle import (
+    BackupReport,
+    CapacityReport,
+    IntegrityReport,
+    LifecycleError,
+    capacity_govern,
+    daily_backup,
+    integrity_check,
+    list_backups,
+    restore_backup,
+)
+
 # v1 历史实现（保留兼容）
 from .daily import DailyLogger
 
@@ -218,6 +231,16 @@ __all__ = [
     "MigrationReport",
     "migrate_file",
     "migrate_all",
+    # M8: Lifecycle
+    "BackupReport",
+    "CapacityReport",
+    "IntegrityReport",
+    "LifecycleError",
+    "capacity_govern",
+    "daily_backup",
+    "integrity_check",
+    "list_backups",
+    "restore_backup",
     # v1 legacy
     "DailyLogger",
 ]
