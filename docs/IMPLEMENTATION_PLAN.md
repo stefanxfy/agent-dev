@@ -100,7 +100,7 @@ Refs: A3, A4, A5, A9, A10
 | **M2** | 写入路径 (Day 2) | 8h | A3, A4, A5, A9, A10, L7, L9 | `pytest tests/test_dual_channel_minimal.py -v` | ✅ **完成** (`a2c0a5d`) |
 | **M3** | 检索 + 安全 (Day 3) | 8h | L1, L2, L4, L5, L8, L12 | `pytest tests/test_retrieval_modes.py -v` | ✅ **完成** (`539b6e7`) |
 | **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` | ✅ **完成** (`bf41c28` + bug 修复 `a9e91af`) |
-| **M5** | 蒸馏 (Day 5) | 6h | A1, A2, A11 | `pytest tests/test_distiller.py -v` | ⏸️ **未开始** |
+| **M5** | 蒸馏 (Day 5) | 6h | A1, A2, A11 | `pytest tests/test_distiller.py -v` | ✅ **完成** (`38f64a9`) |
 | **M6** | 调度 + 可观测 (Day 6) | 6h | A8, A12 (含 5/8 并发场景) | `pytest tests/test_scheduler.py -v` | ⏸️ **未开始** |
 | **M7** | 集成 + UI (Day 7) | 6h | L13, A7 (schema migration) | `pytest tests/test_integration.py -v` | ⏸️ **未开始** |
 | **M8** | 完整测试 + 上线 (Day 8) | 8h | A6, A12 (补 3/8 场景) | `pytest tests/ -v` + demo 全跑 | ⏸️ **未开始** |
@@ -291,10 +291,10 @@ bash scripts/demo_m4.sh
 
 ### Day 5 — M5: 蒸馏
 
-> ⏸️ **状态:未开始** (2026-06-21 更新)
-> 无相关 commit,文件 `distiller.py` 不存在,测试 `test_distiller.py` 不存在。
-
-**目标**:autoDream 跑通,锁 v2.1 安全(防 TOCTOU + 失败回滚 + JSON envelope)。
+> ✅ **状态:已完成** (2026-06-21 更新)
+> commit `38f64a9`。
+> 产出:[distiller.py](agent_core/memory/distiller.py) (~500 行) + [test_distiller.py](tests/test_distiller.py) 22 case + [config.py](agent_core/memory/config.py) `DistillationConfig` 加 `min_sessions_for_distill` 字段。
+> ⚠️ **设计偏离 plan**:锁文件和"上次蒸馏时间"分离为两个文件(`.consolidate-lock` 瞬态 + `.last-distill` 持久 mtime)。原因:O_EXCL 原子创建要求文件不存在,与"保留 mtime"语义冲突。详见 plan §7.1 line 2423-2529。
 
 **目标**:autoDream 跑通,锁 v2.1 安全(防 TOCTOU + 失败回滚 + JSON envelope)。
 
@@ -302,71 +302,34 @@ bash scripts/demo_m4.sh
 
 | 任务 | 产出 | 关键点 |
 | --- | --- | --- |
-| 蒸馏器 | `distiller.py` | 读多 session → LLM 整合 → 候选文件 |
+| 蒸馏器 | `Distiller` class | 读多 session → LLM 整合 → 候选 dict |
 | 锁 v2.1 | `_acquire_lock` / `_release_lock` | **A1 (O_EXCL) + A2 (mtime 回滚) + A11 (JSON envelope) 一次写完** |
-| 调度器 | `scheduler.py` | 四重门: gate / 时间 / 节流 / session 数 |
-| diff/merge review | `dry_run=True` 生成候选 | 用户用 git diff 工具看 |
-| 单测 | `tests/test_distiller.py` | 6 个: 触发 / 锁竞争 / 失败回滚 / 锁强占 / envelope 校验 |
+| 调度器 | `DistillationScheduler` | 四重门: gate / time / busy / sessions |
+| dry_run 默认 | `run(dry_run=True)` | 候选写到 `_candidate/{type}/`,不污染正式目录 |
+| 单测 | `tests/test_distiller.py` | **22 个**(超出 plan 6 个最低要求):四重门(6) / 锁原子(2) / 强占(3) / envelope(3) / 回滚(2) / 核心(4) / 数据结构(2) |
 
-**核心代码模式**(A1+A2+A11 一次写完):
-
-```python
-# distiller.py
-class DistillationScheduler:
-    LOCK_FILE = Path(".agent_data/memory/.consolidate-lock")
-    
-    def _acquire_lock(self) -> int:
-        """A1: 原子创建 / A11: JSON envelope"""
-        prior_mtime = self.LOCK_FILE.stat().st_mtime if self.LOCK_FILE.exists() else 0
-        envelope = {"pid": os.getpid(), "host": socket.gethostname(),
-                    "started_at": time.time(), "schema_version": 1}
-        try:
-            fd = os.open(self.LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(fd, json.dumps(envelope).encode())
-        except FileExistsError:
-            return 0  # A1: 别人持锁
-        return int(prior_mtime * 1000)
-    
-    def _release_lock(self, prior_mtime_ms: int) -> None:
-        """A2: 失败回滚 mtime"""
-        if self._last_failed and prior_mtime_ms > 0:
-            self._write_last_distill_at(prior_mtime_ms / 1000)
-        self.LOCK_FILE.unlink(missing_ok=True)
-```
+**设计要点**(对比 plan 原始描述):
+| plan 写的 | 实际实现 | 备注 |
+| --- | --- | --- |
+| 锁文件 mtime = 上次时间 | 拆为 `.consolidate-lock`(瞬态) + `.last-distill`(持久 mtime) | O_EXCL 与 mtime 持久化冲突,折中 |
+| `_acquire_lock` 返回 0 = 锁被占 | 返回 `LOCK_TAKEN = -1` 表示锁被占,0 = 成功但无 prior | 区分"成功"与"失败" |
+| 强占逻辑 | acquire 前先检查陈旧(PID 死 OR mtime 超),是则删锁 | 显式两步,避免歧义 |
+| 单 `DistillationScheduler` 类 | 拆为 `Distiller`(纯函数) + `DistillationScheduler`(调度+锁) | 关注点分离,易测 |
 
 **验收 demo**:
 ```bash
-# 1. 锁原子创建 (场景 1: 并发锁)
-pytest tests/test_distiller.py::test_lock_atomic -v
-# 起 10 个进程并发 acquire, 只有 1 个赢
-
-# 2. 失败回滚 (场景 7)
-pytest tests/test_distiller.py::test_failure_rolls_back_mtime -v
-
-# 3. JSON envelope 校验
-.venv/bin/python -c "
-from agent_core.memory.distiller import DistillationScheduler
-s = DistillationScheduler()
-# 写一个 fake 锁
-import json
-s.LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-s.LOCK_FILE.write_text(json.dumps({'pid': 99999, 'host': 'fake', 'started_at': 0, 'schema_version': 1}))
-# 读 envelope
-env = s._read_lock_envelope()
-assert env.pid == 99999
-print('✅ envelope parsed')
-# 写垃圾应该返回 empty
-s.LOCK_FILE.write_text('garbage')
-env = s._read_lock_envelope()
-assert env.pid == 0  # 强占允许
-print('✅ garbage rejected')
-"
+bash scripts/demo_m5.sh
+# 5 demo: gate_disabled / too_soon / 10 线程并发 / 失败回滚 / 端到端 dry_run
+# + bonus: 真写盘路径
+# + 22 pytest
 ```
 
+完整 demo 代码见 [`scripts/demo_m5.sh`](scripts/demo_m5.sh)。
+
 **人验收** (15 min):
-- 跑 3 个 demo → 全 ✅
-- 特别看 demo #1:10 进程并发,**只有 1 个**赢锁,其它全 0
-- 决策:⏸️ 待 M5 启动后填
+- 跑 demo → 5/5 + 22 pytest 全绿
+- 特别看 demo #3: 10 线程并发,只有 1 个赢锁,其它 9 个 LOCK_TAKEN
+- 决策:✅ M5 模块验收通过,**真实 LLM 调用与 UI 归 M7**
 
 ---
 
