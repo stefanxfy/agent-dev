@@ -99,7 +99,7 @@ Refs: A3, A4, A5, A9, A10
 | **M1** | 基础 + 配置 (Day 1) | 4h | O8 | `pytest tests/test_types_config.py -v` | ✅ **完成** (`57482f1`) |
 | **M2** | 写入路径 (Day 2) | 8h | A3, A4, A5, A9, A10, L7, L9 | `pytest tests/test_dual_channel_minimal.py -v` | ✅ **完成** (`a2c0a5d`) |
 | **M3** | 检索 + 安全 (Day 3) | 8h | L1, L2, L4, L5, L8, L12 | `pytest tests/test_retrieval_modes.py -v` | ✅ **完成** (`539b6e7`) |
-| **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` | ✅ **完成** (`bf41c28` + bug 修复 `TBD`) |
+| **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` | ✅ **完成** (`bf41c28` + bug 修复 `a9e91af`) |
 | **M5** | 蒸馏 (Day 5) | 6h | A1, A2, A11 | `pytest tests/test_distiller.py -v` | ⏸️ **未开始** |
 | **M6** | 调度 + 可观测 (Day 6) | 6h | A8, A12 (含 5/8 并发场景) | `pytest tests/test_scheduler.py -v` | ⏸️ **未开始** |
 | **M7** | 集成 + UI (Day 7) | 6h | L13, A7 (schema migration) | `pytest tests/test_integration.py -v` | ⏸️ **未开始** |
@@ -107,6 +107,12 @@ Refs: A3, A4, A5, A9, A10
 
 **总人力(预算)**:50h AI 写码 + 1.5h 人验收 + 12.5h buffer = 64h
 **实际消耗**:M1-M3 已完成,详见 §6.1 实际产出
+
+**📋 Demo 脚本约定**(2026-06-21 立):
+- 每个 milestone 验收 demo 都抽到 `scripts/demo_mN.sh`,可独立 `bash` 跑通
+- plan 中**只放 `bash scripts/demo_mN.sh` 一行**,不贴内联代码
+- 脚本模板见 `scripts/demo_m4.sh`(含 demo 分块 + pytest 收尾 + 注释规范)
+- 例外:历史 milestone(M5-M8)首次落地时按本约定写新脚本
 
 ---
 
@@ -127,41 +133,11 @@ Refs: A3, A4, A5, A9, A10
 
 **验收 demo**:
 ```bash
-.venv/bin/python -c "
-from agent_core.memory.types import validate_type
-from agent_core.memory.config import MemoryConfig
-from agent_core.memory.path_validator import MemoryPathValidator
-import tempfile, pathlib
-
-# 1. 类型校验
-assert validate_type('user') == 'user'
-try: validate_type('episodic')  # LLM 试图发明的第 5 类
-except ValueError as e: print(f'✅ blocked: {e}')
-
-# 2. 配置校验 (Pydantic)
-try: MemoryConfig(retrieval={'semantic_weight': 2.0})  # 越界
-except Exception as e: print(f'✅ blocked: {e}')
-
-# 3. 路径校验 (使用临时沙箱, 避免污染 ~/)
-tmp = pathlib.Path(tempfile.mkdtemp()) / 'memory'
-tmp.mkdir()
-v = MemoryPathValidator(tmp)
-real = v.validate('user/foo.md')
-print(f'✅ resolved: {real}')
-
-try: v.validate('../../etc/passwd')  # 越界
-except Exception as e: print(f'✅ blocked: {e}')
-
-try: v.validate('admin/foo.md')  # 非法子目录
-except Exception as e: print(f'✅ blocked: {e}')
-
-try: v.validate('user/run.py')  # 非法扩展名
-except Exception as e: print(f'✅ blocked: {e}')
-
-try: v.validate('user/‮evil.md')  # Unicode trick (U+202E RLO)
-except Exception as e: print(f'✅ blocked: {e}')
-"
+bash scripts/demo_m1.sh
+# Expected: 8/8 demo 通过 + 31 passed
 ```
+
+完整 demo 代码见 [`scripts/demo_m1.sh`](scripts/demo_m1.sh)。
 
 > **API 说明**:MemoryPathValidator 实例化时必须传 `memory_root`(每个 sandbox 一个 validator),
 > 之后的 `validate(rel_path)` 只接受相对路径。这与 v1 sketch 不同,后者把 root 作为
@@ -255,48 +231,11 @@ bash scripts/demo_m2.sh
 
 **验收 demo**:
 ```bash
-# 1. 三模式切换
-.venv/bin/python -c "
-import agent_core.memory as m
-r = m.Retriever(mode='hybrid')
-results = r.search('学习风格', top_k=3)
-print(f'hybrid returned {len(results)} memories')
-r2 = m.Retriever(mode='file')
-print(f'file-only returned {len(r2.search(\"学习风格\", top_k=3))}')
-"
-
-# 2. 冷启动
-rm -rf ~/.agent_data/memory/  # 清空
-.venv/bin/python -c "
-from agent_core.memory import bootstrap
-bootstrap.ensure_seeded()
-import os
-assert os.path.exists(os.path.expanduser('~/.agent_data/memory/user/000_default_learning_style.md'))
-print('✅ seed loaded')
-"
-
-# 3. SecretScanner
-.venv/bin/python -c "
-from agent_core.memory.secret_scanner import SecretScanner
-s = SecretScanner()
-findings = s.scan('我的 API key 是 sk-1234567890abcdefghij')
-assert 'sk-1234567890abcdefghij' in findings
-print('✅ secret detected')
-"
-
-# 4. Token budget
-.venv/bin/python -c "
-from agent_core.memory.retriever import Retriever
-r = Retriever(mode='file', max_injection_tokens=2000)
-ctx = r.build_context(['x' * 8000] * 5)  # 40KB 输入
-assert len(ctx) < 2000 * 4  # 8000 字符 ~2000 tokens
-print(f'✅ truncated to {len(ctx)} chars')
-"
-
-# 5. LLM 合并调用
-pytest tests/test_extractor.py::test_merged_call -v
-# Expected: 1 次 LLM 调用而非 2 次
+bash scripts/demo_m3.sh
+# Expected: 5/5 demo 通过(覆盖 bge-m3 / SecretScanner / Extractor / Retriever / ColdStartLoader)+ pytest 全过
 ```
+
+完整 demo 代码见 [`scripts/demo_m3.sh`](scripts/demo_m3.sh)。
 
 **人验收** (15 min):
 - 跑 5 个 demo → 全 ✅
