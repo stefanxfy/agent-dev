@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import threading
 import time
@@ -56,6 +57,8 @@ from agent_core.memory.memory_store import (
     compute_item_hash,
 )
 from agent_core.memory.meta_db import MetaDB
+
+logger = logging.getLogger("memory.dual_channel")
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -179,6 +182,8 @@ class DualChannelWriter:
         # A10: extraction_in_progress 标志（防止 channel_b 并发）
         self._extraction_in_progress = False
         self._extraction_in_progress_lock = threading.Lock()
+        # M6 场景 8: 跟踪本次提取开始时间,实现 watchdog(防止 extractor hang 永久阻塞)
+        self._extraction_started_at: Optional[float] = None
 
         # atexit 优雅退出（A9）
         atexit.register(self._graceful_shutdown)
@@ -271,6 +276,19 @@ class DualChannelWriter:
         if self._shutdown:
             raise DualChannelError("writer 已 shutdown，禁止提交")
 
+        # M6 场景 8: watchdog 检测 extractor hang 导致的卡死
+        # 如果上次提取已 _extraction_in_progress=True 但超过 timeout,强制重置
+        with self._extraction_in_progress_lock:
+            if self._extraction_in_progress and self._extraction_started_at is not None:
+                age = time.time() - self._extraction_started_at
+                if age > self.extraction_timeout_seconds:
+                    logger.warning(
+                        f"extraction_in_progress 卡死 {age:.1f}s "
+                        f"(>{self.extraction_timeout_seconds}s), 强制重置"
+                    )
+                    self._extraction_in_progress = False
+                    self._extraction_started_at = None
+
         # A10: extraction_in_progress 标志
         with self._extraction_in_progress_lock:
             if self._extraction_in_progress:
@@ -278,6 +296,7 @@ class DualChannelWriter:
                     f"session {self.session_id} 提取已在进行，避免并发"
                 )
             self._extraction_in_progress = True
+            self._extraction_started_at = time.time()
 
         future = self._executor.submit(
             self._do_channel_b_extract,
@@ -380,6 +399,7 @@ class DualChannelWriter:
         self._inflight.discard(future)
         with self._extraction_in_progress_lock:
             self._extraction_in_progress = False
+            self._extraction_started_at = None
 
     # ──────────────────────────────────────────────────────
     # A9: 优雅 shutdown

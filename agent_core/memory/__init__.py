@@ -106,6 +106,10 @@ from .distiller import (
     DistillationResult,
 )
 
+# M6: 调度外层 + OTel 可观测
+from .tracing import tracer, configure_tracing, TRACER_NAME
+from .scheduler import DistillationLoop
+
 # v1 历史实现（保留兼容）
 from .daily import DailyLogger
 
@@ -194,6 +198,11 @@ __all__ = [
     "DistillationScheduler",
     "DistillationError",
     "DistillationResult",
+    # M6: 调度 + 可观测
+    "DistillationLoop",
+    "tracer",
+    "configure_tracing",
+    "TRACER_NAME",
     # v1 legacy
     "DailyLogger",
 ]

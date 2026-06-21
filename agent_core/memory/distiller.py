@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable, Optional, Union
 
 from agent_core.memory.config import DistillationConfig
+from agent_core.memory.tracing import tracer
 
 logger = logging.getLogger("memory.distiller")
 
@@ -375,53 +376,65 @@ class DistillationScheduler:
             existing_memories: 现有记忆;None = 自动从 memory_store 读
         """
         # 1. 门检查
-        ok, reason = self.should_distill()
-        if not ok:
-            return DistillationResult(success=False, skipped=True, skip_reason=reason)
+        with tracer.start_as_current_span("memory.distill") as span:
+            ok, reason = self.should_distill()
+            span.set_attribute("memory.distill.dry_run", dry_run)
+            span.set_attribute("memory.distill.gate_ok", ok)
+            span.set_attribute("memory.distill.gate_reason", reason)
 
-        # 2. 锁
-        prior_mtime_ms = self._acquire_lock()
-        if prior_mtime_ms == self.LOCK_TAKEN:
-            return DistillationResult(success=False, skipped=True, skip_reason="locked")
+            if not ok:
+                return DistillationResult(success=False, skipped=True, skip_reason=reason)
 
-        # 3. 准备输入
-        try:
-            if session_log_files is None:
-                session_log_files = self._scan_session_logs(prior_mtime_ms / 1000)
-            existing = existing_memories if existing_memories is not None else self._read_existing_memories()
+            # 2. 锁
+            prior_mtime_ms = self._acquire_lock()
+            span.set_attribute("memory.distill.lock_taken", prior_mtime_ms == self.LOCK_TAKEN)
+            if prior_mtime_ms == self.LOCK_TAKEN:
+                return DistillationResult(success=False, skipped=True, skip_reason="locked")
 
-            if self.llm is None:
-                self._release_lock(prior_mtime_ms, success=False)
+            # 3. 准备输入
+            try:
+                if session_log_files is None:
+                    session_log_files = self._scan_session_logs(prior_mtime_ms / 1000)
+                existing = existing_memories if existing_memories is not None else self._read_existing_memories()
+
+                if self.llm is None:
+                    self._release_lock(prior_mtime_ms, success=False)
+                    return DistillationResult(
+                        success=False, skipped=True, skip_reason="no_llm_callback",
+                        prior_mtime_ms=prior_mtime_ms,
+                    )
+
+                # 4. 蒸馏
+                distiller = Distiller(self.llm, candidate_root=self._candidate_root)
+                candidates = distiller.distill(session_log_files, existing)
+
+                # 5. 写候选(非 dry_run)
+                written: list[Path] = []
+                if not dry_run:
+                    written = distiller.write_candidates(candidates, self._candidate_root)
+
+                # 6. 释放锁(成功)
+                self._release_lock(prior_mtime_ms, success=True)
+
+                span.set_attribute("memory.distill.success", True)
+                span.set_attribute("memory.distill.candidates", len(candidates))
+                span.set_attribute("memory.distill.candidates_written", len(written))
+
                 return DistillationResult(
-                    success=False, skipped=True, skip_reason="no_llm_callback",
+                    success=True,
+                    candidates=candidates,
+                    candidates_written=written,
+                    sessions_processed=len(session_log_files),
                     prior_mtime_ms=prior_mtime_ms,
                 )
-
-            # 4. 蒸馏
-            distiller = Distiller(self.llm, candidate_root=self._candidate_root)
-            candidates = distiller.distill(session_log_files, existing)
-
-            # 5. 写候选(非 dry_run)
-            written: list[Path] = []
-            if not dry_run:
-                written = distiller.write_candidates(candidates, self._candidate_root)
-
-            # 6. 释放锁(成功)
-            self._release_lock(prior_mtime_ms, success=True)
-
-            return DistillationResult(
-                success=True,
-                candidates=candidates,
-                candidates_written=written,
-                sessions_processed=len(session_log_files),
-                prior_mtime_ms=prior_mtime_ms,
-            )
-        except Exception as e:
-            logger.exception("蒸馏异常,回滚 mtime")
-            self._release_lock(prior_mtime_ms, success=False)
-            return DistillationResult(
-                success=False, prior_mtime_ms=prior_mtime_ms, error=str(e),
-            )
+            except Exception as e:
+                logger.exception("蒸馏异常,回滚 mtime")
+                self._release_lock(prior_mtime_ms, success=False)
+                span.set_attribute("memory.distill.success", False)
+                span.set_attribute("memory.distill.error", str(e))
+                return DistillationResult(
+                    success=False, prior_mtime_ms=prior_mtime_ms, error=str(e),
+                )
 
     # ── 四重门 + session 计数 ────────────────────────────
 
