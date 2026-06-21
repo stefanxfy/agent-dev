@@ -94,18 +94,19 @@ Refs: A3, A4, A5, A9, A10
 
 ## 1. 里程碑总览
 
-| # | 名称 | 时长 | 涉及修复 | 验收命令 |
-| --- | --- | --- | --- | --- |
-| **M1** | 基础 + 配置 (Day 1) | 4h | O8 | `pytest tests/test_types_config.py -v` |
-| **M2** | 写入路径 (Day 2) | 8h | A3, A4, A5, A9, A10, L7, L9 | `pytest tests/test_dual_channel_minimal.py -v` |
-| **M3** | 检索 + 安全 (Day 3) | 8h | L1, L2, L4, L5, L8, L12 | `pytest tests/test_retrieval_modes.py -v` |
-| **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` |
-| **M5** | 蒸馏 (Day 5) | 6h | A1, A2, A11 | `pytest tests/test_distiller.py -v` |
-| **M6** | 调度 + 可观测 (Day 6) | 6h | A8, A12 (含 5/8 并发场景) | `pytest tests/test_scheduler.py -v` |
-| **M7** | 集成 + UI (Day 7) | 6h | L13, A7 (schema migration) | `pytest tests/test_integration.py -v` |
-| **M8** | 完整测试 + 上线 (Day 8) | 8h | A6, A12 (补 3/8 场景) | `pytest tests/ -v` + demo 全跑 |
+| # | 名称 | 时长 | 涉及修复 | 验收命令 | **状态** |
+| --- | --- | --- | --- | --- | --- |
+| **M1** | 基础 + 配置 (Day 1) | 4h | O8 | `pytest tests/test_types_config.py -v` | ✅ **完成** (`57482f1`) |
+| **M2** | 写入路径 (Day 2) | 8h | A3, A4, A5, A9, A10, L7, L9 | `pytest tests/test_dual_channel_minimal.py -v` | ✅ **完成** (`a2c0a5d`) |
+| **M3** | 检索 + 安全 (Day 3) | 8h | L1, L2, L4, L5, L8, L12 | `pytest tests/test_retrieval_modes.py -v` | ✅ **完成** (`539b6e7`) |
+| **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` | ⏸️ **未开始** |
+| **M5** | 蒸馏 (Day 5) | 6h | A1, A2, A11 | `pytest tests/test_distiller.py -v` | ⏸️ **未开始** |
+| **M6** | 调度 + 可观测 (Day 6) | 6h | A8, A12 (含 5/8 并发场景) | `pytest tests/test_scheduler.py -v` | ⏸️ **未开始** |
+| **M7** | 集成 + UI (Day 7) | 6h | L13, A7 (schema migration) | `pytest tests/test_integration.py -v` | ⏸️ **未开始** |
+| **M8** | 完整测试 + 上线 (Day 8) | 8h | A6, A12 (补 3/8 场景) | `pytest tests/ -v` + demo 全跑 | ⏸️ **未开始** |
 
-**总人力**:50h AI 写码 + 1.5h 人验收 + 12.5h buffer(AI 修 bug / 等 LLM 响应 / 跑测试) = 64h
+**总人力(预算)**:50h AI 写码 + 1.5h 人验收 + 12.5h buffer = 64h
+**实际消耗**:M1-M3 已完成,详见 §6.1 实际产出
 
 ---
 
@@ -306,6 +307,10 @@ pytest tests/test_extractor.py::test_merged_call -v
 
 ### Day 4 — M4: L3 压缩
 
+> ⏸️ **状态:未开始** (2026-06-21 更新)
+> 无相关 commit,文件 `sm_layer.py` 不存在,测试 `test_sm_layer.py` 不存在。
+> 实际执行时间待定,需先决定 Day 4 启动日期。
+
 **目标**:会话内压缩(SessionMemory)跑通,这是 v2 升级的核心创新点。
 
 **AI 工作清单**(4h):
@@ -341,11 +346,16 @@ pytest tests/test_sm_layer.py -v -k fallback
 **人验收** (15 min):
 - 跑 2 个 demo → 全 ✅
 - 看压缩后文件 → 内容是否合理(关键决策点)
-- 决策:✅ 继续 M5
+- 决策:⏸️ 待 M4 启动后填
 
 ---
 
 ### Day 5 — M5: 蒸馏
+
+> ⏸️ **状态:未开始** (2026-06-21 更新)
+> 无相关 commit,文件 `distiller.py` 不存在,测试 `test_distiller.py` 不存在。
+
+**目标**:autoDream 跑通,锁 v2.1 安全(防 TOCTOU + 失败回滚 + JSON envelope)。
 
 **目标**:autoDream 跑通,锁 v2.1 安全(防 TOCTOU + 失败回滚 + JSON envelope)。
 
@@ -417,11 +427,15 @@ print('✅ garbage rejected')
 **人验收** (15 min):
 - 跑 3 个 demo → 全 ✅
 - 特别看 demo #1:10 进程并发,**只有 1 个**赢锁,其它全 0
-- 决策:✅ 继续 M6
+- 决策:⏸️ 待 M5 启动后填
 
 ---
 
 ### Day 6 — M6: 调度 + 可观测 + 并发测试
+
+> ⏸️ **状态:未开始** (2026-06-21 更新)
+> 无相关 commit,文件 `scheduler.py` / `tracing.py` 不存在,测试 `test_scheduler.py` / `test_dual_channel_concurrent.py` 不存在。
+> Day 2 已覆盖场景 1/4,场景 2/3/5/6/7/8 全部未做。
 
 **目标**:调度器 + OTel + 补 5/8 并发场景(A12 矩阵的 3/6/7/8 + 已有的 1/4 = 5 个)。
 
@@ -477,11 +491,15 @@ pytest tests/test_dual_channel_concurrent.py -v
 **人验收** (15 min):
 - 跑 3 个 demo → 全 ✅
 - 看 5/8 并发场景全绿
-- 决策:✅ 继续 M7
+- 决策:⏸️ 待 M6 启动后填
 
 ---
 
 ### Day 7 — M7: 集成 + UI + Schema 迁移
+
+> ⏸️ **状态:未开始** (2026-06-21 更新)
+> 无相关 commit,文件 `migration.py` 不存在,`langgraph_agent/agent.py` 与 `router.py` 未打 memory patch。
+> `app_langgraph.py` UI 状态条未集成。
 
 **目标**:集成到主 agent + UI 状态条 + 完整 LLM 合约 + Schema migration 兜底。
 
@@ -524,11 +542,15 @@ print('✅ migrated to v1')
 **人验收** (15 min):
 - 跑 2 个 demo → 全 ✅
 - **特别看 demo #1** — 真实对话,看 memory 是否真的被用
-- 决策:✅ 继续 M8
+- 决策:⏸️ 待 M7 启动后填
 
 ---
 
 ### Day 8 — M8: 完整测试 + 上线准备
+
+> ⏸️ **状态:未开始** (2026-06-21 更新)
+> 无 `lifecycle.py` / `demo_v2.1.py` / `LAUNCH_v2.1.md` / CHANGELOG 条目 / `v2.1.0` git tag。
+> 场景 3 跨进程并发未做。
 
 **目标**:补 3/8 并发场景 + A6 backup/cron + 完整 demo + 上线 checklist。
 
@@ -564,6 +586,8 @@ python scripts/demo_v2.1.py
 - 看 `git log --oneline` → 8 天 commit 历史清晰
 - **最终决策**:🚀 准备上线 / 🛑 还需要修
 
+> ⏸️ **待 M8 启动后填**
+
 ---
 
 ## 3. 风险 & 缓冲
@@ -584,13 +608,31 @@ python scripts/demo_v2.1.py
 
 整个 v2.1 项目完成需要:
 
-- [x] M1-M8 全部绿
-- [x] `pytest tests/ -v` 输出 50+ passed
-- [x] `python scripts/demo_v2.1.py` 输出 10/10 ✅
-- [x] `docs/memory-system-design.md` 反映实际实现(如有差异)
-- [x] `docs/LAUNCH_v2.1.md` 上线 checklist 完整
-- [x] CHANGELOG 写 v2.1.0 条目
-- [x] git tag `v2.1.0`
+### M1-M3 已完成部分(2026-06-21 更新)
+
+- [x] **M1**: commit `57482f1` (feat(memory): M1 基础三件套)
+- [x] **M2**: commit `a2c0a5d` (feat(memory): M2 双通道写入器),配 `a63e6b5` / `be46eca`
+- [x] **M3**: commit `539b6e7` (feat(memory): M3 检索 + 安全),配 `fe144f9` / `7983c72` / `c2e001e` / `f7263c8` / `492d1c7` / `574e096`
+- [x] `pytest tests/ -v` 输出 **154 passed**(M1+M2+M3 内存套件全绿)
+- [x] `docs/memory-system-design.md` 已更新并反映实际实现
+- [x] `agent_core/exceptions.py` + `agent_core/types.py` 已 commit(memory 必修依赖)
+- [x] `docs/context-compaction-token-estimation-theory.md §5.3` 记录 tiktoken vs GLM 偏差(已知问题)
+
+### M4-M8 待完成部分
+
+- [ ] **M4**: L3 压缩 / sm_layer.py
+- [ ] **M5**: 蒸馏 / distiller.py
+- [ ] **M6**: 调度 + 可观测 / scheduler.py + tracing.py + 5 个并发场景
+- [ ] **M7**: 集成 + UI + Schema 迁移 / migration.py + agent.py patch + UI 状态条
+- [ ] **M8**: 完整测试 + 上线准备 / lifecycle.py + demo_v2.1.py + LAUNCH_v2.1.md + CHANGELOG + `v2.1.0` git tag
+- [ ] `pytest tests/ -v` 输出 **200+ passed**(当前 154,待 M4-M8 加 ~50 case)
+- [ ] 8/8 并发场景全绿(当前 2/8: 场景 1、4)
+- [ ] 3 个 token 估算测试校准(`test_chinese_text` / `test_mixed_text` / `test_should_compact_when_near_limit`)
+
+### 已知问题(待修复,不阻塞 M1-M3 完成判定)
+
+- ⚠️ tiktoken vs GLM-4-Flash 计费偏差 -2% ~ -71% — 见 [§5.3 已知问题](context-compaction-token-estimation-theory.md#53-⚠️-已知问题tiktoken-vs-glm-实际计费偏差待修复)
+- ⚠️ 3 个 token 估算测试失败(`test_context.py` line 58/72/235)
 
 ---
 
@@ -616,60 +658,97 @@ python scripts/demo_v2.1.py
 
 ## 6. 附录:文件交付清单
 
+### 6.1 M1-M3 实际产出(2026-06-21 完成)
+
 ```
-agent_core/memory/                    (新增 ~3500 行)
-├── types.py                          (M1, 80 行)
-├── config.py                         (M1, 150 行)
-├── path_validator.py                 (M1, 100 行)
-├── meta_db.py                        (M2, 200 行)
-├── ipc_lock.py                       (M2, 80 行)
-├── memory_store.py                   (M2, 400 行)
-├── dual_channel_writer.py            (M2, 500 行)
-├── memory_editor.py                  (M2, 250 行)
-├── retriever.py                      (M3, 600 行)
-├── extractor.py                      (M3, 300 行)
-├── memory_verifier.py                (M3, 200 行)
-├── secret_scanner.py                 (M3, 80 行)
-├── bootstrap.py                      (M3, 60 行)
-├── seed/                             (M3, 4 个 .md)
-├── sm_layer.py                       (M4, 350 行)
-├── distiller.py                      (M5, 400 行)
-├── scheduler.py                      (M5+M6, 300 行)
-├── tracing.py                        (M6, 60 行)
-├── migration.py                      (M7, 150 行)
-└── lifecycle.py                      (M8, 200 行)
+agent_core/                            (~3400 行,含新增)
+├── exceptions.py                      (统一异常体系,AgentError 根类 + 6 领域子类)
+└── types.py                           (MessageRole 枚举)
 
-agent_core/langgraph_agent/
-└── agent.py                          (M7 patch, +150 行)
+agent_core/memory/                     (~3000 行已交付)
+├── types.py                           (M1, 4 类类型 + validate_type)
+├── config.py                          (M1, MemoryConfig + RetrievalConfig)
+├── path_validator.py                  (M1, 4 层防御)
+├── meta_db.py                         (M2, SQLite cursors/pending/candidates)
+├── ipc_lock.py                        (M2, flock 跨进程锁)
+├── memory_store.py                    (M2, per-file 存储 + frontmatter)
+├── dual_channel_writer.py             (M2, A3+A4+A5+A9+A10 双通道)
+├── memory_editor.py                   (M2, Edit-only + L7+L9 + secret 扫描)
+├── retriever.py                       (M3, semantic/keyword/hybrid + L4 密钥过滤)
+├── extractor.py                       (M3, LLM 提取 + 评分合并)
+├── secret_scanner.py                  (M3, 4 类密钥 pattern)
+├── embeddings.py                      (M3, BGEM3EmbedFn + MiniLMEmbedFn,no Mock)
+└── chroma_store.py                    (M3, ChromaVectorStore,生产 vector_store 唯一实现)
 
-app_langgraph.py                      (M7 patch, +80 行 UI)
-
-tests/                                (新增 ~2500 行)
-├── test_types_config.py              (M1, 200 行, 20 cases)
-├── test_path_validator.py            (M1, 100 行, 10 cases)
-├── test_dual_channel_minimal.py      (M2, 200 行, 5 cases)
-├── test_dual_channel_concurrent.py   (M2+M6+M8, 400 行, 8 cases)
-├── test_retrieval_modes.py           (M3, 250 行, 6 cases)
-├── test_extractor.py                 (M3, 200 行, 5 cases)
-├── test_sm_layer.py                  (M4, 200 行, 8 cases)
-├── test_distiller.py                 (M5, 300 行, 6 cases)
-├── test_scheduler.py                 (M6, 150 行, 6 cases)
-├── test_integration.py               (M7, 300 行, 5 cases)
-└── test_lifecycle.py                 (M8, 150 行, 4 cases)
+tests/                                 (~2400 行,8 文件)
+├── test_types_config.py               (M1, 47 cases)
+├── test_dual_channel_minimal.py       (M2, 7 cases:5 smoke + 场景 1 + 场景 4)
+├── test_cold_start.py                 (M3, 16 cases)
+├── test_retriever.py                  (M3, 25 cases:3 模式 + 类型 + 排名 + get_by_hash)
+├── test_extractor.py                  (M3, ? cases)
+├── test_embeddings.py                 (M3, 15 cases)
+├── test_secret_scanner.py             (M3, ? cases)
+└── test_usage_baseline_restore.py     (8 cases,context compaction v4 配套)
 
 scripts/
-└── demo_v2.1.py                      (M8, 150 行)
+├── setup_embeddings.sh                (一键安装 bge-m3 + ChromaDB)
+├── demo_m2.sh                         (M2 验收 demo)
+└── demo_m3.sh                         (M3 验收 demo)
+
+总计(M1-M3):~3000 行核心代码 + ~2400 行测试 + ~210 个测试 case
+           pytest tests/ 输出: 154 passed / 1 skipped
+```
+
+### 6.2 M4-M8 计划产出(未开始)
+
+```
+agent_core/memory/                     (~1760 行待交付)
+├── sm_layer.py                        (M4, 350 行 — SessionMemory L3 压缩)
+├── distiller.py                       (M5, 400 行 — 蒸馏 + 锁 v2.1)
+├── scheduler.py                       (M5+M6, 300 行 — 蒸馏调度)
+├── tracing.py                         (M6, 60 行 — OTel span)
+├── migration.py                       (M7, 150 行 — Schema migration)
+├── lifecycle.py                       (M8, 200 行 — A6 backup/cron)
+├── memory_verifier.py                 (M3, 200 行 — 召回验证,延后)
+├── bootstrap.py                       (M3, 60 行 — seed 引导,延后)
+└── daily.py                           (已存在,集成点待 M7 接入)
+
+agent_core/langgraph_agent/
+└── agent.py                           (M7 patch, +150 行 — memory 系统接入)
+
+app_langgraph.py                       (M7 patch, +80 行 UI — 状态条)
+
+tests/                                 (~1850 行待交付)
+├── test_path_validator.py             (M1, 100 行, 10 cases — 缺失)
+├── test_dual_channel_concurrent.py    (M2+M6+M8, 400 行, 8 cases — 当前 2/8)
+├── test_retrieval_modes.py            (M3, 250 行, 6 cases — 替代 test_retriever.py)
+├── test_sm_layer.py                   (M4, 200 行, 8 cases)
+├── test_distiller.py                  (M5, 300 行, 6 cases)
+├── test_scheduler.py                  (M6, 150 行, 6 cases)
+├── test_integration.py                (M7, 300 行, 5 cases)
+└── test_lifecycle.py                  (M8, 150 行, 4 cases)
+
+scripts/
+└── demo_v2.1.py                       (M8, 150 行 — 端到端 demo)
 
 docs/
-├── memory-system-design.md           (已有, 3764 行)
-├── IMPLEMENTATION_PLAN.md            (本文件)
-└── LAUNCH_v2.1.md                    (M8, 200 行)
+└── LAUNCH_v2.1.md                     (M8, 200 行 — 上线 checklist)
 
-总计: 8 天, ~6500 行新代码, ~3500 行测试, 79 个测试 case
+总计(M4-M8 待交付):~1760 行核心代码 + ~1850 行测试 + ~53 个测试 case
 ```
+
+### 6.3 总体交付(项目级)
+
+| 项 | 已交付 | 待交付 | 合计 |
+|---|---|---|---|
+| 核心代码 | ~3000 行 | ~1760 行 | ~4760 行 |
+| 测试 | ~2400 行 | ~1850 行 | ~4250 行 |
+| 测试 case | 154 | ~53 | ~207 |
+| commit 数 | 13 (memory 系列) | 估 ~15 | 估 ~28 |
 
 ---
 
-**最后更新**:2026-06-20
-**状态**:待执行
+**最后更新**:2026-06-21
+**M1-M3 状态**:✅ 完成 (commit `57482f1` → `574e096`)
+**M4-M8 状态**:⏸️ 未开始,待启动决策
 **负责**:AI Agent 写码 + 人验收
