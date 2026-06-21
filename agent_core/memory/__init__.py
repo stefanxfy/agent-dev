@@ -19,7 +19,7 @@ from .types import (
     validate_frontmatter,
     validate_type,
 )
-from .config import MemoryConfig
+from .config import DistillationConfig, MemoryConfig
 from .path_validator import MemoryPathValidator, PathSecurityError
 
 # M2 已就绪（双通道脊柱）
@@ -98,6 +98,14 @@ from .sm_layer import (
     TurnContext,
 )
 
+# M5: L5 蒸馏 (autoDream)
+from .distiller import (
+    Distiller,
+    DistillationScheduler,
+    DistillationError,
+    DistillationResult,
+)
+
 # v1 历史实现（保留兼容）
 from .daily import DailyLogger
 
@@ -110,6 +118,7 @@ __all__ = [
     "CURRENT_SCHEMA_VERSION",
     # M1: config
     "MemoryConfig",
+    "DistillationConfig",
     # M1: path
     "MemoryPathValidator",
     "PathSecurityError",
@@ -180,6 +189,11 @@ __all__ = [
     "CompactDecision",
     "CompactResult",
     "TurnContext",
+    # M5: L5 蒸馏
+    "Distiller",
+    "DistillationScheduler",
+    "DistillationError",
+    "DistillationResult",
     # v1 legacy
     "DailyLogger",
 ]

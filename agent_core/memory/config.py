@@ -85,6 +85,7 @@ class DistillationConfig(BaseModel):
     时间门:距离上次成功蒸馏至少 24h 才触发
     规模门:daily log 累计 ≥ 50 行才触发
     变更门:memory 文件相对 prior_mtime 有 ≥ 10% 变更才触发
+    session 门:增量 session 数 ≥ min_sessions_for_distill 才触发(M5 增)
     """
     model_config = ConfigDict(extra="forbid")
 
@@ -92,6 +93,10 @@ class DistillationConfig(BaseModel):
     min_interval_hours: int = Field(default=24, ge=1, le=168)
     min_daily_log_lines: int = Field(default=50, ge=10, le=10000)
     change_threshold_pct: float = Field(default=0.10, ge=0.01, le=1.0)
+    min_sessions_for_distill: int = Field(
+        default=5, ge=1, le=100,
+        description="增量 session 数 ≥ 此值才触发(门3,2026-06-21 M5 增)",
+    )
 
     # 锁抢占阈值（v2.1 A1+A2+A11）
     lock_stale_pid_seconds: int = Field(default=3600, ge=60, le=86400)
