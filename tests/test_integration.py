@@ -319,3 +319,76 @@ class TestSchemaStrict:
                 "created_at": "2025-01-01",
                 "item_hash": "deadbeef",  # 太短
             })
+
+
+# ──────────────────────────────────────────────────────────────────
+# 6. 回归 —— v0 迁移后必须能过 validate_frontmatter (Issue 2 修复点)
+# ──────────────────────────────────────────────────────────────────
+
+class TestMigrationRoundtrip:
+
+    def test_v0_migrated_passes_validate_frontmatter(self, memory_root):
+        """
+        修复 v0 → v2 后,frontmatter 必须满足 validate_frontmatter 必填字段
+        (type / created_at / item_hash / schema_version)
+        """
+        from agent_core.memory.types import validate_frontmatter
+        mem_dir = memory_root / "user"
+        mem_dir.mkdir()
+        mem_file = mem_dir / "oldnote.md"
+        # 极简 v0:只有 title + body,无 type / item_hash / schema_version
+        _write_v0_memory(mem_file, title="M7 v0 测试", body="老格式笔记内容")
+
+        result = migrate_file(mem_file)
+        # 必填字段都在
+        fm = result["frontmatter"]
+        assert fm["type"] == "user"
+        assert fm["item_hash"] == "0" * 64
+        assert fm["schema_version"] == CURRENT_SCHEMA_VERSION
+        # validate 不抛
+        validated = validate_frontmatter(fm)
+        assert validated["schema_version"] == CURRENT_SCHEMA_VERSION
+
+    def test_v0_minimal_body_only(self, memory_root):
+        """v0 极端退化:只有 body,无 frontmatter 字段 → 仍应迁移成功且 validate 通过"""
+        mem_dir = memory_root / "user"
+        mem_dir.mkdir()
+        mem_file = mem_dir / "min.md"
+        # 退化到只有标题(body 即 title)
+        mem_file.write_text(
+            "---\n"
+            "title: bare\n"
+            "---\n\n"
+            "body\n",
+            encoding="utf-8",
+        )
+        result = migrate_file(mem_file)
+        from agent_core.memory.types import validate_frontmatter
+        validated = validate_frontmatter(result["frontmatter"])
+        assert validated["schema_version"] == CURRENT_SCHEMA_VERSION
+
+
+# ──────────────────────────────────────────────────────────────────
+# 7. MigrationError 必须支持 cause= (Issue 1 修复点)
+# ──────────────────────────────────────────────────────────────────
+
+class TestMigrationErrorBase:
+
+    def test_migration_error_accepts_cause_keyword(self):
+        """
+        回归:之前 MigrationError(Exception) 不接 cause=,OSError 路径会 TypeError
+        修复后继承 AgentError,支持 cause= + from e 双链
+        """
+        try:
+            try:
+                raise OSError("disk full (simulated)")
+            except OSError as e:
+                raise MigrationError("写 .bak 失败", cause=e) from e
+        except MigrationError as e:
+            assert e.cause is not None
+            assert isinstance(e.cause, OSError)
+            assert e.__cause__ is e.cause  # from e 也设置
+            assert e.code == "MIGRATION_ERROR"
+            # __str__ 含 code + cause
+            assert "MIGRATION_ERROR" in str(e)
+            assert "disk full" in str(e)

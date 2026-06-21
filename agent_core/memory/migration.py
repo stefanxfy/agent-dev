@@ -32,6 +32,7 @@ from typing import Any, Callable
 
 import yaml
 
+from agent_core.exceptions import AgentError
 from agent_core.memory.types import CURRENT_SCHEMA_VERSION
 
 logger = logging.getLogger("memory.migration")
@@ -44,8 +45,9 @@ __all__ = [
 ]
 
 
-class MigrationError(Exception):
-    """迁移异常"""
+class MigrationError(AgentError):
+    """迁移异常(继承 AgentError → 自动支持 cause= / code=)"""
+    code: str = "MIGRATION_ERROR"
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -226,11 +228,31 @@ def migrate_all(root: Path) -> int:
 # ──────────────────────────────────────────────────────────────────
 
 def _v0_to_v1(data: dict) -> dict:
-    """v0 无 schema_version 字段 → 补 created_at + 默认 confidence"""
+    """
+    v0 无 schema_version 字段 → 补全 frontmatter 必填字段
+
+    必填补全(让迁移后能过 validate_frontmatter):
+    - type: 默认 "user"(v0 绝大多数是用户笔记)
+    - created_at: 默认今天(YYYY-MM-DD,ISO 8601 子集,fromisoformat 可解);
+      若已有值但是 datetime.date(YAML 把无引号日期解析成 date 对象),
+      转成 ISO string 再赋回去
+    - item_hash: 占位 64 字符 hex("0"*64);v0 时代无幂等概念,占位不影响后续
+      (MemoryStore 重写时会用真实 SHA256 替换)
+    - confidence: 默认 0.5
+
+    不补 source_quote:validate 仅在 write() 时必填,read() 不强制
+    """
+    import datetime
+
     data["schema_version"] = 1
-    data.setdefault("created_at", time.strftime("%Y-%m-%d"))
+    data.setdefault("type", "user")
+    # created_at:可能是 string / datetime.date(YAML 解析) / 缺失
+    if "created_at" not in data:
+        data["created_at"] = time.strftime("%Y-%m-%d")
+    elif isinstance(data["created_at"], datetime.date):
+        data["created_at"] = data["created_at"].isoformat()
+    data.setdefault("item_hash", "0" * 64)
     data.setdefault("confidence", 0.5)
-    # v0 可能缺 source_quote(A5),v1 起必填;但不强行补,留给 validate 兜底
     return data
 
 
