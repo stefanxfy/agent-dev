@@ -114,6 +114,7 @@ from .scheduler import DistillationLoop
 from .migration import (
     MigrationRegistry,
     MigrationError,
+    MigrationReport,
     migrate_file,
     migrate_all,
 )
@@ -214,6 +215,7 @@ __all__ = [
     # M7: Schema 迁移
     "MigrationRegistry",
     "MigrationError",
+    "MigrationReport",
     "migrate_file",
     "migrate_all",
     # v1 legacy

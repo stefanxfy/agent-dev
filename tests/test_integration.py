@@ -29,6 +29,7 @@ from agent_core.memory import (
     MemoryStore,
     MigrationError,
     MigrationRegistry,
+    MigrationReport,
     migrate_all,
     migrate_file,
 )
@@ -158,15 +159,20 @@ class TestMigrationFile:
 class TestMigrationBatch:
 
     def test_migrate_all_handles_mixed_versions(self, memory_root):
-        """migrate_all():3 个文件(2 旧 1 新)→ 应迁移 2 个"""
+        """migrate_all():3 个文件(2 旧 1 新)→ 应迁移 2 个,1 个 already_current"""
         user_dir = memory_root / "user"
         user_dir.mkdir()
         _write_v0_memory(user_dir / "v0a.md")
         _write_v1_memory(user_dir / "v1a.md")
         _write_v2_memory(user_dir / "current.md")
 
-        count = migrate_all(memory_root)
-        assert count == 2  # 只迁移了 v0a 和 v1a
+        report = migrate_all(memory_root)
+        assert isinstance(report, MigrationReport)
+        assert report.migrated == 2          # v0a + v1a
+        assert report.already_current == 1   # current.md
+        assert report.skipped == 0
+        assert report.total == 3
+        assert not report.has_errors
 
         # 全部应是 v2
         for name in ("v0a", "v1a", "current"):
@@ -180,9 +186,44 @@ class TestMigrationBatch:
         _write_v0_memory(user_dir / "test.md")
         migrate_file(user_dir / "test.md")  # 产生 .bak
 
-        # 再跑一次 migrate_all → 应该 no-op(已是 v2)
-        count = migrate_all(memory_root)
-        assert count == 0
+        # 再跑一次 migrate_all → 全部 already_current
+        report = migrate_all(memory_root)
+        assert report.migrated == 0
+        assert report.already_current == 1
+        assert report.skipped == 0
+        assert not report.has_errors
+
+    def test_migrate_all_reports_skipped_for_broken_files(self, memory_root):
+        """Issue 3 修复:坏文件应进 skipped + errors,而不是被静默吞掉"""
+        user_dir = memory_root / "user"
+        user_dir.mkdir()
+        _write_v0_memory(user_dir / "good_v0.md")  # 正常 v0
+        # 故意写一个损坏的文件(无 --- frontmatter)
+        (user_dir / "broken.md").write_text(
+            "just plain text, no frontmatter at all\n", encoding="utf-8"
+        )
+
+        report = migrate_all(memory_root)
+        # good_v0 应被迁移,broken 应被 skipped
+        assert report.migrated == 1
+        assert report.already_current == 0
+        assert report.skipped == 1
+        assert report.has_errors
+        assert len(report.errors) == 1
+        broken_path, err_msg = report.errors[0]
+        assert broken_path.name == "broken.md"
+        assert "frontmatter" in err_msg or "---" in err_msg
+        print(f"  skipped: {broken_path.name} → {err_msg[:60]}")
+
+    def test_migrate_all_on_nonexistent_root_returns_empty_report(self, tmp_path):
+        """不存在的 root → 返回空 report,不抛"""
+        fake_root = tmp_path / "does_not_exist"
+        report = migrate_all(fake_root)
+        assert isinstance(report, MigrationReport)
+        assert report.migrated == 0
+        assert report.already_current == 0
+        assert report.skipped == 0
+        assert report.total == 0
 
 
 # ──────────────────────────────────────────────────────────────────

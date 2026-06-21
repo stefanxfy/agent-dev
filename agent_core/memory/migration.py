@@ -18,8 +18,8 @@ Public API:
 - `MigrationRegistry.register(from_v, fn)` —— 注册转换函数
 - `MigrationRegistry.migrate(from_v, data) -> dict` —— 链式迁移
 - `migrate_file(path) -> dict` —— 单文件懒迁移(返回 migrated bool)
-- `migrate_all(root) -> int` —— 批量,返回迁移数
-- `MigrationError` —— 迁移异常基类
+- `migrate_all(root) -> MigrationReport` —— 批量,返回报告(迁移/跳过/已是最新 三种计数)
+- `MigrationError` —— 迁移异常基类(继承 AgentError)
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -40,6 +41,7 @@ logger = logging.getLogger("memory.migration")
 __all__ = [
     "MigrationRegistry",
     "MigrationError",
+    "MigrationReport",
     "migrate_file",
     "migrate_all",
 ]
@@ -48,6 +50,45 @@ __all__ = [
 class MigrationError(AgentError):
     """迁移异常(继承 AgentError → 自动支持 cause= / code=)"""
     code: str = "MIGRATION_ERROR"
+
+
+@dataclass
+class MigrationReport:
+    """
+    migrate_all() 批量迁移结果(取代旧版返回 int)
+
+    字段语义:
+    - migrated: 成功从旧版本升级到 CURRENT_SCHEMA_VERSION 的文件数
+    - already_current: 本来就是 >= CURRENT(无 .bak 写入、文件未动)
+    - skipped: 失败跳过的文件数(frontmatter 损坏 / OSError 等)
+    - errors: (path, error_msg) 元组列表,长度应 == skipped
+
+    使用:
+        r = migrate_all(root)
+        if r.has_errors:
+            log.warning(f"{r.skipped} 个文件跳过,首个:{r.errors[0]}")
+        print(f"migrated={r.migrated}, already_current={r.already_current}")
+    """
+    migrated: int = 0
+    already_current: int = 0
+    skipped: int = 0
+    errors: list[tuple[Path, str]] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        """扫到的 .md 总数(不含 .bak)"""
+        return self.migrated + self.already_current + self.skipped
+
+    @property
+    def has_errors(self) -> bool:
+        return self.skipped > 0
+
+    def __str__(self) -> str:
+        return (
+            f"MigrationReport(migrated={self.migrated}, "
+            f"already_current={self.already_current}, "
+            f"skipped={self.skipped})"
+        )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -195,7 +236,7 @@ def migrate_file(path: Path) -> dict:
     }
 
 
-def migrate_all(root: Path) -> int:
+def migrate_all(root: Path) -> MigrationReport:
     """
     批量迁移 root 下所有 .md 文件
 
@@ -203,12 +244,18 @@ def migrate_all(root: Path) -> int:
         root: memory_root 路径(如 ~/.agent_data/memory)
 
     Returns:
-        int: 迁移文件数(0 = 全部已是最新)
+        MigrationReport:含 migrated / already_current / skipped / errors
+
+    Note:
+        - 返回值从旧版 `int`(迁移数)升级为 `MigrationReport`,
+          调用方需相应调整。旧版 0 = 全部已是最新 的语义不可靠
+          (跳过 N 个也返回 0),新报告可区分 skipped 与 already_current。
+        - 失败的文件不会中断遍历,会被记入 report.errors,供运维后续处理。
     """
     root = Path(root)
+    report = MigrationReport()
     if not root.exists():
-        return 0
-    count = 0
+        return report
     for path in root.rglob("*.md"):
         # 跳过 .bak sidecar
         if path.suffix == ".bak":
@@ -216,11 +263,15 @@ def migrate_all(root: Path) -> int:
         try:
             result = migrate_file(path)
             if result["migrated"]:
-                count += 1
+                report.migrated += 1
+            else:
+                report.already_current += 1
         except MigrationError as e:
+            report.skipped += 1
+            report.errors.append((path, str(e)))
             logger.warning(f"跳过 {path}: {e}")
             continue
-    return count
+    return report
 
 
 # ──────────────────────────────────────────────────────────────────

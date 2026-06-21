@@ -74,9 +74,12 @@ write_md(user_dir / "current_v2.md",
          "v2 当前格式")
 
 # 批量迁移
-migrated = migrate_all(memory_root)
-assert migrated == 2, f"应迁移 2 个,实际 {migrated}"
-print(f"  ✅ migrate_all → migrated={migrated} (v0 + v1)")
+report = migrate_all(memory_root)
+assert report.migrated == 2, f"应迁移 2 个,实际 migrated={report.migrated}"
+assert report.already_current == 1, f"current 应被识别为已最新,实际 already_current={report.already_current}"
+assert report.skipped == 0, f"不应有 skipped,实际 {report.skipped}"
+assert not report.has_errors
+print(f"  ✅ migrate_all → {report} (migrated=2, already_current=1, skipped=0)")
 
 # 验证 .bak sidecar
 baks = list(memory_root.rglob("*.bak"))
