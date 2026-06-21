@@ -101,7 +101,7 @@ Refs: A3, A4, A5, A9, A10
 | **M3** | 检索 + 安全 (Day 3) | 8h | L1, L2, L4, L5, L8, L12 | `pytest tests/test_retrieval_modes.py -v` | ✅ **完成** (`539b6e7`) |
 | **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` | ✅ **完成** (`bf41c28` + bug 修复 `a9e91af`) |
 | **M5** | 蒸馏 (Day 5) | 6h | A1, A2, A11 | `pytest tests/test_distiller.py -v` | ✅ **完成** (`38f64a9`) |
-| **M6** | 调度 + 可观测 (Day 6) | 6h | A8, A12 (含 5/8 并发场景) | `pytest tests/test_scheduler.py -v` | ⏸️ **未开始** |
+| **M6** | 调度 + 可观测 (Day 6) | 6h | A8, A12 (含 5/8 并发场景) | `bash scripts/demo_m6.sh` | ✅ **完成** |
 | **M7** | 集成 + UI (Day 7) | 6h | L13, A7 (schema migration) | `pytest tests/test_integration.py -v` | ⏸️ **未开始** |
 | **M8** | 完整测试 + 上线 (Day 8) | 8h | A6, A12 (补 3/8 场景) | `pytest tests/ -v` + demo 全跑 | ⏸️ **未开始** |
 
@@ -335,9 +335,16 @@ bash scripts/demo_m5.sh
 
 ### Day 6 — M6: 调度 + 可观测 + 并发测试
 
-> ⏸️ **状态:未开始** (2026-06-21 更新)
-> 无相关 commit,文件 `scheduler.py` / `tracing.py` 不存在,测试 `test_scheduler.py` / `test_dual_channel_concurrent.py` 不存在。
-> Day 2 已覆盖场景 1/4,场景 2/3/5/6/7/8 全部未做。
+> ✅ **状态:完成** (2026-06-21 更新)
+> - `agent_core/memory/scheduler.py` —— DistillationLoop (start/stop/tick_once,后台 daemon)
+> - `agent_core/memory/tracing.py` —— OTel tracer (默认 NoOp,env 触发 OTLP)
+> - `tests/test_scheduler.py` —— 9 cases (含 OTel span 嵌套)
+> - `tests/test_dual_channel_concurrent.py` —— 5 scenarios (场景 2/5/6/7/8)
+> - `scripts/demo_m6.sh` —— 3 个端到端 demo
+> - `dual_channel_writer.py` —— extraction watchdog (场景 8 前置)
+> - `distiller.py` —— OTel span 包装 `run()`
+>
+> Day 2 已覆盖场景 1/4,Day 6 补 2/5/6/7/8(场景 3 跨进程归 M8)。
 
 **目标**:调度器 + OTel + 补 5/8 并发场景(A12 矩阵的 3/6/7/8 + 已有的 1/4 = 5 个)。
 
@@ -364,36 +371,14 @@ bash scripts/demo_m5.sh
 
 **验收 demo**:
 ```bash
-# 1. 调度器触发
-.venv/bin/python -c "
-from agent_core.memory.scheduler import DistillationScheduler
-s = DistillationScheduler()
-# 模拟 5 个 session
-for i in range(5): s.record_session(f's{i}')
-# 模拟 24h 前
-s._last_distill_at = time.time() - 25*3600
-assert s.should_distill()
-print('✅ should_distill returned True')
-"
-
-# 2. OTel span
-.venv/bin/python -c "
-from agent_core.memory.tracing import tracer
-with tracer.start_as_current_span('memory.extract') as span:
-    span.set_attribute('memory.candidates', 3)
-    print('✅ span created')
-"
-# 检查输出有 'memory.extract' span
-
-# 3. 5 个新并发场景
-pytest tests/test_dual_channel_concurrent.py -v
-# Expected: 7 passed (1, 2, 4, 5, 6, 7, 8) - 场景 3 仍 skip (跨进程)
+bash scripts/demo_m6.sh
+# 3 个 demo: 调度触发 / OTel span / 5 个并发场景
+# + 14 pytest: tests/test_scheduler.py (9) + tests/test_dual_channel_concurrent.py (5)
 ```
 
 **人验收** (15 min):
-- 跑 3 个 demo → 全 ✅
-- 看 5/8 并发场景全绿
-- 决策:⏸️ 待 M6 启动后填
+- 跑 `bash scripts/demo_m6.sh` → 3 demo 全 ✅,14 pytest 全过
+- 决策:✅ M6 完成,M7 启动
 
 ---
 
@@ -524,7 +509,7 @@ python scripts/demo_v2.1.py
 
 - [ ] **M4**: L3 压缩 / sm_layer.py
 - [ ] **M5**: 蒸馏 / distiller.py
-- [ ] **M6**: 调度 + 可观测 / scheduler.py + tracing.py + 5 个并发场景
+- [x] **M6**: 调度 + 可观测 / scheduler.py + tracing.py + 5 个并发场景
 - [ ] **M7**: 集成 + UI + Schema 迁移 / migration.py + agent.py patch + UI 状态条
 - [ ] **M8**: 完整测试 + 上线准备 / lifecycle.py + demo_v2.1.py + LAUNCH_v2.1.md + CHANGELOG + `v2.1.0` git tag
 - [ ] `pytest tests/ -v` 输出 **200+ passed**(当前 154,待 M4-M8 加 ~50 case)
