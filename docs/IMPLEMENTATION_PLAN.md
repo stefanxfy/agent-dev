@@ -99,7 +99,7 @@ Refs: A3, A4, A5, A9, A10
 | **M1** | 基础 + 配置 (Day 1) | 4h | O8 | `pytest tests/test_types_config.py -v` | ✅ **完成** (`57482f1`) |
 | **M2** | 写入路径 (Day 2) | 8h | A3, A4, A5, A9, A10, L7, L9 | `pytest tests/test_dual_channel_minimal.py -v` | ✅ **完成** (`a2c0a5d`) |
 | **M3** | 检索 + 安全 (Day 3) | 8h | L1, L2, L4, L5, L8, L12 | `pytest tests/test_retrieval_modes.py -v` | ✅ **完成** (`539b6e7`) |
-| **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` | ⏸️ **未开始** |
+| **M4** | L3 压缩 (Day 4) | 4h | — | `pytest tests/test_sm_layer.py -v` | ✅ **完成** (`bf41c28` + bug 修复 `TBD`) |
 | **M5** | 蒸馏 (Day 5) | 6h | A1, A2, A11 | `pytest tests/test_distiller.py -v` | ⏸️ **未开始** |
 | **M6** | 调度 + 可观测 (Day 6) | 6h | A8, A12 (含 5/8 并发场景) | `pytest tests/test_scheduler.py -v` | ⏸️ **未开始** |
 | **M7** | 集成 + UI (Day 7) | 6h | L13, A7 (schema migration) | `pytest tests/test_integration.py -v` | ⏸️ **未开始** |
@@ -307,9 +307,10 @@ pytest tests/test_extractor.py::test_merged_call -v
 
 ### Day 4 — M4: L3 压缩
 
-> ⏸️ **状态:未开始** (2026-06-21 更新)
-> 无相关 commit,文件 `sm_layer.py` 不存在,测试 `test_sm_layer.py` 不存在。
-> 实际执行时间待定,需先决定 Day 4 启动日期。
+> ✅ **状态:已完成** (2026-06-21 更新)
+> commit `bf41c28` + bug 修复 `TBD`。
+> 产出:[sm_layer.py](agent_core/memory/sm_layer.py) 595 行 + [test_sm_layer.py](tests/test_sm_layer.py) 32 case + [config.py](agent_core/memory/config.py) `CompactConfig` 52 行。
+> ⚠️ **M4 范围 = 模块 + 测试**,**集成到对话流不在 M4,归 M7**(参见 §四.0.3 / §Day 7)。
 
 **目标**:会话内压缩(SessionMemory)跑通,这是 v2 升级的核心创新点。
 
@@ -320,33 +321,74 @@ pytest tests/test_extractor.py::test_merged_call -v
 | SessionMemory 文件 | `sm_layer.py` | 每个 session 一个 .md,frontmatter 锁定 schema |
 | L3 压缩触发 | `should_trigger_compact` | 阈值: token > 10K 或 tool > 10 |
 | 5 条回退条件 | 同上 | gate 关 / 文件空 / 模板态 / 提取中 / 仍超阈值 |
-| 压缩算法 | `_compact_to_sm` | 滚动摘要,保留最近 N 轮 + 早期摘要 |
-| 单测 | `tests/test_sm_layer.py` | 8 个: 触发 / 5 回退 / 摘要正确性 / 不丢消息 |
+| 压缩算法 | `compact()` | 滚动摘要,保留最近 N 轮 + 早期摘要 |
+| 单测 | `tests/test_sm_layer.py` | **32 个**(超出 plan 8 个最低要求):文件状态 / 触发 / 5 回退 / compact / extract / 数据结构 / 集成链路 / 回归 |
+| 回归 bug 修复 | `_estimate_messages_tokens` | 累积 bug → used_tokens_estimate 可能为负,新增 `test_compact_estimates_tokens_for_long_messages` 守护 |
 
-**验收 demo**:
+**验收 demo**(2026-06-21 对齐实际 API 后版本):
 ```bash
-# 1. 触发压缩
+# 1. 端到端: 初始化 SM → 填内容 → 触发决策 → 压缩
 .venv/bin/python -c "
-from agent_core.memory.sm_layer import SessionMemoryLayer
-sm = SessionMemoryLayer('demo_s2')
-# 模拟 10K tokens 的对话
-for i in range(100):
-    sm.append_message(f'user msg {i}', f'resp {i}')
-assert sm.should_compact()
-sm.compact()
-assert sm.token_count() < 10000
-print('✅ compacted')
+import tempfile
+from pathlib import Path
+from agent_core.memory import MemoryConfig, SessionMemoryLayer
+from agent_core.memory.sm_layer import TurnContext
+
+tmp = Path(tempfile.mkdtemp())
+sm_path = tmp / 'sm.md'
+config = MemoryConfig().compact
+sm = SessionMemoryLayer('demo_s2', sm_path, config)
+
+# Step 1: 初始化 SM 文件 + 模拟 LLM extract 填充内容
+sm.write_sm_template()
+content = sm.read_sm()
+content = content.replace('<!-- 当前会话目标、约束、已知事实 -->', '用户学习 React,6 周完成项目')
+content = content.replace('<!-- 已做的决策(用户偏好 + 系统决策) -->', '1. 用 Vite 不用 CRA\\n2. TypeScript strict')
+sm_path.write_text(content, encoding='utf-8')
+assert not sm.sm_is_template(), 'SM 文件应为已填内容态'
+
+# Step 2: 触发决策 (token > 10K 阈值)
+ctx = TurnContext(
+    messages=[{'id': 'm1', 'role': 'user', 'content': 'x' * 4000}],
+    total_tokens=12000,
+    tool_count=2,
+)
+decision = sm.should_trigger_compact(ctx)
+print(f'  decision: strategy={decision.strategy}, reason={decision.reason}')
+assert decision.strategy == 'sm_compact', f'应触发 SM-compact,实际 = {decision.strategy}'
+
+# Step 3: compact() 产出 summary + kept_messages
+messages = [{'id': f'm{i}', 'role': 'user' if i%2==0 else 'assistant', 'content': f'msg{i}'*50} for i in range(5)]
+result = sm.compact(messages, context_window=128000)
+assert result is not None
+assert result.used_tokens_estimate > 0, f'used_tokens_estimate 应为正,实际 = {result.used_tokens_estimate}'
+assert '用户学习 React' in result.summary_message['content']
+assert 'Vite' in result.summary_message['content']
+print(f'  ✅ compacted: kept={len(result.kept_messages)}, used_tokens={result.used_tokens_estimate}')
 "
 
-# 2. 5 条回退
-pytest tests/test_sm_layer.py -v -k fallback
-# Expected: 5 passed
+# 2. 5 条回退条件
+.venv/bin/python -m pytest tests/test_sm_layer.py -v -k fallback
+# Expected: 6 passed (5 回退 + 1 template variant)
+
+# 3. 完整套件
+.venv/bin/python -m pytest tests/test_sm_layer.py -v
+# Expected: 32 passed
 ```
 
+**API 变更说明**(对比 plan 原始描述):
+| plan 写的 | 实际实现 | 备注 |
+| --- | --- | --- |
+| `SessionMemoryLayer('demo_s2')` | `SessionMemoryLayer(session_id, sm_path, config)` | 构造函数显式接 3 参数,避免隐式全局 |
+| `sm.append_message(...)` | (无此方法) | 消息是调用方传入的,SM 不持久化原始 messages |
+| `sm.should_compact()` | `sm.should_trigger_compact(ctx)` | 需传 TurnContext(total_tokens, tool_count) |
+| `sm.compact()` | `sm.compact(messages, context_window)` | 需传 messages 列表 + 模型 context_window |
+| `sm.token_count()` | `sm.sm_token_count()` | 仅统计 SM 文件本身,不带消息 |
+
 **人验收** (15 min):
-- 跑 2 个 demo → 全 ✅
-- 看压缩后文件 → 内容是否合理(关键决策点)
-- 决策:⏸️ 待 M4 启动后填
+- 跑 3 个 demo → 全 ✅
+- 看 compact 后 `summary_message.content` → 是否含 SM 关键信息(目标 + 决策)
+- 决策:✅ M4 模块验收通过,**集成待 M7**
 
 ---
 

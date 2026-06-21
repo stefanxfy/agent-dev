@@ -373,14 +373,23 @@ last_compacted_at: null
             return messages
 
     def _estimate_messages_tokens(self, messages: list[dict]) -> int:
-        """估算消息列表的 token 数(启发式,无 LLM)"""
+        """估算消息列表的 token 数(启发式,无 LLM)
+
+        修复记录(2026-06-21):旧实现 chinese/english 跨消息累积,other 用
+        ``len(content) - chinese - english`` 计算,其中 chinese/english 是
+        累积值,导致第二条消息起 other 变负数,total token 错算为负数。
+        修正为按消息独立统计 chinese/english/other 再累加。
+        """
         chinese = english = other = 0
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                chinese += len(re.findall(r"[一-鿿]", content))
-                english += len(re.findall(r"[a-zA-Z]", content))
-                other += len(content) - chinese - english
+                msg_chinese = len(re.findall(r"[一-鿿]", content))
+                msg_english = len(re.findall(r"[a-zA-Z]", content))
+                msg_other = len(content) - msg_chinese - msg_english
+                chinese += msg_chinese
+                english += msg_english
+                other += msg_other
             # 每条消息 role overhead(5 tokens,与 SimpleTokenCounter 一致)
         return int(
             chinese * 0.45

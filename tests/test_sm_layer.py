@@ -331,6 +331,23 @@ class TestCompact:
         # 至少包含 SM 的 token 数
         assert result.used_tokens_estimate >= populated_sm.sm_token_count()
 
+    def test_compact_estimates_tokens_for_long_messages(self, populated_sm):
+        """回归测试:_estimate_messages_tokens 不能返回负数(累积 bug)
+
+        历史 bug:chinese/english 跨消息累积,other 用 content 减累积 chinese/english,
+        从第二条消息起 other 变负数,total token 错算为负数,used_tokens_estimate < 0。
+        修复后每条消息独立统计 chinese/english/other,再累加。
+        """
+        # 5 条 400 字符英文消息 — 旧实现下 total ≈ -60,新实现下 ≈ 5 * 88 = 440
+        messages = [{"id": f"m{i}", "role": "user", "content": "x" * 400} for i in range(5)]
+        result = populated_sm.compact(messages, context_window=128000)
+        assert result is not None
+        assert result.used_tokens_estimate > 0, (
+            f"used_tokens_estimate 应该为正,实际 = {result.used_tokens_estimate}"
+        )
+        # 5 条 400 字符英文 + SM + summary overhead,至少 400 tokens
+        assert result.used_tokens_estimate >= 400
+
 
 # ──────────────────────────────────────────────────────────────────
 # 5. extract_incremental() - 慢路径
