@@ -247,6 +247,9 @@ class MemoryStore:
         """
         读取记忆文件
 
+        M7 懒迁移:若 schema_version 过旧,自动调 migrate_file() 升级,
+        原文件保留 .bak sidecar。
+
         Returns: {"frontmatter": {...}, "body": "..."}
         """
         abs_path = self.validator.validate(rel_path, must_exist=True)
@@ -256,6 +259,19 @@ class MemoryStore:
             raise StorageReadError(f"读记忆文件失败: {e}", cause=e)
 
         fm, body = _parse_frontmatter(content)
+
+        # M7 懒迁移:若 schema_version < CURRENT → 升级
+        if int(fm.get("schema_version", 0)) < CURRENT_SCHEMA_VERSION:
+            from agent_core.memory.migration import migrate_file
+            try:
+                result = migrate_file(abs_path)
+                fm = result["frontmatter"]
+                body = result["body"]
+            except Exception as e:
+                logger.warning(f"懒迁移 {abs_path} 失败,使用原内容: {e}")
+                # 失败 → 用原内容,但 validate_frontmatter 可能仍会拒
+                # 让上层 caller 决定(不静默吞)
+
         # 防御性：再校验一次
         validate_frontmatter(fm)
         return {"frontmatter": fm, "body": body, "path": rel_path}

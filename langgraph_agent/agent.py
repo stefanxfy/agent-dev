@@ -35,12 +35,22 @@ class LangGraphAgent:
         max_turns: int = 10,
         system_prompt: Optional[str] = None,
         db_path: Optional[str] = None,
+        # M7 集成:记忆 + cache_namespace(默认 None = 不启用)
+        memory_retriever=None,
+        memory_store=None,
+        cache_namespace: Optional[str] = None,
+        memory_enabled: bool = False,
     ):
         self.llm_router = llm_router
         self.tool_registry = tool_registry
         self.max_turns = max_turns
         self.system_prompt = system_prompt
-        
+
+        # M7: 记忆模块(若 memory_enabled=True 但 retriever=None,警告但不报错)
+        self.memory_retriever = memory_retriever if memory_enabled else None
+        self.memory_store = memory_store if memory_enabled else None
+        self.cache_namespace = cache_namespace
+
         # 🔑 磁盘持久化路径
         self._db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,6 +168,10 @@ class LangGraphAgent:
                 "tool_registry": self.tool_registry,
                 "system_prompt": self.system_prompt,
                 "thread_id": self._thread_id,
+                # M7: 注入记忆 + cache_namespace(若启用)
+                "memory_retriever": self.memory_retriever,
+                "memory_store": self.memory_store,
+                "cache_namespace": self.cache_namespace,
             }
         }
         

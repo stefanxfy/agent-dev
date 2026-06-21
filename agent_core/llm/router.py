@@ -330,6 +330,7 @@ class LLMRouter:
         tools: Optional[list[dict]] = None,
         system_prompt_override: Optional[str] = None,
         tool_choice: Optional[str] = None,
+        cache_namespace: Optional[str] = None,
     ) -> Generator[StreamChunk, None, None]:
         """
         统一 chat 接口，返回 StreamChunk 生成器（同步）。
@@ -349,6 +350,10 @@ class LLMRouter:
             tool_choice: 工具选择策略。None=auto（默认）、"none"=禁用工具调用、
                 "auto"=同 None、"required"=必须调用工具。
                 压缩场景下传 "none" 防止 LLM 调工具打破输出格式。
+            cache_namespace: M7 新增——prompt cache 命名空间。
+                Anthropic:在 system message + tools 上打 cache_control:{"type":"ephemeral"},
+                          后续相同 namespace 跨调用可命中 prompt cache。
+                OpenAI/GLM:暂不支持,记 warning log,不影响正常调用。
         """
         provider = self.config.provider.value if isinstance(self.config.provider, Enum) else self.config.provider
 
@@ -364,10 +369,10 @@ class LLMRouter:
                 # Fork 模式：跳过 messages 中的 system（用 override）
             else:
                 filtered_messages.append(m)
-        
+
         if provider == "anthropic":
             yield from self._stream_with_retry(
-                lambda: self._chat_anthropic(filtered_messages, tools, system_message, tool_choice),
+                lambda: self._chat_anthropic(filtered_messages, tools, system_message, tool_choice, cache_namespace),
                 provider=provider,
             )
         elif provider == "openai":
@@ -380,6 +385,12 @@ class LLMRouter:
             if system_prompt_override:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
+            if cache_namespace:
+                logger.warning(
+                    "cache_namespace=%r passed but openai provider doesn't "
+                    "support explicit cache_control; implicit caching may apply",
+                    cache_namespace,
+                )
             yield from self._stream_with_retry(
                 lambda: self._chat_openai(final_messages, tools, tool_choice),
                 provider=provider,
@@ -389,6 +400,12 @@ class LLMRouter:
             if system_prompt_override:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
+            if cache_namespace:
+                logger.warning(
+                    "cache_namespace=%r passed but zhipu doesn't support "
+                    "cache_control; ignored",
+                    cache_namespace,
+                )
             yield from self._stream_with_retry(
                 lambda: self._chat_zhipu(final_messages, tools, tool_choice),
                 provider=provider,
@@ -486,6 +503,7 @@ class LLMRouter:
         tools: Optional[list[dict]],
         system_message: Optional[str] = None,  # P2 新增：system prompt
         tool_choice: Optional[str] = None,    # Fork 压缩：传 "none" 禁调工具
+        cache_namespace: Optional[str] = None,  # M7 新增：prompt cache 命名空间
     ) -> Generator[StreamChunk, None, None]:
         """Anthropic Claude 流式调用（同步，支持 thinking blocks）"""
         client = self._get_anthropic_client()
@@ -505,10 +523,25 @@ class LLMRouter:
                 kwargs["tool_choice"] = {"type": "auto"}
         if self.config.temperature > 0:
             kwargs["temperature"] = self.config.temperature
-        
+
         # P2 新增：添加 system prompt（Anthropic 特有格式）
+        # M7 扩展：cache_namespace 非空时,把 system 打包成 content block 并打 cache_control
         if system_message:
-            kwargs["system"] = system_message
+            if cache_namespace:
+                kwargs["system"] = [{
+                    "type": "text",
+                    "text": system_message,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                kwargs["system"] = system_message
+
+        # M7：cache_namespace 非空时,在最后一个 tool 上打 cache_control 锚点
+        # （Anthropic 限制：最多 4 个 cache_control 块,默认放最后一个即可）
+        if cache_namespace and tools:
+            tools = [dict(t) for t in tools]  # 浅拷贝避免污染
+            tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+            kwargs["tools"] = tools
 
         # 开启思考过程（Claude 3.7+）
         if self.config.thinking and self.config.thinking.enabled:
@@ -551,13 +584,15 @@ class LLMRouter:
                         )
                     )
 
-            # 返回 Token 消耗
+            # 返回 Token 消耗 —— M7 修复:补 cached_tokens(Anthropic cache_read_input_tokens)
+            cached = getattr(final_message.usage, "cache_read_input_tokens", 0)
             usage = UsageStats(
                 input_tokens=final_message.usage.input_tokens,
                 output_tokens=final_message.usage.output_tokens,
                 thinking_tokens=getattr(
                     final_message.usage, "thinking_tokens", 0
                 ),
+                cached_tokens=cached,
             )
             yield StreamChunk(usage=usage)
 

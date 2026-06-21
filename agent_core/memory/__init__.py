@@ -110,6 +110,14 @@ from .distiller import (
 from .tracing import tracer, configure_tracing, TRACER_NAME
 from .scheduler import DistillationLoop
 
+# M7: Schema 迁移
+from .migration import (
+    MigrationRegistry,
+    MigrationError,
+    migrate_file,
+    migrate_all,
+)
+
 # v1 历史实现（保留兼容）
 from .daily import DailyLogger
 
@@ -203,6 +211,11 @@ __all__ = [
     "tracer",
     "configure_tracing",
     "TRACER_NAME",
+    # M7: Schema 迁移
+    "MigrationRegistry",
+    "MigrationError",
+    "migrate_file",
+    "migrate_all",
     # v1 legacy
     "DailyLogger",
 ]

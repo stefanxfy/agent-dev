@@ -14,25 +14,74 @@ from .state import AgentState
 
 
 def llm_node(
-    state: AgentState, 
+    state: AgentState,
     config: RunnableConfig,
     writer: StreamWriter,  # 🔑 新增第三个参数：流式写入器
 ) -> dict:
     """
     LLM 调用节点（支持流式输出）。
     对应自研版：agent_core.py 中 for chunk in self.llm.chat(...)
-    
+
+    M7 集成:
+    - 记忆检索:用最近一条 HumanMessage 做 query,调 memory_retriever.search()
+    - 命中拼到 system_prompt 末尾(标记 [记忆库 / N hits])
+    - 推送 memory_status chunk 给 UI
+    - 透传 cache_namespace 给 router(Anthropic prompt cache)
+
     输入：state["messages"]
     输出：AIMessage（可能含 tool_calls）
     流式：通过 writer 增量输出文本/工具调用
     """
     from agent_core.llm.router import StreamChunk
-    
+
     # 从 config 获取依赖
     llm_router = config["configurable"]["llm_router"]
     tool_registry = config["configurable"]["tool_registry"]
     system_prompt = state.get("system_prompt") or config["configurable"].get("system_prompt")
-    
+
+    # M7: 记忆 + cache_namespace 从 configurable 取
+    memory_retriever = config["configurable"].get("memory_retriever")
+    memory_store = config["configurable"].get("memory_store")
+    cache_namespace = config["configurable"].get("cache_namespace")
+
+    # M7: 记忆检索(若 retriever 配置了)
+    memory_hits: list = []
+    if memory_retriever:
+        last_user = next(
+            (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+            None,
+        )
+        if last_user and last_user.content:
+            try:
+                report = memory_retriever.search(str(last_user.content), top_k=5)
+                memory_hits = list(report.hits)
+                # 把命中追加到 system_prompt
+                if memory_hits:
+                    mem_block = f"\n\n[记忆库 / {len(memory_hits)} hits]\n"
+                    for h in memory_hits:
+                        body_preview = (h.body or "")[:200]
+                        mem_block += f"- [{h.type}] {h.title}: {body_preview}\n"
+                    system_prompt = (system_prompt or "") + mem_block
+            except Exception as e:
+                # 记忆检索失败 → 不阻断主流程,只记 warning
+                import logging as _logging
+                _logging.getLogger("memory.llm_node").warning(f"记忆检索失败: {e}")
+
+        # 推送 UI 状态(无论是否有 hits 都推,便于状态条累计)
+        stored_total = 0
+        if memory_store is not None:
+            try:
+                stored_total = sum(memory_store.count_by_type().values())
+            except Exception:
+                pass
+        writer({
+            "type": "memory_status",
+            "hits": len(memory_hits),
+            "stored_total": stored_total,
+            "injected_tokens": sum(len(h.body or "") // 4 for h in memory_hits),
+            "zero_hit": len(memory_hits) == 0,
+        })
+
     # 准备 messages（LangChain 格式 → 自研 Router 格式）
     messages_for_llm = []
     for msg in state["messages"]:
@@ -63,26 +112,29 @@ def llm_node(
                     "content": msg.content,
                 }]
             })
-    
+
     # 获取工具 schemas
     provider = "anthropic" if "claude" in llm_router.config.model.lower() else "openai"
     tool_schemas = tool_registry.list_schemas(provider=provider)
-    
+
     # 调用 LLM（流式，通过 writer 增量输出）
     # 🔑 关键改进：边接收边写入 Stream，不等待完整响应
     full_response = ""
     tool_calls = []
     usage_stats = None
-    
+
     # 如果有 system_prompt，插入消息开头（自研版在 messages_for_llm 中处理）
     if system_prompt:
         has_system = any(m.get("role") == "system" for m in messages_for_llm)
         if not has_system:
             messages_for_llm.insert(0, {"role": "system", "content": system_prompt})
-    
+
     # 🔑 错误处理：LLM 调用异常时优雅降级
     try:
-        chunk_iter = llm_router.chat(messages_for_llm, tools=tool_schemas or None)
+        chunk_iter = llm_router.chat(
+            messages_for_llm, tools=tool_schemas or None,
+            cache_namespace=cache_namespace,
+        )
     except Exception as e:
         error_msg = f"LLM 调用失败: {str(e)}"
         writer({"type": "error", "message": error_msg})
