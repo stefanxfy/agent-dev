@@ -327,54 +327,12 @@ pytest tests/test_extractor.py::test_merged_call -v
 
 **验收 demo**(2026-06-21 对齐实际 API 后版本):
 ```bash
-# 1. 端到端: 初始化 SM → 填内容 → 触发决策 → 压缩
-.venv/bin/python -c "
-import tempfile
-from pathlib import Path
-from agent_core.memory import MemoryConfig, SessionMemoryLayer
-from agent_core.memory.sm_layer import TurnContext
-
-tmp = Path(tempfile.mkdtemp())
-sm_path = tmp / 'sm.md'
-config = MemoryConfig().compact
-sm = SessionMemoryLayer('demo_s2', sm_path, config)
-
-# Step 1: 初始化 SM 文件 + 模拟 LLM extract 填充内容
-sm.write_sm_template()
-content = sm.read_sm()
-content = content.replace('<!-- 当前会话目标、约束、已知事实 -->', '用户学习 React,6 周完成项目')
-content = content.replace('<!-- 已做的决策(用户偏好 + 系统决策) -->', '1. 用 Vite 不用 CRA\\n2. TypeScript strict')
-sm_path.write_text(content, encoding='utf-8')
-assert not sm.sm_is_template(), 'SM 文件应为已填内容态'
-
-# Step 2: 触发决策 (token > 10K 阈值)
-ctx = TurnContext(
-    messages=[{'id': 'm1', 'role': 'user', 'content': 'x' * 4000}],
-    total_tokens=12000,
-    tool_count=2,
-)
-decision = sm.should_trigger_compact(ctx)
-print(f'  decision: strategy={decision.strategy}, reason={decision.reason}')
-assert decision.strategy == 'sm_compact', f'应触发 SM-compact,实际 = {decision.strategy}'
-
-# Step 3: compact() 产出 summary + kept_messages
-messages = [{'id': f'm{i}', 'role': 'user' if i%2==0 else 'assistant', 'content': f'msg{i}'*50} for i in range(5)]
-result = sm.compact(messages, context_window=128000)
-assert result is not None
-assert result.used_tokens_estimate > 0, f'used_tokens_estimate 应为正,实际 = {result.used_tokens_estimate}'
-assert '用户学习 React' in result.summary_message['content']
-assert 'Vite' in result.summary_message['content']
-print(f'  ✅ compacted: kept={len(result.kept_messages)}, used_tokens={result.used_tokens_estimate}')
-"
-
-# 2. 5 条回退条件
-.venv/bin/python -m pytest tests/test_sm_layer.py -v -k fallback
-# Expected: 6 passed (5 回退 + 1 template variant)
-
-# 3. 完整套件
-.venv/bin/python -m pytest tests/test_sm_layer.py -v
-# Expected: 32 passed
+# 1. 端到端 demo(4 case: 生命周期 / 触发 / 压缩 / 回归守护)
+bash scripts/demo_m4.sh
+# Expected: 4/4 demo 通过 + 32 passed
 ```
+
+完整 demo 代码见 [`scripts/demo_m4.sh`](scripts/demo_m4.sh)。
 
 **API 变更说明**(对比 plan 原始描述):
 | plan 写的 | 实际实现 | 备注 |
