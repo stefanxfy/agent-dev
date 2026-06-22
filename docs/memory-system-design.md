@@ -336,6 +336,55 @@ class ExtractionGate:
 
 > **解释**：CC 的实际配置来自 Statsig 服务端下发（`tengu_session_memory`），上面是合理的近似值。生产环境应该把 `min_tokens_to_init` 等参数**暴露在 config 里**，方便不同场景调优（短对话密集 vs 长对话稀疏）。
 
+### 3.3.1 用户调整版决策树（v2.1.1 增）—— M9 修订
+
+> **修订背景**：原 §3.3 决策树是 4 个 AND 串联的门，门2（5K token 间隔）+ 门3（关键词）+ 门4（LLM 评分）必须全过才提交 B。**实际联调发现两个问题**：
+> 1. **5K 间隔门**与"达到 10K 即重置计数"语义重叠，两者只能二选一
+> 2. **4 个 AND 串联**导致"累计 < 10K 且无关键词"的短对话即使说"记住"也不响应（违背用户直觉）
+>
+> M9 联调中与用户对齐后,调整为 **3 门 OR 关系**版本。
+
+**调整后决策树**：
+
+```
+B 触发决策树（v2.1.1 用户版）:
+│
+├─ 门1（累计型）: cumulative_tokens >= 10K  OR  tool_calls >= 10  ?
+│   ├─ 是 → 进入门3 LLM 评分
+│   │       （跑完 B 后，cumulative_tokens / tool_calls 清零，开始新一轮累计）
+│   └─ 否 ↓
+│
+├─ 门2（事件型）: 16 个关键词中 ≥1 命中？
+│   ├─ 是 → 进入门3 LLM 评分
+│   │       （不清零，门2 触发后保留累计计数，允许多次连续触发）
+│   └─ 否 → SKIP, reason: "no_trigger"
+│
+└─ 门3（质量门）: LLM 评分 confidence >= 0.6 ?
+    ├─ 是 → 提交 B
+    └─ 否 → SKIP, reason: "low_confidence(0.XX)"
+```
+
+**关键设计点**：
+
+| 点 | 原版 §3.3 | v2.1.1 用户版 |
+|----|----------|--------------|
+| 门数 | 4 个 AND 串联 | **3 个，门1 OR 门2 → 门3** |
+| 间隔节流 | 5K token 间隔门（门2 原版）| **取消**，改为"门1 跑完清零累计" |
+| 门1 触发后 | 还要过门3 关键词 | **直接走 LLM 评分** |
+| 门2 触发后 | 还要过门1 累计 | **直接走 LLM 评分** |
+| 关键词列表 | 13 个 | **16 个**（增加"记住/记一下/帮我记住/别忘了"） |
+
+**门1 清零逻辑**：
+
+- 门1 触发 LLM 评分后，**不管评分过没过 0.6 都要清零累计**（如果评分 < 0.6，仍算"已经尝试过这个周期"）
+- **修订**：门1 触发后 LLM 评分 < 0.6 → **不清零**累计（详见 §7 错误处理）
+- 门2 触发后 **不清零**（关键词型可连续多次触发）
+
+**会话级累计**：
+
+- 每次 session 开始时 `cumulative_tokens = 0, cumulative_tool_calls = 0`
+- 跨 session 不累计（避免短对话密集场景误触发）
+
 ---
 
 ## 四、记忆写入与压缩方案（v2：双通道 + 分层）
@@ -1220,6 +1269,61 @@ class MemoryExtractor:
 | SM 文件被损坏 | JSON / Markdown 解析失败 | 回退传统 compact + 修复 SM | UI 提示 |
 
 > **关键**：所有回退都是**无缝的**——用户感知不到"系统在降级运行"。Claude Code 的设计哲学也是这样：用户在各种异常路径下都能得到"合理"的响应，只是背后悄悄走了不同的代码路径。
+
+### 4.8 通道 A WAL 行为（v2.1.1 增）—— M9 修订
+
+> **修订背景**：原 §4.1 描述通道 A 写 daily log，但未明确"通道 A 与通道 B 的数据流关系"。**M9 联调澄清**：通道 A 写的 JSONL 是 **WAL（Write-Ahead Log）**，**不是 B 每次必读的"工作文件"**。
+
+**热路径 vs 冷路径**：
+
+| 场景 | A → B 链路 | 是否读 JSONL |
+|------|----------|------------|
+| **正常 turn-end**（同进程、连续运行）| A 内存传 `TurnMessage` 给 B | ❌ **不读** |
+| **进程崩了 + 重启**（A3 恢复）| 从 JSONL 重建 `TurnMessage` 喂给 B 补跑 | ✅ 读 |
+| **跨进程并发**（A4 IPCLock）| 进程 A 写 JSONL，进程 B 锁住 `daily_cursor` 之后从 JSONL 读 turn_range | ✅ 读 |
+| **手动工具排查** | `cat ~/.agent_data/logs/<id>.jsonl \| jq` | ✅ 读 |
+| **M5 蒸馏** | `DistillationScheduler` 读 JSONL 聚合 | ✅ 读 |
+
+**WAL 字段约定**（每行 JSON）：
+
+```python
+entry = {
+    "turn_index": turn_index,        # 主对话轮次序号
+    "user_msg": user_msg,            # 用户原文
+    "assistant_resp": assistant_resp, # 助手响应原文
+    "ts": time.time(),                # 时间戳
+}
+```
+
+**WAL 写入必须 fsync**（不只是 flush）：
+
+```python
+with open(log_path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    f.flush()
+    os.fsync(f.fileno())  # ★ 强制落盘,进程崩了不丢
+```
+
+**通道 A 必不做清单**（不变量 #3 + #4 强化）：
+
+- ❌ 不调 LLM
+- ❌ 不解析内容、关键词检测、LLM 评分
+- ❌ 不向量化
+- ❌ 不写 `~/.agent_data/memory/<type>/` 下任何文件
+- ❌ 不写 vector store
+- ❌ 不读 daily log（只 append，读是 B 或外部工具的事）
+
+**和 SessionManager 的关系**：
+
+- SessionManager 写 `data/sessions/<id>.jsonl`（主对话流，粒度细到每条 message）
+- 通道 A 写 `~/.agent_data/logs/<id>.jsonl`（记忆子系统，粒度粗到每 turn 一行）
+- **两者刻意分开**，免得记忆写入挂掉影响主对话上下文
+
+**为什么 JSONL 仍是必要**（不因为有内存链路就删 JSONL）：
+
+1. **崩溃恢复**：进程在 turn-end 后、B 跑完前 crash，没有 JSONL 就丢了 turn
+2. **跨进程**：Streamlit + CLI 并发时，两个进程看到的 turn 状态需要 JSONL 同步
+3. **调试可观测**：`tail -f` 实时看对话原文是排错最直接的方式
 
 ---
 
@@ -2396,6 +2500,135 @@ def test_cache_namespace_isolation():
 ```
 
 **对应 issue**:L13 审查指出"`cache_safe_params` / `cache_namespace` 是黑魔法",本节给完整契约 + 单测。
+
+### 6.9 门1 周期内去重 + 短对话"记住"策略（v2.1.1 增）—— M9 修订
+
+> **修订背景**:M9 联调中,按 §3.3.1 调整版决策树实现后,发现两个新问题需要明确:
+> 1. **门1 周期内重复提取**:门1 累计型触发会覆盖门2 已提过的内容
+> 2. **短对话"记住"不响应**:严格按 §3.3 后,短对话里"记住"被门1 累计阈值卡住
+
+#### 6.9.1 门1 周期内去重（LLM 提示词层去重,非代码层）
+
+**问题场景**:
+```
+Turn 5: "我总是用 uv"        累计 3.5K
+        门2 命中"总是" → 跑 B → 写入"用户习惯用 uv"
+        (累计不清零,因为门2 触发)
+
+Turn 15: 累计 12K
+         门1 ≥ 10K → 跑 B
+         LLM 看到对话里有 uv 提及 → 又觉得值得记
+         → 重复写入"用户习惯用 uv"(和 Turn 5 一模一样)
+```
+
+**解法**:门1 触发时,**LLM 提示词包含"本周期已提取的记忆"**,让 LLM 自己去重。
+
+**为什么不在代码层去重**:
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **代码层去重**(维护 `_max_processed_turn` 状态) | 状态可控 | **上下文断层**:LLM 看不到完整对话 |
+| **LLM 提示词层去重**(本次方案) | **上下文连贯**:LLM 看到完整对话 + 已记下的 | 依赖 LLM 语义判断 |
+
+**用户明确选**:LLM 提示词层去重,以保证上下文连贯。
+
+**提示词模板**:
+
+```xml
+<existing_memories_in_this_period>
+[user] 习惯用 uv (turn 5)
+[project] 项目叫 agent-dev (turn 8)
+</existing_memories_in_this_period>
+
+<conversation>
+[turn 6] ...
+[turn 7] ...
+...
+[turn 10] ...
+</conversation>
+
+请基于以上评估,提取"本周期内"的新记忆(避免和已提取的重复)
+```
+
+**状态管理**:
+
+```python
+# bridge 维护一个变量
+self.gate1_period_start_turn: int = 0  # 当前门1 周期起点
+
+# 每次门1 跑完,更新该变量
+if decision.via_gate1 and decision.should_extract:
+    self.gate1_period_start_turn = turn_index + 1
+```
+
+**MemoryStore.write 的 `item_hash` 仍保留作为最后兜底**（已有,不依赖 LLM 语义判断）。
+
+#### 6.9.2 短对话"记住"策略（不修,改用 UI toggle 显式表达）
+
+**问题**:
+```
+短对话(累计 < 10K)里用户说"记住我的名字叫张三"
+  → 门1 不达(3K < 10K)
+  → 门2 命中"记住"
+  → 调 LLM 评分
+  → 写盘 ✓
+```
+
+**等等,门2 命中就会调 LLM,为什么说"不响应"?**
+
+> **澄清**:门2 命中 → 调 LLM 评分 → confidence ≥ 0.6 才写盘。这是 §3.3.1 调整版的行为,不是"不响应"。
+>
+> **真正"不响应"的场景是**:门1 不达 + 门2 关键词未命中(比如用户说"我倾向 X"不命中 16 个关键词)。
+
+**两种修法评估**:
+
+| 方案 | 行为 | 评价 |
+|------|------|------|
+| **A. 关键词强意图短路**(门1 不到也调 LLM)| "记住" 命中 → 跳过门1门2 → 调 LLM | **违背设计 §3.3 严格性** |
+| **B. UI toggle "强制提取"** | 用户主动勾 toggle → 该 turn 必走 LLM | **符合 Claude Code `/remember` 哲学** |
+
+**用户选择 B**:不修决策树,改用 UI toggle 显式表达"立刻提取"意图。
+
+**Toggle 设计**:
+
+- **默认关**(严格按 §3.3.1)
+- **勾上后**:该 turn 必走 LLM 评分(绕开门1门2)
+- **不持久化**:每次 session 重新勾
+- **位置**:sidebar `🧠 Memory 状态` 折叠面板
+
+**为什么不选 A**:
+
+1. **违背 §3.3 严格性**:"猜用户意图"是设计本意拒绝的
+2. **关键词扩展风险**:为了命中更多意图,关键词会膨胀,污染决策树
+3. **CC 参考**:Claude Code 用 `/remember` slash command,不靠关键词猜
+4. **可观测**:toggle 显式表达,用户清楚什么时候在"加速模式"
+
+#### 6.9.3 决策树最终版(综合 §3.3.1 + §6.9.1 + §6.9.2)
+
+```
+B 触发决策树（v2.1.1 最终版）:
+│
+├─ Toggle "强制提取" 勾上?
+│   ├─ 是 → 必走门3 LLM 评分
+│   └─ 否 ↓
+│
+├─ 门1（累计型）: cumulative_tokens >= 10K  OR  tool_calls >= 10  ?
+│   ├─ 是 → 进入门3 LLM 评分
+│   │       (提示词含 <existing_memories_in_this_period> 让 LLM 自己去重)
+│   │       (跑完 B 后,累计清零)
+│   └─ 否 ↓
+│
+├─ 门2（事件型）: 16 个关键词中 ≥1 命中?
+│   ├─ 是 → 进入门3 LLM 评分
+│   │       (不清零累计)
+│   └─ 否 → SKIP, reason: "no_trigger"
+│
+└─ 门3（质量门）: LLM 评分 confidence >= 0.6 ?
+    ├─ 是 → 提交 B
+    └─ 否 → SKIP, reason: "low_confidence(0.XX)"
+```
+
+**对应实现 spec**:`docs/superpowers/specs/2026-06-22-react-memory-strict-design.md`
 
 ---
 
