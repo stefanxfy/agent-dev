@@ -516,16 +516,15 @@ def get_agent(session_id=None):
     registry = ToolRegistry()
     register_builtin_tools(registry)
 
-    # M7 ported: 记忆系统 hook(若启用,注入 retriever + store + extractor)
+    # M7 ported: 记忆系统 hook(若启用,注入 retriever + store)
     memory_retriever = None
     memory_store = None
-    memory_extractor = None
     memory_embed_fn = None
     if st.session_state.get("memory_enabled", False):
         try:
             from agent_core.memory import (
                 MemoryStore, ChromaVectorStore, MemoryRetriever,
-                MemoryExtractor, make_embed_fn,
+                make_embed_fn,
             )
             from agent_core.config import config as _agent_config
             # AGENT_DATA_DIR 为空时 fallback 到 ~/.agent_data(与 config.py 默认约定一致)
@@ -542,13 +541,10 @@ def get_agent(session_id=None):
                 vector_store=vec_store,
                 embed_fn=memory_embed_fn,
             )
-            # C 方案: 实时提取器(M3 L1 合并 + 过滤 + 校验)
-            memory_extractor = MemoryExtractor(embed_fn=memory_embed_fn)
         except Exception as e:
             logging.warning(f"Memory system init failed: {e}")
             memory_retriever = None
             memory_store = None
-            memory_extractor = None
             memory_embed_fn = None
 
     # Day 4: 传入 session_id 实现历史持久化
@@ -559,8 +555,7 @@ def get_agent(session_id=None):
         session_data_dir=DATA_DIR,
         memory_retriever=memory_retriever,    # M7 ported: 检索 + 注入
         memory_store=memory_store,             # M7 ported: 库内计数
-        memory_extractor=memory_extractor,     # C 方案: 实时提取
-        memory_embed_fn=memory_embed_fn,       # C 方案: extractor 嵌入
+        # Task 7: Option C 同步提取已删除,改为通过 react_memory_bridge 接入
     )
     return agent
 
