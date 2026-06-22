@@ -306,6 +306,40 @@ class MemoryStore:
                 continue
         return results
 
+    def list_by_session(
+        self,
+        session_id: str,
+        since_turn: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        列出指定 session_id 且 turn_index >= since_turn 的所有记忆
+
+        用途:门1 跑 LLM 评分时,拼"本周期已提取记忆"块
+
+        Returns:
+            [{"frontmatter": {...}, "body": "..."}, ...]
+        """
+        results: list[dict[str, Any]] = []
+        for type_ in ("user", "feedback", "project", "reference"):
+            type_dir = self.root / type_
+            if not type_dir.exists():
+                continue
+            for md_path in type_dir.glob("*.md"):
+                try:
+                    data = self.read(str(md_path.relative_to(self.root)))
+                except Exception:
+                    continue
+                fm = data.get("frontmatter", {})
+                # frontmatter 需同时含 session_id 和 turn_index
+                if fm.get("session_id") != session_id:
+                    continue
+                turn_idx = fm.get("turn_index", -1)
+                if turn_idx < since_turn:
+                    continue
+                data["frontmatter"]["type"] = data["frontmatter"].get("type", type_)
+                results.append(data)
+        return results
+
     def list_all(self) -> dict[str, list[dict[str, Any]]]:
         """列出所有类型的记忆（按 type 分组）"""
         result: dict[str, list[dict[str, Any]]] = {}
