@@ -341,6 +341,16 @@ class DualChannelWriter:
                 # 2. LLM 提取（M3 接 router）
                 candidates = extractor(to_process)
 
+                # M9 review: defensive pairing guard before zip().
+                # 当前 extractor 契约是 1:1（to_process[i] ↔ candidates[i]）,
+                # 但 LLM 契约允许 0-N,zip() 会在长度不齐时静默截断。
+                # 一旦 extractor 改为多 candidate/turn,需同步更新此处配对逻辑。
+                if len(to_process) != len(candidates):
+                    logger.warning(
+                        f"channel_b pairing mismatch: {len(to_process)} messages "
+                        f"vs {len(candidates)} candidates — truncating"
+                    )
+
                 # 3. 逐条写 MemoryStore（A5 幂等）
                 #    将 session_id + turn_index 写入 frontmatter extra,
                 #    供 list_by_session 查询

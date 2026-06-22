@@ -897,6 +897,20 @@ if prompt := st.chat_input("输入消息..."):
                     f"stored={ms['stored_total']} · "
                     f"zero_hit={content.get('zero_hit', False)}"
                 )
+            elif msg_type == "memory_event":
+                # M9: 严格双通道记忆事件 → 累积到 session_state.memory_stats
+                event = content
+                ms = st.session_state.memory_stats
+                kind = event.kind.value
+                if kind == "extract_dispatched":
+                    ms["candidates_written"] = ms.get("candidates_written", 0) + event.candidates_count
+                elif kind == "gate_pass":
+                    ms["gate_passes"] = ms.get("gate_passes", 0) + 1
+                elif kind == "gate_skip":
+                    ms["gate_skips"] = ms.get("gate_skips", 0) + 1
+                elif kind == "extract_error":
+                    ms["last_extract_error"] = str(event.reason or "unknown")
+                st.session_state.memory_stats = ms
 
         # 流式结束：清理 UI
         # 文本区去掉光标
