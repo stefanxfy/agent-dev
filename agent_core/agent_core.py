@@ -153,6 +153,8 @@ class ReactAgent:
         session_data_dir: Optional[str] = None,  # Day 4: session 数据目录
         memory_retriever: Optional["MemoryRetriever"] = None,  # M7 ported: 记忆检索
         memory_store: Optional["MemoryStore"] = None,           # M7 ported: 库内计数
+        memory_extractor: Optional["MemoryExtractor"] = None,   # C 方案: 实时记忆提取
+        memory_embed_fn: Optional[Any] = None,                  # C 方案: extractor 用的嵌入
     ):
         self.llm = llm_router
         self.tools = tool_registry
@@ -172,6 +174,9 @@ class ReactAgent:
         # M7 ported: 记忆系统 hooks(若注入,则每次 LLM 调用前检索 + 推送 memory_status)
         self.memory_retriever = memory_retriever
         self.memory_store = memory_store
+        # C 方案: 实时提取 hook(run() 末尾调 → 把对话转成长期记忆)
+        self.memory_extractor = memory_extractor
+        self.memory_embed_fn = memory_embed_fn
         
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
@@ -724,6 +729,32 @@ class ReactAgent:
             # 循环正常结束（没 break）→ 达到 max_turns
             yield ("system", f"⚠️ 达到最大轮次（{self.max_turns}），强制结束")
 
+        # C 方案: run 末尾做一次实时记忆提取(若注入 extractor)
+        # 简单实现:把本次 user + assistant 消息拼成 prompt,让 LLM 提取候选 → write
+        # 失败不阻断:try/except 兜底,只 log
+        if self.memory_extractor and self.memory_store and len(self.messages) >= 2:
+            try:
+                # 收集本 run 的 user/assistant 文本对(只取最后一对,避免对历史反复提取)
+                last_user = next(
+                    (m["content"] for m in reversed(self.messages)
+                     if m.get("role") == "user" and isinstance(m.get("content"), str)),
+                    None,
+                )
+                last_assistant = next(
+                    (m["content"] for m in reversed(self.messages)
+                     if m.get("role") == "assistant" and isinstance(m.get("content"), str)),
+                    None,
+                )
+                if last_user and last_assistant:
+                    yield ("system", "🧠 正在提取记忆...")
+                    extracted = self._extract_and_write(last_user, last_assistant)
+                    if extracted > 0:
+                        yield ("system", f"✅ 已写入 {extracted} 条记忆")
+                    else:
+                        yield ("system", "🧠 无新增记忆")
+            except Exception as e:
+                _logger.warning(f"Memory extraction failed: {e}")
+
         # Day 4: run 结束后 flush session
         if self._session_manager:
             try:
@@ -741,6 +772,118 @@ class ReactAgent:
             return provider
         # 如果是枚举
         return str(provider.value) if hasattr(provider, "value") else "anthropic"
+
+    # ── C 方案:实时记忆提取 ─────────────────────────────────────────
+    def _extract_and_write(self, user_msg: str, assistant_msg: str) -> int:
+        """
+        单次 run 的实时记忆提取:
+        1. 拼 prompt 让 LLM 提取候选(轻量,只针对最后一对 user/assistant)
+        2. 走 MemoryExtractor.process()(校验 + 合并 + 去密)
+        3. 逐条 memory_store.write()(per-file 写入 ~/.agent_data/memory/<type>/<hash>.md)
+
+        Returns:
+            写入文件数(0 = 无新增)
+        """
+        from agent_core.memory.extractor import ExtractionCandidate
+
+        prompt = f"""从以下对话中提取值得长期记住的信息。每条记忆必须符合 4 类之一:user / feedback / project / reference。
+
+[User]
+{user_msg[:500]}
+
+[Assistant]
+{assistant_msg[:500]}
+
+输出格式(每条记忆 4 行 YAML,无需额外解释;若无记忆输出 "NONE"):
+---
+type: <user|feedback|project|reference>
+title: <短标题 ≤ 20 字>
+body: <一句话描述>
+source_quote: <user 的原话片段>
+tags: [<tag1>, <tag2>]
+importance: <1-10>
+---"""
+
+        raw = self.llm.chat(
+            messages=[{"role": "user", "content": prompt}],
+        )
+        # 收集文本(同步消费)
+        text = ""
+        for chunk in raw:
+            if chunk.text_delta:
+                text += chunk.text_delta.text
+
+        if "NONE" in text.strip()[:20].upper() or not text.strip():
+            return 0
+
+        # 解析 YAML 块(可能有多个)
+        candidates: list[ExtractionCandidate] = []
+        import re as _re
+        # 匹配 --- type:/title:/body:/source_quote:/tags:[...] ---
+        # importance 字段可选(score 自动映射)
+        yaml_block_pattern = _re.compile(
+            r"---\s*\n"
+            r"type:\s*(\S+)\s*\n"
+            r"title:\s*(.+?)\s*\n"
+            r"body:\s*(.+?)\s*\n"
+            r"source_quote:\s*(.*?)\s*\n"
+            r"tags:\s*\[(.*?)\]\s*\n"
+            r"(?:importance:\s*(\d+)\s*\n)?"
+            r"---",
+            _re.DOTALL,
+        )
+        for m in yaml_block_pattern.finditer(text):
+            try:
+                tags = [t.strip().strip("'\"") for t in m.group(5).split(",") if t.strip()]
+                # importance 字段若有则用,否则从 score=0.8 映射
+                if m.group(6):
+                    score = max(0.1, min(1.0, int(m.group(6)) / 10.0))
+                else:
+                    score = 0.8
+                candidates.append(ExtractionCandidate(
+                    type=m.group(1).strip(),
+                    title=m.group(2).strip(),
+                    body=m.group(3).strip(),
+                    source_quote=m.group(4).strip(),
+                    tags=tags,
+                    score=score,
+                ))
+            except Exception:
+                continue
+
+        if not candidates:
+            _logger.debug(f"extract_and_write: 0 candidates from LLM output ({len(text)} chars)")
+            return 0
+
+        # 走 extractor 流程(校验 + 合并 + 去密)
+        cleaned = self.memory_extractor.process(candidates)
+
+        # 写盘(per-file,frontmatter 由 store 自动加)
+        written = 0
+        for c in cleaned:
+            try:
+                # importance:从 score(0-1)映射到 1-10,作为默认 importance
+                importance = max(1, min(10, int(c.score * 10)))
+                # project/reference 类必须含 **Why:** 段(M3 v2.1 §4.5 #7)
+                # LLM 提取时容易漏,这里自动补占位段
+                body = c.body
+                if c.type in ("project", "reference") and "**Why:**" not in body:
+                    body = f"{body}\n\n**Why:** {c.source_quote or '由用户对话中提取'}"
+
+                self.memory_store.write(
+                    type=c.type,
+                    title=c.title,
+                    body=body,
+                    source_quote=c.source_quote or user_msg[:100],
+                    tags=c.tags or [],
+                    extra={"importance": importance},  # M3 起 importance 是必填,走 extra
+                )
+                written += 1
+                _logger.info(f"✅ 记忆已写入: [{c.type}] {c.title}")
+            except Exception as e:
+                _logger.warning(f"memory_store.write failed: {e}")
+
+        return written
 
     # ── history 管理 ──────────────────────────────────────────────────
 
