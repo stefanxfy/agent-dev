@@ -520,11 +520,16 @@ def get_agent(session_id=None):
     memory_retriever = None
     memory_store = None
     memory_embed_fn = None
+    # Task 8: 严格双通道(react_memory_bridge)在 memory_enabled=True 且
+    # 上游 memory_store/vec_store/embed_fn 全部初始化成功后才构造。
+    react_memory_bridge = None
     if st.session_state.get("memory_enabled", False):
         try:
             from agent_core.memory import (
                 MemoryStore, ChromaVectorStore, MemoryRetriever,
                 make_embed_fn,
+                MetaDB, DualChannelWriter, ExtractionGate,
+                ReactMemoryBridge,
             )
             from agent_core.config import config as _agent_config
             # AGENT_DATA_DIR 为空时 fallback 到 ~/.agent_data(与 config.py 默认约定一致)
@@ -541,11 +546,35 @@ def get_agent(session_id=None):
                 vector_store=vec_store,
                 embed_fn=memory_embed_fn,
             )
+
+            # ── Task 8: 严格双通道 wiring ────────────────────────────
+            # meta.db 放 agent 数据根目录(避免污染 data/sessions/ 里的 jsonl)
+            meta_db_path = Path(agent_data_dir) / "meta.db"
+            meta_db = MetaDB(meta_db_path)
+            dual_channel = DualChannelWriter(
+                session_id=session_id or "default",
+                meta_db=meta_db,
+                memory_store=memory_store,
+                vector_store=vec_store,
+                embed_fn=memory_embed_fn,
+            )
+            gate = ExtractionGate(
+                llm_router=router,
+                memory_store=memory_store,
+                session_id=session_id or "default",
+            )
+            react_memory_bridge = ReactMemoryBridge(
+                dual_channel=dual_channel,
+                gate=gate,
+                memory_store=memory_store,
+                session_id=session_id or "default",
+            )
         except Exception as e:
             logging.warning(f"Memory system init failed: {e}")
             memory_retriever = None
             memory_store = None
             memory_embed_fn = None
+            react_memory_bridge = None
 
     # Day 4: 传入 session_id 实现历史持久化
     agent = ReactAgent(
@@ -555,7 +584,7 @@ def get_agent(session_id=None):
         session_data_dir=DATA_DIR,
         memory_retriever=memory_retriever,    # M7 ported: 检索 + 注入
         memory_store=memory_store,             # M7 ported: 库内计数
-        # Task 7: Option C 同步提取已删除,改为通过 react_memory_bridge 接入
+        react_memory_bridge=react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
     )
     return agent
 
