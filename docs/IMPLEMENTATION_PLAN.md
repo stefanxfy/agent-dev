@@ -532,6 +532,37 @@ bash scripts/demo_m7.sh
 
 ---
 
+### Day 9 — M9: ReAct 严格双通道记忆提取 ✅ (2026-06-22)
+
+> ✅ **状态:已完成** (2026-06-22 验收通过)
+> 已交付:删 Option C 同步 hack / 新增 ExtractionGate + ReactMemoryBridge + prompt_templates / 接入 DualChannelWriter + MetaDB / ReactAgent 用 bridge.on_turn_end 替换 / web/app.py 严格双通道 wiring。
+
+**目标**:把 ReAct Agent 的记忆提取从"同步 LLM hack"重构为"三级门 + 严格双通道",门 1 累计 OR 门 2 关键词 → 门 3 LLM 评分,通道 A WAL 即时落盘,通道 B 异步蒸馏并向量化。
+
+**核心改动**:
+- 删 Option C 同步 hack(`memory_extractor` / `_extract_and_write` / `🧠 正在提取` UI 提示)
+- 新增 `ExtractionGate` —— 三级门 OR 关系(门 1 累计计数 / 门 2 关键词命中 / 门 3 LLM 评分)
+- 新增 `ReactMemoryBridge` —— 替换 `on_turn_end` 回调,把 LLM 流式输出交给 ExtractionGate
+- 新增 `prompt_templates` —— `<existing_memories_in_this_period>` 提示词层去重
+- 接入 `DualChannelWriter` + `MetaDB`(sqlite cursor):通道 A 走 WAL fsync 落盘,通道 B 异步 LLM 评分后写盘 + 向量化
+- `ReactAgent` 用 `bridge.on_turn_end` 替换原同步 hook
+- `web/app.py` 严格双通道 wiring,移除所有"立即调用 LLM 提取"的旁路
+
+**验收记录**:
+- ✅ 三级门 OR 关系(门 1 累计 OR 门 2 关键词 → 门 3 LLM 评分)
+- ✅ 通道 A WAL(无 LLM,fsync 落盘)
+- ✅ 通道 B 异步(LLM 评分,后写盘 + 向量化)
+- ✅ 门 1 跑完清零 / 门 2 不清零
+- ✅ LLM 提示词层去重(`<existing_memories_in_this_period>`)
+- ✅ 112 tests passed, 1 pre-existing failure (unrelated), 2 skipped (Windows-only)
+
+**Spec/Plan/Design Doc**:
+- spec: `docs/superpowers/specs/2026-06-22-react-memory-strict-design.md`
+- plan: `docs/superpowers/plans/2026-06-22-react-memory-strict.md`
+- design doc: `docs/memory-system-design.md` §3.3.1 §4.8 §6.9 新增
+
+---
+
 ## 3. 风险 & 缓冲
 
 | 风险 | 概率 | 影响 | 缓解 |
