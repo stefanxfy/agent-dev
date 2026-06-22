@@ -251,26 +251,45 @@ def migrate_all(root: Path) -> MigrationReport:
           调用方需相应调整。旧版 0 = 全部已是最新 的语义不可靠
           (跳过 N 个也返回 0),新报告可区分 skipped 与 already_current。
         - 失败的文件不会中断遍历,会被记入 report.errors,供运维后续处理。
+        - M8:加 IPCLock 跨进程互斥,防止 cron 触发的批量迁移与
+          MemoryStore.read() 的 lazy migration 撞车(.bak 丢失)。
+          若锁被其他进程占用 → 立即返回空 report(非阻塞)。
     """
+    from agent_core.memory.ipc_lock import IPCLock, LockBusy
+
     root = Path(root)
     report = MigrationReport()
     if not root.exists():
         return report
-    for path in root.rglob("*.md"):
-        # 跳过 .bak sidecar
-        if path.suffix == ".bak":
-            continue
-        try:
-            result = migrate_file(path)
-            if result["migrated"]:
-                report.migrated += 1
-            else:
-                report.already_current += 1
-        except MigrationError as e:
-            report.skipped += 1
-            report.errors.append((path, str(e)))
-            logger.warning(f"跳过 {path}: {e}")
-            continue
+
+    # 跨进程互斥:防止 .bak 被另一进程覆盖
+    lock_path = root.parent / f".{root.name}.migrate.lock"
+    lock = IPCLock(lock_path, stale_pid_seconds=3600, stale_mtime_seconds=3600)
+    try:
+        acquired = lock.acquire(blocking=False)
+    except LockBusy:
+        logger.info(f"另一进程正在迁移 {root},跳过(返回空 report)")
+        return report
+    if not acquired:
+        logger.info(f"另一进程正在迁移 {root},跳过(返回空 report)")
+        return report
+    try:
+        for path in root.rglob("*.md"):
+            if path.suffix == ".bak":
+                continue
+            try:
+                result = migrate_file(path)
+                if result["migrated"]:
+                    report.migrated += 1
+                else:
+                    report.already_current += 1
+            except MigrationError as e:
+                report.skipped += 1
+                report.errors.append((path, str(e)))
+                logger.warning(f"跳过 {path}: {e}")
+                continue
+    finally:
+        lock.release()
     return report
 
 

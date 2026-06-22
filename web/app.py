@@ -84,6 +84,17 @@ if "agent" not in st.session_state:
     st.session_state.agent = None
 if "token_stats" not in st.session_state:
     st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0, "cached": 0}
+# M7 ported: 记忆系统状态
+if "memory_stats" not in st.session_state:
+    st.session_state.memory_stats = {
+        "total_searches": 0,
+        "total_hits": 0,
+        "last_zero_hit_turn": None,
+        "current_turn_hits": 0,
+        "stored_total": 0,
+    }
+if "memory_enabled" not in st.session_state:
+    st.session_state.memory_enabled = False
 if "current_thinking" not in st.session_state:
     st.session_state.current_thinking = ""
 if "tool_logs" not in st.session_state:
@@ -121,6 +132,31 @@ with st.sidebar:
             st.caption(f"🔥 cache: {cached_total:,} ({hit_rate:.1f}%)")
     else:
         st.caption("📝 发送消息后显示")
+
+    st.divider()
+
+    # M7 ported: 🧠 Memory 状态(折叠面板,默认折叠)
+    ms = st.session_state.memory_stats
+    with st.expander("🧠 Memory 状态", expanded=False):
+        st.caption(f"{'✅ 启用' if st.session_state.memory_enabled else '⚪ 未启用'}")
+        new_mem_enabled = st.toggle(
+            "启用记忆检索",
+            value=st.session_state.memory_enabled,
+            help="开启后,每条消息会检索相关记忆注入 system prompt",
+            key="memory_enabled_toggle",
+        )
+        if new_mem_enabled != st.session_state.memory_enabled:
+            st.session_state.memory_enabled = new_mem_enabled
+            st.session_state.agent = None  # 强制重建 agent
+            st.rerun()
+        st.metric("Searches", ms["total_searches"])
+        st.metric("Total Hits", ms["total_hits"])
+        st.metric("Last Turn Hits", ms["current_turn_hits"])
+        if ms["stored_total"]:
+            st.metric("Stored (N)", f"{ms['stored_total']}")
+        if ms["last_zero_hit_turn"]:
+            gap = ms["total_searches"] - ms["last_zero_hit_turn"]
+            st.metric("Last 0-hit", f"{gap} turns ago")
 
     st.divider()
     st.header("⚙️ LLM 配置")
@@ -437,6 +473,13 @@ with st.sidebar:
         st.session_state.messages = []
         st.session_state.tool_logs = []
         st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0, "cached": 0}
+        st.session_state.memory_stats = {
+            "total_searches": 0,
+            "total_hits": 0,
+            "last_zero_hit_turn": None,
+            "current_turn_hits": 0,
+            "stored_total": 0,
+        }
         st.session_state.current_thinking = ""
         if st.session_state.agent:
             st.session_state.agent.reset()
@@ -472,8 +515,40 @@ def get_agent(session_id=None):
     router = LLMRouter(config)
     registry = ToolRegistry()
     register_builtin_tools(registry)
+
+    # M7 ported: 记忆系统 hook(若启用,注入 retriever + store)
+    memory_retriever = None
+    memory_store = None
+    if st.session_state.get("memory_enabled", False):
+        try:
+            from agent_core.memory import MemoryStore, ChromaVectorStore, MemoryRetriever, make_embed_fn
+            from agent_core.config import settings as _settings
+            mem_root = Path(_settings.agent_data_dir) / "memory"
+            mem_root.mkdir(parents=True, exist_ok=True)
+            memory_store = MemoryStore(mem_root)
+            chroma_path = Path(_settings.agent_data_dir) / "chroma"
+            chroma_path.mkdir(parents=True, exist_ok=True)
+            vec_store = ChromaVectorStore(str(chroma_path), collection="react_demo")
+            embed_fn = make_embed_fn()  # 默认 MiniLM(无 bge 下载)
+            memory_retriever = MemoryRetriever(
+                memory_store=memory_store,
+                vector_store=vec_store,
+                embed_fn=embed_fn,
+            )
+        except Exception as e:
+            logging.warning(f"Memory system init failed: {e}")
+            memory_retriever = None
+            memory_store = None
+
     # Day 4: 传入 session_id 实现历史持久化
-    agent = ReactAgent(router, registry, max_turns=max_turns, session_id=session_id, session_data_dir=DATA_DIR)
+    agent = ReactAgent(
+        router, registry,
+        max_turns=max_turns,
+        session_id=session_id,
+        session_data_dir=DATA_DIR,
+        memory_retriever=memory_retriever,  # M7 ported
+        memory_store=memory_store,           # M7 ported
+    )
     return agent
 
 
@@ -770,6 +845,20 @@ if prompt := st.chat_input("输入消息..."):
                     f"🔥 [Cache] in={content.input_tokens:,} · "
                     f"cached={content.cached_tokens:,} · "
                     f"hit={hit_rate:.1f}%"
+                )
+            elif msg_type == "memory_status":
+                # M7 ported: 记忆检索状态 → 累积到 session_state.memory_stats
+                ms = st.session_state.memory_stats
+                ms["total_searches"] += 1
+                ms["total_hits"] += int(content.get("hits", 0))
+                ms["current_turn_hits"] = int(content.get("hits", 0))
+                ms["stored_total"] = int(content.get("stored_total", 0))
+                if content.get("zero_hit"):
+                    ms["last_zero_hit_turn"] = ms["total_searches"]
+                logging.debug(
+                    f"🧠 [Memory] hits={content.get('hits', 0)} · "
+                    f"stored={ms['stored_total']} · "
+                    f"zero_hit={content.get('zero_hit', False)}"
                 )
 
         # 流式结束：清理 UI

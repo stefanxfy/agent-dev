@@ -151,6 +151,8 @@ class ReactAgent:
         max_context_tokens: int = 100_000,  # Day 3: Token 预算（已被 ContextManager 替代，保留向后兼容）
         session_id: Optional[str] = None,   # Day 4: 会话 ID（可选）
         session_data_dir: Optional[str] = None,  # Day 4: session 数据目录
+        memory_retriever: Optional["MemoryRetriever"] = None,  # M7 ported: 记忆检索
+        memory_store: Optional["MemoryStore"] = None,           # M7 ported: 库内计数
     ):
         self.llm = llm_router
         self.tools = tool_registry
@@ -166,6 +168,10 @@ class ReactAgent:
         
         # P2 新增：从 LLMConfig 读取 system_prompt
         self.system_prompt = self.llm.config.system_prompt
+
+        # M7 ported: 记忆系统 hooks(若注入,则每次 LLM 调用前检索 + 推送 memory_status)
+        self.memory_retriever = memory_retriever
+        self.memory_store = memory_store
         
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
@@ -404,13 +410,50 @@ class ReactAgent:
 
             # ── 准备发送给 LLM 的 messages ──────────────────────────
             messages_for_llm = list(self.messages)
-            
+
             # P2 新增：如果有 system_prompt，添加到消息开头
             if self.system_prompt:
                 # 检查是否已经有 system message
                 has_system = any(m.get("role") == "system" for m in messages_for_llm)
                 if not has_system:
                     messages_for_llm.insert(0, {"role": "system", "content": self.system_prompt})
+
+            # M7 ported: 记忆检索(若启用)→ 拼成 system 片段 + 推送 memory_status
+            if self.memory_retriever:
+                # 用最后一条 user message 做 query
+                last_user_msg = next(
+                    (m for m in reversed(messages_for_llm) if m.get("role") == "user"),
+                    None,
+                )
+                if last_user_msg and isinstance(last_user_msg.get("content"), str):
+                    try:
+                        report = self.memory_retriever.search(last_user_msg["content"], top_k=5)
+                        hits = report.hits if hasattr(report, "hits") else []
+                        if hits:
+                            mem_block = "\n\n[记忆库 / {} hits]\n".format(len(hits))
+                            for h in hits:
+                                mem_block += f"- [{getattr(h, 'type', '?')}] {getattr(h, 'title', '')}: {(getattr(h, 'body', '') or '')[:200]}\n"
+                            # 追加到 system prompt(不覆盖,只是叠加)
+                            messages_for_llm = [{"role": "system", "content": (self.system_prompt or "") + mem_block}] + [
+                                m for m in messages_for_llm if m.get("role") != "system"
+                            ]
+                        # 推送 memory_status 给 UI(stream chunk)
+                        stored_total = 0
+                        if self.memory_store:
+                            try:
+                                counts = self.memory_store.count_by_type()
+                                stored_total = sum(counts.values()) if isinstance(counts, dict) else 0
+                            except Exception:
+                                pass
+                        injected_tokens = sum(len((getattr(h, "body", "") or "")) // 4 for h in hits)
+                        yield ("memory_status", {
+                            "hits": len(hits),
+                            "stored_total": stored_total,
+                            "injected_tokens": injected_tokens,
+                            "zero_hit": len(hits) == 0,
+                        })
+                    except Exception as e:
+                        _logger.warning(f"Memory retrieval failed: {e}")
 
             # ── 调用 LLM（流式）─────────────────────────────────────
             tool_schemas = self.tools.list_schemas(provider=self._detect_provider())
@@ -432,6 +475,7 @@ class ReactAgent:
                 llm_chunks = self.llm.chat(
                     messages=messages_for_llm,
                     tools=tool_schemas or None,
+                    cache_namespace=f"react:{self._session_manager.session_id if self._session_manager else 'default'}",  # M7 ported: prompt cache namespace
                 )
             except Exception as e:
                 # LLM 调用异常，优雅降级
