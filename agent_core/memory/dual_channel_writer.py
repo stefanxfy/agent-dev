@@ -342,7 +342,9 @@ class DualChannelWriter:
                 candidates = extractor(to_process)
 
                 # 3. 逐条写 MemoryStore（A5 幂等）
-                for cand in candidates:
+                #    将 session_id + turn_index 写入 frontmatter extra,
+                #    供 list_by_session 查询
+                for m, cand in zip(to_process, candidates):
                     try:
                         item_hash = self.memory_store.write(
                             type=cand.type,
@@ -350,6 +352,10 @@ class DualChannelWriter:
                             body=cand.body,
                             source_quote=cand.source_quote,
                             tags=cand.tags,
+                            extra={
+                                "session_id": self.session_id,
+                                "turn_index": m.turn_index,
+                            },
                         )
                         # 4. 写 vector store —— 必须含 embedding(ChromaVectorStore 强制)
                         #    计算 embedding 失败 → 整个 candidate 失败,MemoryStore 已写不撤回
