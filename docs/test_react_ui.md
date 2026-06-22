@@ -136,61 +136,33 @@ tail -f ~/.agent_data/logs/*.jsonl
 
 #### 预期发生(肉眼可见)
 
-**主聊天区**:每条回复**末尾**会显示一条 system 消息:
-```
-🧠 正在提取记忆...
-✅ 已写入 N 条记忆       ← N = 该 turn 实际抽出的条数,1-3 不等
-# 或
-🧠 无新增记忆            ← 当 LLM 判断这条对话不值得长期记住
-```
-
-**Terminal 2 (watch -n 1)**:每条 turn 后目录出现 1-3 个 `.md` 文件
-```
-~/.agent_data/memory/user/
-├── a1b2c3d4e5f6.md   ← 第 1 轮:"我叫小明..."
-├── b2c3d4e5f6a1.md   ← 第 1 轮:"做 Python 后端"
-├── c3d4e5f6a1b2.md   ← 第 2 轮:"在上海工作"
-├── d4e5f6a1b2c3.md   ← 第 3 轮:"喜欢简洁"
-├── e5f6a1b2c3d4.md   ← 第 4 轮:"习惯用 uv"
-```
+**主聊天区**:无 "🧠 正在提取" 同步消息(通道 B 异步,不阻塞流)
 
 **Terminal 1 (后端日志)**:
 ```
-[INFO] react_agent: ✅ 记忆已写入: [user] 用户姓名/职业
-[INFO] react_agent: ✅ 记忆已写入: [user] 编程语言偏好
-[INFO] react_agent: ✅ 记忆已写入: [user] 地理位置
-...
+[INFO] react_agent: ✅ 记忆已写入: [user] 用户姓名     ← 来自通道 B 异步
+[INFO] memory.react_bridge: 门1 跑完清零: gate1_period_start_turn=5  ← 累计 10K 触发
+[INFO] memory.dual_channel: channel_a write turn=5    ← 通道 A 同步
+```
+
+**Terminal 2 (watch -n 1)**:频道变化(累计 10K 后才有 B 写盘)
+```
+~/.agent_data/memory/user/
+├── a1b2c3d4...md    ← 累计过 10K 后写入
+~/.agent_data/logs/
+└── s1.jsonl          ← 通道 A 每 turn 追加 1 行
 ```
 
 **sidebar `🧠 Memory 状态`**:
-- `启用实时提取`:✅ 打开
-- Searches:4(每 turn 一次)
-- Total Hits:0(首次还没历史记忆可命中)
-- Last Turn Hits:0
-- Stored:user 类计数随 turn 累加(4 轮后约 5-8 条)
+- 本会话累计: 12,000 tokens(累计 10K 时跑 B,清零)
+- 本会话 tool: 0
+- Daily Log: 1 line
+- Memory: 1 file
 
-**亲眼看到**:打开 `~/.agent_data/memory/user/a1b2c3d4e5f6.md`:
-```yaml
----
-type: user
-title: 用户姓名/职业
-importance: 7
-schema_version: 2
-created_at: '2026-06-22T...'
-source_quote: '我叫小明,做 Python 后端开发'
-tags: [name, identity]
-item_hash: a1b2c3d4...
----
-
-# 用户姓名/职业
-
-用户名叫小明,做 Python 后端开发
-```
-
-> **如果 turn 后 `~/.agent_data/memory/` 仍然为空**,检查:
-> 1. sidebar toggle 是否打开
-> 2. 后端日志有无 `Memory extraction failed:` 警告
-> 3. `.env` 里 LLM provider 是否配好(extract 步骤会再调一次 LLM)
+**关键差异 vs Option C**:
+- 短对话(< 10K 且无关键词):不写盘(以前是每 turn 必提)
+- 累计过 10K:走 LLM 评分(以前是强制提)
+- 异步不阻塞:聊天区不显示 "🧠 正在提取"(以前同步显示)
 
 ---
 
