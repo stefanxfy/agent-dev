@@ -1,0 +1,160 @@
+"""
+ReAct 严格双通道端到端集成测试
+参考 spec §8.2
+"""
+import tempfile
+from pathlib import Path
+import shutil
+from unittest.mock import MagicMock
+
+from agent_core.memory.react_memory_bridge import (
+    ReactMemoryBridge,
+    MemoryEventKind,
+)
+from agent_core.memory.dual_channel_writer import DualChannelWriter
+from agent_core.memory.extraction_gate import ExtractionGate
+from agent_core.memory.memory_store import MemoryStore
+from agent_core.memory.meta_db import MetaDB
+
+
+def _make_bridge(llm_json_response: str, session_id: str = "s1"):
+    """helper:构造完整组件栈"""
+    tmp = Path(tempfile.mkdtemp(prefix="e2e_"))
+    meta = MetaDB(":memory:")
+    store = MemoryStore(tmp)
+    embed = MagicMock()
+    embed.encode.return_value = [0.1] * 4
+    vec = MagicMock()
+    dual = DualChannelWriter(
+        session_id=session_id, meta_db=meta,
+        memory_store=store, vector_store=vec, embed_fn=embed,
+    )
+    router = MagicMock()
+    def fake_chat(messages, **kw):
+        chunk = MagicMock()
+        chunk.text_delta.text = llm_json_response
+        yield chunk
+    router.chat = fake_chat
+    router.config.provider = "mock"
+    gate = ExtractionGate(llm_router=router, memory_store=store, session_id=session_id)
+    bridge = ReactMemoryBridge(
+        dual_channel=dual, gate=gate, memory_store=store,
+        session_id=session_id, max_workers=1,
+    )
+    return bridge, dual, store, tmp
+
+
+def test_channel_a_writes_daily_log():
+    """turn 末尾 ~/.agent_data/logs/<session>.jsonl 有 1 行"""
+    bridge, dual, store, tmp = _make_bridge(
+        '{"should_extract": false, "confidence": 0, "candidates": []}'
+    )
+    try:
+        # 注:DualChannelWriter 的日志路径 = memory_store.root.parent / "logs",
+        # 跨用例共用 ~/.agent_data 父目录时会撞路径. 这里清掉上次残留.
+        # 又:DualChannelWriter 的幂等检查是 turn_index <= daily_cursor,
+        # daily_cursor 初始为 0,turn_index=0 会被短路;这里用 1 绕过.
+        log_path = store.root.parent / "logs" / f"{bridge.session_id}.jsonl"
+        if log_path.exists():
+            log_path.unlink()
+        list(bridge.on_turn_end(
+            user_msg="hello", assistant_resp="hi",
+            turn_index=1, input_tokens=100, output_tokens=50, tool_calls_in_turn=0,
+            last_messages=[{"role": "user", "content": "hello"}],
+            recent_turns=[],
+        ))
+        assert log_path.exists()
+        assert log_path.read_text().count("\n") == 1
+    finally:
+        bridge.shutdown(timeout=5)
+        dual.shutdown(timeout=5)
+        shutil.rmtree(tmp)
+
+
+def test_gate1_clears_counter_after_extract():
+    """门1 跑完 → 累计清零"""
+    bridge, dual, store, tmp = _make_bridge(
+        '{"should_extract": true, "confidence": 0.85, "reason": "ok", '
+        '"candidates": [{"type": "user", "title": "姓名", "body": "张三", '
+        '"source_quote": "我叫张三"}]}'
+    )
+    try:
+        # 累计到 12K(过门1)
+        list(bridge.on_turn_end(
+            user_msg="Python 协程", assistant_resp="asyncio",
+            turn_index=0, input_tokens=6000, output_tokens=6000, tool_calls_in_turn=0,
+            last_messages=[{"role": "user", "content": "Python 协程"}],
+            recent_turns=[],
+        ))
+        # 跑完后累计应清零
+        assert bridge.cumulative_tokens == 0
+        assert bridge.cumulative_tool_calls == 0
+    finally:
+        bridge.shutdown(timeout=5)
+        dual.shutdown(timeout=5)
+        shutil.rmtree(tmp)
+
+
+def test_gate2_does_not_clear_counter():
+    """门2 跑完 → 累计不清零"""
+    bridge, dual, store, tmp = _make_bridge(
+        '{"should_extract": true, "confidence": 0.85, "reason": "ok", '
+        '"candidates": [{"type": "user", "title": "姓名", "body": "张三", '
+        '"source_quote": "我叫张三"}]}'
+    )
+    try:
+        # 累计 200(没过门1,但有"记住"关键词)
+        list(bridge.on_turn_end(
+            user_msg="记住我叫张三", assistant_resp="好",
+            turn_index=0, input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+            last_messages=[{"role": "user", "content": "记住我叫张三"}],
+            recent_turns=[],
+        ))
+        # 累计应保留(门2 跑完不清零)
+        assert bridge.cumulative_tokens == 200
+        assert bridge.cumulative_tool_calls == 0
+    finally:
+        bridge.shutdown(timeout=5)
+        dual.shutdown(timeout=5)
+        shutil.rmtree(tmp)
+
+
+def test_dedup_via_prompt():
+    """门1 跑 LLM 评分时,prompt 含 <existing_memories_in_this_period>"""
+    captured_prompts = []
+
+    bridge, dual, store, tmp = _make_bridge(
+        '{"should_extract": false, "confidence": 0, "candidates": []}'
+    )
+    # 替换 llm_router.chat 捕获 prompt
+    router = bridge.gate.llm_router
+    original_chat = router.chat
+    def fake_chat_capture(messages, **kw):
+        captured_prompts.append(messages)
+        chunk = MagicMock()
+        chunk.text_delta.text = '{"should_extract": false, "confidence": 0, "candidates": []}'
+        yield chunk
+    router.chat = fake_chat_capture
+
+    try:
+        # 先写一条记忆(模拟"本周期已提过")
+        store.write(
+            type="user", title="已有", body="已有记忆",
+            source_quote="turn 1", tags=[],
+            extra={"session_id": "s1", "turn_index": 1},
+        )
+        # 累计 12K 触发门1
+        list(bridge.on_turn_end(
+            user_msg="Python", assistant_resp="解释",
+            turn_index=5, input_tokens=6000, output_tokens=6000, tool_calls_in_turn=0,
+            last_messages=[{"role": "user", "content": "Python"}],
+            recent_turns=[],
+        ))
+        # 检查 LLM 调用的 prompt 含 <existing_memories_in_this_period>
+        assert len(captured_prompts) > 0
+        user_msg = captured_prompts[0][-1]["content"]  # 最后一条 user 消息
+        assert "<existing_memories_in_this_period>" in user_msg
+    finally:
+        bridge.shutdown(timeout=5)
+        dual.shutdown(timeout=5)
+        shutil.rmtree(tmp)
