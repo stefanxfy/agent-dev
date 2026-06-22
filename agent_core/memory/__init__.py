@@ -110,6 +110,11 @@ from .distiller import (
 from .tracing import tracer, configure_tracing, TRACER_NAME
 from .scheduler import DistillationLoop
 
+# M9: 严格双通道(ReAct 决策树 + 桥接器)
+from .extraction_gate import ExtractionGate, TurnContext, Decision
+from .react_memory_bridge import ReactMemoryBridge, MemoryEvent, MemoryEventKind
+from .prompt_templates import build_extract_prompt, EXTRACT_SYSTEM_PROMPT
+
 # M7: Schema 迁移
 from .migration import (
     MigrationRegistry,
@@ -225,6 +230,15 @@ __all__ = [
     "tracer",
     "configure_tracing",
     "TRACER_NAME",
+    # M9: 严格双通道(ReAct)
+    "ExtractionGate",
+    "TurnContext",
+    "Decision",
+    "ReactMemoryBridge",
+    "MemoryEvent",
+    "MemoryEventKind",
+    "build_extract_prompt",
+    "EXTRACT_SYSTEM_PROMPT",
     # M7: Schema 迁移
     "MigrationRegistry",
     "MigrationError",
