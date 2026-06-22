@@ -522,11 +522,13 @@ def get_agent(session_id=None):
     if st.session_state.get("memory_enabled", False):
         try:
             from agent_core.memory import MemoryStore, ChromaVectorStore, MemoryRetriever, make_embed_fn
-            from agent_core.config import settings as _settings
-            mem_root = Path(_settings.agent_data_dir) / "memory"
+            from agent_core.config import config as _agent_config
+            # AGENT_DATA_DIR 为空时 fallback 到 ~/.agent_data(与 config.py 默认约定一致)
+            agent_data_dir = _agent_config.agent_data_dir or str(Path.home() / ".agent_data")
+            mem_root = Path(agent_data_dir) / "memory"
             mem_root.mkdir(parents=True, exist_ok=True)
             memory_store = MemoryStore(mem_root)
-            chroma_path = Path(_settings.agent_data_dir) / "chroma"
+            chroma_path = Path(agent_data_dir) / "chroma"
             chroma_path.mkdir(parents=True, exist_ok=True)
             vec_store = ChromaVectorStore(str(chroma_path), collection="react_demo")
             embed_fn = make_embed_fn()  # 默认 MiniLM(无 bge 下载)

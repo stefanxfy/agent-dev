@@ -6,12 +6,15 @@ LLM Router — 统一多厂商 LLM 调用（支持流式输出）
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Generator, Optional
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("llm.router")
 
 
 # ── 枚举与配置 ────────────────────────────────────────────────────────────
