@@ -71,6 +71,7 @@ from agent_core.llm.router import (
     UsageStats,
 )
 from agent_core.agent_core import ReactAgent
+from agent_core.memory.config import MemoryConfig  # M10 C7.1: 共享实例,line 648 + 719
 from agent_core.session.manager import SessionManager
 from agent_core.session.storage import SessionStorage
 from agent_core.tools.base import ToolRegistry
@@ -644,6 +645,8 @@ def get_agent(session_id=None):
             agent_data_dir = _agent_config.agent_data_dir or str(Path.home() / ".agent_data")
             mem_root = Path(agent_data_dir) / "memory"
             mem_root.mkdir(parents=True, exist_ok=True)
+            # M10 C7.1 final review fix: 单一 MemoryConfig 实例,cost_tracker / ReactAgent / UI 共享
+            memory_config = MemoryConfig()
             memory_store = MemoryStore(mem_root)
             chroma_path = Path(agent_data_dir) / "chroma"
             chroma_path.mkdir(parents=True, exist_ok=True)
@@ -663,10 +666,18 @@ def get_agent(session_id=None):
             # (retry/backoff/未来 cost tracker)的干扰。cache_namespace 由 gate
             # 默认 "memory_extract_score" 隔离,不需要在 router 层设。
             extractor_router = LLMRouter(config)
+            # M10 C7.1 final review fix: 默认启用 cost guard(spec §13.7)
+            # 从 memory_config 读 budget;UI Runtime Config 可运行时替换
+            from agent_core.memory.cost_tracker import CostTracker as _DefaultCT
+            _cost_tracker = _DefaultCT(
+                daily_budget_usd=memory_config.cost.daily_budget_usd,
+                enabled=memory_config.cost.enabled,
+            )
             gate = ExtractionGate(
                 llm_router=extractor_router,
                 memory_store=memory_store,
                 session_id=session_id or "default",
+                cost_tracker=_cost_tracker,
             )
             # M10 C1.2: 先构造 dual_channel,后构造 bridge,然后再装上 event_callback
             # (bridge 构造需 dual_channel 已就绪,所以 dual_channel 先造)
@@ -697,7 +708,6 @@ def get_agent(session_id=None):
 
     # Day 4: 传入 session_id 实现历史持久化
     # M10 C6.4: 传入 MemoryConfig,UI expander 才能 set_runtime in-place 改字段
-    from agent_core.memory.config import MemoryConfig
     agent = ReactAgent(
         router, registry,
         max_turns=max_turns,
@@ -706,7 +716,7 @@ def get_agent(session_id=None):
         memory_retriever=memory_retriever,    # M7 ported: 检索 + 注入
         memory_store=memory_store,             # M7 ported: 库内计数
         react_memory_bridge=react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
-        memory_config=MemoryConfig(),          # M10 C6.4: UI 运行时切换 hook
+        memory_config=memory_config,           # M10 C6.4 + C7.1: 共享 MemoryConfig 实例
     )
 
     # M10 C3.1: 启动 DistillationLoop(后台 daemon,10 分钟检查 4 重门)

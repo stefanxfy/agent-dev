@@ -61,3 +61,76 @@ def test_react_agent_accepts_memory_config_param():
         memory_config=config,
     )
     assert agent.memory_config is config
+
+
+def test_get_agent_auto_constructs_cost_tracker():
+    """M10 C7.1 final review fix: get_agent() 默认构造 CostTracker 并传给 ExtractionGate
+
+    source-level check(streamlit 不在 .venv,跑不了真 get_agent)
+    改用 AST 解析 web/app.py 源码,避免 import streamlit
+    """
+    import ast
+    from pathlib import Path
+
+    src_path = Path("web/app.py")
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+
+    # 找到 get_agent 函数
+    get_agent_func = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "get_agent":
+            get_agent_func = node
+            break
+    assert get_agent_func is not None, "get_agent 函数未在 web/app.py 中找到"
+
+    func_src = ast.unparse(get_agent_func)
+    # CostTracker 类被实例化
+    assert "CostTracker" in func_src, "CostTracker 未在 get_agent 中实例化"
+    # cost_tracker= kwarg 传给 gate / ExtractionGate
+    assert "cost_tracker=" in func_src, "cost_tracker 未作为 kwarg 传给 gate"
+    # memory_config 被 hoist 到 get_agent 顶部作为单一共享实例
+    assert "memory_config = MemoryConfig()" in func_src, (
+        "memory_config 未在 get_agent 顶部 hoist 为单一实例"
+    )
+
+
+def test_get_agent_uses_shared_memory_config_instance():
+    """M10 C7.1: get_agent() 内 ReactAgent 收到的是 gate 用的同一 memory_config
+
+    AST-level:ReactAgent 调用使用变量 'memory_config'(共享)而不是 'MemoryConfig()'(新实例)
+    """
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("web/app.py").read_text(encoding="utf-8"))
+    get_agent_func = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "get_agent"),
+        None,
+    )
+    assert get_agent_func is not None, "get_agent 函数未找到"
+
+    # 找 ReactAgent(...) 调用,验它的 memory_config kwarg 是 Name(id='memory_config')
+    func_src = ast.unparse(get_agent_func)
+    react_idx = func_src.find("ReactAgent(")
+    assert react_idx != -1, "ReactAgent 未在 get_agent 中调用"
+
+    # AST 检查 keyword args
+    call_node = None
+    for node in ast.walk(get_agent_func):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "ReactAgent":
+            call_node = node
+            break
+    assert call_node is not None, "ReactAgent Call 节点未找到"
+
+    memory_config_kwarg = next(
+        (kw for kw in call_node.keywords if kw.arg == "memory_config"),
+        None,
+    )
+    assert memory_config_kwarg is not None, "ReactAgent 没收到 memory_config kwarg"
+    assert isinstance(memory_config_kwarg.value, ast.Name), (
+        f"ReactAgent.memory_config 应是变量引用 (Name), 实际 {type(memory_config_kwarg.value).__name__} — "
+        "可能存在两实例 bug(gate 用一个,ReactAgent 又 new 一个)"
+    )
+    assert memory_config_kwarg.value.id == "memory_config", (
+        f"ReactAgent.memory_config 变量名应为 'memory_config',实际 '{memory_config_kwarg.value.id}'"
+    )

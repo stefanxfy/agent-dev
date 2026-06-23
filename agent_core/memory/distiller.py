@@ -462,8 +462,12 @@ class DistillationScheduler:
                         prior_mtime_ms=prior_mtime_ms,
                     )
 
-                # 4. 蒸馏
-                distiller = Distiller(self.llm, candidate_root=self._candidate_root)
+                # 4. 蒸馏(M10 C2.3 final review fix: 透传 sm_dir 让 Distiller 读 cross-session SM)
+                distiller = Distiller(
+                    self.llm,
+                    candidate_root=self._candidate_root,
+                    sm_dir=self.memory_root / "sm",
+                )
                 candidates = distiller.distill(session_log_files, existing)
 
                 # 5. 写候选(非 dry_run)

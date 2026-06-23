@@ -105,6 +105,35 @@ def test_distill_prompt_includes_sm_when_sm_dir_set(tmp_path):
     assert "跨会话 SM 摘要" in prompt
 
 
+def test_distillation_scheduler_threads_sm_dir_to_distiller(tmp_path, monkeypatch):
+    """M10 C7.1 final review fix: DistillationScheduler.run()
+    必须把 sm_dir 透传给 Distiller(L4 cross-session SM 输入才能在生产路径生效)
+    """
+    from unittest.mock import MagicMock, patch
+    from agent_core.memory.distiller import DistillationScheduler
+
+    monkeypatch.setattr("agent_core.memory.distiller.Distiller", MagicMock())
+
+    scheduler = DistillationScheduler(
+        memory_root=tmp_path,
+        llm_callback=lambda p: "[]",
+    )
+    # 触发 run() 的最小路径:门检查/lock/scan 都 mock 掉,直接到构造 Distiller
+    with patch.object(scheduler, "should_distill", return_value=(True, "ok")):
+        with patch.object(scheduler, "_acquire_lock", return_value=0):
+            with patch.object(scheduler, "_scan_session_logs", return_value=[]):
+                with patch.object(scheduler, "_read_existing_memories", return_value=[]):
+                    with patch.object(scheduler, "_release_lock", return_value=None):
+                        scheduler.run(dry_run=True)
+
+    # 验:Distiller 构造时传了 sm_dir kwarg
+    from agent_core.memory.distiller import Distiller as MockDist
+    call_kwargs = MockDist.call_args.kwargs
+    assert "sm_dir" in call_kwargs
+    expected = tmp_path / "sm"
+    assert call_kwargs["sm_dir"] == expected
+
+
 def test_distill_skips_sm_when_sm_dir_none(tmp_path):
     """sm_dir 为 None 时,prompt 不含 SM 段(或显式标记"(无)")"""
     captured_prompts = []
