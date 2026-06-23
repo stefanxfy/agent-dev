@@ -12,6 +12,7 @@ M1 / Day 1 — O8 修复 + v2.1 §5.3.1 封闭分类
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime
 from typing import Any, Literal, TypedDict
@@ -255,6 +256,29 @@ def validate_body(type_: MemoryType, body: str) -> None:
         )
 
 
+# ──────────────────────────────────────────────────────────────────
+# 4. 候选稳定去重 key（M10 C4.4）
+# ──────────────────────────────────────────────────────────────────
+
+def compute_candidate_key(type_: str, body: str) -> str:
+    """M10 C4.4: 候选稳定去重 key（sha256 of "{type}:{body}"）
+
+    用于 review 决策回灌：accept/reject 时记此 key，下次 distill 跳过同 key 候选。
+
+    注意: 不用 compute_item_hash（那个需要 source_quote，候选没这字段）。
+    type + body 已足够稳定地标识"同一条候选"。
+
+    >>> len(compute_candidate_key("user", "x"))
+    64
+    >>> compute_candidate_key("user", "x") == compute_candidate_key("user", "x")
+    True
+    >>> compute_candidate_key("user", "x") != compute_candidate_key("feedback", "x")
+    True
+    """
+    payload = f"{type_}:{body}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 __all__ = [
     "MemoryType",
     "Frontmatter",
@@ -263,5 +287,6 @@ __all__ = [
     "type_description",
     "validate_frontmatter",
     "validate_body",
+    "compute_candidate_key",
     "CURRENT_SCHEMA_VERSION",
 ]

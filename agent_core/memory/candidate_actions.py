@@ -116,6 +116,25 @@ def _serialize_candidate(parsed: dict) -> str:
     return f"---\n{parsed['frontmatter_raw']}\n---\n{parsed['body']}"
 
 
+# M10 C4.4: 候选 markdown 由 Distiller._render_body 生成, 格式固定为
+# '# {title}\n\n**Why:** {why}\n\n## 内容\n{body}\n'。scheduler skip-decided
+# 用 LLM 原始 body 字段算 key, 这里从渲染后的 markdown 里抽回原始 body,
+# 保证 accept/reject 记的 key 与 scheduler 跳过的 key 一致(端到端闭环)。
+_CONTENT_SECTION_RE = re.compile(r"## 内容\n(.*)$", re.DOTALL)
+
+
+def _extract_raw_body_for_key(parsed: dict) -> str:
+    """从 parsed['body'](渲染后的 markdown)抽回 LLM 原始 body 算决策 key
+
+    找不到 '## 内容' 段(非标准候选)时回退到整个 parsed['body']。
+    """
+    body = parsed.get("body", "")
+    m = _CONTENT_SECTION_RE.search(body)
+    if m:
+        return m.group(1).rstrip("\n")
+    return body
+
+
 # ─────────────────────────────────────
 # public API
 # ─────────────────────────────────────
@@ -174,6 +193,23 @@ def accept_candidate(
     # 删候选
     cand_path.unlink(missing_ok=True)
     logger.info(f"accepted candidate {cand_path.name} -> {type_}/{item_hash[:12]}.md")
+
+    # M10 C4.4: 记 review 决策(best-effort,meta_db 不可用则跳过)
+    # 用 _extract_raw_body_for_key 抽回 LLM 原始 body 算 key,
+    # 与 scheduler skip-decided(c["body"])口径一致(端到端闭环)
+    try:
+        from agent_core.memory.meta_db import MetaDB
+        from agent_core.memory.types import compute_candidate_key
+        meta_path = Path(memory_root).parent / "meta.db"
+        if meta_path.exists():
+            db = MetaDB(meta_path)
+            db.record_candidate_decision(
+                compute_candidate_key(parsed["type"], _extract_raw_body_for_key(parsed)),
+                "accepted",
+            )
+    except Exception as e:
+        logger.debug(f"record_candidate_decision(accepted) 跳过: {e}")
+
     return item_hash
 
 
@@ -184,10 +220,26 @@ def reject_candidate(
 ) -> None:
     """拒绝候选: 删除文件
 
-    meta_db.candidates.status 的写入留给 C4.4(本任务不双写)。
+    M10 C4.4: best-effort 记 review 决策到 meta_db(accepted|rejected)。
+    必须在 unlink 前先 parse(否则文件已删读不到 type/body)。
     """
+    parsed = _parse_candidate(cand_path)  # M10 C4.4: unlink 前先 parse
     cand_path.unlink(missing_ok=True)
     logger.info(f"rejected candidate {cand_path.name}: {reason or '(no reason)'}")
+
+    # M10 C4.4: 记 review 决策(best-effort)
+    try:
+        from agent_core.memory.meta_db import MetaDB
+        from agent_core.memory.types import compute_candidate_key
+        meta_path = Path(memory_root).parent / "meta.db"
+        if meta_path.exists():
+            db = MetaDB(meta_path)
+            db.record_candidate_decision(
+                compute_candidate_key(parsed["type"], _extract_raw_body_for_key(parsed)),
+                "rejected",
+            )
+    except Exception as e:
+        logger.debug(f"record_candidate_decision(rejected) 跳过: {e}")
 
 
 def edit_candidate(

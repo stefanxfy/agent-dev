@@ -58,6 +58,7 @@ class DistillationResult:
         candidates_written: 写出去的 .md 文件路径(dry_run=True 时为空)
         sessions_processed: 本次处理的 session 数
         prior_mtime_ms: 锁文件 prior mtime(用于诊断)
+        run_id: 本次写候选用的 run_id(dry_run=True 时为空)
         error: 异常 message(若有)
     """
     success: bool
@@ -67,6 +68,7 @@ class DistillationResult:
     candidates_written: list[Path] = field(default_factory=list)
     sessions_processed: int = 0
     prior_mtime_ms: int = 0
+    run_id: str = ""  # M10 C4.3: 本次写候选用的 run_id(dry_run=True 时为空)
     error: str = ""
 
 
@@ -466,8 +468,35 @@ class DistillationScheduler:
 
                 # 5. 写候选(非 dry_run)
                 written: list[Path] = []
+                run_id = ""  # M10 C4.3: 本次 run 的隔离目录名
                 if not dry_run:
-                    written = distiller.write_candidates(candidates, self._candidate_root)
+                    # M10 C4.4: 跳过已审候选(best-effort,meta_db 不可用则全写)
+                    try:
+                        from agent_core.memory.meta_db import MetaDB
+                        from agent_core.memory.types import compute_candidate_key
+                        meta_path = self.memory_root.parent / "meta.db"
+                        if meta_path.exists():
+                            db = MetaDB(meta_path)
+                            decided = db.list_decided_candidates()
+                            before = len(candidates)
+                            candidates = [
+                                c for c in candidates
+                                if compute_candidate_key(
+                                    c.get("type", "user"), c.get("body", "")
+                                ) not in decided
+                            ]
+                            if before != len(candidates):
+                                span.set_attribute(
+                                    "memory.distill.skipped_decided", before - len(candidates)
+                                )
+                    except Exception as e:
+                        logger.debug(f"skip-decided 过滤跳过(meta_db 不可用): {e}")
+
+                    # M10 C4.3: 透传 run_id,候选落到 _candidate/{run_id}/{type}/...
+                    run_id = f"run_{int(time.time())}"
+                    written = distiller.write_candidates(
+                        candidates, self._candidate_root, run_id=run_id
+                    )
 
                 # 6. 释放锁(成功)
                 self._release_lock(prior_mtime_ms, success=True)
@@ -482,6 +511,7 @@ class DistillationScheduler:
                     candidates_written=written,
                     sessions_processed=len(session_log_files),
                     prior_mtime_ms=prior_mtime_ms,
+                    run_id=run_id,  # M10 C4.3
                 )
             except Exception as e:
                 logger.exception("蒸馏异常,回滚 mtime")

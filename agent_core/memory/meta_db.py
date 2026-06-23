@@ -76,6 +76,13 @@ CREATE TABLE IF NOT EXISTS candidates (
 
 CREATE INDEX IF NOT EXISTS idx_candidates_status
     ON candidates (session_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS candidate_decisions (
+    cand_key    TEXT NOT NULL,           -- compute_candidate_key(type, body) (M10 C4.4)
+    decision    TEXT NOT NULL,           -- accepted | rejected
+    decided_at  REAL NOT NULL,
+    PRIMARY KEY (cand_key)
+);
 """
 
 
@@ -334,6 +341,43 @@ class MetaDB:
             ]
         except sqlite3.Error as e:
             raise MetaDBError(f"list_candidates 失败: {e}", cause=e)
+
+    # ── Candidate decisions（M10 C4.4: review 决策回灌） ────
+
+    def record_candidate_decision(self, cand_key: str, decision: str) -> None:
+        """M10 C4.4: 记一条 review 决策（UPSERT，同 key 覆盖）
+
+        Args:
+            cand_key: compute_candidate_key(type, body)
+            decision: "accepted" 或 "rejected"
+        """
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO candidate_decisions (cand_key, decision, decided_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(cand_key) DO UPDATE SET
+                        decision = excluded.decision,
+                        decided_at = excluded.decided_at
+                    """,
+                    (cand_key, decision, time.time()),
+                )
+        except sqlite3.Error as e:
+            raise MetaDBError(f"record_candidate_decision 失败: {e}", cause=e)
+
+    def list_decided_candidates(self) -> set[str]:
+        """M10 C4.4: 返回所有已审候选 key 集合（accepted + rejected 都算已审）
+
+        返回 set[str] 便于 O(1) 查询；候选数不大，一次性全读可接受。
+        """
+        try:
+            rows = self._conn().execute(
+                "SELECT cand_key FROM candidate_decisions"
+            ).fetchall()
+            return {r["cand_key"] for r in rows}
+        except sqlite3.Error as e:
+            raise MetaDBError(f"list_decided_candidates 失败: {e}", cause=e)
 
 
 __all__ = ["MetaDB", "MetaDBError"]
