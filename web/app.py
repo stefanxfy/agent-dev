@@ -184,6 +184,33 @@ with st.sidebar:
                 else:
                     st.caption("上次 tick: gate 拦住")
 
+    # M10 C4.1: 📥 待审候选提醒(折叠面板,默认折叠)
+    # mem_root 与 get_agent() 同口径(config.agent_data_dir or ~/.agent_data)
+    # session_state 不存 mem_root, 这里从 config 现算(sidebar rerun 频繁, 纯读)
+    with st.expander("📥 待审记忆", expanded=False):
+        try:
+            from agent_core.config import config as _agent_config_c4
+            _cand_data_dir = _agent_config_c4.agent_data_dir or str(Path.home() / ".agent_data")
+            _mem_root_for_cand = Path(_cand_data_dir) / "memory"
+        except Exception:
+            _mem_root_for_cand = Path.home() / ".agent_data" / "memory"
+
+        if not _mem_root_for_cand.exists():
+            st.caption("(memory 目录不存在)")
+        else:
+            from agent_core.memory.candidate_actions import list_candidates as _list_cands
+            pending = _list_cands(_mem_root_for_cand)
+            st.caption(f"{len(pending)} 条待审")
+            for _p in pending[:5]:
+                st.caption(f"· {_p.name}")
+            if len(pending) > 5:
+                st.caption(f"... 共 {len(pending)} 条")
+            try:
+                st.page_link("pages/02_Candidate_Review.py", label="查看全部 →")
+            except Exception:
+                # 老 Streamlit 无 page_link → link_button 兜底
+                st.link_button("查看全部 →", "/Candidate_Review")
+
     st.divider()
     st.header("⚙️ LLM 配置")
 
