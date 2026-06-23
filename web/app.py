@@ -604,8 +604,12 @@ def get_agent(session_id=None):
             # meta.db 放 agent 数据根目录(避免污染 data/sessions/ 里的 jsonl)
             meta_db_path = Path(agent_data_dir) / "meta.db"
             meta_db = MetaDB(meta_db_path)
+            # M10 C5.4: 给 extraction gate 独立 router 实例,避免主 agent 路由
+            # (retry/backoff/未来 cost tracker)的干扰。cache_namespace 由 gate
+            # 默认 "memory_extract_score" 隔离,不需要在 router 层设。
+            extractor_router = LLMRouter(config)
             gate = ExtractionGate(
-                llm_router=router,
+                llm_router=extractor_router,
                 memory_store=memory_store,
                 session_id=session_id or "default",
             )
