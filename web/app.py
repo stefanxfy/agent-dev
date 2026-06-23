@@ -159,6 +159,32 @@ with st.sidebar:
             st.metric("Last 0-hit", f"{gap} turns ago")
 
     st.divider()
+
+    # M10 C3.2: 🌙 Auto-dream 蒸馏状态(折叠面板,默认折叠)
+    with st.expander("🌙 Auto-dream", expanded=False):
+        # 关键:用 st.session_state.get("agent") 而不是 get_agent()
+        # sidebar rerun 频繁,不能每次重建 agent
+        agent = st.session_state.get("agent")
+        if agent is None:
+            st.caption("(agent 未初始化)")
+        else:
+            loop = getattr(agent, "_distillation_loop", None)
+            if loop is None:
+                st.caption("(未启动)")
+            else:
+                status = loop.get_status()
+                st.metric("状态", "🟢 跑" if status["running"] else "🔴 停")
+                st.metric("Tick 数", status["tick_count"])
+                st.metric("间隔(s)", status["interval_seconds"])
+                if status["last_tick_at"]:
+                    st.caption(f"上次 tick: {status['last_tick_at']}")
+                if status["last_result_success"] is not None:
+                    succ = "✓" if status["last_result_success"] else "✗"
+                    st.caption(f"上次结果: {succ} ({status['last_candidates_count']} 候选)")
+                else:
+                    st.caption("上次 tick: gate 拦住")
+
+    st.divider()
     st.header("⚙️ LLM 配置")
 
     # 从 .env 读取默认厂商

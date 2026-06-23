@@ -130,13 +130,22 @@ class Distiller:
         self,
         candidates: list[dict],
         candidate_root: Optional[Union[str, Path]] = None,
+        run_id: Optional[str] = None,  # M10 C3.3: 子目录隔离,便于回灌追踪
     ) -> list[Path]:
         """
-        写候选到 {candidate_root}/{type}/{timestamp}_{slug}.md
+        写候选到 {candidate_root}/{run_id}/{type}/{timestamp}_{slug}.md (M10 C3.3)
 
-        每个候选一个文件,frontmatter + body,符合 v2.1 §4.1 + §七.3 schema
+        或 {candidate_root}/{type}/{timestamp}_{slug}.md (run_id=None,旧行为)
+
+        run_id sanitize:仅保留 [\w\-],其余替换为 _ 防止路径穿越
         """
         root = Path(candidate_root) if candidate_root else self.candidate_root
+        if run_id:
+            # M10 C3.3: 防止 path traversal(../../etc → _.._.._etc)
+            safe_run_id = re.sub(r"[^\w\-]", "_", run_id)
+            if not safe_run_id:
+                raise ValueError(f"run_id '{run_id}' sanitize 后为空,拒绝写入")
+            root = root / safe_run_id
         written: list[Path] = []
         ts = time.strftime("%Y-%m-%dT%H-%M-%S")
         for cand in candidates:

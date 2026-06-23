@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 from agent_core.memory.distiller import (
     DistillationResult,
@@ -66,6 +67,10 @@ class DistillationLoop:
         self._interval_seconds: int = 0
         self._tick_count: int = 0
 
+        # M10 C3.2: 状态可观测字段
+        self._last_tick_at: Optional[str] = None  # ISO timestamp of last tick
+        self._last_result: Optional[DistillationResult] = None  # last run result (None if gate 拦住)
+
     # ── 公开 API ──────────────────────────────────────
 
     @property
@@ -94,6 +99,9 @@ class DistillationLoop:
 
             if not ok:
                 logger.debug(f"tick_once gate 拦住: {reason}")
+                # M10 C3.2: 状态可观测 — 必须在 _fire_callback 之前更新
+                self._last_tick_at = datetime.now(timezone.utc).isoformat()
+                self._last_result = None
                 self._fire_callback(None)
                 return None
 
@@ -107,6 +115,9 @@ class DistillationLoop:
 
             span.set_attribute("memory.distill.success", result.success)
             span.set_attribute("memory.distill.candidates", len(result.candidates))
+            # M10 C3.2: 状态可观测 — callback 抛错也不能阻断字段更新
+            self._last_tick_at = datetime.now(timezone.utc).isoformat()
+            self._last_result = result
             self._fire_callback(result)
             return result
 
@@ -154,6 +165,28 @@ class DistillationLoop:
         else:
             logger.warning(f"DistillationLoop stop 超时 {timeout}s")
         return stopped
+
+    def get_status(self) -> dict[str, Any]:
+        """M10 C3.2: sidebar 用的状态摘要
+
+        Returns:
+            {
+                "running": bool,
+                "tick_count": int,
+                "interval_seconds": int,
+                "last_tick_at": ISO str or None,
+                "last_result_success": bool or None,  # None = no result yet
+                "last_candidates_count": int or None,
+            }
+        """
+        return {
+            "running": self.is_running,
+            "tick_count": self.tick_count,
+            "interval_seconds": self._interval_seconds,
+            "last_tick_at": self._last_tick_at,
+            "last_result_success": self._last_result.success if self._last_result else None,
+            "last_candidates_count": len(self._last_result.candidates) if self._last_result else None,
+        }
 
     # ── 内部 ────────────────────────────────────────────
 
