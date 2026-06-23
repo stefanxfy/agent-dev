@@ -563,6 +563,36 @@ bash scripts/demo_m7.sh
 
 ---
 
+### Day 10 — M10: 全 gap 接入 + 生产化 (2026-06-23)
+
+> ✅ **状态:已完成** (2026-06-23 验收通过)
+> 已交付:M9 gap analysis 列出的 17 项 missing + 20 项 built-not-wired 全部接入。覆盖安全(写入路径 L1-L4 防御、SecretScanner、chmod)、生产化(成本/延迟守卫、降级 banner、runtime config)、可观测(OTel 4 路径 span)、UI(candidate review page、sidebar status、runtime config expander)。
+
+**目标**:把 M9 后留下的全部 gap 闭合 — 写入路径安全、生产化兜底、可观测完整、UI 可用、runtime 可调。从 spec 拆出 6 个 cluster / 23 task。
+
+**核心改动**:
+
+- **C1 安全闭合**:`MemoryPathValidator` 接入 `MemoryStore.write`(L1) + `DualChannelWriter` Channel B 预校验(L4);`os.chmod(abs_path, 0o600)` 落盘后强制;`SecretScanner.redact()` Channel B 写入前 sanitize,残留命中 → drop + emit `SECRET_DETECTED` event。
+- **C2 SM 生产化**:`SessionMemoryLayer.compact()` 接入 `ReactAgent.run()` fast path(`ContextManager.check_and_compact` 之前),SM 落盘 JSON snapshot 持久化,`DistillationScheduler.run()` 透传 `sm_dir` 让 `Distiller` 读 cross-session SM(spec §4.4 L4 输入)。
+- **C3 蒸馏启停**:`DistillationLoop` 后台 daemon(10 分钟 tick,4 重门),`get_agent()` 启停接入 + `st.session_state` 单例化避免 Streamlit rerun leak;sidebar 状态行 + candidate 落 `run_id` 子目录(隔离 + skip 已审)。
+- **C4 候选审核**:`Candidate Review` 独立 Streamlit page,`candidate_actions.accept/reject/edit/skip` 5 函数(写库走 `MemoryStore.write` canonical path 自动去重 H1),accept/reject best-effort 记 `candidate_decisions` 表;`DistillationScheduler.run(dry_run)` 透传 + skip 已审(`compute_candidate_key` sha256)。
+- **C5 写入强化**:`MemoryStore.write` 前置 `validate_type`/`validate_body`(已在 M1 实现,verified);`_llm_score` 提示词层去重(`list_by_session(since_turn=gate1_period_start)`);`LLMRouter(config)` 独立实例给 extraction gate(C5.4 隔离 retry/backoff)。
+- **C6 可观测 + 生产化**:`memory.search` / `memory.extract.gate` / `memory.sm.compact` 三个 OTel span + `configure_tracing()` 在 `get_agent()` 启用;`CostTracker` 默认构造 + 每日 budget 守卫(`BudgetExceeded` exception);`LatencyTimeout` via `ThreadPoolExecutor` 包裹 LLM call(`LatencyTimeout` exception);`MemoryEventKind` 加 4 个 fallback 值(`LOCK_BUSY` / `RATE_LIMITED` / `BUDGET_EXCEEDED` / `TIMEOUT`,后两个有发射点);sidebar `last_extract_error` 降级 banner + 重置按钮;`MemoryConfig.set_runtime(dotted_path, value)` 运行时切换 + `ExtractionGate.set_cost_tracker()` swap + sidebar `Runtime Config` expander(slider + Apply)。
+
+**验收记录**:
+- ✅ 17 commits on `feature/fork-compact`,0 回归
+- ✅ 351 tests passed / 3 skipped / 1 pre-existing failure unrelated to M10
+- ✅ Defense-in-depth security(MemoryStore + DualChannelWriter 两道 path validation)
+- ✅ 3 review rounds caught real bugs:`_llm_score` exception swallow / missing `memory_config` wiring / unwired `sm_dir` + missing `CostTracker` auto-construction
+- ✅ Final whole-branch review(opus model):Approved to merge
+
+**Spec/Plan/Design Doc**:
+- spec: `docs/superpowers/specs/2026-06-23-m10-integration-design.md`
+- plan: `docs/superpowers/plans/2026-06-23-m10-integration.md`
+- progress ledger: `.git/sdd/m10-progress.md`
+
+---
+
 ## 3. 风险 & 缓冲
 
 | 风险 | 概率 | 影响 | 缓解 |
