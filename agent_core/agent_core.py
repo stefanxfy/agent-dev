@@ -209,6 +209,9 @@ class ReactAgent:
         # 优先级：API 真实数字 > 字面估算。F5 刷新后仍能保持 33,345 而不是 58,406。
         self._restore_usage_baseline()
 
+        # M10 C3.1: DistillationLoop 注入位(由 web/app.py:get_agent() 挂上)
+        self._distillation_loop: Optional["DistillationLoop"] = None
+
     def _restore_usage_baseline(self):
         """
         从 jsonl 历史最后一条带 usage 的 entry 恢复 context_manager baseline。
@@ -851,6 +854,14 @@ class ReactAgent:
 
         在切换会话或销毁 Agent 前显式调用。
         """
+        # M10 C3.1: 停蒸馏 loop(若有)
+        if getattr(self, "_distillation_loop", None) is not None:
+            try:
+                self._distillation_loop.stop(timeout=5.0)
+            except Exception as e:
+                _logger.warning(f"DistillationLoop.stop 失败: {e}")
+            self._distillation_loop = None
+
         if self._session_manager:
             try:
                 self._session_manager.close()

@@ -593,6 +593,39 @@ def get_agent(session_id=None):
         memory_store=memory_store,             # M7 ported: 库内计数
         react_memory_bridge=react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
     )
+
+    # M10 C3.1: 启动 DistillationLoop(后台 daemon,10 分钟检查 4 重门)
+    # 用 st.session_state 单例化(避免 Streamlit rerun 每次 leak 一个 daemon 线程)
+    try:
+        from agent_core.memory.distiller import DistillationScheduler
+        from agent_core.memory.scheduler import DistillationLoop
+
+        existing_loop = st.session_state.get("distillation_loop")
+        if existing_loop is None or not getattr(existing_loop, "is_running", False):
+            # mem_root 来自 memory_enabled 分支或 fallback 构造
+            if "mem_root" not in dir():
+                from agent_core.config import config as _agent_config_fb
+                _agent_data_dir = _agent_config_fb.agent_data_dir or str(Path.home() / ".agent_data")
+                mem_root = Path(_agent_data_dir) / "memory"
+            mem_root.mkdir(parents=True, exist_ok=True)
+            distill_scheduler = DistillationScheduler(
+                memory_root=mem_root,
+                llm_callback=None,  # 默认 stub;真 LLM 由 scheduler 内部注入
+            )
+            distill_loop = DistillationLoop(
+                scheduler=distill_scheduler,
+                on_result=lambda r: logging.debug(f"DistillationLoop tick: {r}"),
+            )
+            distill_loop.start(interval_seconds=600)  # 10 min per spec §7
+            st.session_state.distillation_loop = distill_loop
+            logging.info("DistillationLoop 启动: interval=600s")
+    except Exception as e:
+        logging.warning(f"DistillationLoop 启动失败: {e}")
+        # 不阻塞 agent 返回 — loop 失败不应影响 chat
+
+    # 把 loop 挂到 agent(每次 rerun 都重挂,但 loop 实例不变)
+    agent._distillation_loop = st.session_state.get("distillation_loop")
+
     return agent
 
 
