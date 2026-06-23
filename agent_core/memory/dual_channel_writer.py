@@ -57,6 +57,7 @@ from agent_core.memory.memory_store import (
     compute_item_hash,
 )
 from agent_core.memory.meta_db import MetaDB
+from agent_core.memory.path_validator import MemoryPathValidator, PathSecurityError
 from agent_core.memory.secret_scanner import SecretScanner
 
 if TYPE_CHECKING:
@@ -207,6 +208,11 @@ class DualChannelWriter:
         # M10 C1.2: secret sanitize 配置
         self.scanner = SecretScanner()
         self.event_callback = event_callback
+
+        # M10 C1.4: §14.1 防御纵深 — Channel B 入口 path validator
+        # 即使 MemoryStore.write 已调 validator(C1.1 前置),
+        # 这里再加一道,捕获任何 future regression。
+        self._path_validator = MemoryPathValidator(memory_store.root)
 
         # atexit 优雅退出（A9）
         atexit.register(self._graceful_shutdown)
@@ -379,6 +385,26 @@ class DualChannelWriter:
                 #    供 list_by_session 查询
                 for m, cand in zip(to_process, candidates):
                     try:
+                        # M10 C1.4: §14.1 防御纵深 — Channel B 入口 path validator
+                        # 用占位符 .md 构造 rel_path,只验证 type 是否在白名单 + 类型检查
+                        rel_path = f"{cand.type}/__channel_b_preflight__.md"
+                        try:
+                            self._path_validator.validate(rel_path)
+                        except PathSecurityError as e:
+                            logger.warning(
+                                f"channel_b: 拒绝 candidate(cand.title={cand.title!r}): "
+                                f"type={cand.type!r} 触发 path validator: {e}"
+                            )
+                            if self.event_callback:
+                                try:
+                                    # 复用 SECRET_DETECTED 事件太重 — 改用 channel_b_path_rejected
+                                    # 但目前 MemoryEventKind 没这个值,跳过 event 推送,只 log + skip
+                                    pass
+                                except Exception as cb_err:
+                                    logger.error(f"event_callback 抛错: {cb_err}")
+                            skipped += 1
+                            continue
+
                         # M10 C1.2: §14.4 secret sanitize(写盘前)
                         # redact() 可能改 cand.body 中的 secret 区间
                         redacted_body = self.scanner.redact(cand.body)

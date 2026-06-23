@@ -115,3 +115,57 @@ def test_channel_b_sanitizes_secret_before_write(tmp_path):
     content = md_files[0].read_text()
     assert "sk-1234567890abcdefghij" not in content
     assert "[REDACTED:openai_sk]" in content
+
+
+# ─────────────────────────────────────
+# C: PathValidator pre-flight(2 个)
+# ─────────────────────────────────────
+
+def test_channel_b_rejects_unknown_type(tmp_path):
+    """Channel B 入口拒绝未知 type(不在 4 类白名单)"""
+    from agent_core.memory.path_validator import PathSecurityError
+
+    writer = _make_writer(tmp_path)
+    # 先写 channel A 触发 daily_cursor 推进到 1,让 channel B 处理范围包含 turn_index=1
+    writer.channel_a_inline_write("hi", "hello", turn_index=1)
+    cand = ExtractionCandidate(
+        title="bogus",
+        body="normal content",
+        type="../../etc",  # 路径穿越 type
+        source_quote="normal",
+    )
+    def extractor(_):
+        return [cand]
+
+    result = writer._do_channel_b_extract(
+        messages=[TurnMessage(1, "test", "test")],
+        extractor=extractor,
+    )
+    # 应被 pre-flight 拦截
+    assert result.get("written", 0) == 0
+    assert result.get("skipped", 0) == 1
+    # 验:没有任何 md 落盘
+    md_files = list((tmp_path / "memory").rglob("*.md"))
+    assert len(md_files) == 0
+
+
+def test_channel_b_rejects_unicode_null_in_type(tmp_path):
+    """Channel B 入口拒绝 type 含 \\x00(unicode trick)"""
+    writer = _make_writer(tmp_path)
+    # 先写 channel A 触发 daily_cursor 推进到 1,让 channel B 处理范围包含 turn_index=1
+    writer.channel_a_inline_write("hi", "hello", turn_index=1)
+    cand = ExtractionCandidate(
+        title="obfuscated",
+        body="normal content",
+        type="user\x00",
+        source_quote="normal",
+    )
+    def extractor(_):
+        return [cand]
+
+    result = writer._do_channel_b_extract(
+        messages=[TurnMessage(1, "test", "test")],
+        extractor=extractor,
+    )
+    assert result.get("written", 0) == 0
+    assert result.get("skipped", 0) == 1
