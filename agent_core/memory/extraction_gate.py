@@ -141,6 +141,10 @@ class ExtractionGate:
         # 调 LLM(用 cache_namespace 隔离)
         try:
             text = self._call_llm(prompt)
+        except (BudgetExceeded, LatencyTimeout):
+            # M10 C6.2/C6.3: 让上层 bridge 转为 BUDGET_EXCEEDED/TIMEOUT MemoryEvent,
+            # 不要 swallow 成 llm_call_error(...)
+            raise
         except Exception as e:
             logger.warning(f"LLM 评分调用失败: {e}")
             return Decision(
