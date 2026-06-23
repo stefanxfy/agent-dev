@@ -287,6 +287,34 @@ class MemoryConfig(BaseModel):
         """序列化为 dict（路径转为 str，便于 JSON）"""
         return self.model_dump(mode="json")
 
+    def set_runtime(self, key: str, value: Any) -> None:
+        """M10 C6.4: 运行时修改配置(不重建 agent,字段直接 in-place 改)。
+
+        支持 dotted path:
+            config.set_runtime("cost.daily_budget_usd", 0.5)
+            config.set_runtime("distillation.enabled", False)
+            config.set_runtime("enabled", False)  # 顶层字段
+
+        Args:
+            key: dotted path,例如 "cost.daily_budget_usd"
+            value: 新值(由 Pydantic 在 setattr 时校验类型)
+
+        Raises:
+            KeyError: 当 key 路径上任何一段不存在。
+                注意:类型错误(int 给 str 字段)由 Pydantic 抛 ValidationError,
+                不吞 — 让调用方拿到原始异常更易定位。
+        """
+        parts = key.split(".")
+        obj: Any = self
+        for p in parts[:-1]:
+            if not hasattr(obj, p):
+                raise KeyError(f"Unknown config path: {key!r} (no attr {p!r})")
+            obj = getattr(obj, p)
+        final = parts[-1]
+        if not hasattr(obj, final):
+            raise KeyError(f"Unknown config path: {key!r} (no attr {final!r})")
+        setattr(obj, final, value)
+
 
 def _coerce_env_value(v: str) -> Any:
     """env 值类型推断（true/false/int/float/原样 str）"""

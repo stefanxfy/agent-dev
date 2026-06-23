@@ -221,6 +221,42 @@ with st.sidebar:
                 # 老 Streamlit 无 page_link → link_button 兜底
                 st.link_button("查看全部 →", "/Candidate_Review")
 
+    # M10 C6.4: Runtime Config(运行时切换不重建 agent)
+    with st.expander("🎛 Runtime Config", expanded=False):
+        _rt_agent = st.session_state.get("agent")
+        if not _rt_agent:
+            st.caption("⚠️ Agent 未就绪")
+        elif not getattr(_rt_agent, "react_memory_bridge", None):
+            st.caption("⚠️ 记忆系统未启用")
+        else:
+            # memory_config / _memory_config 两种属性名都试(brief Step D 验证:实际都不存在)
+            _rt_config = getattr(_rt_agent, "memory_config", None) \
+                or getattr(_rt_agent, "_memory_config", None)
+            if _rt_config is None:
+                st.caption("⚠️ 找不到 memory_config 属性")
+            else:
+                _current_budget = _rt_config.cost.daily_budget_usd
+                _new_budget = st.number_input(
+                    "Daily budget (USD)",
+                    min_value=0.0,
+                    max_value=100.0,
+                    value=float(_current_budget),
+                    step=0.1,
+                    key="runtime_daily_budget",
+                )
+                if st.button("Apply", key="apply_runtime_budget"):
+                    # 改 config(运行时,不会触发 agent 重建)
+                    _rt_config.set_runtime("cost.daily_budget_usd", _new_budget)
+                    # 替换 gate 的 cost_tracker 实例
+                    from agent_core.memory.cost_tracker import CostTracker as _CT
+                    _rt_gate = _rt_agent.react_memory_bridge.gate
+                    _rt_gate.set_cost_tracker(_CT(
+                        daily_budget_usd=_new_budget,
+                        enabled=_rt_config.cost.enabled,
+                    ))
+                    st.success(f"✅ Budget 改为 ${_new_budget:.2f}")
+                    st.rerun()
+
     st.divider()
     st.header("⚙️ LLM 配置")
 

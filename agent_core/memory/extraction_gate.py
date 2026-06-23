@@ -248,3 +248,10 @@ class ExtractionGate:
             if chunk.text_delta:
                 text += chunk.text_delta.text
         return text
+
+    def set_cost_tracker(self, new_tracker: "CostTracker") -> None:
+        """M10 C6.4: 运行时替换 cost_tracker(避免 UI 戳穿 _cost_tracker 私有属性)。
+
+        不做迁移旧 total / reset 等 — YAGNI。要重置总额时由 UI 显式 new 一个。
+        """
+        self._cost_tracker = new_tracker
