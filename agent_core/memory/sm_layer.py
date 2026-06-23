@@ -32,11 +32,13 @@ SessionMemoryLayer — 仿照 Claude Code SessionMemory (TypeScript)
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
 from concurrent.futures import Future
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Optional
 
@@ -445,12 +447,73 @@ last_compacted_at: null
             + 50  # summary overhead
         )
 
-        return CompactResult(
+        result = CompactResult(
             summary_message=summary_message,
             kept_messages=kept_messages,
             used_tokens_estimate=used_tokens_estimate,
             strategy="sm_compact",
         )
+
+        # M10 C2.2: 持久化 compact 结果(.md frontmatter 更新 + .json snapshot)
+        self._persist_compact_result(result)
+
+        return result
+
+    def _persist_compact_result(self, result: CompactResult) -> None:
+        """M10 C2.2: 持久化 compact 结果
+
+        写两个东西:
+        1. 更新 .md frontmatter(last_compacted_at)
+        2. 写 .json 文件(snapshot,供 C2.3 distiller 跨会话读)
+
+        Args:
+            result: compact() 返回的 CompactResult
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 1. 更新 .md frontmatter(只更新 last_compacted_at,body 不动)
+        try:
+            if self.sm_exists():
+                content = self.read_sm() or ""
+                if "last_compacted_at:" in content:
+                    new_content = re.sub(
+                        r"(last_compacted_at:\s*)([^\n]+|\n)?",
+                        lambda m: f"last_compacted_at: {now_iso}\n",
+                        content,
+                        count=1,
+                    )
+                else:
+                    # 插在 closing `---` 之后
+                    new_content = re.sub(
+                        r"(---\n)",
+                        f"---\nlast_compacted_at: {now_iso}\n",
+                        content,
+                        count=1,
+                    )
+                self.sm_path.write_text(new_content, encoding="utf-8")
+                self._last_compacted_at = now_iso
+                logger.debug(f"SM .md frontmatter 更新: {self.sm_path}")
+        except Exception as e:
+            logger.warning(f"更新 SM .md frontmatter 失败: {e}")
+
+        # 2. 写 .json snapshot
+        try:
+            json_path = self.sm_path.with_suffix(".json")
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(
+                json.dumps({
+                    "session_id": self.session_id,
+                    "summary_message_content": result.summary_message.get("content", ""),
+                    "kept_messages_count": len(result.kept_messages),
+                    "used_tokens_estimate": result.used_tokens_estimate,
+                    "strategy": result.strategy,
+                    "updated_at": now_iso,
+                }, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.debug(f"SM .json snapshot 写入: {json_path}")
+        except Exception as e:
+            logger.warning(f"写 SM .json 失败: {e}")
 
     def _truncate_sections(self, sm: str, max_per_section: int) -> str:
         """按 `## Section` 切,每个 section 单独截断到 max_per_section 字符

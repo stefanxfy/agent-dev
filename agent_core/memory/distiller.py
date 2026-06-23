@@ -95,9 +95,11 @@ class Distiller:
         self,
         llm_callback: Callable[[str], str],
         candidate_root: Optional[Union[str, Path]] = None,
+        sm_dir: Optional[Union[str, Path]] = None,  # M10 C2.3
     ):
         self.llm = llm_callback
         self.candidate_root = Path(candidate_root) if candidate_root else Path(self.DEFAULT_CANDIDATE_ROOT)
+        self.sm_dir = Path(sm_dir) if sm_dir else None  # None = 不读 SM
 
     def distill(
         self,
@@ -115,7 +117,11 @@ class Distiller:
         sessions_text = self._read_sessions(session_log_files)
         existing_text = self._format_existing(existing_memories or [])
 
-        prompt = self._build_prompt(sessions_text, existing_text)
+        # M10 C2.3: SM 跨会话作为 L4 输入
+        sm_data = self._read_sm_files(self.sm_dir) if self.sm_dir else []
+        sm_text = self._format_sm_files(sm_data)
+
+        prompt = self._build_prompt(sessions_text, existing_text, sm_text)
         response = self.llm(prompt)
         candidates = self._parse_response(response)
         return candidates
@@ -161,9 +167,23 @@ class Distiller:
 
     # ── prompt 模板(§7.3) ────────────────────────────────
 
-    def _build_prompt(self, sessions_text: str, existing_text: str) -> str:
+    def _build_prompt(
+        self,
+        sessions_text: str,
+        existing_text: str,
+        sm_text: str = "(无跨会话 SM 摘要)",
+    ) -> str:
         """v2.1 §7.3 蒸馏 prompt(per-file 输出)"""
         return f"""从以下对话日志和现有记忆中, 蒸馏出值得保留的长期记忆.
+
+跨会话 SM 摘要(L4 输入,直接复用,不要再提取):
+{sm_text}
+
+现有记忆(不要重复提取):
+{existing_text}
+
+增量日志:
+{sessions_text}
 
 输出: 每个候选记忆一个 markdown 文件, 含 YAML frontmatter.
 
@@ -201,12 +221,6 @@ body 格式:
   }}
 ]
 ```
-
-现有记忆(不要重复提取):
-{existing_text}
-
-增量日志:
-{sessions_text}
 """
 
     # ── helpers ─────────────────────────────────────────
@@ -222,6 +236,39 @@ body 格式:
             except OSError as e:
                 logger.warning(f"读 session 文件失败 {p}: {e}")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _read_sm_files(sm_dir: Optional[Path]) -> list[dict]:
+        """M10 C2.3: 读所有 SM .json 文件,反序列化为 list
+
+        Returns:
+            [{"session_id": "...", "summary_message_content": "...", ...}, ...]
+            文件不存在或为空 → []
+        """
+        if not sm_dir or not sm_dir.exists():
+            return []
+        out: list[dict] = []
+        for p in sm_dir.glob("*.json"):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                data["_path"] = str(p)  # 加 path 便于 debug
+                out.append(data)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(f"读 SM 文件失败 {p}: {e}")
+        return out
+
+    @staticmethod
+    def _format_sm_files(sm_data_list: list[dict]) -> str:
+        """格式化 SM 数据为 prompt 片段"""
+        if not sm_data_list:
+            return "(无跨会话 SM 摘要)"
+        lines = []
+        for d in sm_data_list:
+            sid = d.get("session_id", "?")
+            content = d.get("summary_message_content", "")[:300]
+            tokens = d.get("used_tokens_estimate", "?")
+            lines.append(f"### Session {sid} (~{tokens} tokens)\n{content}")
+        return "\n\n".join(lines)
 
     @staticmethod
     def _format_existing(memories: list[dict]) -> str:
