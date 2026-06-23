@@ -551,6 +551,13 @@ def get_agent(session_id=None):
             # meta.db 放 agent 数据根目录(避免污染 data/sessions/ 里的 jsonl)
             meta_db_path = Path(agent_data_dir) / "meta.db"
             meta_db = MetaDB(meta_db_path)
+            gate = ExtractionGate(
+                llm_router=router,
+                memory_store=memory_store,
+                session_id=session_id or "default",
+            )
+            # M10 C1.2: 先构造 dual_channel,后构造 bridge,然后再装上 event_callback
+            # (bridge 构造需 dual_channel 已就绪,所以 dual_channel 先造)
             dual_channel = DualChannelWriter(
                 session_id=session_id or "default",
                 meta_db=meta_db,
@@ -558,16 +565,16 @@ def get_agent(session_id=None):
                 vector_store=vec_store,
                 embed_fn=memory_embed_fn,
             )
-            gate = ExtractionGate(
-                llm_router=router,
-                memory_store=memory_store,
-                session_id=session_id or "default",
-            )
             react_memory_bridge = ReactMemoryBridge(
                 dual_channel=dual_channel,
                 gate=gate,
                 memory_store=memory_store,
                 session_id=session_id or "default",
+            )
+            # M10 C1.2: 把 event_callback 绑到 dual_channel(bridge 已就绪,可引用其方法)
+            dual_channel.event_callback = (
+                lambda evt: react_memory_bridge._enqueue_secret_event(evt)
+                if react_memory_bridge else None
             )
         except Exception as e:
             logging.warning(f"Memory system init failed: {e}")
@@ -910,6 +917,9 @@ if prompt := st.chat_input("输入消息..."):
                     ms["gate_skips"] = ms.get("gate_skips", 0) + 1
                 elif kind == "extract_error":
                     ms["last_extract_error"] = str(event.reason or "unknown")
+                elif kind == "secret_detected":
+                    # M10 C1.2: §14.4 Channel B secret sanitize 事件
+                    ms["secrets_redacted"] = ms.get("secrets_redacted", 0) + 1
                 st.session_state.memory_stats = ms
 
         # 流式结束：清理 UI

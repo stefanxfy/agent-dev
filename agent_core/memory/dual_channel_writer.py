@@ -43,10 +43,10 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Optional, Protocol, Union
+from typing import Any, Callable, Optional, Protocol, TYPE_CHECKING, Union
 
 from agent_core.exceptions import AgentError
 from agent_core.memory.embeddings import EmbedFn
@@ -57,8 +57,26 @@ from agent_core.memory.memory_store import (
     compute_item_hash,
 )
 from agent_core.memory.meta_db import MetaDB
+from agent_core.memory.secret_scanner import SecretScanner
+
+if TYPE_CHECKING:
+    from agent_core.memory.react_memory_bridge import MemoryEvent
 
 logger = logging.getLogger("memory.dual_channel")
+
+
+# ──────────────────────────────────────────────────────────────────
+# M10 C1.2: 辅助函数(lazy import 避免循环依赖)
+# ──────────────────────────────────────────────────────────────────
+
+def _make_secret_event(turn_index: int) -> "MemoryEvent":
+    """构造 SECRET_DETECTED MemoryEvent(避免循环 import)"""
+    from agent_core.memory.react_memory_bridge import MemoryEvent, MemoryEventKind
+    return MemoryEvent(
+        kind=MemoryEventKind.SECRET_DETECTED,
+        turn_index=turn_index,
+        reason="channel_b_sanitize_unrecoverable",
+    )
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -148,6 +166,7 @@ class DualChannelWriter:
         *,
         extraction_timeout_seconds: int = 60,
         executor_workers: int = 2,
+        event_callback: Optional[Callable[["MemoryEvent"], None]] = None,  # M10 C1.2
     ):
         self.session_id = session_id
         self.meta_db = meta_db
@@ -184,6 +203,10 @@ class DualChannelWriter:
         self._extraction_in_progress_lock = threading.Lock()
         # M6 场景 8: 跟踪本次提取开始时间,实现 watchdog(防止 extractor hang 永久阻塞)
         self._extraction_started_at: Optional[float] = None
+
+        # M10 C1.2: secret sanitize 配置
+        self.scanner = SecretScanner()
+        self.event_callback = event_callback
 
         # atexit 优雅退出（A9）
         atexit.register(self._graceful_shutdown)
@@ -356,6 +379,26 @@ class DualChannelWriter:
                 #    供 list_by_session 查询
                 for m, cand in zip(to_process, candidates):
                     try:
+                        # M10 C1.2: §14.4 secret sanitize(写盘前)
+                        # redact() 可能改 cand.body 中的 secret 区间
+                        redacted_body = self.scanner.redact(cand.body)
+                        if redacted_body != cand.body:
+                            remaining = self.scanner.scan(redacted_body)
+                            if not remaining.is_clean:
+                                # redact 后仍命中(罕见,如双重编码)→ 整条丢弃 + 推事件
+                                logger.warning(
+                                    f"channel_b: 丢弃 candidate(cand.title={cand.title!r}): "
+                                    f"redact 后仍命中 {len(remaining.hits)} 个 secret"
+                                )
+                                if self.event_callback:
+                                    try:
+                                        self.event_callback(_make_secret_event(m.turn_index))
+                                    except Exception as cb_err:
+                                        logger.error(f"event_callback 抛错: {cb_err}")
+                                skipped += 1
+                                continue
+                            cand = replace(cand, body=redacted_body)
+
                         item_hash = self.memory_store.write(
                             type=cand.type,
                             title=cand.title,

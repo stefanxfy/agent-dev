@@ -279,6 +279,30 @@ class SecretScanner:
                 f"(共 {len(result.hits)} 处命中)"
             )
 
+    def redact(self, text: str) -> str:
+        """
+        §14.4: 扫描后把所有命中区间替换为 [REDACTED:<pattern_name>]
+
+        Args:
+            text: 原始文本
+        Returns:
+            redact 后的文本。多次命中区间按 start 倒序替换(避免 span 偏移)
+            无命中返回原文本。
+        """
+        if not text:
+            return text
+        result = self.scan(text)
+        if result.is_clean:
+            return text
+        # 倒序替换:从右往左,span 位置不变
+        sorted_hits = sorted(result.hits, key=lambda h: h.span[0], reverse=True)
+        redacted = text
+        for hit in sorted_hits:
+            start, end = hit.span
+            replacement = f"[REDACTED:{hit.pattern_name}]"
+            redacted = redacted[:start] + replacement + redacted[end:]
+        return redacted
+
 
 # ──────────────────────────────────────────────────────────────────
 # Module-level 单例
@@ -305,6 +329,11 @@ def assert_clean(text: str) -> None:
     get_default_scanner().assert_clean(text)
 
 
+def redact_text(text: str) -> str:
+    """便捷函数: 用默认 scanner redact"""
+    return get_default_scanner().redact(text)
+
+
 __all__ = [
     "SecretScanner",
     "SecretHit",
@@ -312,4 +341,5 @@ __all__ = [
     "get_default_scanner",
     "scan_text",
     "assert_clean",
+    "redact_text",
 ]

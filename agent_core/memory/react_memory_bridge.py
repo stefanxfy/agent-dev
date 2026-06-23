@@ -5,6 +5,7 @@ ReactAgent ↔ DualChannelWriter 适配层
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterator, Optional
@@ -26,6 +27,7 @@ class MemoryEventKind(str, Enum):
     EXTRACT_DISPATCHED = "extract_dispatched"
     EXTRACT_DONE = "extract_done"
     EXTRACT_ERROR = "extract_error"
+    SECRET_DETECTED = "secret_detected"  # M10 C1.2
 
 
 @dataclass
@@ -59,6 +61,10 @@ class ReactMemoryBridge:
         self.cumulative_tokens = 0
         self.cumulative_tool_calls = 0
 
+        # M10 C1.2: secret 事件 queue(executor 线程 → generator 线程)
+        self._pending_secret_events: list[MemoryEvent] = []
+        self._secret_queue_lock = threading.Lock()
+
         # A3 重启恢复
         self.gate1_period_start_turn = 0
         self.recover_state()
@@ -74,6 +80,19 @@ class ReactMemoryBridge:
         except Exception as e:
             logger.warning(f"recover_state 失败,默认 0: {e}")
 
+    def _enqueue_secret_event(self, evt: MemoryEvent) -> None:
+        """thread-safe 入队,供 DualChannelWriter 的 event_callback 调用"""
+        with self._secret_queue_lock:
+            self._pending_secret_events.append(evt)
+
+    def _drain_secret_events(self) -> Iterator[MemoryEvent]:
+        """drain queue 并 yield,generator 线程安全"""
+        with self._secret_queue_lock:
+            pending = self._pending_secret_events
+            self._pending_secret_events = []
+        for evt in pending:
+            yield evt
+
     def on_turn_end(
         self,
         user_msg: str,
@@ -85,6 +104,9 @@ class ReactMemoryBridge:
         last_messages: list[dict],
         recent_turns: list[TurnMessage],
     ) -> Iterator[MemoryEvent]:
+        # M10 C1.2: 先 drain 之前 turn 的 secret 事件
+        yield from self._drain_secret_events()
+
         # 1. 累计 token / tool
         self.cumulative_tokens += input_tokens + output_tokens
         self.cumulative_tool_calls += tool_calls_in_turn
