@@ -188,6 +188,15 @@ class CompactConfig(BaseModel):
     )
 
 
+class CostConfig(BaseModel):
+    """M10 C6.2: 成本预算配置"""
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True)
+    daily_budget_usd: float = Field(default=1.0, ge=0.0)
+    per_extract_budget_usd: float = Field(default=0.05, ge=0.0)
+
+
 class SafetyConfig(BaseModel):
     """
     安全策略（§14 安全模型）
@@ -228,6 +237,7 @@ class MemoryConfig(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     compact: CompactConfig = Field(default_factory=CompactConfig)
+    cost: CostConfig = Field(default_factory=CostConfig)
 
     # 全局开关
     enabled: bool = Field(default=True, description="总开关")
@@ -269,7 +279,7 @@ class MemoryConfig(BaseModel):
                 continue
             # 嵌套字段
             section, field = parts[0], "__".join(parts[1:])
-            if section in ("retrieval", "distillation", "paths", "safety", "compact"):
+            if section in ("retrieval", "distillation", "paths", "safety", "compact", "cost"):
                 data.setdefault(section, {})[field] = _coerce_env_value(v)
         return cls.model_validate(data)
 
@@ -301,5 +311,6 @@ __all__ = [
     "DistillationConfig",
     "PathsConfig",
     "SafetyConfig",
+    "CostConfig",
     "MemoryConfig",
 ]

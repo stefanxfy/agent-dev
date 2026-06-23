@@ -10,12 +10,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Iterator, Optional
 
+from agent_core.memory.cost_tracker import BudgetExceeded
 from agent_core.memory.dual_channel_writer import (
     DualChannelWriter,
     TurnMessage,
     ExtractionCandidate,
 )
 from agent_core.memory.extraction_gate import ExtractionGate, TurnContext
+from agent_core.memory.latency import LatencyTimeout
 
 logger = logging.getLogger("memory.react_bridge")
 
@@ -28,6 +30,12 @@ class MemoryEventKind(str, Enum):
     EXTRACT_DONE = "extract_done"
     EXTRACT_ERROR = "extract_error"
     SECRET_DETECTED = "secret_detected"  # M10 C1.2
+    # M10 C6.5: 5 回退条件 banner 用的 enum 值(LOCK_BUSY / RATE_LIMITED
+    # 当前无自然发射点,YAGNI 只占位;C6.2 / C6.3 有发射点)
+    LOCK_BUSY = "lock_busy"
+    RATE_LIMITED = "rate_limited"
+    BUDGET_EXCEEDED = "budget_exceeded"  # M10 C6.2
+    TIMEOUT = "timeout"  # M10 C6.3
 
 
 @dataclass
@@ -137,7 +145,21 @@ class ReactMemoryBridge:
             last_messages=last_messages,
             gate1_period_start_turn=self.gate1_period_start_turn,
         )
-        decision = self.gate.should_extract(ctx)
+        # M10 C6.2 + C6.3: 预算/超时异常 → yield 对应 MemoryEvent,跳过本轮
+        try:
+            decision = self.gate.should_extract(ctx)
+        except BudgetExceeded as e:
+            yield MemoryEvent(
+                kind=MemoryEventKind.BUDGET_EXCEEDED, turn_index=turn_index,
+                reason=f"daily_budget_exceeded(${e.today_total:.4f}>${e.budget:.4f})",
+            )
+            return
+        except LatencyTimeout as e:
+            yield MemoryEvent(
+                kind=MemoryEventKind.TIMEOUT, turn_index=turn_index,
+                reason=f"latency_exceeded({e.timeout}s)",
+            )
+            return
 
         if not decision.should_extract:
             yield MemoryEvent(

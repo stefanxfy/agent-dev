@@ -4,12 +4,15 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, Protocol, Any
 
+from agent_core.memory.cost_tracker import BudgetExceeded, CostTracker
 from agent_core.memory.dual_channel_writer import ExtractionCandidate
+from agent_core.memory.latency import LatencyTimeout
 from agent_core.memory.prompt_templates import (
     EXTRACT_SYSTEM_PROMPT,
     build_extract_prompt,
@@ -70,11 +73,14 @@ class ExtractionGate:
         memory_store: _MemoryStoreProtocol,
         session_id: str,
         cache_namespace: Optional[str] = None,
+        cost_tracker: Optional[CostTracker] = None,  # M10 C6.2
     ):
         self.llm_router = llm_router
         self.memory_store = memory_store
         self.session_id = session_id
         self.cache_namespace = cache_namespace or self.CACHE_NAMESPACE
+        self._cost_tracker = cost_tracker  # M10 C6.2
+        self._latency_timeout = 8.0  # M10 C6.3 (秒)
 
     def should_extract(self, ctx: TurnContext) -> Decision:
         with tracer.start_as_current_span("memory.extract.gate") as span:
@@ -195,7 +201,38 @@ class ExtractionGate:
         )
 
     def _call_llm(self, prompt: str) -> str:
-        """调 LLM,收集 text_delta"""
+        """调 LLM,收集 text_delta(M10 C6.2 + C6.3 加守卫)
+
+        顺序: budget check → timeout wrap → cost accumulate
+        """
+        # M10 C6.2: 预算检查
+        if self._cost_tracker:
+            budget_err = self._cost_tracker.check_budget()
+            if budget_err is not None:
+                raise budget_err
+
+        # M10 C6.3: timeout wrap(走 ThreadPoolExecutor)
+        text = ""
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(self._do_llm_call, prompt)
+                text = future.result(timeout=self._latency_timeout)
+        except concurrent.futures.TimeoutError:
+            raise LatencyTimeout(self._latency_timeout)
+
+        # M10 C6.2: 累计 cost(chars/4 粗略估算)
+        if self._cost_tracker:
+            input_tokens = len(prompt) // 4
+            output_tokens = len(text) // 4
+            self._cost_tracker.add(input_tokens, output_tokens)
+
+        return text
+
+    def _do_llm_call(self, prompt: str) -> str:
+        """_call_llm 的非 timeout 版本(给 ThreadPoolExecutor 调)
+
+        必须独立成方法:lambda/局部函数不能被 pickle
+        """
         text = ""
         for chunk in self.llm_router.chat(
             messages=[

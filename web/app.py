@@ -113,6 +113,16 @@ if "chat_session_id" not in st.session_state:
 
 # ── 侧边栏：LLM 配置 ─────────────────────────────────────────
 with st.sidebar:
+    # M10 C6.5: 降级 banner(任一 MemoryEventKind: BUDGET/TIMEOUT/LOCK/RATE/EXTRACT_ERROR 时显示)
+    ms = st.session_state.get("memory_stats", {})
+    last_err = ms.get("last_extract_error")
+    if last_err:
+        st.error(f"⚠️ 记忆系统降级中: {last_err}")
+        if st.button("🔄 重置", key="reset_degraded_state"):
+            ms["last_extract_error"] = None
+            st.session_state.memory_stats = ms
+            st.rerun()
+
     # ── Token 消耗面板（永久显示） ───────────────────────────────
     stats = st.session_state.token_stats
     total = stats["input"] + stats["output"] + stats["thinking"]
@@ -1015,6 +1025,10 @@ if prompt := st.chat_input("输入消息..."):
                 elif kind == "gate_skip":
                     ms["gate_skips"] = ms.get("gate_skips", 0) + 1
                 elif kind == "extract_error":
+                    ms["last_extract_error"] = str(event.reason or "unknown")
+                # M10 C6.2 / C6.3: 预算超限 / 超时 → 同样写入 last_extract_error
+                # banner 显示已通用(消费 last_extract_error)
+                elif kind in ("budget_exceeded", "timeout"):
                     ms["last_extract_error"] = str(event.reason or "unknown")
                 elif kind == "secret_detected":
                     # M10 C1.2: §14.4 Channel B secret sanitize 事件
