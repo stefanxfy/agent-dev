@@ -179,20 +179,25 @@ class MemoryStore:
             MemoryExistsError: 同 hash 已存在（A5 幂等，overwrite=False）
             PathSecurityError: 路径越界
         """
-        # 1. 校验 type
+        # 1. 计算 item_hash (前置,仅依赖 type/body/source_quote 字符串,
+        #    不依赖 type 校验或路径校验)
+        item_hash = compute_item_hash(type, body, source_quote)  # type: ignore[arg-type]
+
+        # 2. M10 C1.1: 路径校验前置(security check 先于 schema check, §14.1)
+        rel_path = f"{type}/{item_hash}.md"
+        abs_path = self.validator.validate(rel_path)  # 失败抛 PathSecurityError
+
+        # 3. 校验 type
         validate_type(type)
 
-        # 2. L7: source_quote 必填
+        # 4. L7: source_quote 必填
         if not source_quote or not source_quote.strip():
             raise ValueError("source_quote 必填（v2.1 L7 不变量），防止凭空记忆")
 
-        # 3. 校验 body（含 **Why:** 强制）
+        # 5. 校验 body（含 **Why:** 强制）
         validate_body(type, body)  # type: ignore[arg-type]
 
-        # 4. 计算 item_hash
-        item_hash = compute_item_hash(type, body, source_quote)  # type: ignore[arg-type]
-
-        # 5. 构造 frontmatter
+        # 6. 构造 frontmatter
         now = datetime.now(timezone.utc).isoformat()
         fm: dict[str, Any] = {
             "type": type,
@@ -205,17 +210,13 @@ class MemoryStore:
         if extra:
             fm.update(extra)
 
-        # 6. frontmatter 校验（防御性，实际我们刚构造，但 schema_version 等要过）
+        # 7. frontmatter 校验（防御性，实际我们刚构造，但 schema_version 等要过）
         validate_frontmatter(fm)
 
-        # 7. 构造文件内容（frontmatter + 标题 + body）
+        # 8. 构造文件内容（frontmatter + 标题 + body）
         # title 放在 frontmatter 之后第一行（Markdown H1），便于阅读
         fm_str = _serialize_frontmatter(fm)
         content = f"---\n{fm_str}---\n\n# {title}\n\n{body}\n"
-
-        # 8. 路径校验 + 解析
-        rel_path = f"{type}/{item_hash}.md"
-        abs_path = self.validator.validate(rel_path)
 
         # 9. A5 幂等：已存在且不覆盖 → 抛异常
         if abs_path.exists() and not overwrite:
@@ -232,6 +233,8 @@ class MemoryStore:
                 os.fsync(fd)
                 os.close(fd)
                 os.replace(tmp_path, abs_path)
+                # 11. M10 C1.3: chmod 0o600(§14.3, 落盘权限收紧)
+                os.chmod(abs_path, 0o600)
             except Exception as e:
                 with __import__("contextlib").suppress(OSError):
                     os.close(fd)
