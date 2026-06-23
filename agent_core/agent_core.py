@@ -162,19 +162,20 @@ class ReactAgent:
         memory_store: Optional["MemoryStore"] = None,           # M7 ported: 库内计数
         react_memory_bridge: Optional["ReactMemoryBridge"] = None,  # Task 7: 双通道记忆桥接器(取代 Option C)
         session_memory: Optional["SessionMemoryLayer"] = None,  # M10 C2.1: L3 SM 快路径
+        memory_config: Optional["MemoryConfig"] = None,  # M10 C6.4: 运行时切换 hook(set_runtime 用)
     ):
         self.llm = llm_router
         self.tools = tool_registry
         self.max_turns = max_turns
         self.max_context_tokens = max_context_tokens  # 保留向后兼容
         self.messages: list[dict] = []  # 当前对话消息列表（对齐 Claude Code messages: Message[]）
-        
+
         # Day 5: ContextManager（替代 _trim_messages）
         self.context_manager = CM(
             llm_router=llm_router,
             model=getattr(llm_router.config, 'model', 'glm-4'),
         )
-        
+
         # P2 新增：从 LLMConfig 读取 system_prompt
         self.system_prompt = self.llm.config.system_prompt
 
@@ -185,6 +186,8 @@ class ReactAgent:
         self.react_memory_bridge = react_memory_bridge
         # M10 C2.1: L3 SM 快路径(可选注入,None 时走 ContextManager 传统路径)
         self.session_memory = session_memory
+        # M10 C6.4: 运行时配置切换 hook — UI expander 用 set_runtime 改字段不重建 agent
+        self.memory_config = memory_config  # type: ignore[assignment]
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
         if session_id:

@@ -229,7 +229,7 @@ class MemoryConfig(BaseModel):
         config = MemoryConfig.from_env()           # 从 MEMORY_xxx env 读
         config = MemoryConfig.from_dict({...})     # 从 dict 读（测试友好）
     """
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     # 子配置
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
@@ -297,12 +297,11 @@ class MemoryConfig(BaseModel):
 
         Args:
             key: dotted path,例如 "cost.daily_budget_usd"
-            value: 新值(由 Pydantic 在 setattr 时校验类型)
+            value: 新值(由 Pydantic 在 setattr 时校验类型 — validate_assignment=True)
 
         Raises:
-            KeyError: 当 key 路径上任何一段不存在。
-                注意:类型错误(int 给 str 字段)由 Pydantic 抛 ValidationError,
-                不吞 — 让调用方拿到原始异常更易定位。
+            KeyError: 当 key 路径上任何一段不存在(extra='forbid')
+            ValidationError: 当 value 类型不匹配字段 schema(validate_assignment=True)
         """
         parts = key.split(".")
         obj: Any = self

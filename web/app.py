@@ -696,6 +696,8 @@ def get_agent(session_id=None):
             react_memory_bridge = None
 
     # Day 4: 传入 session_id 实现历史持久化
+    # M10 C6.4: 传入 MemoryConfig,UI expander 才能 set_runtime in-place 改字段
+    from agent_core.memory.config import MemoryConfig
     agent = ReactAgent(
         router, registry,
         max_turns=max_turns,
@@ -704,6 +706,7 @@ def get_agent(session_id=None):
         memory_retriever=memory_retriever,    # M7 ported: 检索 + 注入
         memory_store=memory_store,             # M7 ported: 库内计数
         react_memory_bridge=react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
+        memory_config=MemoryConfig(),          # M10 C6.4: UI 运行时切换 hook
     )
 
     # M10 C3.1: 启动 DistillationLoop(后台 daemon,10 分钟检查 4 重门)

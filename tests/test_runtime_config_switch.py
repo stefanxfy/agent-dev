@@ -37,3 +37,27 @@ def test_set_runtime_raises_keyerror_on_unknown_path():
         config.set_runtime("nonexistent.field", 5.0)
     # 错误信息里应该提到未知字段名,便于排查
     assert "nonexistent" in str(excinfo.value)
+
+
+def test_set_runtime_raises_validation_error_on_type_mismatch():
+    """type mismatch → ValidationError (MemoryConfig 启用了 validate_assignment=True)"""
+    from pydantic import ValidationError
+    from agent_core.memory.config import MemoryConfig
+    config = MemoryConfig()
+    # enabled 是 bool — 传 object() 应被 Pydantic 拦下
+    with pytest.raises(ValidationError):
+        config.set_runtime("enabled", object())
+
+
+def test_react_agent_accepts_memory_config_param():
+    """ReactAgent.__init__ 接受 memory_config 参数并存为 self.memory_config"""
+    from agent_core.agent_core import ReactAgent
+    from agent_core.memory.config import MemoryConfig
+    from unittest.mock import MagicMock
+    config = MemoryConfig()
+    agent = ReactAgent(
+        llm_router=MagicMock(),
+        tool_registry=MagicMock(),
+        memory_config=config,
+    )
+    assert agent.memory_config is config
