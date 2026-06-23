@@ -43,6 +43,13 @@ from .tools.base import ToolRegistry
 # Day 5: 上下文管理器
 from .context.manager import ContextManager as CM
 
+# M10 C2.1: L3 SessionMemoryLayer 快路径(字符串前向引用避免循环 import)
+from .memory.sm_layer import TurnContext as _TurnContext  # noqa: E402,F401
+try:
+    from .memory.sm_layer import SessionMemoryLayer as _SessionMemoryLayer  # type: ignore # noqa: F401,E402
+except ImportError:  # pragma: no cover
+    _SessionMemoryLayer = None  # type: ignore[assignment]
+
 # ── Debug 日志配置 ───────────────────────────────────────────────
 
 # 创建 logger（使用单例模式防止重复配置）
@@ -154,6 +161,7 @@ class ReactAgent:
         memory_retriever: Optional["MemoryRetriever"] = None,  # M7 ported: 记忆检索
         memory_store: Optional["MemoryStore"] = None,           # M7 ported: 库内计数
         react_memory_bridge: Optional["ReactMemoryBridge"] = None,  # Task 7: 双通道记忆桥接器(取代 Option C)
+        session_memory: Optional["SessionMemoryLayer"] = None,  # M10 C2.1: L3 SM 快路径
     ):
         self.llm = llm_router
         self.tools = tool_registry
@@ -175,7 +183,8 @@ class ReactAgent:
         self.memory_store = memory_store
         # Task 7: 双通道记忆桥接器(取代 Option C,run() 末尾调 bridge.on_turn_end)
         self.react_memory_bridge = react_memory_bridge
-        
+        # M10 C2.1: L3 SM 快路径(可选注入,None 时走 ContextManager 传统路径)
+        self.session_memory = session_memory
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
         if session_id:
@@ -379,32 +388,79 @@ class ReactAgent:
         # 检查 token 预算，必要时自动压缩
         # Fork 模式：传入主 agent 的 system_prompt + tools，复用 cache prefix
         tool_schemas = self.tools.list_schemas(provider=self._detect_provider())
-        compacted, compact_result = self.context_manager.check_and_compact(
-            self.messages,
-            parent_system=self.system_prompt,
-            parent_tools=tool_schemas or None,
-            parent_messages=self.messages,
-        )
-        if compact_result:
-            if compact_result.success:
-                self.messages = compacted
-                _logger.info(f"Context compacted: {compact_result.summary_str()}")
 
-                # 对齐 Claude Code buildPostCompactMessages 单一构造点
-                # 顺序: boundary → summary → preserved head
-                # 之前 P0 bug: 只写了 boundary + summary 两方法，preserved head 6 条不写盘
-                # 现场: data/sessions/7f071c62.jsonl
-                if self._session_manager:
-                    try:
-                        self._persist_compacted_messages(self.messages, compact_result)
-                    except Exception as e:
-                        _logger.warning(f"Failed to persist compaction to session: {e}")
+        # M10 C2.1: L3 SM 快路径决策(§4.3/§4.4)
+        # 在 ContextManager 之前先问 SM:命中 sm_compact 走零 LLM 快路径
+        # 否则 fallback 到 ContextManager(原有逻辑)
+        sm_compact_used = False
+        if self.session_memory is not None:
+            try:
+                total_tokens = sum(
+                    self._estimate_message_tokens(m) for m in self.messages
+                )
+                tool_count = getattr(self, "cumulative_tool_calls", 0)
+                ctx = _TurnContext(
+                    messages=self.messages,
+                    total_tokens=total_tokens,
+                    tool_count=tool_count,
+                )
+                decision = self.session_memory.should_trigger_compact(ctx)
+                _logger.debug(
+                    f"SM decision: strategy={decision.strategy}, reason={decision.reason}"
+                )
+                if decision.strategy == "sm_compact":
+                    sm_result = self.session_memory.compact(
+                        self.messages,
+                        context_window=self.max_context_tokens,
+                    )
+                    if sm_result is not None:
+                        # SM 压缩成功:替换 messages
+                        self.messages = [sm_result.summary_message] + list(sm_result.kept_messages)
+                        sm_compact_used = True
+                        _logger.info(
+                            f"SM-compact OK: ~{sm_result.used_tokens_estimate} tokens estimated"
+                        )
+                        yield (
+                            "system",
+                            f"📦 [L3 fast path] 上下文已压缩(SM 文件): ~{sm_result.used_tokens_estimate} tokens",
+                        )
+                    # else: SM 返回 None → fallback 走 ContextManager
+                elif decision.strategy == "wait":
+                    # 等 extraction 完成(本期简化:记 log,fallback ContextManager)
+                    _logger.info(
+                        f"SM wait: {decision.reason}, fallback ContextManager"
+                    )
+            except Exception as e:
+                # SM 决策/压缩异常 → 安全回退到 ContextManager
+                _logger.warning(f"SM fast path 异常,fallback ContextManager: {e}")
 
-                yield ("system", f"📦 上下文已压缩: {compact_result.tokens_freed:,} tokens 释放")
-            else:
-                _logger.warning(f"Context compact failed: {compact_result.error}")
-                # 压缩失败时回退到旧的截断策略
-                self._trim_messages()
+        if not sm_compact_used:
+            compacted, compact_result = self.context_manager.check_and_compact(
+                self.messages,
+                parent_system=self.system_prompt,
+                parent_tools=tool_schemas or None,
+                parent_messages=self.messages,
+            )
+            if compact_result:
+                if compact_result.success:
+                    self.messages = compacted
+                    _logger.info(f"Context compacted: {compact_result.summary_str()}")
+
+                    # 对齐 Claude Code buildPostCompactMessages 单一构造点
+                    # 顺序: boundary → summary → preserved head
+                    # 之前 P0 bug: 只写了 boundary + summary 两方法，preserved head 6 条不写盘
+                    # 现场: data/sessions/7f071c62.jsonl
+                    if self._session_manager:
+                        try:
+                            self._persist_compacted_messages(self.messages, compact_result)
+                        except Exception as e:
+                            _logger.warning(f"Failed to persist compaction to session: {e}")
+
+                    yield ("system", f"📦 上下文已压缩: {compact_result.tokens_freed:,} tokens 释放")
+                else:
+                    _logger.warning(f"Context compact failed: {compact_result.error}")
+                    # 压缩失败时回退到旧的截断策略
+                    self._trim_messages()
         # Day 3 旧逻辑（保留作为 fallback）
         # self._trim_messages()
 
