@@ -14,6 +14,7 @@ from agent_core.memory.prompt_templates import (
     EXTRACT_SYSTEM_PROMPT,
     build_extract_prompt,
 )
+from agent_core.memory.tracing import tracer
 
 logger = logging.getLogger("memory.extraction_gate")
 
@@ -76,21 +77,32 @@ class ExtractionGate:
         self.cache_namespace = cache_namespace or self.CACHE_NAMESPACE
 
     def should_extract(self, ctx: TurnContext) -> Decision:
-        gate1_pass = (
-            ctx.cumulative_tokens >= self.MIN_TOKENS_TO_INIT
-            or ctx.cumulative_tool_calls >= self.MIN_TOOL_CALLS
-        )
-        gate2_pass = self._keyword_filter(ctx.last_messages)
+        with tracer.start_as_current_span("memory.extract.gate") as span:
+            span.set_attribute("memory.gate.session_id", ctx.session_id)
+            span.set_attribute("memory.gate.cumulative_tokens", ctx.cumulative_tokens)
+            span.set_attribute("memory.gate.cumulative_tool_calls", ctx.cumulative_tool_calls)
 
-        if not (gate1_pass or gate2_pass):
-            return Decision(
-                should_extract=False,
-                reason="no_trigger(gate1_no_threshold, gate2_no_keyword)",
-                via_gate1=False,
+            gate1_pass = (
+                ctx.cumulative_tokens >= self.MIN_TOKENS_TO_INIT
+                or ctx.cumulative_tool_calls >= self.MIN_TOOL_CALLS
             )
+            gate2_pass = self._keyword_filter(ctx.last_messages)
+            span.set_attribute("memory.gate.gate1_pass", gate1_pass)
+            span.set_attribute("memory.gate.gate2_pass", gate2_pass)
 
-        # 门3:LLM 评分
-        return self._llm_score(ctx, via_gate1=gate1_pass and not gate2_pass)
+            if not (gate1_pass or gate2_pass):
+                decision = Decision(
+                    should_extract=False,
+                    reason="no_trigger(gate1_no_threshold, gate2_no_keyword)",
+                    via_gate1=False,
+                )
+            else:
+                # 门3:LLM 评分
+                decision = self._llm_score(ctx, via_gate1=gate1_pass and not gate2_pass)
+
+            span.set_attribute("memory.gate.should_extract", decision.should_extract)
+            span.set_attribute("memory.gate.reason", decision.reason)
+            return decision
 
     def _keyword_filter(self, last_messages: list[dict]) -> bool:
         text = " ".join(

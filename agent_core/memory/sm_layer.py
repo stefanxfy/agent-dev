@@ -44,6 +44,7 @@ from typing import Any, Callable, Literal, Optional
 
 from agent_core.exceptions import StorageError
 from agent_core.memory.config import CompactConfig
+from agent_core.memory.tracing import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -424,40 +425,48 @@ last_compacted_at: null
         Returns:
             CompactResult 或 None(SM 文件不可用 → 让 caller 走传统)
         """
-        if not self.sm_exists() or self.sm_is_template():
-            return None
+        with tracer.start_as_current_span("memory.sm.compact") as span:
+            span.set_attribute("memory.sm.input_count", len(messages))
+            span.set_attribute("memory.sm.context_window", context_window)
 
-        sm_content = self.read_sm() or ""
-        truncated = self._truncate_sections(sm_content, self.config.max_per_section_chars)
+            if not self.sm_exists() or self.sm_is_template():
+                span.set_attribute("memory.sm.result", "no_sm_file")
+                return None
 
-        summary_message = {
-            "role": "user",
-            "content": (
-                f"[Session memory summary]\n\n"
-                f"The following is a condensed summary of our session so far. "
-                f"Full SM file: {self.sm_path}\n\n"
-                f"{truncated}"
-            ),
-        }
+            sm_content = self.read_sm() or ""
+            truncated = self._truncate_sections(sm_content, self.config.max_per_section_chars)
 
-        kept_messages = self._slice_kept_messages(messages)
-        used_tokens_estimate = (
-            self.sm_token_count()
-            + self._estimate_messages_tokens(kept_messages)
-            + 50  # summary overhead
-        )
+            summary_message = {
+                "role": "user",
+                "content": (
+                    f"[Session memory summary]\n\n"
+                    f"The following is a condensed summary of our session so far. "
+                    f"Full SM file: {self.sm_path}\n\n"
+                    f"{truncated}"
+                ),
+            }
 
-        result = CompactResult(
-            summary_message=summary_message,
-            kept_messages=kept_messages,
-            used_tokens_estimate=used_tokens_estimate,
-            strategy="sm_compact",
-        )
+            kept_messages = self._slice_kept_messages(messages)
+            used_tokens_estimate = (
+                self.sm_token_count()
+                + self._estimate_messages_tokens(kept_messages)
+                + 50  # summary overhead
+            )
 
-        # M10 C2.2: 持久化 compact 结果(.md frontmatter 更新 + .json snapshot)
-        self._persist_compact_result(result)
+            result = CompactResult(
+                summary_message=summary_message,
+                kept_messages=kept_messages,
+                used_tokens_estimate=used_tokens_estimate,
+                strategy="sm_compact",
+            )
 
-        return result
+            # M10 C2.2: 持久化 compact 结果(.md frontmatter 更新 + .json snapshot)
+            self._persist_compact_result(result)
+
+            span.set_attribute("memory.sm.kept_count", len(result.kept_messages))
+            span.set_attribute("memory.sm.used_tokens_estimate", result.used_tokens_estimate)
+            span.set_attribute("memory.sm.strategy", result.strategy)
+            return result
 
     def _persist_compact_result(self, result: CompactResult) -> None:
         """M10 C2.2: 持久化 compact 结果

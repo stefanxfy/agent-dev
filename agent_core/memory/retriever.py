@@ -39,6 +39,7 @@ from agent_core.memory.secret_scanner import (
     SecretScanner,
     get_default_scanner,
 )
+from agent_core.memory.tracing import tracer
 
 logger = logging.getLogger(__name__)
 
@@ -227,38 +228,47 @@ class MemoryRetriever:
         Returns:
             RetrievalReport(hits=sorted by score desc)
         """
-        if not query or not query.strip():
-            return RetrievalReport(query=query, mode=RetrievalMode(mode), hits=[])
+        with tracer.start_as_current_span("memory.search") as span:
+            span.set_attribute("memory.search.query_len", len(query))
+            span.set_attribute("memory.search.top_k", top_k)
+            span.set_attribute("memory.search.mode", str(mode) if not isinstance(mode, str) else mode)
 
-        if isinstance(mode, str):
-            try:
-                mode = RetrievalMode(mode)
-            except ValueError:
-                raise RetrievalError(f"未知检索模式: {mode!r}")
+            if not query or not query.strip():
+                empty = RetrievalReport(query=query, mode=RetrievalMode(mode), hits=[])
+                span.set_attribute("memory.search.hits_count", 0)
+                return empty
 
-        t0 = time.time()
-        # 多召 → 融合 → 重排 → L4 过滤 → 截 top_k
-        candidates = self._retrieve_candidates(query, top_k * 3, mode, types)
-        ranked = self._rerank(candidates, mode)
-        filtered = self._filter_secrets(ranked)
-        final = filtered[:top_k]
+            if isinstance(mode, str):
+                try:
+                    mode = RetrievalMode(mode)
+                except ValueError:
+                    raise RetrievalError(f"未知检索模式: {mode!r}")
 
-        elapsed_ms = (time.time() - t0) * 1000
+            t0 = time.time()
+            # 多召 → 融合 → 重排 → L4 过滤 → 截 top_k
+            candidates = self._retrieve_candidates(query, top_k * 3, mode, types)
+            ranked = self._rerank(candidates, mode)
+            filtered = self._filter_secrets(ranked)
+            final = filtered[:top_k]
 
-        report = RetrievalReport(
-            query=query,
-            mode=mode,
-            hits=final,
-            total_candidates=len(candidates),
-            secret_filtered=len(ranked) - len(filtered),
-            elapsed_ms=elapsed_ms,
-        )
-        logger.debug(
-            f"retriever.search({query!r}, {mode.value}, top_k={top_k}) → "
-            f"{len(final)} hits ({report.secret_filtered} secret-filtered, "
-            f"{elapsed_ms:.1f}ms)"
-        )
-        return report
+            elapsed_ms = (time.time() - t0) * 1000
+
+            report = RetrievalReport(
+                query=query,
+                mode=mode,
+                hits=final,
+                total_candidates=len(candidates),
+                secret_filtered=len(ranked) - len(filtered),
+                elapsed_ms=elapsed_ms,
+            )
+            span.set_attribute("memory.search.hits_count", len(final))
+            span.set_attribute("memory.search.elapsed_ms", elapsed_ms)
+            logger.debug(
+                f"retriever.search({query!r}, {mode.value}, top_k={top_k}) → "
+                f"{len(final)} hits ({report.secret_filtered} secret-filtered, "
+                f"{elapsed_ms:.1f}ms)"
+            )
+            return report
 
     def get_by_hash(self, item_hash: str, type: str) -> Optional[MemoryHit]:
         """按 hash 精确获取(检索辅助 / 调试用)"""

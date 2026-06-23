@@ -556,6 +556,15 @@ def extract_text(content):
 # ── 初始化 Agent ───────────────────────────────────────────────
 def get_agent(session_id=None):
     """创建或更新 Agent 实例"""
+    # M10 C6.1: 启用 OTel tracer(读 env OTEL_EXPORTER_OTLP_ENDPOINT,
+    # 没设则 NoOp,不破坏 dev 体验)。tracing 失败不阻断 agent。
+    try:
+        from agent_core.memory.tracing import configure_tracing
+        if configure_tracing():
+            logging.info("OTel tracer 启用")
+    except Exception as e:
+        logging.warning(f"configure_tracing 失败: {e}")
+
     config = LLMConfig(
         provider=provider.lower(),
         model=model,
