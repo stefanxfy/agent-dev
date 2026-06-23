@@ -134,3 +134,60 @@ def test_get_agent_uses_shared_memory_config_instance():
     assert memory_config_kwarg.value.id == "memory_config", (
         f"ReactAgent.memory_config 变量名应为 'memory_config',实际 '{memory_config_kwarg.value.id}'"
     )
+
+
+def test_memory_config_hoisted_outside_memory_enabled_block():
+    """M10 C7.1 fix: memory_config = MemoryConfig() 必须在 `if memory_enabled` 块外
+
+    否则 memory_enabled=False 时 ReactAgent 收到 UnboundLocalError。
+    这个测试是真实运行报错后的回归守卫。
+    """
+    import ast
+    from pathlib import Path
+
+    tree = ast.parse(Path("web/app.py").read_text(encoding="utf-8"))
+    get_agent_func = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "get_agent"),
+        None,
+    )
+    assert get_agent_func is not None
+
+    # 找 memory_config = MemoryConfig() 这个赋值节点,验它不在 if 块内
+    found_assignment = None
+    for node in ast.walk(get_agent_func):
+        # Skip nested function definitions
+        if isinstance(node, ast.FunctionDef) and node is not get_agent_func:
+            continue
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id == "memory_config":
+                if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) \
+                        and node.value.func.id == "MemoryConfig":
+                    found_assignment = node
+                    break
+    assert found_assignment is not None, "memory_config = MemoryConfig() 未在 get_agent 中找到"
+
+    # 关键检查:这个赋值节点的祖先链不能有 If(test=<memory_enabled test>)
+    # 简化:它的直接父节点不能是 If(用 ast.NodeVisitor 遍历父链)
+    # 我们手动递归检查祖先链
+    def has_if_ancestor(node, target_node, root):
+        """BFS 找 target_node 的祖先链,看是否有 If"""
+        for child in ast.iter_child_nodes(root):
+            if child is target_node:
+                return False  # 找到了 target,但 parent 不是 If
+            if isinstance(child, ast.If):
+                # 检查 target 是否在 child 的 body/orelse 中
+                for sub in ast.walk(child):
+                    if sub is target_node:
+                        return True
+                # 检查 child 子树外
+                if has_if_ancestor(node, target_node, child):
+                    return True
+            elif has_if_ancestor(node, target_node, child):
+                return True
+        return False
+
+    assert not has_if_ancestor(None, found_assignment, get_agent_func), (
+        "memory_config = MemoryConfig() 在 `if memory_enabled` 块内 — "
+        "memory_enabled=False 时会触发 UnboundLocalError"
+    )

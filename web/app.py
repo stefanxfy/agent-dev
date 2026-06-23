@@ -632,6 +632,9 @@ def get_agent(session_id=None):
     # Task 8: 严格双通道(react_memory_bridge)在 memory_enabled=True 且
     # 上游 memory_store/vec_store/embed_fn 全部初始化成功后才构造。
     react_memory_bridge = None
+    # M10 C7.1: 单一 MemoryConfig 实例必须 hoist 到 memory_enabled 块之前
+    # 因为 ReactAgent(memory_config=...) 在 if 块外(line 719)使用
+    memory_config = MemoryConfig()
     if st.session_state.get("memory_enabled", False):
         try:
             from agent_core.memory import (
@@ -645,8 +648,6 @@ def get_agent(session_id=None):
             agent_data_dir = _agent_config.agent_data_dir or str(Path.home() / ".agent_data")
             mem_root = Path(agent_data_dir) / "memory"
             mem_root.mkdir(parents=True, exist_ok=True)
-            # M10 C7.1 final review fix: 单一 MemoryConfig 实例,cost_tracker / ReactAgent / UI 共享
-            memory_config = MemoryConfig()
             memory_store = MemoryStore(mem_root)
             chroma_path = Path(agent_data_dir) / "chroma"
             chroma_path.mkdir(parents=True, exist_ok=True)
