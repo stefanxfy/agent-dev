@@ -44,10 +44,11 @@ class LLMModel(str, Enum):
     GLM_4_7 = "GLM-4.7"
 
     # MiniMax (MiniMax 文本模型)
-    # MiniMax-Text-01 是 MiniMax 平台最新的通用文本模型(2026 年 6 月)
+    # MiniMax-M3 是当前生产模型(2026 年 6 月)
     # 通过 OpenAI 兼容端点 https://api.minimaxi.com/v1 调用
-    MINIMAX_TEXT_01 = "MiniMax-Text-01"
-    MINIMAX_TEXT_01_PREVIEW = "MiniMax-Text-01-preview"  # 旧版预览,留作 fallback
+    MINIMAX_M3 = "MiniMax-M3"  # 主线生产模型
+    MINIMAX_TEXT_01 = "MiniMax-Text-01"  # 旧版通用文本(留作兼容)
+    MINIMAX_TEXT_01_PREVIEW = "MiniMax-Text-01-preview"  # 预览版(留作兼容)
 
 
 class ThinkingConfig(BaseModel):
@@ -423,14 +424,17 @@ class LLMRouter:
             )
         elif provider == "minimax":
             # MiniMax:OpenAI 兼容,与 zhipu 行为对齐
+            # 实测(2026-06-24 smoke test):MiniMax-M3 支持 implicit prompt cache
+            # (cached=114 / input=186 = 61.3% 命中率),不需要显式 cache_control 块
             final_messages = messages
             if system_prompt_override:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
             if cache_namespace:
-                logger.warning(
-                    "cache_namespace=%r passed but minimax doesn't support "
-                    "cache_control; ignored",
+                # explicit cache_control 块暂未验证;只记 info,不影响调用
+                logger.info(
+                    "cache_namespace=%r passed to minimax; implicit caching may apply",
+                    cache_namespace,
                     cache_namespace,
                 )
             yield from self._stream_with_retry(
