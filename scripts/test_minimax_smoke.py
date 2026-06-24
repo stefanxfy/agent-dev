@@ -58,25 +58,37 @@ def main() -> int:
     print("\n[2/4] 流式 chat 调用...")
     messages = [{"role": "user", "content": "用一句话介绍你自己,不超过 20 字。"}]
     collected_text = ""
+    collected_thinking = ""
     collected_usage = None
     chunk_count = 0
+    thinking_chunk_count = 0
+    text_chunk_count = 0
     try:
         for chunk in router.chat(messages=messages):
             chunk_count += 1
+            if chunk.thinking_delta and chunk.thinking_delta.thinking:
+                collected_thinking += chunk.thinking_delta.thinking
+                thinking_chunk_count += 1
             if chunk.text_delta and chunk.text_delta.text:
                 collected_text += chunk.text_delta.text
+                text_chunk_count += 1
             if chunk.usage:
                 collected_usage = chunk.usage
     except Exception as e:
         print(f"   ❌ chat() 抛异常: {type(e).__name__}: {e}")
         return 1
 
-    print(f"   chunks: {chunk_count}")
+    print(f"   总 chunks: {chunk_count} (thinking={thinking_chunk_count}, text={text_chunk_count})")
+    print(f"   思考过程: {collected_thinking[:80]!r}{'...' if len(collected_thinking) > 80 else ''}")
     print(f"   收到文本: {collected_text!r}")
     if not collected_text:
         print("   ❌ 没收到任何文本,可能 MiniMax-M3 不支持或 model name 错")
         return 1
-    print("   ✅ 收到流式文本")
+    # 关键:确认 <think> 标签已经被 splitter 正确分离(原文不应再含 <think>)
+    if "<think>" in collected_text or "</think>" in collected_text:
+        print(f"   ❌ text_delta 里还残留 <think> 标签,splitter 没工作")
+        return 1
+    print("   ✅ 流式响应正常,thinking 与 text 已分离")
 
     # ── Test 3: UsageStats 解析 ──
     print("\n[3/4] UsageStats 解析...")

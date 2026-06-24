@@ -5,7 +5,7 @@ Fork 模式下 system_prompt_override 在 zhipu/openai 路径的行为
 """
 import pytest
 from dataclasses import dataclass
-from agent_core.llm.router import UsageStats, LLMConfig, LLMRouter, LLMProvider, LLMModel
+from agent_core.llm.router import UsageStats, LLMConfig, LLMRouter, LLMProvider, LLMModel, _ThinkTagSplitter, StreamChunk
 
 
 # 模拟不同 provider 的 usage 对象
@@ -396,3 +396,223 @@ class TestMinimaxProvider:
             del os.environ["MINIMAX_API_KEY"]
             if hasattr(_config, "_cache"):
                 _config._cache.pop("MINIMAX_API_KEY", None)
+
+
+# ═══════════════════════════════════════════════════════════════
+# _ThinkTagSplitter 测试 — MiniMax M3 等把 thinking 包在 <think>...</think>
+# 标签里的 model 需要的状态机
+#
+# 关键设计:streaming emit — 每 chunk 立即 emit 已确定的内容,
+# 只缓冲最后 N 字符(可能是不完整的标签)。保证:
+# 1. UI 能实时看到 thinking 流(不是等 </think> 出现才一次性 emit)
+# 2. 不丢内容 — 拼接所有 chunk 得到的字符串 == 原始输入
+# 3. 标签跨 chunk 切片时仍能正确切分
+# ═══════════════════════════════════════════════════════════════
+
+def _collect_splitter(splitter, *texts):
+    """Helper: 喂多个 chunk,收集 StreamChunk 列表(包含 flush)"""
+    out = []
+    for t in texts:
+        out.extend(splitter.feed(t))
+    out.extend(splitter.flush())
+    return out
+
+
+def _join_chunks(chunks) -> str:
+    """拼接所有 delta(thinking + text)成单一字符串,用于内容守恒断言"""
+    parts = []
+    for c in chunks:
+        if c.thinking_delta:
+            parts.append(c.thinking_delta.thinking)
+        elif c.text_delta:
+            parts.append(c.text_delta.text)
+    return "".join(parts)
+
+
+def _assert_no_lost_content(input_texts, chunks):
+    """断言:拼接所有 chunk 得到的字符串 == 拼接所有 input(除了 <think>/</think>/紧跟 \n 这些被吃掉的)
+
+    模拟 splitter 行为:
+    1. 把 </think>\n 整段去掉(标签 + 紧跟的换行)
+    2. 把 <think> 去掉
+    3. 任何剩余的 </think> 单独去掉(没有紧跟 \n 的情况)
+    """
+    raw_input = "".join(input_texts)
+    # 1. 吃掉 </think>\n 整段
+    expected = raw_input.replace("</think>\n", "")
+    # 2. 吃掉 <think>
+    expected = expected.replace("<think>", "")
+    # 3. 任何剩余的 </think>(没紧跟 \n 的)
+    expected = expected.replace("</think>", "")
+    actual = _join_chunks(chunks)
+    assert actual == expected, (
+        f"内容丢失!\n  原始(去标签后): {expected!r}\n  实际 chunk 拼接: {actual!r}"
+    )
+
+
+class TestThinkTagSplitter:
+    """_ThinkTagSplitter 状态机:把 <think>...</think> 标签转成 ThinkingDelta"""
+
+    def test_no_think_tag_passes_through_as_text(self):
+        """纯文本(无 <think>)→ streaming emit 后拼接 == 原文本"""
+        chunks = _collect_splitter(_ThinkTagSplitter(), "hello world")
+        # 拼接所有 chunk = 原文本
+        assert _join_chunks(chunks) == "hello world"
+        # 没有 thinking_delta
+        assert all(c.thinking_delta is None for c in chunks)
+
+    def test_basic_think_block(self):
+        """简单 <think>foo</think> → thinking=foo"""
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "<think>reasoning here</think>",
+        )
+        _assert_no_lost_content(["<think>reasoning here</think>"], chunks)
+        # 拼接后:全部 thinking
+        joined = _join_chunks(chunks)
+        assert joined == "reasoning here"
+        # 至少有一个 thinking_delta
+        assert any(c.thinking_delta is not None for c in chunks)
+
+    def test_think_then_text(self):
+        """<think>...</think> + 后续文本 → thinking 段 + text 段"""
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "<think>\n用户问什么\n</think>\n答案是 42",
+        )
+        _assert_no_lost_content(["<think>\n用户问什么\n</think>\n答案是 42"], chunks)
+        # 拼接后应该是"用户问什么" + "答案是 42"(去掉标签和 \n)
+        joined = _join_chunks(chunks)
+        assert "用户问什么" in joined
+        assert "答案是 42" in joined
+        # text 部分不应该有 leading \n
+        text_chunks = [c for c in chunks if c.text_delta]
+        for c in text_chunks:
+            assert not c.text_delta.text.startswith("\n"), \
+                f"</think> 后的 \\n 应被吃掉,实际: {c.text_delta.text!r}"
+
+    def test_text_before_think(self):
+        """先文本后 think: hello<think>foo</think> → text=hello, thinking=foo"""
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "hello<think>foo</think>",
+        )
+        _assert_no_lost_content(["hello<think>foo</think>"], chunks)
+        # 拼接后 == "hellofoo"
+        assert _join_chunks(chunks) == "hellofoo"
+
+    def test_open_tag_split_across_chunks(self):
+        """<think> 标签跨 chunk:`<thi` + `nk>foo</think>`"""
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "<thi", "nk>foo</think>",
+        )
+        _assert_no_lost_content(["<thi", "nk>foo</think>"], chunks)
+        # 拼接后:thinking="foo"
+        assert _join_chunks(chunks) == "foo"
+
+    def test_close_tag_split_across_chunks(self):
+        """</think> 标签跨 chunk:`<think>foo</thin` + `k>`
+
+        拼接成完整:<think>foo</think>(close tag 完整,后面无内容)
+        所以 thinking='foo',无 text
+        """
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "<think>foo</thin", "k>",
+        )
+        _assert_no_lost_content(["<think>foo</thin", "k>"], chunks)
+        # 拼接后 == "foo"
+        assert _join_chunks(chunks) == "foo"
+        # 至少一个 thinking 段
+        assert any(c.thinking_delta for c in chunks)
+
+    def test_both_tags_split(self):
+        """open 和 close 标签都被切碎:`<th` + `ink>foo</` + `think>`"""
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "<th", "ink>foo</", "think>",
+        )
+        _assert_no_lost_content(["<th", "ink>foo</", "think>"], chunks)
+        # 拼接后 == "foo"("</think>" 末尾被切开成 <think>foo</think>)
+        assert _join_chunks(chunks) == "foo"
+
+    def test_multiple_think_blocks(self):
+        """多对标签:<think>a</think>X<think>b</think>Y → thinking=[a,b], text=[X,Y]"""
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "<think>think1</think>A<think>think2</think>B",
+        )
+        _assert_no_lost_content(["<think>think1</think>A<think>think2</think>B"], chunks)
+        # 拼接后 == "think1Athink2B"
+        assert _join_chunks(chunks) == "think1Athink2B"
+        # 至少 2 个 thinking 段 + 2 个 text 段
+        thinking_chunks = [c for c in chunks if c.thinking_delta]
+        text_chunks = [c for c in chunks if c.text_delta]
+        assert len(thinking_chunks) >= 1
+        assert len(text_chunks) >= 1
+        # thinking 总和 = "think1" + "think2" = "think1think2"
+        assert "".join(c.thinking_delta.thinking for c in thinking_chunks) == "think1think2"
+        # text 总和 = "A" + "B" = "AB"
+        assert "".join(c.text_delta.text for c in text_chunks) == "AB"
+
+    def test_empty_think_block(self):
+        """空 think 块 <think></think> → 0 个 chunk(标签被切掉,无残留)"""
+        chunks = _collect_splitter(
+            _ThinkTagSplitter(),
+            "<think></think>",
+        )
+        _assert_no_lost_content(["<think></think>"], chunks)
+        # 拼接后是空字符串
+        assert _join_chunks(chunks) == ""
+
+    def test_unclosed_think_partial_buffer_at_end(self):
+        """未关闭 <think>(流到末尾)→ buffer 残留由 flush 兜底"""
+        s = _ThinkTagSplitter()
+        # 喂一段无 </think> 的 thinking
+        chunks_from_feed = s.feed("<think>partial reasoning")
+        # flush 兜底
+        chunks_from_flush = s.flush()
+        all_chunks = chunks_from_feed + chunks_from_flush
+        _assert_no_lost_content(["<think>partial reasoning"], all_chunks)
+        # 拼接后 == "partial reasoning"
+        assert _join_chunks(all_chunks) == "partial reasoning"
+
+    def test_partial_buffer_at_end_flushed_as_text(self):
+        """NORMAL 状态下末尾是 <think> 部分前缀 → flush 兜底为 text(不丢内容)"""
+        s = _ThinkTagSplitter()
+        chunks_from_feed = s.feed("hello <thi")  # <thi 是 <think> 前缀
+        chunks_from_flush = s.flush()
+        all_chunks = chunks_from_feed + chunks_from_flush
+        _assert_no_lost_content(["hello <thi"], all_chunks)
+        # 拼接后 == "hello <thi"
+        assert _join_chunks(all_chunks) == "hello <thi"
+
+    def test_real_minimax_response(self):
+        """实测 MiniMax M3 真实响应格式(2026-06-24 smoke test 验证过)
+
+        原 response: '<think>\\n用户要求用一句话介绍自己...\\n</think>\\n我是AI助手,擅长解答问题'
+        拆成 3 个 chunk 喂入
+        """
+        s = _ThinkTagSplitter()
+        all_inputs = [
+            "<think>\n用户要求一句话介绍自己\n",
+            "</think>\n我是AI助手",
+            ",擅长解答问题",
+        ]
+        chunks = []
+        for inp in all_inputs:
+            chunks += s.feed(inp)
+        chunks += s.flush()
+        _assert_no_lost_content(all_inputs, chunks)
+        # 拼接后:thinking = "用户要求一句话介绍自己"(去掉 \n + 标签)
+        # text = "我是AI助手,擅长解答问题"
+        full = _join_chunks(chunks)
+        assert "用户要求" in full
+        assert "我是AI助手" in full
+        assert "擅长解答问题" in full
+        # 答案(text 段)不应该有 leading \n
+        text_chunks = [c for c in chunks if c.text_delta]
+        if text_chunks:
+            assert not text_chunks[0].text_delta.text.startswith("\n"), \
+                f"</think> 后的 \\n 应被吃掉,实际: {text_chunks[0].text_delta.text!r}"
