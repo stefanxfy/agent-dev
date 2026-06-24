@@ -5,7 +5,7 @@ Fork 模式下 system_prompt_override 在 zhipu/openai 路径的行为
 """
 import pytest
 from dataclasses import dataclass
-from agent_core.llm.router import UsageStats, LLMConfig, LLMRouter, LLMProvider
+from agent_core.llm.router import UsageStats, LLMConfig, LLMRouter, LLMProvider, LLMModel
 
 
 # 模拟不同 provider 的 usage 对象
@@ -253,3 +253,146 @@ class TestForkSystemPromptOverride:
         # 不应有两个 system
         system_count = sum(1 for m in captured["messages"] if m.get("role") == "system")
         assert system_count == 1, f"应只有一个 system，实际 {system_count} 个"
+
+
+# ═══════════════════════════════════════════════════════════════
+# MiniMax (MiniMax) provider 测试
+# 覆盖:enum 注册 / LLMConfig 接受 / chat() 路由 / base_url / system_prompt_override
+# 文档:https://platform.minimaxi.com/docs/api-reference/text-openai-api
+# ═══════════════════════════════════════════════════════════════
+
+class TestMinimaxProvider:
+    """MiniMax (MiniMax) provider 接入测试 — OpenAI 兼容端点"""
+
+    def test_minimax_provider_enum_exists(self):
+        """LLMProvider.MINIMAX 必须存在(值 'minimax')"""
+        assert hasattr(LLMProvider, "MINIMAX")
+        assert LLMProvider.MINIMAX.value == "minimax"
+
+    def test_minimax_model_enum_registered(self):
+        """LLMModel 必须包含 MiniMax 模型名(MiniMax-Text-01)"""
+        assert hasattr(LLMModel, "MINIMAX_TEXT_01")
+        assert LLMModel.MINIMAX_TEXT_01.value == "MiniMax-Text-01"
+
+    def test_llm_config_accepts_minimax_provider(self):
+        """LLMConfig(provider='minimax') 不报错"""
+        cfg = LLMConfig(
+            provider="minimax",
+            model="MiniMax-Text-01",
+            api_key="test-key",
+        )
+        assert cfg.provider == LLMProvider.MINIMAX
+        assert cfg.model == "MiniMax-Text-01"
+
+    def test_minimax_routes_to_chat_minimax(self):
+        """chat() 收到 provider='minimax' 必须路由到 _chat_minimax(而不是 zhipu/openai)"""
+        cfg = LLMConfig(
+            provider="minimax",
+            model="MiniMax-Text-01",
+            api_key="test-key",
+        )
+        router = LLMRouter(cfg)
+
+        # Monkey-patch _chat_minimax,验证 chat() 实际调用了它
+        from agent_core.llm import router as router_module
+        RouterClass = router_module.LLMRouter
+        called = {"flag": False, "provider": None}
+        original = RouterClass._chat_minimax
+
+        def mock_chat_minimax(self, msgs, tools, tool_choice=None):
+            called["flag"] = True
+            return iter([])
+
+        RouterClass._chat_minimax = mock_chat_minimax
+        try:
+            list(router.chat(messages=[{"role": "user", "content": "hi"}]))
+        finally:
+            RouterClass._chat_minimax = original
+        assert called["flag"] is True, "chat() 没把 provider='minimax' 路由到 _chat_minimax"
+
+    def test_minimax_empty_override_does_not_inject_system(self):
+        """minimax: 空 system_prompt_override 不应注入空 system(与 zhipu 行为一致,保持 cache prefix 对齐)"""
+        cfg = LLMConfig(
+            provider="minimax",
+            model="MiniMax-Text-01",
+            api_key="test-key",
+            system_prompt="",
+        )
+        router = LLMRouter(cfg)
+        from agent_core.llm import router as router_module
+        RouterClass = router_module.LLMRouter
+        captured = {}
+        original = RouterClass._chat_minimax
+
+        def mock_chat_minimax(self, msgs, tools, tool_choice=None):
+            captured["messages"] = msgs
+            return iter([])
+
+        RouterClass._chat_minimax = mock_chat_minimax
+        try:
+            list(router.chat(
+                messages=[{"role": "user", "content": "hi"}],
+                system_prompt_override="",
+            ))
+        finally:
+            RouterClass._chat_minimax = original
+        # 第一个 message 仍是 user(空 override 不注入)
+        assert captured["messages"][0] == {"role": "user", "content": "hi"}, \
+            f"minimax 空 override 不应注入 system,实际收到: {captured['messages']}"
+
+    def test_minimax_non_empty_override_injects_system(self):
+        """minimax: 非空 override 必须注入到 messages 头(Fork 模式正常用法)"""
+        cfg = LLMConfig(
+            provider="minimax",
+            model="MiniMax-Text-01",
+            api_key="test-key",
+        )
+        router = LLMRouter(cfg)
+        from agent_core.llm import router as router_module
+        RouterClass = router_module.LLMRouter
+        captured = {}
+        original = RouterClass._chat_minimax
+
+        def mock_chat_minimax(self, msgs, tools, tool_choice=None):
+            captured["messages"] = msgs
+            return iter([])
+
+        RouterClass._chat_minimax = mock_chat_minimax
+        try:
+            list(router.chat(
+                messages=[{"role": "user", "content": "hi"}],
+                system_prompt_override="You are helpful",
+            ))
+        finally:
+            RouterClass._chat_minimax = original
+        assert captured["messages"][0] == {"role": "system", "content": "You are helpful"}
+        assert captured["messages"][1] == {"role": "user", "content": "hi"}
+
+    def test_minimax_client_default_base_url(self):
+        """_get_minimax_client() 默认 base_url 必须是 https://api.minimaxi.com/v1
+        源码级校验(.venv 没装 openai,不能 import openai)
+        """
+        import inspect
+        from agent_core.llm import router as router_module
+        src = inspect.getsource(router_module.LLMRouter._get_minimax_client)
+        assert "https://api.minimaxi.com/v1" in src, (
+            "_get_minimax_client 默认 base_url 应该是 https://api.minimaxi.com/v1,"
+            f"实际源码:\n{src}"
+        )
+        # 允许 base_url 覆盖(LLMConfig.base_url 字段)
+        assert "self.config.base_url" in src, "需要支持 base_url 覆盖"
+
+    def test_minimax_config_registers_api_key(self):
+        """config.minimax_api_key 必须能从 MINIMAX_API_KEY env 读出"""
+        import os
+        from agent_core.config import config as _config
+        os.environ["MINIMAX_API_KEY"] = "test-minimax-key-123"
+        # 清理缓存(typed() 会缓存结果)
+        if hasattr(_config, "_cache"):
+            _config._cache.pop("MINIMAX_API_KEY", None)
+        try:
+            assert _config.minimax_api_key == "test-minimax-key-123"
+        finally:
+            del os.environ["MINIMAX_API_KEY"]
+            if hasattr(_config, "_cache"):
+                _config._cache.pop("MINIMAX_API_KEY", None)

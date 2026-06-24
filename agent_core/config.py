@@ -50,9 +50,10 @@ ENV_VAR_REGISTRY: tuple[EnvVarSpec, ...] = (
     EnvVarSpec("ANTHROPIC_API_KEY", str, "", "Anthropic Claude API Key"),
     EnvVarSpec("OPENAI_API_KEY", str, "", "OpenAI GPT API Key"),
     EnvVarSpec("ZHIPU_API_KEY", str, "", "智谱 GLM API Key"),
+    EnvVarSpec("MINIMAX_API_KEY", str, "", "MiniMax (MiniMax) API Key — OpenAI 兼容端点"),
 
     # ── Default LLM ──
-    EnvVarSpec("DEFAULT_PROVIDER", Literal["anthropic", "openai", "zhipu"], "zhipu", "默认 LLM 厂商"),
+    EnvVarSpec("DEFAULT_PROVIDER", Literal["anthropic", "openai", "zhipu", "minimax"], "zhipu", "默认 LLM 厂商"),
     EnvVarSpec("DEFAULT_MODEL", str, "GLM-5.1", "默认 LLM 模型"),
     EnvVarSpec("DEFAULT_TEMPERATURE", float, 0.7, "默认 LLM 温度"),
     EnvVarSpec("DEFAULT_MAX_TOKENS", int, 4096, "默认最大输出 tokens"),
@@ -175,6 +176,11 @@ class Config:
     @property
     def zhipu_api_key(self) -> str:
         spec = next(s for s in ENV_VAR_REGISTRY if s.name == "ZHIPU_API_KEY")
+        return str(self.typed(spec))
+
+    @property
+    def minimax_api_key(self) -> str:
+        spec = next(s for s in ENV_VAR_REGISTRY if s.name == "MINIMAX_API_KEY")
         return str(self.typed(spec))
 
     @property

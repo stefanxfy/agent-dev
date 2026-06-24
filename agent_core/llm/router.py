@@ -23,6 +23,7 @@ class LLMProvider(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     ZHIPU = "zhipu"  # 智谱 GLM
+    MINIMAX = "minimax"  # MiniMax (MiniMax API,OpenAI 兼容)
 
 
 class LLMModel(str, Enum):
@@ -41,6 +42,12 @@ class LLMModel(str, Enum):
     GLM_5 = "GLM-5.1"
     GLM_5_TURBO = "glm-5-turbo"
     GLM_4_7 = "GLM-4.7"
+
+    # MiniMax (MiniMax 文本模型)
+    # MiniMax-Text-01 是 MiniMax 平台最新的通用文本模型(2026 年 6 月)
+    # 通过 OpenAI 兼容端点 https://api.minimaxi.com/v1 调用
+    MINIMAX_TEXT_01 = "MiniMax-Text-01"
+    MINIMAX_TEXT_01_PREVIEW = "MiniMax-Text-01-preview"  # 旧版预览,留作 fallback
 
 
 class ThinkingConfig(BaseModel):
@@ -302,6 +309,7 @@ class LLMRouter:
         self._anthropic_client = None
         self._openai_client = None
         self._zhipu_client = None
+        self._minimax_client = None  # MiniMax (OpenAI 兼容)
 
     # ── 懒加载客户端 ────────────────────────────────────────────────────────
 
@@ -411,6 +419,22 @@ class LLMRouter:
                 )
             yield from self._stream_with_retry(
                 lambda: self._chat_zhipu(final_messages, tools, tool_choice),
+                provider=provider,
+            )
+        elif provider == "minimax":
+            # MiniMax:OpenAI 兼容,与 zhipu 行为对齐
+            final_messages = messages
+            if system_prompt_override:
+                final_messages = [{"role": "system", "content": system_prompt_override}]
+                final_messages.extend(filtered_messages)
+            if cache_namespace:
+                logger.warning(
+                    "cache_namespace=%r passed but minimax doesn't support "
+                    "cache_control; ignored",
+                    cache_namespace,
+                )
+            yield from self._stream_with_retry(
+                lambda: self._chat_minimax(final_messages, tools, tool_choice),
                 provider=provider,
             )
         else:
@@ -695,6 +719,26 @@ class LLMRouter:
             )
         return self._zhipu_client
 
+    def _get_minimax_client(self):
+        """获取 MiniMax 客户端（OpenAI 兼容端点,文档:platform.minimaxi.com/docs/api-reference/text-openai-api）
+
+        注意:URL 路径名是 text-openai-api,说明其 chat completions 端点完全
+        兼容 OpenAI 协议,直接用 openai.OpenAI SDK + base_url 覆盖即可。
+        401/429 等 HTTP 错误由 _stream_with_retry 统一处理。
+        """
+        if self._minimax_client is None:
+            import openai
+            from ..config import config as _config
+            api_key = self.config.api_key or _config.minimax_api_key
+            # 官方文档 base_url:https://api.minimaxi.com/v1
+            # 也可由 LLMConfig.base_url 覆盖(便于私有部署 / 代理)
+            base_url = self.config.base_url or "https://api.minimaxi.com/v1"
+            self._minimax_client = openai.OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+            )
+        return self._minimax_client
+
     def _chat_zhipu(
         self,
         messages: list[dict],
@@ -797,6 +841,122 @@ class LLMRouter:
         # 这里不再需要流结束后一次性 yield。
 
         # 流式结束后，如果有完整的 tool_calls，yield 它们
+        for idx in sorted(tool_calls_buffer.keys()):
+            tc = tool_calls_buffer[idx]
+            if tc["id"] and tc["name"]:
+                import json
+                try:
+                    tool_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
+                except json.JSONDecodeError:
+                    tool_input = {"raw_arguments": tc["arguments"]}
+                yield StreamChunk(
+                    tool_call=ToolCallDelta(
+                        tool_name=tc["name"],
+                        tool_input=tool_input,
+                        tool_use_id=tc["id"],
+                        is_final=True,
+                    )
+                )
+
+    # ── MiniMax (MiniMax) 流式实现 ────────────────────────────────────
+    #
+    # 协议：OpenAI 兼容(参考 docs/platform.minimaxi.com/docs/api-reference/text-openai-api)
+    # 端点：https://api.minimaxi.com/v1/chat/completions
+    # 鉴权：Authorization: Bearer <MINIMAX_API_KEY>
+    # 行为对齐 _chat_zhipu：Anthropic-style content list → string 转换
+    #   + reasoning_content 流式 thinking(若 model 支持) + tool_calls 解析
+    # 注意：tool_choice "none" / "auto" / "required" 由 MiniMax 自行映射
+
+    def _chat_minimax(
+        self,
+        messages: list[dict],
+        tools: Optional[list[dict]],
+        tool_choice: Optional[str] = None,
+    ) -> Generator[StreamChunk, None, None]:
+        """MiniMax (MiniMax) 流式调用 — OpenAI 兼容协议"""
+        client = self._get_minimax_client()
+
+        # 转换 messages 格式：MiniMax 要求 role 为小写，content 为 string
+        minimax_messages = []
+        for m in messages:
+            role = m["role"].lower()
+            content = m["content"]
+            # 如果 content 是 list（Anthropic 格式），转换为 string
+            if isinstance(content, list):
+                text_parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                        elif item.get("type") == "tool_result":
+                            text_parts.append(f"[Tool Result: {item.get('content', '')}]")
+                content = "\n".join(text_parts)
+            minimax_messages.append({"role": role, "content": content})
+
+        kwargs: dict = {
+            "model": self.config.model,
+            "messages": minimax_messages,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if tools:
+            openai_tools = []
+            for t in tools:
+                if "type" in t and t.get("type") == "function":
+                    openai_tools.append(t)
+                else:
+                    # Anthropic 格式 → OpenAI 格式
+                    openai_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": t.get("name", ""),
+                            "description": t.get("description", ""),
+                            "parameters": t.get("input_schema", {}),
+                        }
+                    })
+            kwargs["tools"] = openai_tools
+            if tool_choice is not None:
+                # OpenAI 兼容协议：接受 "auto" / "none" / "required"
+                kwargs["tool_choice"] = tool_choice
+        if self.config.temperature > 0:
+            kwargs["temperature"] = self.config.temperature
+
+        stream = client.chat.completions.create(**kwargs)
+
+        tool_calls_buffer: dict = {}  # index -> {"id", "name", "arguments"}
+
+        for chunk in stream:
+            if chunk.choices:
+                delta = chunk.choices[0].delta
+
+                # 文本增量
+                if delta.content:
+                    yield StreamChunk(text_delta=TextDelta(text=delta.content))
+
+                # MiniMax reasoning_content（若支持,与 zhipu 行为一致）
+                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    yield StreamChunk(
+                        thinking_delta=ThinkingDelta(thinking=delta.reasoning_content)
+                    )
+
+                # 工具调用增量（OpenAI 格式）
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_buffer:
+                            tool_calls_buffer[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc.id:
+                            tool_calls_buffer[idx]["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            tool_calls_buffer[idx]["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            tool_calls_buffer[idx]["arguments"] += tc.function.arguments
+
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = UsageStats.from_chunk_usage(chunk.usage)
+                yield StreamChunk(usage=usage)
+
+        # 流式结束后，yield 完整的 tool_calls
         for idx in sorted(tool_calls_buffer.keys()):
             tc = tool_calls_buffer[idx]
             if tc["id"] and tc["name"]:
