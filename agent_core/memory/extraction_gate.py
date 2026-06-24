@@ -80,7 +80,7 @@ class ExtractionGate:
         self.session_id = session_id
         self.cache_namespace = cache_namespace or self.CACHE_NAMESPACE
         self._cost_tracker = cost_tracker  # M10 C6.2
-        self._latency_timeout = 8.0  # M10 C6.3 (秒)
+        self._latency_timeout = 30.0  # M10 C6.3 (秒,2026-06-24 调到 30 适配长 prompt)
 
     def should_extract(self, ctx: TurnContext) -> Decision:
         with tracer.start_as_current_span("memory.extract.gate") as span:

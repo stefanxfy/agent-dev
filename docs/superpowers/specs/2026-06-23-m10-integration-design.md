@@ -264,7 +264,7 @@
 
 **目标**:
 - `CostConfig.latency_budget_p95_ms = 8000`
-- bridge 调 LLM 用 `concurrent.futures` + 8s timeout,超时则 drop 候选 + 推 `extract_error: timeout`
+- bridge 调 LLM 用 `concurrent.futures` + 30s timeout(2026-06-24 从 8s 调到 30s 适配长 prompt),超时则 drop 候选 + 推 `extract_error: timeout`
 - 主 turn 流照常,不卡
 
 **影响范围**: `react_memory_bridge.py` + 测试 3 cases

@@ -948,7 +948,7 @@ git commit -m "feat(memory): Cost budget guard 接入(§13.7)"
 - [ ] **Step 1-5: timeout drop**
 
 ```python
-def _call_llm_with_timeout(self, prompt, timeout=8.0):
+def _call_llm_with_timeout(self, prompt, timeout=30.0):
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         future = ex.submit(self._call_llm, prompt)
         try:

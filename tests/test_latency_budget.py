@@ -68,7 +68,7 @@ def test_bridge_emits_timeout_event_on_latency_timeout():
 
     # Mock gate.should_extract 抛 LatencyTimeout
     gate = MagicMock()
-    gate.should_extract.side_effect = LatencyTimeout(timeout=8.0)
+    gate.should_extract.side_effect = LatencyTimeout(timeout=30.0)
 
     bridge = ReactMemoryBridge(
         dual_channel=dual,
