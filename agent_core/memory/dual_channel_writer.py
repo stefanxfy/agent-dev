@@ -429,7 +429,10 @@ class DualChannelWriter:
                         f"extract:  可疑相似(sim={_sim_str})但无 dedup_judge,放行写盘"
                     )
                     return False
-                is_dup = bool(self.dedup_judge(cand, hits))
+                # 预解析 hits:caller 负责把 [{id, distance}] 转为 [{id, title, body, distance}]
+                # 喂给 dedup_judge / build_dedup_prompt(Chroma 不再存 metadata/document)
+                resolved_hits = self._resolve_hits_for_prompt(hits)
+                is_dup = bool(self.dedup_judge(cand, resolved_hits))
                 logger.info(
                     f"extract:  LLM 去重判定(sim={_sim_str}) → "
                     f"{'重复跳过' if is_dup else '新增写盘'} [{cand.type}] {cand.title!r}"
@@ -442,6 +445,42 @@ class DualChannelWriter:
                 f"extract:  语义去重出错(放行写盘,不阻断): {type(e).__name__}: {e}"
             )
             return False
+
+    def _resolve_hits_for_prompt(self, hits: list[dict]) -> list[dict]:
+        """把 vec.query() 返回的 [{id, distance}] 预解析为
+        [{id, title, body, distance}],title/body 从 MemoryStore 读。
+
+        失败(文件已被删)用空字符串占位,避免去重流程中断。
+        """
+        resolved: list[dict] = []
+        for h in hits:
+            item_hash = h.get("id", "")
+            distance = h.get("distance", 0.0)
+            if not item_hash:
+                resolved.append({"id": "", "title": "?", "body": "", "distance": distance})
+                continue
+            type_ = None
+            for t in ("user", "feedback", "event", "project", "reference"):
+                rel = self.memory_store.root / t / f"{item_hash}.md"
+                if rel.exists():
+                    type_ = t
+                    break
+            title, body = "", ""
+            if type_:
+                try:
+                    data = self.memory_store.read(f"{type_}/{item_hash}.md")
+                    fm = data.get("frontmatter", {}) or {}
+                    title = fm.get("title", "")
+                    body = data.get("body", "")
+                except Exception:
+                    pass
+            resolved.append({
+                "id": item_hash,
+                "title": title,
+                "body": body,
+                "distance": distance,
+            })
+        return resolved
 
     def _do_extract_candidates(
         self,

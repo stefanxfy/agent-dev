@@ -73,7 +73,8 @@ def _router_yielding(text):
 def test_llm_judge_parses_is_duplicate_true():
     judge = make_llm_dedup_judge(_router_yielding('{"is_duplicate": true, "reason": "同一事实"}'))
     cand = ExtractionCandidate(type="user", title="周杰伦", body="喜欢周杰伦", source_quote="x")
-    assert judge(cand, [{"metadata": {"title": "周杰伦"}, "document": "喜欢周杰伦"}]) is True
+    # 新契约:judge 接收 caller 预解析后的 [{id, title, body, distance}]
+    assert judge(cand, [{"id": "h1", "title": "周杰伦", "body": "喜欢周杰伦", "distance": 0.05}]) is True
 
 
 def test_llm_judge_parses_false_and_handles_code_fence():
@@ -92,19 +93,26 @@ def test_llm_judge_failure_returns_false():
 # ── extract_candidates 集成 ─────────────────────────────────────────────────
 
 class _FakeVec:
-    """可控 query 结果 + 记录 add 的假向量库"""
+    """可控 query 结果 + 记录 add 的假向量库
+
+    新契约(方案 A / T1-T2 锁定):
+    - query() 返回 [{id, distance}] —— Chroma 不再存 metadata/document
+    - add(id, embedding) —— 不再接收 metadata/document
+    """
     def __init__(self, hits):
+        # 接受 [{id, distance, ...}] 形态;query 时只暴露 id/distance
         self._hits = hits
-        self.added = []
+        self.added: list[tuple] = []
         _collection_name = "fake"
         self._collection_name = _collection_name
         self._path = "fake"
 
     def query(self, embedding, top_k):
-        return self._hits
+        # 严格只返 id + distance(模拟 Chroma 新契约)
+        return [{"id": h.get("id", ""), "distance": h.get("distance", 1.0)} for h in self._hits]
 
-    def add(self, doc):
-        self.added.append(doc)
+    def add(self, id, embedding):
+        self.added.append((id, embedding))
 
     def count(self):
         return len(self.added)
@@ -150,7 +158,8 @@ def _run_one_candidate(tmp_path, hits, *, judge=None, cfg=None):
 def test_auto_duplicate_skips_without_llm(tmp_path):
     """相似度 ≥ 0.95 → 直接跳过,不调 LLM,不写 .md"""
     judge = MagicMock()
-    hits = [{"distance": 0.03, "metadata": {"title": "周杰伦"}, "document": "喜欢周杰伦"}]  # sim 0.97
+    # 新契约:_FakeVec.query() 只返 id+distance;title/body 不通过 vec 传
+    hits = [{"id": "h1", "distance": 0.03}]  # sim 0.97
     result, vec, md_count = _run_one_candidate(tmp_path, hits, judge=judge)
 
     assert result["written"] == 0 and result["skipped"] == 1
@@ -162,10 +171,17 @@ def test_auto_duplicate_skips_without_llm(tmp_path):
 def test_judge_band_calls_llm_and_skips_when_duplicate(tmp_path):
     """相似度在 [0.85, 0.95) → 调 LLM;判重复 → 跳过"""
     judge = MagicMock(return_value=True)
-    hits = [{"distance": 0.10, "metadata": {"title": "周杰伦"}, "document": "喜欢周杰伦"}]  # sim 0.90
+    hits = [{"id": "h1", "distance": 0.10}]  # sim 0.90
     result, vec, md_count = _run_one_candidate(tmp_path, hits, judge=judge)
 
     judge.assert_called_once()
+    # 新契约:judge 收到 caller 预解析后的 [{id, title, body, distance}]
+    args, _ = judge.call_args
+    resolved = args[1]
+    assert isinstance(resolved, list), f"judge 第 2 参数应为 list,实际 {type(resolved)}"
+    if resolved:
+        assert "title" in resolved[0] and "body" in resolved[0], \
+            f"judge 应收到预解析后的 hit(含 title/body),实际 {resolved[0]}"
     assert result["written"] == 0 and result["skipped"] == 1
     assert md_count == 0
 
@@ -173,7 +189,7 @@ def test_judge_band_calls_llm_and_skips_when_duplicate(tmp_path):
 def test_judge_band_writes_when_not_duplicate(tmp_path):
     """相似度在可疑带 → LLM 判「不重复」→ 照常写盘"""
     judge = MagicMock(return_value=False)
-    hits = [{"distance": 0.10, "metadata": {"title": "周深"}, "document": "喜欢周深"}]  # sim 0.90
+    hits = [{"id": "h1", "distance": 0.10}]  # sim 0.90
     result, vec, md_count = _run_one_candidate(tmp_path, hits, judge=judge)
 
     judge.assert_called_once()
@@ -185,7 +201,7 @@ def test_judge_band_writes_when_not_duplicate(tmp_path):
 def test_low_similarity_writes_without_llm(tmp_path):
     """相似度 < judge_floor → 新记忆,不调 LLM,正常写"""
     judge = MagicMock()
-    hits = [{"distance": 0.40, "metadata": {"title": "无关"}, "document": "明天下雨"}]  # sim 0.60
+    hits = [{"id": "h1", "distance": 0.40}]  # sim 0.60
     result, vec, md_count = _run_one_candidate(tmp_path, hits, judge=judge)
 
     judge.assert_not_called()
@@ -196,10 +212,52 @@ def test_low_similarity_writes_without_llm(tmp_path):
 def test_dedup_disabled_writes_everything(tmp_path):
     """dedup_config.enabled=False → 完全不去重(即便相似度极高也照写)"""
     judge = MagicMock()
-    hits = [{"distance": 0.01, "metadata": {"title": "周杰伦"}, "document": "喜欢周杰伦"}]  # sim 0.99
+    hits = [{"id": "h1", "distance": 0.01}]  # sim 0.99
     result, vec, md_count = _run_one_candidate(
         tmp_path, hits, judge=judge, cfg=DedupConfig(enabled=False),
     )
     judge.assert_not_called()
     assert result["written"] == 1
     assert md_count == 1
+
+
+# ── build_dedup_prompt 新契约 (T5):接收 caller 预解析的 [{id, title, body, distance}] ──
+
+def test_build_dedup_prompt_uses_resolved_hits():
+    """新契约:build_dedup_prompt 接 resolved_hits[{id,title,body,distance}],
+    不再访问 metadata/document。
+    """
+    from agent_core.memory.prompt_templates import build_dedup_prompt
+
+    hits = [
+        {"id": "h1", "title": "姓名", "body": "用户叫小明", "distance": 0.95},
+        {"id": "h2", "title": "喜好", "body": "用户喜欢咖啡", "distance": 0.85},
+    ]
+    prompt = build_dedup_prompt("候选:用户叫张三", hits)
+
+    # 验证 title + body 都进入 prompt
+    assert "[姓名]" in prompt
+    assert "用户叫小明" in prompt
+    assert "[喜好]" in prompt
+    assert "用户喜欢咖啡" in prompt
+
+    # 验证不依赖 metadata/document 字段
+    assert "metadata" not in prompt.lower(), f"prompt 不应含 'metadata': {prompt[:300]}"
+    assert "document" not in prompt.lower(), f"prompt 不应含 'document': {prompt[:300]}"
+
+
+def test_build_dedup_prompt_empty_hits():
+    from agent_core.memory.prompt_templates import build_dedup_prompt
+
+    prompt = build_dedup_prompt("候选:任何", [])
+    assert "(无)" in prompt
+
+
+def test_build_dedup_prompt_uses_title_fallback_when_missing():
+    """如果 resolved_hits 条目没有 title 字段,降级为 '?'"""
+    from agent_core.memory.prompt_templates import build_dedup_prompt
+
+    hits = [{"id": "h1", "body": "用户叫小明", "distance": 0.95}]  # no title
+    prompt = build_dedup_prompt("候选:用户叫张三", hits)
+    assert "[?]" in prompt
+    assert "用户叫小明" in prompt
