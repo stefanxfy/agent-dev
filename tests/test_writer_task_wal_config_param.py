@@ -27,7 +27,7 @@ def _make_minimal_writer(monkeypatch, tmp_path, **overrides):
         session_id="s1",
         meta_db=db,
         memory_store=store,
-        vector_store=None,        # Phase 1 不调 channel_b
+        vector_store=None,        # Phase 1 不调 extract_candidates
         embed_fn=embed,
         **overrides,
     )

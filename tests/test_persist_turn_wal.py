@@ -1,9 +1,9 @@
 """
-channel_a_inline_write 走 memory_tasks 表测试
+persist_turn 走 memory_tasks 表测试
 
 Phase 1 / Step 1.2.6 + Phase 4 适配 — TDD 红 → 绿
 
-- 调用 channel_a_inline_write → memory_tasks 新增一行(state=NONE)
+- 调用 persist_turn → memory_tasks 新增一行(state=NONE)
 - 不再写 JSONL 文件
 - 不再 add_pending / remove_pending
 - 不再 set_cursor
@@ -80,22 +80,22 @@ def _count_cursors(db, session_id="s-wal-a"):
 
 
 class TestChannelAWritesToNewTable:
-    """channel_a_inline_write 直接走 memory_tasks"""
+    """persist_turn 直接走 memory_tasks"""
 
     def test_writes_to_memory_tasks(self, tmp_path):
         writer, db = _make_writer(tmp_path)
-        writer.channel_a_inline_write("hi", "hello")
+        writer.persist_turn("hi", "hello")
         rows = _list_tasks(db)
         assert len(rows) == 1
         assert rows[0][0] == 1
-        assert rows[0][1] == "NONE"  # Channel A 刚落盘,未决
+        assert rows[0][1] == "NONE"  # persist_turn 刚落盘,未决
         assert rows[0][2] == "hi"
         assert rows[0][3] == "hello"
 
     def test_no_jsonl_file_created(self, tmp_path):
         """不再写 daily log JSONL 文件"""
         writer, db = _make_writer(tmp_path)
-        writer.channel_a_inline_write("hi", "hello")
+        writer.persist_turn("hi", "hello")
         # 找 .jsonl 文件
         jsonl_files = list(tmp_path.rglob("*.jsonl"))
         assert jsonl_files == [], f"不应有 JSONL,但发现: {jsonl_files}"
@@ -103,25 +103,25 @@ class TestChannelAWritesToNewTable:
     def test_no_add_pending_called(self, tmp_path):
         """不再 add_pending / remove_pending"""
         writer, db = _make_writer(tmp_path)
-        writer.channel_a_inline_write("hi", "hello")
+        writer.persist_turn("hi", "hello")
         assert _count_pending(db) == 0
 
     def test_no_cursor_table_writes(self, tmp_path):
-        """Phase 4:cursors 表已 DROP,Channel A 不再写 cursor 行"""
+        """Phase 4:cursors 表已 DROP,persist_turn 不再写 cursor 行"""
         writer, db = _make_writer(tmp_path)
-        writer.channel_a_inline_write("hi", "hello")
+        writer.persist_turn("hi", "hello")
         assert _count_cursors(db) == 0
 
     def test_returns_new_turn_index(self, tmp_path):
         writer, _ = _make_writer(tmp_path)
-        idx = writer.channel_a_inline_write("hi", "hello")
+        idx = writer.persist_turn("hi", "hello")
         assert idx == 1  # 第一次写 → turn 1
 
     def test_sequential_writes_increment_turn(self, tmp_path):
         writer, db = _make_writer(tmp_path)
-        i1 = writer.channel_a_inline_write("a", "A")
-        i2 = writer.channel_a_inline_write("b", "B")
-        i3 = writer.channel_a_inline_write("c", "C")
+        i1 = writer.persist_turn("a", "A")
+        i2 = writer.persist_turn("b", "B")
+        i3 = writer.persist_turn("c", "C")
         assert (i1, i2, i3) == (1, 2, 3)
         assert _count_tasks(db) == 3
         rows = _list_tasks(db)
@@ -129,14 +129,14 @@ class TestChannelAWritesToNewTable:
 
     def test_explicit_turn_index_advances(self, tmp_path):
         writer, _ = _make_writer(tmp_path)
-        i1 = writer.channel_a_inline_write("a", "A", turn_index=10)
-        i2 = writer.channel_a_inline_write("b", "B", turn_index=11)
+        i1 = writer.persist_turn("a", "A", turn_index=10)
+        i2 = writer.persist_turn("b", "B", turn_index=11)
         assert (i1, i2) == (10, 11)
 
-    def test_state_field_is_none_after_channel_a(self, tmp_path):
-        """Channel A 落盘后,state 应是 NONE(等 Channel B 走完后变 PENDING)"""
+    def test_state_field_is_none_after_persist_turn(self, tmp_path):
+        """persist_turn 落盘后,state 应是 NONE(等 extract_candidates 走完后变 PENDING)"""
         writer, db = _make_writer(tmp_path)
-        writer.channel_a_inline_write("x", "y")
+        writer.persist_turn("x", "y")
         with db.transaction() as conn:
             task = conn.execute(
                 "SELECT state FROM memory_tasks WHERE session_id=? AND turn_index=1",
@@ -151,9 +151,9 @@ class TestChannelAIdempotency:
     def test_explicit_turn_index_below_max_noop(self, tmp_path):
         """传 turn_index <= max(已写 turn_index) → 跳过,不入表"""
         writer, db = _make_writer(tmp_path)
-        writer.channel_a_inline_write("first", "1st")
+        writer.persist_turn("first", "1st")
         # 再用显式小 turn_index 调
-        idx = writer.channel_a_inline_write("dup", "dup", turn_index=0)
+        idx = writer.persist_turn("dup", "dup", turn_index=0)
         assert idx == 1  # 返回已存在的 max
         assert _count_tasks(db) == 1  # 没有新行
         # 验证表里还是 1 行(Step 1.2.7 的 UNIQUE 冲突测试是底层 insert_task 的)
@@ -172,7 +172,7 @@ class TestChannelANoDailyCursorAttribute:
         """连续写入时,从 max(memory_tasks.turn_index) 派生下一个 turn_index"""
         writer, _ = _make_writer(tmp_path)
         # 不传 turn_index → 内部用 max+1
-        i1 = writer.channel_a_inline_write("a", "A")
-        i2 = writer.channel_a_inline_write("b", "B")
-        i3 = writer.channel_a_inline_write("c", "C")
+        i1 = writer.persist_turn("a", "A")
+        i2 = writer.persist_turn("b", "B")
+        i3 = writer.persist_turn("c", "C")
         assert (i1, i2, i3) == (1, 2, 3)

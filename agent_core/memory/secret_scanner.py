@@ -18,7 +18,7 @@ M3 / Day 3 — L8 修复
 
 触发点：
 - MemoryEditor.edit_memory 写入 new_string 前
-- Channel B 提取 LLM 输出后（防止 LLM 误把 key 写到 memory 里）
+- extract_candidates 提取 LLM 输出后（防止 LLM 误把 key 写到 memory 里）
 - Cold start 加载外部文件时
 """
 

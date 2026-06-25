@@ -112,7 +112,7 @@ class TestMarkDoneWithCandidatesEdgeCases:
 
     def test_refuses_when_state_not_inflight(self, db):
         """state != INFLIGHT 也允许 mark_done(SQL 不强校验 state 起点)"""
-        # 这是设计选择:mark_done 是 set-and-forget,Channel B 调用方自己保证起点是 INFLIGHT
+        # 这是设计选择:mark_done 是 set-and-forget,extract_candidates 调用方自己保证起点是 INFLIGHT
         # 测试:从 PENDING 直接 mark_done 也成功(写覆盖)
         tid = _new(db, state="PENDING")
         db.mark_done_with_candidates(tid, '[{"title": "x"}]')

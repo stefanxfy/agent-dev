@@ -1,12 +1,12 @@
 """
-双通道写入器（v2.1 §4.1 脊柱）
+双通道写入器(Phase 5 重命名)
 
 M2 / Day 2 — A3+A5+A9+A10 五项审查修复一次到位(Phase 4 删 A4 daily/extract 锁)
 
 设计要点:
 1. 双通道
-   - 通道 A:内联写 memory_tasks 表(state=NONE,无 LLM,同步,秒级返回)
-   - 通道 B:后台提取(LLM,async,CAS 抢占 INFLIGHT + mark_done_with_candidates)
+   - persist_turn(旧 channel_a):内联写 memory_tasks 表(state=NONE,无 LLM,同步,秒级返回)
+   - extract_candidates(旧 channel_b):后台提取(LLM,async,CAS 抢占 INFLIGHT + mark_done_with_candidates)
 2. A5: 幂等去重(item_hash via MemoryStore)
    - 同 (session_id, item_hash) UNIQUE 约束
    - 同 hash 已存在 → skip,不写盘
@@ -20,12 +20,20 @@ M2 / Day 2 — A3+A5+A9+A10 五项审查修复一次到位(Phase 4 删 A4 daily/
    - 取代旧 A3 cursors 表 + A10 pending_writes 表 + 旧 A4 daily/extract 锁
 
 不变量(v2.1 §4.5):
-- #3 通道 A 只写 memory_tasks(state=NONE),不调 LLM
-- #4 通道 B 推进前必须 cas_grab_task(INFLIGHT) → 成功后 mark_done_with_candidates
+- #3 persist_turn 只写 memory_tasks(state=NONE),不调 LLM
+- #4 extract_candidates 推进前必须 cas_grab_task(INFLIGHT) → 成功后 mark_done_with_candidates
+
+Phase 5 rename refactor:
+- 旧 channel_a_inline_write → persist_turn
+- 旧 channel_b_background_extract → extract_candidates
+- 旧 _do_channel_a_write → _do_persist_turn
+- 旧 _do_channel_b_extract → _do_extract_candidates
+- 日志前缀 "channel A:" / "extract: " → "persist:" / "extract:"
+- DualChannelWriter 类名保留(架构概念),方法名换为功能名
 
 已知限制:
 - vector_store 必须是 ChromaVectorStore 实现(见 agent_core.memory.chroma_store)
-- _do_extract 是 LLM 提取的实际逻辑(M3 接 LLM router)
+- _do_extract_candidates 是 LLM 提取的实际逻辑(M3 接 LLM router)
 """
 
 from __future__ import annotations
@@ -71,7 +79,7 @@ def _make_secret_event(turn_index: int) -> "MemoryEvent":
     return MemoryEvent(
         kind=MemoryEventKind.SECRET_DETECTED,
         turn_index=turn_index,
-        reason="channel_b_sanitize_unrecoverable",
+        reason="extract_sanitize_unrecoverable",
     )
 
 
@@ -140,16 +148,16 @@ class DualChannelWriter:
         vec, embed = make_chroma_store("/tmp/chroma")  # ChromaVectorStore + bge-m3
         w = DualChannelWriter("s1", db, store, vec, embed)
 
-        # 通道 A: 内联写 daily log
-        w.channel_a_inline_write("记住我叫小明", "已记", turn_index=0)
+        # persist_turn: 内联写 turn 到 memory_tasks
+        w.persist_turn("记住我叫小明", "已记", turn_index=0)
 
-        # 通道 B: 后台提取(异步)
-        w.channel_b_background_extract([TurnMessage(0, "我叫小明", "已记")])
+        # extract_candidates: 后台提取(异步)
+        w.extract_candidates([TurnMessage(0, "我叫小明", "已记")])
         w.shutdown(timeout=30)
 
-        # 重启恢复(A3)
+        # 重启恢复(A3):startup_scan 自动恢复
         w2 = DualChannelWriter("s1", db, store, vec, embed)
-        assert w2.daily_cursor == 0
+        result = w2.startup_scan()  # 清理旧 DONE/FAILED + 熔断 INFLIGHT + 派工
     """
 
     def __init__(
@@ -178,7 +186,7 @@ class DualChannelWriter:
         self.dedup_judge = dedup_judge
         # M11: WAL 状态机配置(Phase 1/2 用,Phase 3 env 接入)
         self.task_wal_config = task_wal_config
-        # embed_fn 必须非 None:channel B 写入 vector_store 需要先编码
+        # embed_fn 必须非 None:extract_candidates 写入 vector_store 需要先编码
         # 失败时立即 EmbeddingError,不静默(不再有 Mock 兜底)
         if embed_fn is None:
             raise DualChannelError(
@@ -199,7 +207,7 @@ class DualChannelWriter:
         self._inflight: set[Future] = set()
         self.extraction_timeout_seconds = extraction_timeout_seconds
 
-        # A10: extraction_in_progress 标志（防止 channel_b 并发）
+        # A10: extraction_in_progress 标志(防止 extract_candidates 并发)
         self._extraction_in_progress = False
         self._extraction_in_progress_lock = threading.Lock()
         # M6 场景 8: 跟踪本次提取开始时间,实现 watchdog(防止 extractor hang 永久阻塞)
@@ -209,7 +217,7 @@ class DualChannelWriter:
         self.scanner = SecretScanner()
         self.event_callback = event_callback
 
-        # M10 C1.4: §14.1 防御纵深 — Channel B 入口 path validator
+        # M10 C1.4: §14.1 防御纵深 — extract_candidates 入口 path validator
         # 即使 MemoryStore.write 已调 validator(C1.1 前置),
         # 这里再加一道,捕获任何 future regression。
         self._path_validator = MemoryPathValidator(memory_store.root)
@@ -221,18 +229,19 @@ class DualChannelWriter:
     # 通道 A：内联写 daily log（无 LLM，同步）
     # ──────────────────────────────────────────────────────
 
-    def channel_a_inline_write(
+    def persist_turn(
         self,
         user_msg: str,
         assistant_resp: str,
         turn_index: Optional[int] = None,
     ) -> int:
         """
-        通道 A:内联写一条 turn 到 memory_tasks(state=NONE)
+        持久化一条 turn 到 memory_tasks(state=NONE)
 
+        Phase 5 rename:旧 channel_a_inline_write
         M11 / Phase 4 single source of truth:不再写 JSONL / pending / cursors 三 IO,
         直接写新表。
-        state='NONE' 表示 Channel A 刚落盘,Channel B 取走时再 CAS → INFLIGHT → DONE/FAILED。
+        state='NONE' 表示 persist_turn 刚落盘,extract_candidates 取走时再 CAS → INFLIGHT → DONE/FAILED。
 
         Args:
             user_msg: 用户消息
@@ -259,7 +268,7 @@ class DualChannelWriter:
         max_idx = self._max_turn_index()
         if max_idx is not None and turn_index <= max_idx:
             logger.debug(
-                f"channel A: turn {turn_index} <= max({max_idx}),跳过(幂等)"
+                f"persist: turn {turn_index} <= max({max_idx}),跳过(幂等)"
             )
             return max_idx
 
@@ -267,11 +276,11 @@ class DualChannelWriter:
         existing = self.meta_db.get_task_by_turn(self.session_id, turn_index)
         if existing is not None:
             logger.debug(
-                f"channel A: turn {turn_index} 已写过(task#{existing['task_id']}),跳过"
+                f"persist: turn {turn_index} 已写过(task#{existing['task_id']}),跳过"
             )
             return existing["turn_index"]
 
-        # 直接走 memory_tasks 表,state='NONE' 标记 Channel A 刚落盘
+        # 直接走 memory_tasks 表,state='NONE' 标记 persist_turn 刚落盘
         self.meta_db.insert_task(
             session_id=self.session_id,
             turn_index=turn_index,
@@ -281,7 +290,7 @@ class DualChannelWriter:
             max_attempts=self.task_wal_config.max_retry,
         )
 
-        logger.debug(f"channel A: turn {turn_index} 写入 memory_tasks (state=NONE)")
+        logger.debug(f"persist: turn {turn_index} 写入 memory_tasks (state=NONE)")
         return turn_index
 
     def _next_turn_index(self) -> int:
@@ -313,7 +322,7 @@ class DualChannelWriter:
         attempts=3 → 4 倍
         attempts=0 → 0.5 × 基准(立即可重试,边界行为可接受)
 
-        Phase 2 / Step 2.2.3:Channel B 失败重试时使用,startup_scan 步骤 3
+        Phase 2 / Step 2.2.3:extract_candidates 失败重试时使用,startup_scan 步骤 3
         也会读 next_at 决定是否到时间重排 PENDING。
         """
         return time.time() + retry_backoff_seconds * (2 ** (attempts - 1))
@@ -322,14 +331,16 @@ class DualChannelWriter:
     # 通道 B：后台 LLM 提取（异步 + cursor 持久化）
     # ──────────────────────────────────────────────────────
 
-    def channel_b_background_extract(
+    def extract_candidates(
         self,
         messages: list[TurnMessage],
         *,
         llm_extractor: Optional[Callable[[list[TurnMessage]], list[ExtractionCandidate]]] = None,
     ) -> Future:
         """
-        通道 B:后台异步提取
+        后台异步提取 candidates(LLM)
+
+        Phase 5 rename:旧 channel_b_background_extract
 
         Args:
             messages: 要处理的 turn 列表(由 caller 决定范围;bridge 通常传单个 turn_msg)
@@ -364,7 +375,7 @@ class DualChannelWriter:
             self._extraction_started_at = time.time()
 
         future = self._executor.submit(
-            self._do_channel_b_extract,
+            self._do_extract_candidates,
             messages,
             llm_extractor or (lambda _msgs: []),  # 默认空列表
         )
@@ -406,7 +417,7 @@ class DualChannelWriter:
             if action is DedupAction.AUTO_DUPLICATE:
                 _top_title = (hits[0].get("metadata") or {}).get("title", "?")
                 logger.info(
-                    f"channel B: 语义重复(auto, sim={_sim_str} >= "
+                    f"extract:  语义重复(auto, sim={_sim_str} >= "
                     f"{cfg.auto_threshold}) 跳过 [{cand.type}] {cand.title!r} "
                     f"≈ 已有 {_top_title!r}"
                 )
@@ -415,12 +426,12 @@ class DualChannelWriter:
             if action is DedupAction.NEEDS_JUDGE:
                 if self.dedup_judge is None:
                     logger.debug(
-                        f"channel B: 可疑相似(sim={_sim_str})但无 dedup_judge,放行写盘"
+                        f"extract:  可疑相似(sim={_sim_str})但无 dedup_judge,放行写盘"
                     )
                     return False
                 is_dup = bool(self.dedup_judge(cand, hits))
                 logger.info(
-                    f"channel B: LLM 去重判定(sim={_sim_str}) → "
+                    f"extract:  LLM 去重判定(sim={_sim_str}) → "
                     f"{'重复跳过' if is_dup else '新增写盘'} [{cand.type}] {cand.title!r}"
                 )
                 return is_dup
@@ -428,11 +439,11 @@ class DualChannelWriter:
             return False  # NEW
         except Exception as e:
             logger.warning(
-                f"channel B: 语义去重出错(放行写盘,不阻断): {type(e).__name__}: {e}"
+                f"extract:  语义去重出错(放行写盘,不阻断): {type(e).__name__}: {e}"
             )
             return False
 
-    def _do_channel_b_extract(
+    def _do_extract_candidates(
         self,
         messages: list[TurnMessage],
         extractor: Callable[[list[TurnMessage]], list[ExtractionCandidate]],
@@ -440,6 +451,7 @@ class DualChannelWriter:
         """
         实际执行提取(在 executor 线程)
 
+        Phase 5 rename:旧 _do_channel_b_extract
         Phase 4:不写 pending_writes、不推进 extract_cursor、不取 _ipc_extract 锁
         — memory_tasks 单表 CAS + startup_scan 兜底是 single source of truth。
 
@@ -454,12 +466,12 @@ class DualChannelWriter:
         if not to_process:
             _incoming = [m.turn_index for m in messages]
             logger.warning(
-                f"channel B: messages 为空,提取被跳过 — 传入 turn_index={_incoming}"
+                f"extract:  messages 为空,提取被跳过 — 传入 turn_index={_incoming}"
             )
             return {"extracted": 0, "written": 0, "skipped": 0}
 
         logger.info(
-            f"channel B 提取开始: session={self.session_id}, "
+            f"extract 提取开始: session={self.session_id}, "
             f"turns={len(to_process)} (turn_index={[m.turn_index for m in to_process]})"
         )
 
@@ -470,18 +482,20 @@ class DualChannelWriter:
         for m in to_process:
             task_row = self.meta_db.get_task_by_turn(self.session_id, m.turn_index)
             if task_row is None:
-                # 没注册过的 turn(理论上 Channel A 写后必有,容错 skip)
+                # 没注册过的 turn(理论上 persist_turn 写后必有,容错 skip)
                 logger.debug(
-                    f"channel B: turn={m.turn_index} 不在 memory_tasks(可能未走 Channel A),跳过 CAS"
+                    f"extract:  turn={m.turn_index} 不在 memory_tasks(可能未走 persist_turn),跳过 CAS"
                 )
                 continue
+            # 偏差 1 修复:from_states 含 FAILED,设计文档 § 5.1 阶段 1 伪代码
+            # 允许 runtime 期间失败的 turn 自动恢复,不必等 startup_scan 重排
             if self.meta_db.cas_grab_task(
-                task_row["task_id"], ["PENDING", "NONE"], "INFLIGHT"
+                task_row["task_id"], ["PENDING", "NONE", "FAILED"], "INFLIGHT"
             ):
                 wal_inflight_ids.append(task_row["task_id"])
             else:
                 logger.debug(
-                    f"channel B: turn={m.turn_index} task#{task_row['task_id']} "
+                    f"extract:  turn={m.turn_index} task#{task_row['task_id']} "
                     f"state={task_row['state']} 不在 (PENDING/NONE),跳过 CAS"
                 )
 
@@ -491,7 +505,7 @@ class DualChannelWriter:
             # 1. LLM 提取(M3 接 router)
             candidates = extractor(to_process)
             logger.debug(
-                f"channel B: extractor 返回 {len(candidates)} candidates"
+                f"extract:  extractor 返回 {len(candidates)} candidates"
             )
 
             # 2026-06-24 Bug 1c 修复:candidates 与 messages 不是 1:1。
@@ -506,19 +520,19 @@ class DualChannelWriter:
                     _body_preview = cand.body[:80].replace("\n", " ")
                     _quote_preview = (cand.source_quote or "")[:60].replace("\n", " ")
                     logger.debug(
-                        f"channel B: 候选记忆 turn={stamp_turn} type={cand.type!r} "
+                        f"extract:  候选记忆 turn={stamp_turn} type={cand.type!r} "
                         f"title={cand.title!r} tags={cand.tags} score={cand.score} "
                         f"| body[{len(cand.body)}]={_body_preview!r} "
                         f"| source_quote={_quote_preview!r}"
                     )
 
-                    # M10 C1.4: §14.1 防御纵深 — Channel B 入口 path validator
-                    rel_path = f"{cand.type}/__channel_b_preflight__.md"
+                    # M10 C1.4: §14.1 防御纵深 — extract_candidates 入口 path validator
+                    rel_path = f"{cand.type}/__extract_preflight__.md"
                     try:
                         self._path_validator.validate(rel_path)
                     except PathSecurityError as e:
                         logger.warning(
-                            f"channel_b: 拒绝 candidate(cand.title={cand.title!r}): "
+                            f"extract:  拒绝 candidate(cand.title={cand.title!r}): "
                             f"type={cand.type!r} 触发 path validator: {e}"
                         )
                         skipped += 1
@@ -530,7 +544,7 @@ class DualChannelWriter:
                         remaining = self.scanner.scan(redacted_body)
                         if not remaining.is_clean:
                             logger.warning(
-                                f"channel_b: 丢弃 candidate(cand.title={cand.title!r}): "
+                                f"extract:  丢弃 candidate(cand.title={cand.title!r}): "
                                 f"redact 后仍命中 {len(remaining.hits)} 个 secret"
                             )
                             if self.event_callback:
@@ -541,7 +555,7 @@ class DualChannelWriter:
                             skipped += 1
                             continue
                         logger.debug(
-                            f"channel B: candidate {cand.title!r} 命中 secret,"
+                            f"extract:  candidate {cand.title!r} 命中 secret,"
                             f"已 redact body 后继续写盘"
                         )
                         cand = replace(cand, body=redacted_body)
@@ -553,7 +567,7 @@ class DualChannelWriter:
                             self.embed_fn, "model_name", type(self.embed_fn).__name__
                         )
                         logger.debug(
-                            f"channel B: 向量化中 model={_emb_model} "
+                            f"extract:  向量化中 model={_emb_model} "
                             f"text[{len(text_for_emb)}] chars (title={cand.title!r})"
                         )
                         embedding = self.embed_fn.encode(text_for_emb)
@@ -581,7 +595,7 @@ class DualChannelWriter:
                     )
                     md_path = self.memory_store.root / cand.type / f"{item_hash}.md"
                     logger.debug(
-                        f"channel B: MemoryStore 已写 {md_path} "
+                        f"extract:  MemoryStore 已写 {md_path} "
                         f"(hash={item_hash[:12]}, body[{len(cand.body)}] chars)"
                     )
 
@@ -598,14 +612,14 @@ class DualChannelWriter:
                     })
                     written += 1
                     logger.info(
-                        f"channel B: 已持久化 [{cand.type}] {cand.title!r} "
+                        f"extract:  已持久化 [{cand.type}] {cand.title!r} "
                         f"(hash={item_hash[:8]}, turn={stamp_turn})"
                     )
                 except MemoryStoreError as e:
                     if "已存在" in str(e):
                         skipped += 1
                         logger.debug(
-                            f"channel B: [{cand.type}] {cand.title!r} 已存在, 跳过(幂等)"
+                            f"extract:  [{cand.type}] {cand.title!r} 已存在, 跳过(幂等)"
                         )
                         continue
                     raise
@@ -619,7 +633,7 @@ class DualChannelWriter:
                         ensure_ascii=False,
                     )
                 except Exception as dump_err:
-                    logger.warning(f"channel B: candidates JSON 序列化失败: {dump_err}")
+                    logger.warning(f"extract:  candidates JSON 序列化失败: {dump_err}")
                     candidates_json = "[]"
                 # 把 candidates 写到 stamp_turn 对应的 task(INFLIGHT 状态)
                 stamp_task = self.meta_db.get_task_by_turn(self.session_id, stamp_turn)
@@ -637,28 +651,41 @@ class DualChannelWriter:
                         self.meta_db.mark_done_with_candidates(tid, "[]")
 
             logger.info(
-                f"channel B 提取完成: extracted={len(candidates)}, "
+                f"extract 提取完成: extracted={len(candidates)}, "
                 f"written={written}, skipped={skipped}"
             )
             return {"extracted": len(candidates), "written": written, "skipped": skipped}
 
         except Exception as e:
             # 失败 → 所有 wal_inflight_ids 标 FAILED(退避公式 → startup_scan 重排)
+            # 偏差 3 修复:与设计文档 § 5.1 阶段 5 伪代码对齐 — 终态判别
+            # attempts >= max_attempts → next_at=None(终态,等人工);否则 → 退避公式
             logger.error(
-                f"channel B 提取失败 turn_index={[m.turn_index for m in to_process]}: {e}"
+                f"extract 提取失败 turn_index={[m.turn_index for m in to_process]}: {e}"
             )
+            max_attempts = self.task_wal_config.max_retry
             for tid in wal_inflight_ids:
                 task_now = self.meta_db.get_task(tid)
                 if task_now and task_now["state"] == "INFLIGHT":
-                    new_attempts = (task_now["attempts"] or 0) + 1
-                    next_at = self._calc_next_at(
-                        new_attempts, self.task_wal_config.retry_backoff_seconds
-                    )
+                    # 偏差 2 修复:CAS 已 +1,这里读 task_now["attempts"] 即可
+                    new_attempts = task_now["attempts"] or 0
+                    if new_attempts >= max_attempts:
+                        # 终态:重试用尽,next_at=None 让 cleanup_failed_tasks 接管
+                        next_at_ts: Optional[float] = None
+                        logger.error(
+                            f"task#{tid} attempts={new_attempts} >= max={max_attempts} "
+                            f"→ 终态 FAILED(需人工): {e}"
+                        )
+                    else:
+                        # 可重试:指数退避
+                        next_at_ts = self._calc_next_at(
+                            new_attempts, self.task_wal_config.retry_backoff_seconds
+                        )
                     try:
                         self.meta_db.mark_failed(
                             tid,
                             attempts=new_attempts,
-                            next_at=next_at,
+                            next_at=next_at_ts,
                             error=f"{type(e).__name__}: {e}",
                         )
                     except Exception as mf_err:
@@ -666,7 +693,7 @@ class DualChannelWriter:
                             f"mark_failed 失败 task#{tid}: {mf_err}"
                         )
 
-            raise DualChannelError(f"channel B extract 失败: {e}", cause=e)
+            raise DualChannelError(f"extract extract 失败: {e}", cause=e)
 
     def _on_extract_done(self, future: Future) -> None:
         """提取完成回调（无论成功失败，释放 in_progress 标志）
@@ -685,12 +712,12 @@ class DualChannelWriter:
         exc = future.exception()
         if exc is not None:
             logger.error(
-                f"channel B extract future 异常(已被 fire-and-forget 吞掉): "
+                f"extract extract future 异常(已被 fire-and-forget 吞掉): "
                 f"{type(exc).__name__}: {exc}",
                 exc_info=exc,
             )
         else:
-            logger.debug("channel B extract future 正常完成")
+            logger.debug("extract extract future 正常完成")
 
     # ──────────────────────────────────────────────────────
     # A9: 优雅 shutdown

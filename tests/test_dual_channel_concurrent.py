@@ -2,10 +2,10 @@
 M6 / Day 6 并发测试 —— 5/8 不变量场景(场景 3 跨进程归 M8)
 
 设计 §4.5.1 场景矩阵:
-- 场景 1 (Phase 1 覆盖): 双线程 channel_a 并发 → test_channel_a_task_wal.TestConcurrent
+- 场景 1 (Phase 1 覆盖): 双线程 persist_turn 并发 → test_persist_turn_task_wal.TestConcurrent
 - 场景 2 (M6): A 写 turns 0–5 → B 跑 1 次处理 → 再跑 1 次处理 0 条(task 全 DONE 后 no-op)
 - 场景 3 (M8): 跨进程 A+B → 跳过
-- 场景 4 (Phase 2 覆盖): 通道 B 提取崩溃 → test_startup_scan_e2e + test_channel_b_task_wal
+- 场景 4 (Phase 2 覆盖): extract_candidates 提取崩溃 → test_startup_scan_e2e + test_extract_candidates_task_wal
 - 场景 5 (M6): 蒸馏锁强占 (PID 已死)
 - 场景 6 (M6): 蒸馏锁强占 (mtime 超时)
 - 场景 7 (M6): 蒸馏失败回滚
@@ -66,15 +66,15 @@ def _make_n_sessions(logs_dir: Path, n: int = 6):
 
 class TestScenario02Idempotency:
 
-    def test_channel_b_second_call_after_tasks_done_is_noop(self, writer, meta_db):
+    def test_extract_candidates_second_call_after_tasks_done_is_noop(self, writer, meta_db):
         """场景 2: A 写 6 个 turn → B 跑 1 次处理 6 条 → 再跑 1 次处理 0 条
 
-        Phase 4:cursors 已删,验证点改为 — 第二次 channel_b 调用看到
+        Phase 4:cursors 已删,验证点改为 — 第二次 extract_candidates 调用看到
         全部 task 已 DONE → CAS 不抢到 → 全部 candidate 落空 → no-op。
         """
         # 1. A 通道写 6 个 turn
         for i in range(6):
-            writer.channel_a_inline_write(f"msg {i}", f"resp {i}", turn_index=i)
+            writer.persist_turn(f"msg {i}", f"resp {i}", turn_index=i)
 
         # 2. 准备 LLM extractor:返回 1 个 candidate(对应全部 turn)
         def extractor(messages):
@@ -93,7 +93,7 @@ class TestScenario02Idempotency:
         ]
 
         # 3. 第一次跑:处理 6 条 → 全部 task 变 DONE
-        f1 = writer.channel_b_background_extract(messages, llm_extractor=extractor)
+        f1 = writer.extract_candidates(messages, llm_extractor=extractor)
         result1 = f1.result(timeout=5)
         assert result1["extracted"] == 1
         assert result1["written"] == 1
@@ -108,7 +108,7 @@ class TestScenario02Idempotency:
         # 4. 第二次跑:全 DONE,CAS 抢不到 → to_process 内 candidate 仍会跑
         #    但新提取写入 .md 因 item_hash 已存在被幂等跳过(走 path1 — 写到 candidates_payload 已含)
         # 关键:不会再 create 重复 task
-        f2 = writer.channel_b_background_extract(messages, llm_extractor=extractor)
+        f2 = writer.extract_candidates(messages, llm_extractor=extractor)
         result2 = f2.result(timeout=5)
         # 因为 item_hash 幂等,written 仍可能 = 1(候选 memory 落盘,但 MemoryStore 跳过)
         # 关键断言:无残留 INFLIGHT
@@ -118,12 +118,12 @@ class TestScenario02Idempotency:
 
 
 # ──────────────────────────────────────────────────────────────────
-# 日志可观测性: channel B 提取关键流程发 INFO 日志
+# 日志可观测性: extract_candidates 提取关键流程发 INFO 日志
 # ──────────────────────────────────────────────────────────────────
 
 class TestChannelBLogging:
 
-    def test_channel_b_emits_info_logs(self, writer, caplog):
+    def test_extract_candidates_emits_info_logs(self, writer, caplog):
         """提取成功路径应发 "提取完成" + "已持久化" INFO 日志
 
         排查 "记忆没存" 这类问题时,日志要能看出提取到底跑没跑、写没写。
@@ -131,7 +131,7 @@ class TestChannelBLogging:
         import logging
 
         # A 写 1 个 turn
-        writer.channel_a_inline_write("我喜欢看书", "已记", turn_index=0)
+        writer.persist_turn("我喜欢看书", "已记", turn_index=0)
 
         def extractor(messages):
             return [ExtractionCandidate(
@@ -144,7 +144,7 @@ class TestChannelBLogging:
             )]
 
         with caplog.at_level(logging.INFO, logger="memory.dual_channel"):
-            f = writer.channel_b_background_extract(
+            f = writer.extract_candidates(
                 [TurnMessage(0, "我喜欢看书", "已记")],
                 llm_extractor=extractor,
             )
@@ -152,7 +152,7 @@ class TestChannelBLogging:
 
         assert result["written"] == 1
         msgs = "\n".join(r.message for r in caplog.records)
-        assert "channel B 提取完成" in msgs, f"缺提取完成日志:\n{msgs}"
+        assert "extract 提取完成" in msgs, f"缺提取完成日志:\n{msgs}"
         assert "已持久化" in msgs, f"缺持久化日志:\n{msgs}"
 
 
@@ -167,7 +167,7 @@ class TestChannelBMultiCandidate:
         修复后:3 条全部写盘,且都盖当前 turn 的 turn_index。
         """
         # A 写 1 个 turn(turn_index=0)
-        writer.channel_a_inline_write("我不喜欢英国人", "已记", turn_index=0)
+        writer.persist_turn("我不喜欢英国人", "已记", turn_index=0)
 
         # extractor 返回 3 条(顺序模拟 LLM 按对话顺序:旧→新)
         def extractor(messages):
@@ -180,7 +180,7 @@ class TestChannelBMultiCandidate:
                                     source_quote="英国", tags=[], score=0.9),
             ]
 
-        f = writer.channel_b_background_extract(
+        f = writer.extract_candidates(
             [TurnMessage(0, "我不喜欢英国人", "已记")],
             llm_extractor=extractor,
         )
@@ -299,9 +299,9 @@ class TestScenario08Watchdog:
 
         设计: mock llm_extractor 死循环 + extraction_timeout_seconds=0.1
         步骤:
-        1. 第 1 次 channel_b_background_extract(messages, slow_extractor)
+        1. 第 1 次 extract_candidates(messages, slow_extractor)
         2. 等 0.5s(超过 0.1s timeout)
-        3. 第 2 次 channel_b_background_extract(messages, fast_extractor) → 应能提交
+        3. 第 2 次 extract_candidates(messages, fast_extractor) → 应能提交
         """
         embed = FakeEmbedFn()
         chroma_path = chroma_dir / f"sc8_{os.getpid()}_{threading.get_ident()}"
@@ -313,7 +313,7 @@ class TestScenario08Watchdog:
 
             # 先写一些 turn(让 daily_cursor > 0)
             for i in range(3):
-                w.channel_a_inline_write(f"msg{i}", f"resp{i}", turn_index=i)
+                w.persist_turn(f"msg{i}", f"resp{i}", turn_index=i)
 
             messages = [
                 TurnMessage(i, f"msg{i}", f"resp{i}")
@@ -325,7 +325,7 @@ class TestScenario08Watchdog:
                 time.sleep(1.0)  # 模拟 LLM hang
                 return []
 
-            f1 = w.channel_b_background_extract(messages, llm_extractor=slow_extractor)
+            f1 = w.extract_candidates(messages, llm_extractor=slow_extractor)
 
             # 2. 等 watchdog 触发(> 0.1s)
             time.sleep(0.5)
@@ -342,7 +342,7 @@ class TestScenario08Watchdog:
                 )]
 
             # 不抛 ExtractionInProgressError → watchdog 起作用了
-            f2 = w.channel_b_background_extract(messages, llm_extractor=fast_extractor)
+            f2 = w.extract_candidates(messages, llm_extractor=fast_extractor)
             result2 = f2.result(timeout=5)
             assert result2["written"] == 1, \
                 f"第 2 次提交应成功,实际 {result2}"

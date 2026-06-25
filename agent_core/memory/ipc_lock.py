@@ -323,12 +323,12 @@ class IPCLock:
 # ──────────────────────────────────────────────────────────────────
 
 def make_daily_lock(memory_root: Union[str, Path]) -> IPCLock:
-    """通道 A 的跨进程锁"""
+    """persist_turn 的跨进程锁"""
     return IPCLock(Path(memory_root) / ".locks" / "daily.ipclock")
 
 
 def make_extract_lock(memory_root: Union[str, Path]) -> IPCLock:
-    """通道 B 的跨进程锁"""
+    """extract_candidates 的跨进程锁"""
     return IPCLock(Path(memory_root) / ".locks" / "extract.ipclock")
 
 

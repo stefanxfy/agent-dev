@@ -1,15 +1,15 @@
 """
 Bug 3 修复测试 — ChromaDB 拒绝空 tags list 的 metadata
 
-复现:channel_b 提取出 tags=[] 的 candidate 时,ChromaDB upsert 会抛
+复现:extract_candidates 提取出 tags=[] 的 candidate 时,ChromaDB upsert 会抛
   ValueError: Expected metadata list value for key 'tags' to be non-empty in upsert.
-导致 _do_channel_b_extract 走 except → pending stuck + attempts=1。
+导致 _do_extract_candidates 走 except → pending stuck + attempts=1。
 
 修复:chroma_store.add 入口处过滤掉空 list 的 metadata 字段。
 
 不变量:
 1. vec.add(... tags=[]) → 成功(tags 字段被剔除,其他字段保留)
-2. channel_b_extract 走 extractor 返回 tags=[] → 正常写入(memory + vec)
+2. extract_candidates 走 extractor 返回 tags=[] → 正常写入(memory + vec)
 """
 from __future__ import annotations
 
@@ -95,28 +95,28 @@ class TestBug3FixEmptyTagsMetadata:
             meta = result["metadatas"][0]
             assert meta["tags"] == ["food", "preference"]
 
-    def test_channel_b_extract_with_empty_tags_succeeds(
+    def test_extract_candidates_with_empty_tags_succeeds(
         self, meta_db_path, memory_root, logs_dir, chroma_dir,
     ):
-        """Bug 3 修复:channel_b 走 extractor 返回 tags=[] → 正常写入
+        """Bug 3 修复:extract_candidates 走 extractor 返回 tags=[] → 正常写入
 
         完整集成测试:模拟 LLM extractor 返回 tags=[] 的候选,
-        验证 channel A → channel B 完整路径不会因空 tags 卡住。
+        验证 persist_turn → extract_candidates 完整路径不会因空 tags 卡住。
         """
         embed = FakeEmbedFn()
-        chroma_path = chroma_dir / f"channel_b_empty_{os.getpid()}_{threading.get_ident()}"
+        chroma_path = chroma_dir / f"extract_candidates_empty_{os.getpid()}_{threading.get_ident()}"
         meta_db = MetaDB(meta_db_path)
         memory_store = MemoryStore(memory_root)
 
-        with ChromaVectorStore(str(chroma_path), collection="channel_b_empty") as vec:
+        with ChromaVectorStore(str(chroma_path), collection="extract_candidates_empty") as vec:
             writer = DualChannelWriter("s1", meta_db, memory_store, vec, embed)
 
-            # 1. channel A 写一条 turn
-            writer.channel_a_inline_write("用户偏好消息", "好的")
+            # 1. persist_turn 写一条 turn
+            writer.persist_turn("用户偏好消息", "好的")
 
-            # 2. channel B 提取,extractor 返回 tags=[] 的候选
+            # 2. extract_candidates 提取,extractor 返回 tags=[] 的候选
             messages = [TurnMessage(1, "用户偏好消息", "好的")]
-            future = writer.channel_b_background_extract(
+            future = writer.extract_candidates(
                 messages,
                 llm_extractor=lambda _m: [
                     ExtractionCandidate(

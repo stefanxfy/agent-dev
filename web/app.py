@@ -1059,7 +1059,7 @@ if prompt := st.chat_input("输入消息..."):
                 elif kind in ("budget_exceeded", "timeout"):
                     ms["last_extract_error"] = str(event.reason or "unknown")
                 elif kind == "secret_detected":
-                    # M10 C1.2: §14.4 Channel B secret sanitize 事件
+                    # M10 C1.2: §14.4 extract_candidates secret sanitize 事件
                     ms["secrets_redacted"] = ms.get("secrets_redacted", 0) + 1
                 st.session_state.memory_stats = ms
 

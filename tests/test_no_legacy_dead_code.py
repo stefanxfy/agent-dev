@@ -7,17 +7,17 @@ Phase 4 / Step 4.4.2-4.4.6 bundled — 死代码清理断言
 被删项:
 - MetaDB 7 个旧表方法:set_cursor / get_cursor / add_pending / remove_pending /
   bump_pending_attempts / update_pending_payload / list_pending
-- DualChannelWriter.channel_a_inline_write 不再调 set_cursor
-- DualChannelWriter._do_channel_a_write 整个方法删
-- DualChannelWriter._do_channel_b_extract 不再调 add_pending / remove_pending /
+- DualChannelWriter.persist_turn 不再调 set_cursor
+- DualChannelWriter._do_persist_turn_write 整个方法删
+- DualChannelWriter._do_extract_candidates 不再调 add_pending / remove_pending /
   bump_pending_attempts / set_cursor("extract", ...)
 - DualChannelWriter.recover_pending 整个方法删
 - DualChannelWriter._load_messages_for_retry / _on_recovery_done 删
 - DualChannelWriter 不再 import make_daily_lock / make_extract_lock
   (但 IPCLock 类本身仍被 distiller/migration 用 — 不动)
 - DualChannelWriter.daily_cursor / extract_cursor 属性删
-  (extract_cursor 本来就是 _do_channel_b_extract 局部用)
-- DualChannelWriter.channel_b_background_extract 删 advance_cursor 参数
+  (extract_cursor 本来就是 _do_extract_candidates 局部用)
+- DualChannelWriter.extract_candidates 删 advance_cursor 参数
   (recovery 路径已无)
 """
 import inspect
@@ -51,40 +51,40 @@ class TestMetaDBLegacyMethodsGone:
 
 
 class TestDualChannelWriterNoLegacyIO:
-    """Step 4.4.3 + 4.4.4 + 4.4.5:Channel A/B 旧 IO 全清"""
+    """Step 4.4.3 + 4.4.4 + 4.4.5:persist_turn/B 旧 IO 全清"""
 
-    def test_channel_a_inline_write_no_set_cursor(self):
-        """channel_a_inline_write 源码不再调 set_cursor"""
+    def test_persist_turn_no_set_cursor(self):
+        """persist_turn 源码不再调 set_cursor"""
         from agent_core.memory.dual_channel_writer import DualChannelWriter
-        src = inspect.getsource(DualChannelWriter.channel_a_inline_write)
+        src = inspect.getsource(DualChannelWriter.persist_turn)
         assert "set_cursor" not in src, (
-            "channel_a_inline_write 不应再调 set_cursor"
+            "persist_turn 不应再调 set_cursor"
         )
 
-    def test_do_channel_a_write_method_gone(self):
-        """_do_channel_a_write 已删(写 JSONL 的旧方法)"""
+    def test_do_persist_turn_write_method_gone(self):
+        """_do_persist_turn_write 已删(写 JSONL 的旧方法)"""
         from agent_core.memory.dual_channel_writer import DualChannelWriter
-        assert not hasattr(DualChannelWriter, "_do_channel_a_write"), (
-            "_do_channel_a_write 应在 Phase 4 删"
+        assert not hasattr(DualChannelWriter, "_do_persist_turn_write"), (
+            "_do_persist_turn_write 应在 Phase 4 删"
         )
 
-    def test_do_channel_b_extract_no_legacy_io(self):
-        """_do_channel_b_extract 源码不再调 add_pending / remove_pending /
+    def test_do_extract_candidates_no_legacy_io(self):
+        """_do_extract_candidates 源码不再调 add_pending / remove_pending /
         bump_pending_attempts / set_cursor"""
         from agent_core.memory.dual_channel_writer import DualChannelWriter
-        src = inspect.getsource(DualChannelWriter._do_channel_b_extract)
+        src = inspect.getsource(DualChannelWriter._do_extract_candidates)
         for legacy in (
             "add_pending", "remove_pending",
             "bump_pending_attempts", "set_cursor",
         ):
             assert legacy not in src, (
-                f"_do_channel_b_extract 不应再调 {legacy}"
+                f"_do_extract_candidates 不应再调 {legacy}"
             )
 
     def test_advance_cursor_param_gone(self):
-        """channel_b_background_extract 不再有 advance_cursor 参数"""
+        """extract_candidates 不再有 advance_cursor 参数"""
         from agent_core.memory.dual_channel_writer import DualChannelWriter
-        sig = inspect.signature(DualChannelWriter.channel_b_background_extract)
+        sig = inspect.signature(DualChannelWriter.extract_candidates)
         assert "advance_cursor" not in sig.parameters, (
             "advance_cursor 参数应随 recover_pending 一起删"
         )
@@ -127,7 +127,7 @@ class TestDualChannelWriterNoLegacyLocks:
 
 class TestDualChannelWriterCursorsGone:
     """daily_cursor / extract_cursor 属性删
-    (cursors 表已 DROP,Channel A 走 max(turn_index) 派生)"""
+    (cursors 表已 DROP,persist_turn 走 max(turn_index) 派生)"""
 
     def test_no_daily_cursor_attribute(self):
         from agent_core.memory.dual_channel_writer import DualChannelWriter

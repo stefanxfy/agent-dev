@@ -44,7 +44,7 @@ def _make_bridge(llm_json_response: str, session_id: str = "s1"):
     return bridge, dual, store, tmp
 
 
-def test_channel_a_writes_daily_log():
+def test_persist_turn_writes_daily_log():
     """turn 末尾 memory_tasks 表新增 1 行(state=NONE)"""
     bridge, dual, store, tmp = _make_bridge(
         '{"should_extract": false, "confidence": 0, "candidates": []}'

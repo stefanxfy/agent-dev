@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS candidate_decisions (
 );
 
 -- Phase 4 / Step 4.4.1:迁移 — 旧 cursors / pending_writes 表彻底删除。
--- 这两张表在 Phase 1-3 期间由 Channel A / B 双写保留(向后兼容旧测试),
+-- 这两张表在 Phase 1-3 期间由 persist_turn / B 双写保留(向后兼容旧测试),
 -- Phase 4 后不再 CREATE;DROP TABLE 兜底已有 db 文件。
 DROP TABLE IF EXISTS cursors;
 DROP TABLE IF EXISTS pending_writes;
@@ -147,7 +147,7 @@ class MetaDB:
         """获取当前线程的连接（懒创建）
 
         Phase 2 / Step 2.2.10b 修复::memory: 模式跨线程共享同一 conn。
-        默认 SQLite :memory: 给每线程开独立 in-memory db,导致 Channel B
+        默认 SQLite :memory: 给每线程开独立 in-memory db,导致 extract_candidates
         在 executor 线程看到的 db 是空的 → get_task_by_turn 返 None →
         CAS 跳过 → candidates 不落盘。:memory: 是单文件库,跨线程共享
         无锁风险(单测用);生产是文件模式不受影响。
@@ -281,7 +281,7 @@ class MetaDB:
     ) -> Optional[dict]:
         """按 (session_id, turn_index) 反查 task(UNIQUE 约束保证 1:1)。
 
-        Phase 2 / Step 2.2.10b:Channel B 走新表时,从 TurnMessage.turn_index
+        Phase 2 / Step 2.2.10b:extract_candidates 走新表时,从 TurnMessage.turn_index
         反查 task_id,再 cas_grab_task / mark_done_with_candidates。
 
         Returns:dict(含 task_id / state / candidates_payload / ...) 或 None。
@@ -312,6 +312,9 @@ class MetaDB:
     ) -> bool:
         """CAS 抢占:state ∈ from_states → 转到 to_state,自动写 inflight_at=now()。
 
+        偏差 2 修复:与设计文档 § 5.1 阶段 1 伪代码对齐 — 抢占时同时
+        attempts=attempts+1(成功 +1 与失败 +1 都算 1 次「处理尝试」)。
+
         Returns:
             True  抢到(rowcount==1)
             False 别人抢到(state 已不在 from_states 中)
@@ -325,6 +328,7 @@ class MetaDB:
                     UPDATE memory_tasks
                     SET state = ?,
                         inflight_at = ?,
+                        attempts = attempts + 1,
                         updated_at = ?
                     WHERE task_id = ?
                       AND state IN ({placeholders})
@@ -488,7 +492,7 @@ class MetaDB:
         """重排可重试 FAILED → PENDING:state='FAILED' AND attempts < max_attempts AND next_at <= now。
 
         Phase 2 / Step 2.2.8:startup_scan 步骤 3。退避到期但还在重试次数内
-        的 FAILED 转回 PENDING,等下次 Channel B 派工。
+        的 FAILED 转回 PENDING,等下次 extract_candidates 派工。
         保留 attempts/next_at/extraction_error(给 audit 可见上次失败)。
         """
         now = time.time()
@@ -514,7 +518,7 @@ class MetaDB:
         """派工列表:state IN ('NONE', 'PENDING') ORDER BY turn_index ASC。
 
         Phase 2 / Step 2.2.9:startup_scan 步骤 4 返回所有待处理任务,
-        Channel B 后台循环 dispatch 时按 turn_index 顺序处理。
+        extract_candidates 后台循环 dispatch 时按 turn_index 顺序处理。
         """
         try:
             with self.transaction() as conn:

@@ -3,7 +3,7 @@ get_task_by_turn 测试
 
 Phase 2 / Step 2.2.10b — TDD 红 → 绿
 
-Channel B 走新表时,需要按 (session_id, turn_index) 反查 task_id。
+extract_candidates 走新表时,需要按 (session_id, turn_index) 反查 task_id。
 UNIQUE(session_id, turn_index) 保证一条 = 一个 task。
 
 - 查到返 dict(含 task_id / state / attempts / max_attempts)

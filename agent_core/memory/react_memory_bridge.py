@@ -24,13 +24,13 @@ logger = logging.getLogger("memory.react_bridge")
 
 
 class MemoryEventKind(str, Enum):
-    CHANNEL_A_OK = "channel_a_ok"
+    TURN_PERSISTED = "turn_persisted"
     GATE_SKIP = "gate_skip"
     GATE_PASS = "gate_pass"
     EXTRACT_DISPATCHED = "extract_dispatched"
     EXTRACT_DONE = "extract_done"
     EXTRACT_ERROR = "extract_error"
-    EXTRACT_DEFERRED = "extract_deferred"  # channel_b 忙,turn 入队等下次 flush
+    EXTRACT_DEFERRED = "extract_deferred"  # extract 忙,turn 入队等下次 flush
     SECRET_DETECTED = "secret_detected"  # M10 C1.2
     # M10 C6.5: 5 回退条件 banner 用的 enum 值(LOCK_BUSY / RATE_LIMITED
     # 当前无自然发射点,YAGNI 只占位;C6.2 / C6.3 有发射点)
@@ -90,8 +90,8 @@ class ReactMemoryBridge:
         self._pending_secret_events: list[MemoryEvent] = []
         self._secret_queue_lock = threading.Lock()
 
-        # 2026-06-24: channel_b 排队 queue(修复 turn 被 silently drop 的 race)
-        # bridge.on_turn_end 调 channel_b_background_extract 时,如果上一个 extract
+        # 2026-06-24: extract 排队 queue(修复 turn 被 silently drop 的 race)
+        # bridge.on_turn_end 调 extract_candidates 时,如果上一个 extract
         # 还没完(_extraction_in_progress=True)会抛 ExtractionInProgressError,
         # 旧代码 catch 后 yield EXTRACT_ERROR 静默结束,turn 永远进不了 .md / vec。
         # 新行为:catch 后入队,_on_extract_done 回调自动 flush。
@@ -127,34 +127,34 @@ class ReactMemoryBridge:
         self.cumulative_tokens += input_tokens + output_tokens
         self.cumulative_tool_calls += tool_calls_in_turn
 
-        # 2. 通道 A(同步,无 LLM)
-        # Bug 1 修复(2026-06-24):不传 turn_index,让 channel A 内部用 daily_cursor + 1
+        # 2. persist_turn(同步,无 LLM)
+        # Bug 1 修复(2026-06-24):不传 turn_index,让 persist_turn 内部用 daily_cursor + 1
         # 避免 per-run turn 计数 vs session-global daily_cursor 冲突
         #
-        # Bug 1b 修复(2026-06-24):接住 channel A 写回的 session-global cursor,
-        # 作为 channel B 的 turn_index(见下方 turn_msg)。
-        # 原 Bug 1 修复只对齐了 channel A,channel B 仍用 run-local turn_index,
-        # 导致第一轮后 channel B 窗口过滤 extract_cursor<=turn_index<=daily_cursor
+        # Bug 1b 修复(2026-06-24):接住 persist_turn 写回的 session-global cursor,
+        # 作为 extract_candidates 的 turn_index(见下方 turn_msg)。
+        # 原 Bug 1 修复只对齐了 persist_turn,extract_candidates 仍用 run-local turn_index,
+        # 导致第一轮后 extract_candidates 窗口过滤 extract_cursor<=turn_index<=daily_cursor
         # 永远 miss(run-local turn_index 每轮重置回 1,extract_cursor 已推进过 1),
         # 记忆被静默丢弃。这里统一两通道编号。
         try:
-            written_cursor = self.dual_channel.channel_a_inline_write(
+            written_cursor = self.dual_channel.persist_turn(
                 user_msg=user_msg,
                 assistant_resp=assistant_resp,
-                # turn_index 缺省 → channel A 内部用 self.daily_cursor + 1
+                # turn_index 缺省 → persist_turn 内部用 self.daily_cursor + 1
             )
             logger.debug(
-                f"turn {turn_index}: channel A 写盘成功 "
+                f"turn {turn_index}: persist_turn 写盘成功 "
                 f"(session cursor={written_cursor})"
             )
             yield MemoryEvent(
-                kind=MemoryEventKind.CHANNEL_A_OK, turn_index=turn_index,
+                kind=MemoryEventKind.TURN_PERSISTED, turn_index=turn_index,
             )
         except Exception as e:
-            logger.error(f"通道 A 写盘失败: {e}")
+            logger.error(f"persist_turn 写盘失败: {e}")
             yield MemoryEvent(
                 kind=MemoryEventKind.EXTRACT_ERROR, turn_index=turn_index,
-                reason=f"channel_a_error({e})",
+                reason=f"turn_persist_error({e})",
             )
             return
 
@@ -214,9 +214,9 @@ class ReactMemoryBridge:
             self.cumulative_tool_calls = 0
             logger.info(f"门1 跑完清零 token/工具预算窗口 (turn={turn_index})")
 
-        # 5. 通道 B(异步)
-        # Bug 1b:用 channel A 写回的 session-global cursor,而非 run-local turn_index,
-        # 保证 channel B 窗口过滤 extract_cursor <= turn_index <= daily_cursor 命中
+        # 5. extract_candidates(异步)
+        # Bug 1b:用 persist_turn 写回的 session-global cursor,而非 run-local turn_index,
+        # 保证 extract_candidates 窗口过滤 extract_cursor <= turn_index <= daily_cursor 命中
         # (written_cursor == daily_cursor 刚写的,extract_cursor <= daily_cursor 恒成立)
         turn_msg = TurnMessage(
             turn_index=written_cursor,
@@ -230,7 +230,7 @@ class ReactMemoryBridge:
             return candidates_snapshot
 
         try:
-            future = self.dual_channel.channel_b_background_extract(
+            future = self.dual_channel.extract_candidates(
                 messages=[turn_msg],
                 llm_extractor=_extractor,
             )
@@ -238,7 +238,7 @@ class ReactMemoryBridge:
             # 用 add_done_callback 而不是 _on_extract_done(后者属于 dual_channel_writer 内部)
             future.add_done_callback(self._flush_pending_extracts)
             logger.info(
-                f"turn {turn_index}: channel B 已提交提取 "
+                f"turn {turn_index}: extract_candidates 已提交提取 "
                 f"({len(candidates_snapshot)} candidates)"
             )
             yield MemoryEvent(
@@ -256,19 +256,19 @@ class ReactMemoryBridge:
             with self._pending_extracts_lock:
                 self._pending_extracts.append(pending)
             logger.info(
-                f"channel_b 忙,turn={turn_index} 入队 "
+                f"extract 忙,turn={turn_index} 入队 "
                 f"(queue size={len(self._pending_extracts)})"
             )
             yield MemoryEvent(
                 kind=MemoryEventKind.EXTRACT_DEFERRED, turn_index=turn_index,
-                reason=f"channel_b_busy({e})",
+                reason=f"extract_busy({e})",
                 candidates_count=len(candidates_snapshot),
             )
         except Exception as e:
-            logger.error(f"通道 B 提交失败: {e}")
+            logger.error(f"extract_candidates 提交失败: {e}")
             yield MemoryEvent(
                 kind=MemoryEventKind.EXTRACT_ERROR, turn_index=turn_index,
-                reason=f"channel_b_dispatch_error({e})",
+                reason=f"extract_dispatch_error({e})",
             )
 
     def shutdown(self, timeout: float = 30.0) -> bool:
@@ -290,10 +290,10 @@ class ReactMemoryBridge:
         """executor 线程触发的 done callback
 
         触发时机:
-        - 上一个 channel_b extract 正常完成(success 或 exception 都触发)
+        - 上一个 extract 正常完成(success 或 exception 都触发)
         - 由 future.add_done_callback 自动调用
 
-        行为:从 _pending_extracts 队首取一个,调 channel_b_background_extract 提交。
+        行为:从 _pending_extracts 队首取一个,调 extract_candidates 提交。
         如果还是被 in-flight 占了(竞态),放回队首等下次 callback。
         """
         while True:
@@ -303,7 +303,7 @@ class ReactMemoryBridge:
                 next_pe = self._pending_extracts[0]
 
             try:
-                future = self.dual_channel.channel_b_background_extract(
+                future = self.dual_channel.extract_candidates(
                     messages=[next_pe.turn_msg],
                     llm_extractor=next_pe.extractor,
                 )

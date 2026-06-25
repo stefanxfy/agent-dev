@@ -50,5 +50,5 @@ class TestMemoryTasksDDL:
             assert idx in _DDL, f"DDL 缺索引: {idx}"
 
     def test_ddl_state_default_none(self):
-        """state 字段默认 'NONE'(Channel A 刚落盘完未决状态)"""
+        """state 字段默认 'NONE'(persist_turn 刚落盘完未决状态)"""
         assert "DEFAULT 'NONE'" in _DDL or 'DEFAULT "NONE"' in _DDL

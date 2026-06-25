@@ -58,7 +58,7 @@ def test_on_turn_end_high_confidence_writes():
         ))
 
         kinds = [e.kind for e in events]
-        assert MemoryEventKind.CHANNEL_A_OK in kinds
+        assert MemoryEventKind.TURN_PERSISTED in kinds
         # 门3 过 → gate_pass + extract_dispatched(异步等不到 done)
         assert any(k in kinds for k in (
             MemoryEventKind.GATE_PASS, MemoryEventKind.EXTRACT_DISPATCHED,
@@ -95,7 +95,7 @@ def test_on_turn_end_below_threshold_skips():
         ))
 
         kinds = [e.kind for e in events]
-        assert MemoryEventKind.CHANNEL_A_OK in kinds
+        assert MemoryEventKind.TURN_PERSISTED in kinds
         assert MemoryEventKind.GATE_SKIP in kinds
     finally:
         bridge.shutdown(timeout=5)
@@ -163,7 +163,7 @@ def test_gate_extraction_context_is_current_turn_only():
 
 
 def _wait_extract_done(meta, session_id, target_turn, timeout=5.0):
-    """轮询等 channel B 完成 — Phase 4:看 memory_tasks.state 是否变 DONE/FAILED"""
+    """轮询等 extract_candidates 完成 — Phase 4:看 memory_tasks.state 是否变 DONE/FAILED"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         row = meta.get_task_by_turn(session_id, target_turn)
@@ -177,9 +177,9 @@ def test_second_turn_persists_when_run_local_turn_index_resets():
     """回归(Bug 1b):连续两轮、run-local turn_index 都传 1(模拟 Streamlit 每条
     用户消息 ReAct 步数重置回 1)→ 第二轮记忆必须照样落盘。
 
-    修复前:channel A 用 session-global daily_cursor+1,channel B 却用 run-local
+    修复前:persist_turn 用 session-global daily_cursor+1,extract_candidates 却用 run-local
     turn_index;第一轮后 extract_cursor 推到 2,第二轮 turn_index 又是 1,
-    channel B 窗口过滤 extract_cursor(2) <= 1 失败 → to_process=[] → 静默丢弃。
+    extract_candidates 窗口过滤 extract_cursor(2) <= 1 失败 → to_process=[] → 静默丢弃。
     """
     tmp = Path(tempfile.mkdtemp(prefix="bridge_bug1b_"))
     try:
@@ -236,7 +236,7 @@ def test_second_turn_persists_when_run_local_turn_index_resets():
             turn_index=1,  # ← 仍是 1,复现 bug 触发条件
             input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
         ))
-        # turn 2 在 memory_tasks(看 bridge 内部 channel_a 自动推到 2)
+        # turn 2 在 memory_tasks(看 bridge 内部 persist_turn 自动推到 2)
         assert _wait_extract_done(meta, "s_bug1b", target_turn=2), \
             "第 2 轮提取应完成(修复前会因 to_process=[] 静默丢弃)"
 

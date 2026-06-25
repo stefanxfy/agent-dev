@@ -3,7 +3,7 @@
 
 - 纯决策:decide_action 三档阈值 + similarity/top_similarity
 - LLM 判定器:make_llm_dedup_judge 解析 + 失败放行
-- channel B 集成:auto 跳过(不调 LLM)/ 可疑带调 LLM / 不够相似照写
+- extract_candidates 集成:auto 跳过(不调 LLM)/ 可疑带调 LLM / 不够相似照写
 """
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def test_llm_judge_failure_returns_false():
     assert judge(cand, []) is False
 
 
-# ── channel B 集成 ─────────────────────────────────────────────────
+# ── extract_candidates 集成 ─────────────────────────────────────────────────
 
 class _FakeVec:
     """可控 query 结果 + 记录 add 的假向量库"""
@@ -131,7 +131,7 @@ def _run_one_candidate(tmp_path, hits, *, judge=None, cfg=None):
         dedup_config=cfg if cfg is not None else DedupConfig(),
         dedup_judge=judge,
     )
-    w.channel_a_inline_write("我喜欢周杰伦", "已记", turn_index=0)
+    w.persist_turn("我喜欢周杰伦", "已记", turn_index=0)
 
     def extractor(msgs):
         return [ExtractionCandidate(
@@ -140,7 +140,7 @@ def _run_one_candidate(tmp_path, hits, *, judge=None, cfg=None):
             tags=[], score=0.9,
         )]
 
-    f = w.channel_b_background_extract([TurnMessage(0, "我喜欢周杰伦", "已记")], llm_extractor=extractor)
+    f = w.extract_candidates([TurnMessage(0, "我喜欢周杰伦", "已记")], llm_extractor=extractor)
     result = f.result(timeout=5)
     md_count = len(list((store.root / "user").glob("*.md"))) if (store.root / "user").exists() else 0
     w.shutdown(timeout=5)

@@ -60,10 +60,10 @@ def test_bridge_emits_timeout_event_on_latency_timeout():
     )
     from agent_core.memory.latency import LatencyTimeout
 
-    # Mock dual_channel(通道 A 成功)
+    # Mock dual_channel(persist_turn 成功)
     dual = MagicMock()
-    dual.channel_a_inline_write = MagicMock()  # 不抛异常
-    dual.channel_b_background_extract = MagicMock()
+    dual.persist_turn = MagicMock()  # 不抛异常
+    dual.extract_candidates = MagicMock()
 
     # Mock gate.should_extract 抛 LatencyTimeout
     gate = MagicMock()

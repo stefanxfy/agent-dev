@@ -569,7 +569,7 @@ class DistillationScheduler:
         """
         统计 since_mtime 之后改动的 session 数
 
-        目录约定:.agent_data/logs/{session_id}.jsonl(DualChannelWriter._do_channel_a_write)
+        目录约定:.agent_data/logs/{session_id}.jsonl(DualChannelWriter._do_persist_turn_write)
         """
         logs_dir = self.memory_root.parent / "logs"
         if not logs_dir.exists():
