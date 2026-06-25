@@ -97,13 +97,17 @@ def _add_failed_retryable(db, turn_index, *, next_at):
 
 
 def _add_inflight_stuck(db, turn_index, *, inflight_at):
+    """直接置 INFLIGHT(不走 CAS)— 测试只想建 fixture,attempts 从 0 开始
+
+    偏差 2 修复后,cas_grab_task 会 attempts+1;这里直写 INFLIGHT
+    避免污染(测试断言要 attempts=1 表示熔断 +1)
+    """
     tid = db.insert_task(
         session_id="s1", turn_index=turn_index,
         user_msg="x", assistant_resp="y",
         state="NONE", max_attempts=3,
     )
-    db.update_task_state(tid, "PENDING")
-    db.cas_grab_task(tid, ["PENDING"], "INFLIGHT")
+    db.update_task_state(tid, "INFLIGHT")
     with db.transaction() as conn:
         conn.execute(
             "UPDATE memory_tasks SET inflight_at=? WHERE task_id=?",

@@ -22,13 +22,17 @@ def db():
 
 
 def _add_inflight(db, turn_index=1, inflight_at=None, max_attempts=3):
+    """直接置 INFLIGHT(不走 CAS)— 测试只想建 fixture,不验证 CAS 路径
+
+    偏差 2 修复后,cas_grab_task 会 +1 attempts;这里用直写 INFLIGHT
+    避免污染 attempts 字段(测试断言要 attempts=0 / attempts+1 等)
+    """
     tid = db.insert_task(
         session_id="s1", turn_index=turn_index,
         user_msg="x", assistant_resp="y",
         state="NONE", max_attempts=max_attempts,
     )
-    db.update_task_state(tid, "PENDING")
-    db.cas_grab_task(tid, ["PENDING"], "INFLIGHT")
+    db.update_task_state(tid, "INFLIGHT")
     if inflight_at is not None:
         with db.transaction() as conn:
             conn.execute(
