@@ -261,3 +261,27 @@ def test_build_dedup_prompt_uses_title_fallback_when_missing():
     prompt = build_dedup_prompt("候选:用户叫张三", hits)
     assert "[?]" in prompt
     assert "用户叫小明" in prompt
+
+
+def test_top_similarity_debug_log_does_not_depend_on_metadata(caplog):
+    """top_similarity 的 debug log 不再读 h.get('metadata').get('title')。
+
+    验证 Chroma 严格分离(方案 A)后,top_similarity debug log 不依赖
+    metadata 字段(Chroma 已不存 metadata)。用 caplog 捕获 debug 日志,
+    验证日志内容不含 'metadata' 字样且仍含 top_sim。
+    """
+    import logging
+
+    hits = [
+        {"id": "h1", "distance": 0.05},   # 新契约,只有 id + distance
+        {"id": "h2", "distance": 0.20},
+    ]
+    with caplog.at_level(logging.DEBUG, logger="memory.dedup"):
+        result = top_similarity(hits)
+    assert result == pytest.approx(0.95)
+
+    debug_msg = "\n".join(r.message for r in caplog.records if r.levelno == logging.DEBUG)
+    assert "top_sim=0.9500" in debug_msg
+    # 不依赖 metadata
+    assert "metadata" not in debug_msg.lower()
+    assert "titles=" not in debug_msg  # 旧 log 含 "titles=" 前缀

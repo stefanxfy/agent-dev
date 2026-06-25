@@ -62,6 +62,7 @@ def similarity_from_distance(distance: float) -> float:
 def top_similarity(hits: list[dict]) -> Optional[float]:
     """从 vector_store.query 的结果取最高相似度(hits 按 distance 升序)。
 
+    hits 形状:vec.query() 返回的 [{id, distance}, ...] 按 distance 升序。
     无召回 → None。
     """
     if not hits:
@@ -70,10 +71,7 @@ def top_similarity(hits: list[dict]) -> Optional[float]:
 
     top_sim = similarity_from_distance(hits[0].get("distance", 1.0))
     # DEBUG: 记录召回结果
-    _log.debug(
-        f"向量召回: 命中 {len(hits)} 条, top_sim={top_sim:.4f}, "
-        f"titles={[(h.get('metadata') or {}).get('title', '?')[:30] for h in hits]}"
-    )
+    _log.debug(f"向量召回: 命中 {len(hits)} 条, top_sim={top_sim:.4f}")
     return top_sim
 
 
