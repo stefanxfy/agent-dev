@@ -599,17 +599,7 @@ class DualChannelWriter:
                         f"(hash={item_hash[:12]}, body[{len(cand.body)}] chars)"
                     )
 
-                    self.vector_store.add({
-                        "id": item_hash,
-                        "embedding": embedding,
-                        "metadata": {
-                            "type": cand.type,
-                            "title": cand.title,
-                            "tags": cand.tags,
-                            "session_id": self.session_id,
-                        },
-                        "document": text_for_emb,
-                    })
+                    self.vector_store.add(item_hash, embedding)
                     written += 1
                     logger.info(
                         f"extract:  已持久化 [{cand.type}] {cand.title!r} "

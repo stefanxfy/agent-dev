@@ -317,12 +317,7 @@ class ColdStartLoader:
                 metadata["tags"] = item.tags
             # VectorStoreProtocol.add(doc: dict) — 统一字典格式
             # 由 ChromaVectorStore 实现(见 chroma_store.py)
-            self.vector_store.add({
-                "id": item_hash,
-                "embedding": embedding,
-                "metadata": metadata,
-                "document": text_for_emb,
-            })
+            self.vector_store.add(item_hash, embedding)
         except Exception as e:
             # 向量写入失败不阻塞(文件已写, M5 重索引能补)
             logger.warning(f"seed 向量化失败({item.title}): {e}")

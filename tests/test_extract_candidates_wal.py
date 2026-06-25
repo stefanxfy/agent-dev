@@ -308,3 +308,64 @@ class TestChannelBCasIncrementsAttempts:
         assert db.get_task(tid)["attempts"] == 1, (
             f"CAS 应该 +1 attempts,实际 {db.get_task(tid)['attempts']}"
         )
+
+
+def test_extract_candidates_vec_add_uses_positional_id_embedding(tmp_path):
+    """Channel B 提取后 vec.add 必须只用位置参数 (id, embedding),不再传 metadata/document。
+
+    验证 Chroma 严格分离(方案 A)契约:写盘路径不传结构化字段。
+    """
+    from unittest.mock import MagicMock
+    from agent_core.memory.memory_store import MemoryStore
+    from agent_core.memory.meta_db import MetaDB
+    from agent_core.memory.dual_channel_writer import DualChannelWriter
+    from agent_core.memory.extractor import ExtractionCandidate
+    from conftest import FakeEmbedFn
+
+    # 用 MagicMock spy 替代真实 Chroma
+    vec = MagicMock()
+    vec.count.return_value = 0
+
+    embed = FakeEmbedFn()
+    dual = DualChannelWriter(
+        session_id="s1",
+        meta_db=MetaDB(":memory:"),
+        memory_store=MemoryStore(tmp_path),
+        vector_store=vec,
+        embed_fn=embed,
+    )
+
+    # 模拟一次 extract:直接调用内部方法,绕过 LLM
+    # 让 _do_extract_candidates 接受一个 candidate 并走完写盘
+    from agent_core.memory.dual_channel_writer import ExtractionCandidate, TurnMessage
+    msg = TurnMessage(turn_index=1, user_msg="我叫张三", assistant_resp="记住了")
+    cand = ExtractionCandidate(
+        type="user", title="姓名", body="张三",
+        source_quote="我叫张三", tags=["person"],
+    )
+
+    # 直接调 _do_extract_candidates(用 lambda extractor)
+    dual._do_extract_candidates(
+        [msg],
+        extractor=lambda _msgs: [cand],
+    )
+
+    # 验证 vec.add 被调,只用位置参数 (id, embedding)
+    assert vec.add.called, "vec.add 未被调用"
+
+    for call in vec.add.call_args_list:
+        args, kwargs = call
+        assert len(args) == 2, (
+            f"vec.add 应只接 2 个位置参数 (id, embedding),得到 {len(args)} 个: {args}"
+        )
+        assert isinstance(args[0], str), (
+            f"arg[0] 应是 id str,得到 {type(args[0]).__name__}: {args[0]!r}"
+        )
+        assert isinstance(args[1], list), (
+            f"arg[1] 应是 embedding list,得到 {type(args[1]).__name__}"
+        )
+        assert not kwargs, (
+            f"vec.add 应不接 kwargs(metadata/document/dict),得到 {kwargs}"
+        )
+
+    dual.shutdown(timeout=5)
