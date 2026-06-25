@@ -60,6 +60,7 @@ from agent_core.memory.memory_store import (
 from agent_core.memory.meta_db import MetaDB
 from agent_core.memory.path_validator import MemoryPathValidator, PathSecurityError
 from agent_core.memory.secret_scanner import SecretScanner
+from agent_core.memory.wal_config import TaskWALConfig
 
 if TYPE_CHECKING:
     from agent_core.memory.react_memory_bridge import MemoryEvent
@@ -171,7 +172,10 @@ class DualChannelWriter:
         event_callback: Optional[Callable[["MemoryEvent"], None]] = None,  # M10 C1.2
         dedup_config: Optional[Any] = None,   # DedupConfig;None → 不做语义去重(向后兼容)
         dedup_judge: Optional[Callable[[Any, list[dict]], bool]] = None,  # 可疑带 LLM 判定器
+        task_wal_config: TaskWALConfig = TaskWALConfig(),  # M11: WAL 状态机配置
     ):
+        if task_wal_config is None:
+            raise ValueError("task_wal_config 不能为 None,使用 TaskWALConfig() 取默认")
         self.session_id = session_id
         self.meta_db = meta_db
         self.memory_store = memory_store
@@ -179,6 +183,8 @@ class DualChannelWriter:
         # 语义去重(向量召回 + LLM 判定)。dedup_config=None 时整体关闭,行为同旧版。
         self.dedup_config = dedup_config
         self.dedup_judge = dedup_judge
+        # M11: WAL 状态机配置(Phase 1/2 用,Phase 3 env 接入)
+        self.task_wal_config = task_wal_config
         # embed_fn 必须非 None:channel B 写入 vector_store 需要先编码
         # 失败时立即 EmbeddingError,不静默(不再有 Mock 兜底)
         if embed_fn is None:
