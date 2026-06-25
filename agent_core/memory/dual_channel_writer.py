@@ -754,6 +754,73 @@ class DualChannelWriter:
     # 诊断 / 重启恢复
     # ──────────────────────────────────────────────────────
 
+    # 重试上限:连续失败 N 次后放弃,删除 pending 行避免永久卡住
+    MAX_RETRY_ATTEMPTS = 3
+
+    def startup_scan(self) -> dict[str, Any]:
+        """启动时调用:4 步恢复流程,基于 memory_tasks 单一真相。
+
+        Phase 2 / Step 2.2.10:替代旧 recover_pending(读 pending_writes)。
+        新流程直接走 memory_tasks 表,不依赖 pending_writes。
+
+        步骤:
+          1a. delete_done_tasks  — 清理 >done_retention_seconds 的 DONE
+          1b. delete_failed_tasks — 清理 >failed_retention_seconds 的 FAILED 终态
+          2.  melt_stuck_inflight  — 熔断超 30 min 的 INFLIGHT
+          3.  reschedule_retryable_failed — FAILED 退避到期 → PENDING
+          4.  list_dispatchable_tasks — 返派工列表(NONE / PENDING,本 session)
+
+        Returns:
+            {
+                "done_deleted": int,
+                "failed_deleted": int,
+                "inflight_melted": int,
+                "failed_rescheduled": int,
+                "dispatchable": list[dict],
+            }
+        """
+        now = time.time()
+        cfg = self.task_wal_config
+
+        # 1a. 清理旧 DONE
+        done_cutoff = now - cfg.done_retention_seconds
+        done_deleted = self.meta_db.delete_done_tasks(before_timestamp=done_cutoff)
+
+        # 1b. 清理旧 FAILED 终态
+        failed_cutoff = now - cfg.failed_retention_seconds
+        failed_deleted = self.meta_db.delete_failed_tasks(before_timestamp=failed_cutoff)
+
+        # 2. 熔断 stuck INFLIGHT(30 min 阈值)
+        #    与 inflight_at 比较:max_age = 30 min
+        INFLIGHT_TIMEOUT_SECONDS = 1800
+        inflight_melted = self.meta_db.melt_stuck_inflight(
+            max_age_seconds=INFLIGHT_TIMEOUT_SECONDS
+        )
+
+        # 3. 重排退避到期的 FAILED
+        failed_rescheduled = self.meta_db.reschedule_retryable_failed()
+
+        # 4. 派工列表(本 session 的 NONE / PENDING)
+        dispatchable = self.meta_db.list_dispatchable_tasks(
+            session_id=self.session_id, limit=100
+        )
+
+        logger.info(
+            f"startup_scan 完成: session={self.session_id} "
+            f"done_deleted={done_deleted} failed_deleted={failed_deleted} "
+            f"inflight_melted={inflight_melted} "
+            f"failed_rescheduled={failed_rescheduled} "
+            f"dispatchable={len(dispatchable)}"
+        )
+
+        return {
+            "done_deleted": done_deleted,
+            "failed_deleted": failed_deleted,
+            "inflight_melted": inflight_melted,
+            "failed_rescheduled": failed_rescheduled,
+            "dispatchable": dispatchable,
+        }
+
     def stats(self) -> dict[str, Any]:
         """运行统计（用于 UI / 日志）"""
         return {
