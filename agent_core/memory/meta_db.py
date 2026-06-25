@@ -83,6 +83,38 @@ CREATE TABLE IF NOT EXISTS candidate_decisions (
     decided_at  REAL NOT NULL,
     PRIMARY KEY (cand_key)
 );
+
+-- M11: memory_tasks 表 —— 单表收编 turn 原文 + 状态机 + candidates + 重试信息
+-- 替代旧 cursors / pending_writes / JSONL 三源架构
+-- 五态:NONE / PENDING / INFLIGHT / DONE / FAILED
+CREATE TABLE IF NOT EXISTS memory_tasks (
+    task_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id           TEXT NOT NULL,
+    turn_index           INTEGER NOT NULL,
+    state                TEXT NOT NULL DEFAULT 'NONE'
+                          CHECK(state IN ('NONE','PENDING','INFLIGHT','DONE','FAILED')),
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    max_attempts         INTEGER NOT NULL DEFAULT 3,
+    next_at              REAL,
+    inflight_at          REAL,
+    user_msg             TEXT NOT NULL,
+    assistant_resp       TEXT NOT NULL,
+    turn_metadata        TEXT,
+    candidates_payload   TEXT,
+    extraction_error     TEXT,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    UNIQUE (session_id, turn_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_state
+    ON memory_tasks (state, next_at);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_session_turn
+    ON memory_tasks (session_id, turn_index);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_compaction
+    ON memory_tasks (state, updated_at);
 """
 
 
