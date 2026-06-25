@@ -191,58 +191,32 @@ class ChromaVectorStore:
     # VectorStoreProtocol 接口
     # ──────────────────────────────────────────────
 
-    def add(self, doc: dict[str, Any]) -> None:
-        """
-        添加一条向量
+    def add(self, id: str, embedding: list[float]) -> None:
+        """添加一条向量(只存 id + embedding,无 metadata / document)
 
         Args:
-            doc: 必须包含以下字段:
-                - id: str           唯一标识(用作 ChromaDB id)
-                - embedding: list[float]  嵌入向量(维度必须一致)
-                - metadata: dict    元数据(type/title/tags/importance/...)
-                - document: str     原始文本(可选,用于 show)
+            id: 唯一标识(item_hash,用作 ChromaDB id)
+            embedding: 嵌入向量(维度必须一致)
 
         Raises:
             ChromaStoreError: 字段缺失 / 维度不匹配 / chromadb 错误
         """
-        # 字段校验
-        if "id" not in doc:
-            raise ChromaStoreError("doc 必须含 'id' 字段")
-        if "embedding" not in doc:
-            raise ChromaStoreError("doc 必须含 'embedding' 字段")
-        if not isinstance(doc["embedding"], list) or not doc["embedding"]:
+        if not isinstance(id, str) or not id:
+            raise ChromaStoreError(f"id 必须是非空 str,实际为 {type(id).__name__}")
+        if not isinstance(embedding, list) or not embedding:
             raise ChromaStoreError(
-                f"embedding 必须是 list[float],实际为 "
-                f"{type(doc['embedding']).__name__}"
+                f"embedding 必须是 list[float],实际为 {type(embedding).__name__}"
             )
 
-        embedding = doc["embedding"]
         self._validate_embedding_dim(embedding)
-
-        metadata = doc.get("metadata", {})
-        # ChromaDB 约束:list 类型 metadata value 必须非空
-        # 移除空 list 值,避免 upsert 报
-        # "Expected metadata list value for key 'X' to be non-empty in upsert"
-        if metadata:
-            metadata = {
-                k: v for k, v in metadata.items()
-                if not (isinstance(v, list) and len(v) == 0)
-            }
-        document = doc.get("document", "")
 
         with self._lock:
             coll = self._get_or_create_collection(len(embedding))
             try:
-                coll.upsert(
-                    ids=[str(doc["id"])],
-                    embeddings=[embedding],
-                    metadatas=[metadata] if metadata else None,
-                    documents=[document] if document else None,
-                )
+                coll.upsert(ids=[id], embeddings=[embedding])
             except Exception as e:
                 raise ChromaStoreError(
-                    f"ChromaDB add 失败(id={doc['id']}): {e}",
-                    cause=e,
+                    f"ChromaDB add 失败(id={id}): {e}", cause=e,
                 )
 
     def count(self) -> int:
