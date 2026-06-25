@@ -521,6 +521,46 @@ class MetaDB:
         except sqlite3.Error as e:
             raise MetaDBError(f"delete_failed_tasks 失败: {e}", cause=e)
 
+    def melt_stuck_inflight(self, max_age_seconds: float) -> int:
+        """熔断卡死 INFLIGHT:state='INFLIGHT' AND inflight_at < now - max_age_seconds → FAILED。
+
+        Phase 2 / Step 2.2.7:startup_scan 步骤 2,处理进程崩溃导致 INFLIGHT
+        永远不释放的死锁。attempts+1 + 写 next_at(用退避公式) + extraction_error
+        标记 "inflight timeout"。
+        """
+        now = time.time()
+        cutoff = now - max_age_seconds
+        try:
+            with self.transaction() as conn:
+                # 找出 stuck 行,先读再算 next_at
+                cur = conn.execute(
+                    "SELECT task_id, attempts, max_attempts FROM memory_tasks "
+                    "WHERE state = 'INFLIGHT' AND inflight_at < ?",
+                    (cutoff,),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return 0
+                for task_id, attempts, max_attempts in rows:
+                    new_attempts = (attempts or 0) + 1
+                    # 退避公式:now + 60 × 2^(new_attempts-1)
+                    backoff = 60 * (2 ** (new_attempts - 1))
+                    next_at = now + backoff
+                    error_msg = f"inflight timeout (>{max_age_seconds}s)"
+                    conn.execute(
+                        "UPDATE memory_tasks "
+                        "SET state = 'FAILED', "
+                        "    attempts = ?, "
+                        "    next_at = ?, "
+                        "    extraction_error = ?, "
+                        "    updated_at = ? "
+                        "WHERE task_id = ? AND state = 'INFLIGHT'",
+                        (new_attempts, next_at, error_msg, now, task_id),
+                    )
+                return len(rows)
+        except sqlite3.Error as e:
+            raise MetaDBError(f"melt_stuck_inflight 失败: {e}", cause=e)
+
     def list_dispatchable_tasks(
         self,
         session_id: Optional[str] = None,
