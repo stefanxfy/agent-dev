@@ -306,6 +306,20 @@ class DualChannelWriter:
             f.flush()
             os.fsync(f.fileno())
 
+    @staticmethod
+    def _calc_next_at(attempts: int, retry_backoff_seconds: int) -> float:
+        """退避公式:next_at = now + retry_backoff_seconds × 2^(attempts - 1)。
+
+        attempts=1 → 基准间隔(默认 60s)
+        attempts=2 → 2 倍
+        attempts=3 → 4 倍
+        attempts=0 → 0.5 × 基准(立即可重试,边界行为可接受)
+
+        Phase 2 / Step 2.2.3:Channel B 失败重试时使用,startup_scan 步骤 3
+        也会读 next_at 决定是否到时间重排 PENDING。
+        """
+        return time.time() + retry_backoff_seconds * (2 ** (attempts - 1))
+
     # ──────────────────────────────────────────────────────
     # 通道 B：后台 LLM 提取（异步 + cursor 持久化）
     # ──────────────────────────────────────────────────────
