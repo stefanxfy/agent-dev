@@ -319,6 +319,170 @@ class MetaDB:
         except sqlite3.Error as e:
             raise MetaDBError(f"list_pending 失败: {e}", cause=e)
 
+    # ── memory_tasks（M11 单表 WAL 状态机） ───────────
+
+    def insert_task(
+        self,
+        session_id: str,
+        turn_index: int,
+        user_msg: str,
+        assistant_resp: str,
+        state: str = "NONE",
+        max_attempts: int = 3,
+        turn_metadata: Optional[str] = None,
+    ) -> Optional[int]:
+        """插入一行 memory_tasks,返回 task_id。
+
+        UNIQUE(session_id, turn_index) 约束:重复插入返回 None(幂等)。
+        A 通道写盘时使用,同 session 同 turn 二次写 = 幂等,不算错。
+        """
+        now = time.time()
+        try:
+            with self.transaction() as conn:
+                try:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO memory_tasks
+                            (session_id, turn_index, user_msg, assistant_resp,
+                             state, max_attempts, turn_metadata,
+                             created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id, turn_index, user_msg, assistant_resp,
+                            state, max_attempts, turn_metadata,
+                            now, now,
+                        ),
+                    )
+                    return int(cur.lastrowid)
+                except sqlite3.IntegrityError:
+                    # UNIQUE 冲突,幂等返回 None
+                    return None
+        except sqlite3.Error as e:
+            raise MetaDBError(f"insert_task 失败: {e}", cause=e)
+
+    def get_task(self, task_id: int) -> Optional[dict]:
+        """按 task_id 读一行,返回 dict 或 None(不存在)。"""
+        try:
+            row = self._conn().execute(
+                """
+                SELECT task_id, session_id, turn_index, state,
+                       attempts, max_attempts, next_at, inflight_at,
+                       user_msg, assistant_resp, turn_metadata,
+                       candidates_payload, extraction_error,
+                       created_at, updated_at
+                FROM memory_tasks WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
+        except sqlite3.Error as e:
+            raise MetaDBError(f"get_task 失败: {e}", cause=e)
+
+    def cas_grab_task(
+        self,
+        task_id: int,
+        from_states: list[str],
+        to_state: str,
+    ) -> bool:
+        """CAS 抢占:state ∈ from_states → 转到 to_state,自动写 inflight_at=now()。
+
+        Returns:
+            True  抢到(rowcount==1)
+            False 别人抢到(state 已不在 from_states 中)
+        """
+        now = time.time()
+        placeholders = ",".join("?" * len(from_states))
+        try:
+            with self.transaction() as conn:
+                cur = conn.execute(
+                    f"""
+                    UPDATE memory_tasks
+                    SET state = ?,
+                        inflight_at = ?,
+                        updated_at = ?
+                    WHERE task_id = ?
+                      AND state IN ({placeholders})
+                    """,
+                    (to_state, now, now, task_id, *from_states),
+                )
+                return cur.rowcount == 1
+        except sqlite3.Error as e:
+            raise MetaDBError(f"cas_grab_task 失败: {e}", cause=e)
+
+    def update_task_state(
+        self,
+        task_id: int,
+        new_state: str,
+    ) -> None:
+        """通用 state 字段更新,自动刷 updated_at。"""
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    "UPDATE memory_tasks SET state = ?, updated_at = ? WHERE task_id = ?",
+                    (new_state, time.time(), task_id),
+                )
+        except sqlite3.Error as e:
+            raise MetaDBError(f"update_task_state 失败: {e}", cause=e)
+
+    def mark_done_with_candidates(
+        self,
+        task_id: int,
+        candidates_payload: str,
+    ) -> None:
+        """state → DONE,candidates_payload 落盘(JSON 字符串)。
+
+        Phase 2 关键:此方法在 LLM 算完之后、写 memory_store 之前调用,
+        确保 candidates 持久化,崩了不丢。
+        """
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE memory_tasks
+                    SET state = 'DONE',
+                        candidates_payload = ?,
+                        updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (candidates_payload, time.time(), task_id),
+                )
+        except sqlite3.Error as e:
+            raise MetaDBError(f"mark_done_with_candidates 失败: {e}", cause=e)
+
+    def mark_failed(
+        self,
+        task_id: int,
+        attempts: int,
+        next_at: Optional[float],
+        error: str,
+    ) -> None:
+        """state → FAILED,记录 attempts / next_at / extraction_error。
+
+        Args:
+            attempts: 本次失败后的累计次数
+            next_at: 下次可重试时间(指数退避算出);终态(>=max)时传 None
+            error: 错误描述
+        """
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE memory_tasks
+                    SET state = 'FAILED',
+                        attempts = ?,
+                        next_at = ?,
+                        extraction_error = ?,
+                        updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (attempts, next_at, error, time.time(), task_id),
+                )
+        except sqlite3.Error as e:
+            raise MetaDBError(f"mark_failed 失败: {e}", cause=e)
+
     # ── Candidates（L6 + A5 幂等去重） ──────────────────────
 
     def add_candidate(
