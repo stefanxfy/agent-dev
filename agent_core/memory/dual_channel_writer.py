@@ -240,33 +240,28 @@ class DualChannelWriter:
         turn_index: Optional[int] = None,
     ) -> int:
         """
-        通道 A：内联写一条 turn 到 daily log
+        通道 A：内联写一条 turn 到 memory_tasks(state=NONE)
+
+        M11 / Phase 1.2.6:不再走 JSONL / pending / cursor 三 IO,直接写新表。
+        state='NONE' 表示 Channel A 刚落盘,Channel B 取走时再 PENDING → INFLIGHT → DONE/FAILED。
+        daily_cursor 属性仍维护(同步推进),Phase 4 才删。
 
         Args:
             user_msg: 用户消息
             assistant_resp: 助手响应
             turn_index: turn 在 session 内的全局索引。
-                传 None(默认)= 用 daily_cursor + 1(推荐,避免 per-run 计数冲突);
-                显式传 int= 用 caller 提供的值(向后兼容)。
+                传 None(默认)= 用 daily_cursor + 1;
+                显式传 int= 用 caller 提供的值(向后兼容,<= daily_cursor 时幂等跳过)。
 
         Returns:
             写入后的 daily_cursor
 
         不变量 #3: 不调 LLM，必须同步 + 快速（< 10ms）
-        不变量 #4: 推进 cursor 前必须成功写盘（A10 transactional）
-
-        Bug 1 修复(2026-06-24):
-        原代码要求 caller 传 turn_index,导致 per-run turn 计数 vs session-global
-        daily_cursor 冲突 — 每次新 run 的 turn 1 都被 idempotent no-op 拦下,
-        新 turn 的 user_msg 完全没进 daily log。
-        修法:turn_index 默认 None → channel A 内部用 daily_cursor + 1,
-        保证每次调用都真正写一条新 turn,不依赖 caller 传对。
         """
         if self._shutdown:
             raise DualChannelError("writer 已 shutdown，禁止写入")
 
         # Bug 1 修复:turn_index 缺省时用 daily_cursor + 1
-        # 这样每个 on_turn_end 调用都自然推进 cursor,不再被 idempotent 拦下
         if turn_index is None:
             turn_index = self.daily_cursor + 1
 
@@ -274,29 +269,22 @@ class DualChannelWriter:
             # 幂等：同 turn 已写过(caller 显式传了重复 turn_index)
             return self.daily_cursor
 
-        # A10 transactional: 先记 pending
-        pending_id = self.meta_db.add_pending(self.session_id, {
-            "action": "channel_a_write",
-            "turn_index": turn_index,
-            "user_msg": user_msg,
-            "assistant_resp": assistant_resp,
-        })
+        # M11:直接走 memory_tasks 表,state='NONE' 标记 Channel A 刚落盘
+        self.meta_db.insert_task(
+            session_id=self.session_id,
+            turn_index=turn_index,
+            user_msg=user_msg,
+            assistant_resp=assistant_resp,
+            state="NONE",
+            max_attempts=self.task_wal_config.max_retry,
+        )
 
-        # A4: 跨进程锁 + 进程内 lock 双层保护
-        with self._ipc_daily:
-            try:
-                self._do_channel_a_write(user_msg, assistant_resp, turn_index)
-                # A3: 推进 cursor（仅在写成功后）
-                self.daily_cursor = turn_index
-                self.meta_db.set_cursor(self.session_id, "daily", turn_index)
-            except Exception:
-                # 失败：保留 pending（下次启动可重试）
-                raise
-            else:
-                # 成功：删除 pending
-                self.meta_db.remove_pending(pending_id)
+        # 同步推进 daily_cursor 属性(Phase 4 删 cursor 前保持兼容)
+        self.daily_cursor = turn_index
+
         logger.debug(
-            f"channel A: turn {turn_index} 写入 daily log (daily_cursor={self.daily_cursor})"
+            f"channel A: turn {turn_index} 写入 memory_tasks "
+            f"(daily_cursor={self.daily_cursor})"
         )
         return self.daily_cursor
 
