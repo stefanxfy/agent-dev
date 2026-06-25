@@ -204,6 +204,7 @@ class MemoryStore:
             "created_at": now,
             "item_hash": item_hash,
             "schema_version": CURRENT_SCHEMA_VERSION,
+            "title": title,   # mirror body H1 into frontmatter for uniform read access
         }
         if tags:
             fm["tags"] = list(tags)

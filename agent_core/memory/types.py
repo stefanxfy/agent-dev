@@ -118,6 +118,7 @@ _OPTIONAL_FRONTMATTER: frozenset[str] = frozenset({
     "seed_origin",           # M3: 原始来源标识(区分 user_input/manual/seed)
     "session_id",            # M9: channel B 写入,供 list_by_session 查询
     "turn_index",            # M9: 同上
+    "title",                 # T4.1: mirror body H1 for uniform read access
 })
 
 # 哪些类型必须含 **Why:** 段落（v2.1 §4.5 #7 不变量）

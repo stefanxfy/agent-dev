@@ -310,22 +310,27 @@ def test_semantic_hit_metadata_from_memory_store_only(workspace):
     embed = workspace["embed"]
 
     # 写一条 memory 到 MemoryStore(frontmatter 含 tags/importance)
-    item_hash = compute_item_hash("user", "我叫张三", "我叫张三")
+    body = "张三"
+    source_quote = "我叫张三"
+    item_hash = compute_item_hash("user", body, source_quote)
     store.write(
         type="user", title="姓名",
-        body="张三", source_quote="我叫张三",
+        body=body, source_quote=source_quote,
         tags=["person"], extra={"importance": 8},
     )
     vec.add(item_hash, embed.encode("姓名 张三"))
 
-    # 检索
+    # 检索（显式 semantic 模式以触发 _semantic_search 分支）
     r = MemoryRetriever(
         memory_store=store, vector_store=vec,
         embed_fn=embed, config=workspace["config"],
     )
-    report = r.search("张三", top_k=1)
+    report = r.search("张三", top_k=1, mode="semantic")
     hit = report.hits[0]
     assert hit.title == "姓名"
     assert hit.tags == ["person"]
     assert hit.importance == 8
     assert hit.type == "user"
+    assert "semantic" in hit.breakdown, (
+        f"hit 应来自 semantic 分支,得到 {hit.breakdown!r}"
+    )
