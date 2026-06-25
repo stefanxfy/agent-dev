@@ -137,8 +137,8 @@ from .lifecycle import (
     restore_backup,
 )
 
-# v1 历史实现（保留兼容）
-from .daily import DailyLogger
+# v1 DailyLogger 已删除(2026-06-25 dead config cleanup)
+# 历史 JSONL daily log 已被 memory_tasks WAL 表 + memory_store 收编
 
 __all__ = [
     # M1: types
@@ -255,6 +255,4 @@ __all__ = [
     "integrity_check",
     "list_backups",
     "restore_backup",
-    # v1 legacy
-    "DailyLogger",
 ]

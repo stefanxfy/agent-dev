@@ -569,7 +569,9 @@ class DistillationScheduler:
         """
         统计 since_mtime 之后改动的 session 数
 
-        目录约定:.agent_data/logs/{session_id}.jsonl(DualChannelWriter._do_persist_turn_write)
+        目录约定:.agent_data/logs/{session_id}.jsonl
+        注:Phase 4 之后 DualChannelWriter 不再写日志目录,该目录为空,
+        本函数总是返 0 — M5 session 数量门永久阻断,待单独重构。
         """
         logs_dir = self.memory_root.parent / "logs"
         if not logs_dir.exists():

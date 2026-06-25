@@ -1106,54 +1106,6 @@ def test_list_sessions_custom_title_head_fallback(tmpdir: str):
                    f"got {s['title']!r}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  P2-1: daily.py 多线程锁
-# ═══════════════════════════════════════════════════════════════════════════
-
-def test_daily_logger_thread_safety():
-    """P2-1 回归：DailyLogger 多线程并发 log() 不交叉写
-
-    Stage3 会接入 Fork Agent 异步提取，必须支持多线程并发写日志。
-    """
-    import tempfile, threading, importlib.util
-    # 绕过 agent_core/memory/__init__.py（它 import 了尚未实现的 memory_store/distiller/scheduler）
-    spec = importlib.util.spec_from_file_location(
-        "daily_module",
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "memory", "daily.py")
-    )
-    daily_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(daily_module)
-    DailyLogger = daily_module.DailyLogger
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        logger = DailyLogger(log_dir=tmpdir)
-
-        # 启动 10 个线程并发写 100 条日志
-        def worker(thread_id: int):
-            for i in range(100):
-                logger.log(
-                    session_id=f"thread-{thread_id}",
-                    category="user_preference",
-                    key=f"key-{thread_id}-{i}",
-                    value=f"value-{thread_id}-{i}",
-                )
-
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        # 验证：10*100 = 1000 条日志都被写入
-        from pathlib import Path
-        from datetime import datetime as _dt
-        today = _dt.now().strftime("%Y-%m-%d")
-        log_file = Path(tmpdir) / f"{today}.md"
-        content = log_file.read_text(encoding="utf-8")
-        # 统计 "Session: thread-" 出现次数
-        session_count = content.count("Session: thread-")
-        Test.assert_equal("1000 条日志全部写入", session_count, 1000)
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  P2-2: search 工具网络错误向上抛

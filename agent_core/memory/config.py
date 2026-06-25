@@ -93,7 +93,6 @@ class DistillationConfig(BaseModel):
 
     enabled: bool = True
     min_interval_hours: int = Field(default=24, ge=1, le=168)
-    min_daily_log_lines: int = Field(default=50, ge=10, le=10000)
     change_threshold_pct: float = Field(default=0.10, ge=0.01, le=1.0)
     min_sessions_for_distill: int = Field(
         default=5, ge=1, le=100,
@@ -118,10 +117,6 @@ class PathsConfig(BaseModel):
     memory_root: Path = Field(
         default=Path("~/.agent_data/memory"),
         description="per-file 记忆根目录（user/feedback/project/reference/）",
-    )
-    daily_log_dir: Path = Field(
-        default=Path("~/.agent_data/logs"),
-        description="daily log 写入目录",
     )
     vector_index_dir: Path = Field(
         default=Path("~/.agent_data/vector_index"),
