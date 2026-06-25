@@ -561,6 +561,28 @@ class MetaDB:
         except sqlite3.Error as e:
             raise MetaDBError(f"melt_stuck_inflight 失败: {e}", cause=e)
 
+    def reschedule_retryable_failed(self) -> int:
+        """重排可重试 FAILED → PENDING:state='FAILED' AND attempts < max_attempts AND next_at <= now。
+
+        Phase 2 / Step 2.2.8:startup_scan 步骤 3。退避到期但还在重试次数内
+        的 FAILED 转回 PENDING,等下次 Channel B 派工。
+        保留 attempts/next_at/extraction_error(给 audit 可见上次失败)。
+        """
+        now = time.time()
+        try:
+            with self.transaction() as conn:
+                cur = conn.execute(
+                    "UPDATE memory_tasks "
+                    "SET state = 'PENDING', updated_at = ? "
+                    "WHERE state = 'FAILED' "
+                    "  AND attempts < max_attempts "
+                    "  AND next_at IS NOT NULL AND next_at <= ?",
+                    (now, now),
+                )
+                return cur.rowcount
+        except sqlite3.Error as e:
+            raise MetaDBError(f"reschedule_retryable_failed 失败: {e}", cause=e)
+
     def list_dispatchable_tasks(
         self,
         session_id: Optional[str] = None,
