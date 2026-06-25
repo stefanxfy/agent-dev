@@ -1,5 +1,5 @@
 """
-记忆任务 WAL 配置 (Phase 1 / Step 1.2.3)
+记忆任务 WAL 配置 (Phase 1 / Step 1.2.3 + Phase 3 / Step 3.3.1)
 
 设计要点:
 - env 字段走 `MEMORY_WAL__<FIELD>` 双下划线约定(项目惯例)
@@ -9,7 +9,27 @@
 """
 from __future__ import annotations
 
+import os
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+def _coerce_env_value(v: str):
+    """env 值类型推断(true/false/int/float/原样 str)。与 config.py 同款。"""
+    v_lower = v.strip().lower()
+    if v_lower in ("true", "yes", "1", "on"):
+        return True
+    if v_lower in ("false", "no", "0", "off"):
+        return False
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
 
 
 class TaskWALConfig(BaseModel):
@@ -46,6 +66,29 @@ class TaskWALConfig(BaseModel):
             data.pop("failed_retention_seconds", None)
             data["failed_retention_seconds"] = days * 86400
         return data
+
+    @classmethod
+    def from_env(cls, prefix: str = "MEMORY_WAL_") -> "TaskWALConfig":
+        """从环境变量构造。
+
+        约定:
+            MEMORY_WAL__MAX_RETRY=5
+            MEMORY_WAL__RETRY_BACKOFF_SECONDS=60
+            MEMORY_WAL__DONE_RETENTION_DAYS=1
+            MEMORY_WAL__FAILED_RETENTION_DAYS=1
+        (前缀默认 `MEMORY_WAL_`,允许 caller 传别的用于测试。)
+
+        Phase 3 / Step 3.3.1:复用项目 `_coerce_env_value` 风格(类型推断),
+        走 Pydantic 校验;非法值抛 ValidationError。
+        """
+        data: dict = {}
+        for k, v in os.environ.items():
+            if not k.startswith(prefix):
+                continue
+            # MEMORY_WAL__MAX_RETRY → "max_retry" (剥前缀 + 一个 _)
+            key = k[len(prefix):].lstrip("_").lower()
+            data[key] = _coerce_env_value(v)
+        return cls.model_validate(data)
 
 
 __all__ = ["TaskWALConfig"]
