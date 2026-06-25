@@ -483,6 +483,79 @@ class MetaDB:
         except sqlite3.Error as e:
             raise MetaDBError(f"mark_failed 失败: {e}", cause=e)
 
+    # ── M11 startup_scan helpers ──────────────────────
+
+    def delete_done_tasks(self, before_timestamp: float) -> int:
+        """清理 state='DONE' AND updated_at < before_timestamp 的行。
+
+        Phase 2 / Step 2.2.5:startup_scan 步骤 1a 调用,根据
+        task_wal_config.done_retention_seconds 计算 before_timestamp。
+        Returns:删除行数。
+        """
+        try:
+            with self.transaction() as conn:
+                cur = conn.execute(
+                    "DELETE FROM memory_tasks "
+                    "WHERE state = 'DONE' AND updated_at < ?",
+                    (before_timestamp,),
+                )
+                return cur.rowcount
+        except sqlite3.Error as e:
+            raise MetaDBError(f"delete_done_tasks 失败: {e}", cause=e)
+
+    def delete_failed_tasks(self, before_timestamp: float) -> int:
+        """清理 FAILED 终态(attempts >= max_attempts)AND updated_at < before_timestamp。
+
+        Phase 2 / Step 2.2.6:startup_scan 步骤 1b,只删终态 FAILED,
+        退避中 FAILED(attempts < max_attempts)保留等下次重试。
+        """
+        try:
+            with self.transaction() as conn:
+                cur = conn.execute(
+                    "DELETE FROM memory_tasks "
+                    "WHERE state = 'FAILED' AND attempts >= max_attempts "
+                    "AND updated_at < ?",
+                    (before_timestamp,),
+                )
+                return cur.rowcount
+        except sqlite3.Error as e:
+            raise MetaDBError(f"delete_failed_tasks 失败: {e}", cause=e)
+
+    def list_dispatchable_tasks(
+        self,
+        session_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """派工列表:state IN ('NONE', 'PENDING') ORDER BY turn_index ASC。
+
+        Phase 2 / Step 2.2.9:startup_scan 步骤 4 返回所有待处理任务,
+        Channel B 后台循环 dispatch 时按 turn_index 顺序处理。
+        """
+        try:
+            with self.transaction() as conn:
+                if session_id is None:
+                    cur = conn.execute(
+                        "SELECT task_id, session_id, turn_index, state, attempts, "
+                        "       max_attempts, next_at, inflight_at "
+                        "FROM memory_tasks "
+                        "WHERE state IN ('NONE', 'PENDING') "
+                        "ORDER BY turn_index ASC LIMIT ?",
+                        (limit,),
+                    )
+                else:
+                    cur = conn.execute(
+                        "SELECT task_id, session_id, turn_index, state, attempts, "
+                        "       max_attempts, next_at, inflight_at "
+                        "FROM memory_tasks "
+                        "WHERE session_id = ? AND state IN ('NONE', 'PENDING') "
+                        "ORDER BY turn_index ASC LIMIT ?",
+                        (session_id, limit),
+                    )
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+        except sqlite3.Error as e:
+            raise MetaDBError(f"list_dispatchable_tasks 失败: {e}", cause=e)
+
     # ── Candidates（L6 + A5 幂等去重） ──────────────────────
 
     def add_candidate(
