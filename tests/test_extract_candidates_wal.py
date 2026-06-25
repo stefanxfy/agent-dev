@@ -29,15 +29,23 @@ class _FakeCandidate:
 
 
 class _FakeVectorStore:
-    """最小 stub:只接 add(),存到内存(Phase 2.2.10b extract_candidates 走新表测试用)。"""
+    """T1/T2 锁定后的新契约:add(id, embedding) / query()→[{id, distance}]"""
     def __init__(self):
-        self.items: list[dict] = []
+        self.items: list[tuple[str, list[float]]] = []  # [(id, embedding), ...]
 
-    def add(self, item: dict) -> None:
-        self.items.append(item)
+    def add(self, id: str, embedding: list[float]) -> None:
+        self.items.append((id, embedding))
 
     def query(self, embedding, top_k=5):
-        return []  # 语义去重不参与,空 list = 无命中
+        # 按 id 字母序选 top_k(简单 mock,不需要真算相似度)
+        sorted_items = sorted(self.items, key=lambda x: x[0])
+        return [
+            {"id": item[0], "distance": 0.1 * i}
+            for i, item in enumerate(sorted_items[:top_k])
+        ]
+
+    def count(self):
+        return len(self.items)
 
 
 def _make_writer(tmp_path, *, session_id="s1"):

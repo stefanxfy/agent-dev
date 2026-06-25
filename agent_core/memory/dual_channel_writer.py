@@ -122,15 +122,13 @@ class ExtractionCandidate:
 
 
 class VectorStoreProtocol(Protocol):
-    """vector_store 接口(必须由 ChromaVectorStore 实现,见 chroma_store.py)
+    """vector_store 接口(方案 A 严格分离契约)
 
-    字段约定 add(doc: dict):
-        - id:        str 唯一标识(item_hash)
-        - embedding: list[float] 向量(维度由 embed_fn 决定)
-        - metadata:  dict (type/title/tags/...)
-        - document:  str 原始文本(可选)
+    add() 只接 (id, embedding) 两个位置参数,不接 metadata/document。
+    query() 只返回 [{id, distance}, ...],不返 metadata/document。
+    结构化字段(type/title/tags/...)由 MemoryStore 负责。
     """
-    def add(self, doc: dict[str, Any]) -> None: ...
+    def add(self, id: str, embedding: list[float]) -> None: ...
     def count(self) -> int: ...
 
 

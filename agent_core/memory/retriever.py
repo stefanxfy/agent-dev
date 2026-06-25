@@ -109,8 +109,12 @@ class RetrievalReport:
 # retriever 期望的 vector_store 接口
 # ChromaVectorStore 必须实现 query()(见 chroma_store.py)
 class VectorSearchable(Protocol):
-    """retriever 用的 vector 接口"""
-    def add(self, doc: dict) -> None: ...
+    """retriever 用的 vector 接口(方案 A 严格分离契约)
+
+    add() 只接 (id, embedding) 两个位置参数,不接 metadata/document。
+    query() 只返回 [{id, distance}, ...],不返 metadata/document。
+    """
+    def add(self, id: str, embedding: list[float]) -> None: ...
     def count(self) -> int: ...
     def query(self, embedding: list[float], top_k: int) -> list[dict]: ...
 
