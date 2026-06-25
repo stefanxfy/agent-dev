@@ -256,14 +256,15 @@ class ChromaVectorStore:
 
     def query(self, embedding: list[float], top_k: int) -> list[dict]:
         """
-        向量检索 top_k
+        向量检索 top_k(严格分离契约:只返回 {id, distance})
 
         Args:
             embedding: 查询向量(必须与 collection dim 一致)
             top_k: 返回前 k 条
 
         Returns:
-            [{"id", "metadata", "document", "distance"}, ...] 按 distance 升序
+            [{"id": str, "distance": float}, ...] 按 distance 升序。
+            不再有 metadata / document —— 所有结构化字段从 MemoryStore 读。
         """
         self._validate_embedding_dim(embedding)
 
@@ -280,22 +281,15 @@ class ChromaVectorStore:
                     f"ChromaDB query 失败: {e}", cause=e
                 )
 
-        # ChromaDB 返回 {ids: [[]], metadatas: [[]], distances: [[]], documents: [[]]}
+        # ChromaDB 返回 {ids: [[]], distances: [[]]}
         if not res or not res.get("ids") or not res["ids"][0]:
             return []
         ids = res["ids"][0]
-        metas = (res.get("metadatas") or [[]])[0]
-        docs = (res.get("documents") or [[]])[0]
         dists = (res.get("distances") or [[]])[0]
-        out: list[dict] = []
-        for i, id_ in enumerate(ids):
-            out.append({
-                "id": id_,
-                "metadata": metas[i] if i < len(metas) else {},
-                "document": docs[i] if i < len(docs) else "",
-                "distance": float(dists[i]) if i < len(dists) else 0.0,
-            })
-        return out
+        return [
+            {"id": id_, "distance": float(dists[i]) if i < len(dists) else 0.0}
+            for i, id_ in enumerate(ids)
+        ]
 
 
 # ──────────────────────────────────────────────────────────────────

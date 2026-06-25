@@ -93,3 +93,23 @@ def test_add_stores_only_id_and_embedding_under_the_hood(tmp_path):
         assert m in (None, {}), f"metadata 残留: {m!r}"
     for d in docs:
         assert d in (None, ""), f"document 残留: {d!r}"
+
+
+def test_query_returns_only_id_and_distance(tmp_path):
+    """新契约:query() 返回的 hit 只含 {id, distance},无 metadata/document。"""
+    embed = FakeEmbedFn()
+    vec = _make_vec(tmp_path, name="query_shape")
+    vec.add("a", embed.encode("alpha"))
+    vec.add("b", embed.encode("beta"))
+    hits = vec.query(embed.encode("alpha"), top_k=2)
+    assert len(hits) == 2
+    for h in hits:
+        assert set(h.keys()) == {"id", "distance"}, (
+            f"query() 返回多余字段: {set(h.keys()) - {'id', 'distance'}}"
+        )
+    # 验证按 distance 升序
+    assert hits[0]["distance"] <= hits[1]["distance"]
+    # 验证 id 是字符串
+    assert all(isinstance(h["id"], str) for h in hits)
+    # 验证 distance 是 float
+    assert all(isinstance(h["distance"], float) for h in hits)
