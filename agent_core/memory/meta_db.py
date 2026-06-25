@@ -381,6 +381,35 @@ class MetaDB:
         except sqlite3.Error as e:
             raise MetaDBError(f"get_task 失败: {e}", cause=e)
 
+    def get_task_by_turn(
+        self,
+        session_id: str,
+        turn_index: int,
+    ) -> Optional[dict]:
+        """按 (session_id, turn_index) 反查 task(UNIQUE 约束保证 1:1)。
+
+        Phase 2 / Step 2.2.10b:Channel B 走新表时,从 TurnMessage.turn_index
+        反查 task_id,再 cas_grab_task / mark_done_with_candidates。
+
+        Returns:dict(含 task_id / state / candidates_payload / ...) 或 None。
+        """
+        try:
+            with self.transaction() as conn:
+                row = conn.execute(
+                    "SELECT task_id, session_id, turn_index, state, attempts, "
+                    "       max_attempts, next_at, inflight_at, user_msg, "
+                    "       assistant_resp, turn_metadata, candidates_payload, "
+                    "       extraction_error, created_at, updated_at "
+                    "FROM memory_tasks "
+                    "WHERE session_id = ? AND turn_index = ?",
+                    (session_id, turn_index),
+                ).fetchone()
+                if not row:
+                    return None
+                return dict(row)
+        except sqlite3.Error as e:
+            raise MetaDBError(f"get_task_by_turn 失败: {e}", cause=e)
+
     def cas_grab_task(
         self,
         task_id: int,
