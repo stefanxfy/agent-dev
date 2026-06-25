@@ -415,7 +415,22 @@ class DualChannelWriter:
             _sim_str = f"{sim:.4f}" if sim is not None else "none"
 
             if action is DedupAction.AUTO_DUPLICATE:
-                _top_title = (hits[0].get("metadata") or {}).get("title", "?")
+                # best-effort:从 MemoryStore 读 top1 的 title 用于日志
+                # (Chroma 不再存 metadata;_resolve_hits_for_prompt 不在这里调用
+                # 因为 AUTO_DUPLICATE 跳过路径不喂 LLM,不需要预解析)
+                _top_id = hits[0].get("id", "")
+                _top_title = "?"
+                if _top_id:
+                    for t in ("user", "feedback", "event", "project", "reference"):
+                        rel = self.memory_store.root / t / f"{_top_id}.md"
+                        if rel.exists():
+                            try:
+                                _top_title = self.memory_store.read(
+                                    f"{t}/{_top_id}.md"
+                                ).get("frontmatter", {}).get("title", "?")
+                            except Exception:
+                                pass
+                            break
                 logger.info(
                     f"extract:  语义重复(auto, sim={_sim_str} >= "
                     f"{cfg.auto_threshold}) 跳过 [{cand.type}] {cand.title!r} "

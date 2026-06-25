@@ -510,3 +510,68 @@ class TestScenario03CrossProcess:
         # 清理
         proc_a.wait(timeout=5)
         assert proc_a.returncode == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# T6: AUTO_DUPLICATE 分支的 log 应包含已有记忆的 title(从 MemoryStore 读)
+# ──────────────────────────────────────────────────────────────────
+
+def test_auto_duplicate_log_includes_top_title_from_memory_store(writer, caplog):
+    """AUTO_DUPLICATE 分支的 log 应包含已有记忆的 title(从 MemoryStore 读)。
+
+    验证 Chroma 严格分离(方案 A)后,高相似度跳过路径的可观测性
+    仍能输出 top1 title,而不是 '?'(Chroma metadata 不可用时)。
+    """
+    import logging
+    from types import SimpleNamespace
+
+    # fixture 没注入 dedup_config,临时挂一个(autouse=True 不破坏既有测试)
+    writer.dedup_config = SimpleNamespace(
+        enabled=True, auto_threshold=0.5, judge_floor=0.3, top_k=5
+    )
+
+    # 准备:库里有一条 title='姓名' 的 user 记忆
+    writer.persist_turn("我叫张三", "已记", turn_index=0)
+
+    def seed_extractor(messages):
+        return [ExtractionCandidate(
+            type="user", title="姓名",
+            body="用户叫张三", source_quote="我叫张三",
+            tags=["person"], score=0.9,
+        )]
+
+    # 先把种子记忆写进 MemoryStore + vec
+    f = writer.extract_candidates(
+        [TurnMessage(0, "我叫张三", "已记")],
+        llm_extractor=seed_extractor,
+    )
+    result = f.result(timeout=5)
+    assert result["written"] == 1
+
+    # 现在模拟一次高相似度的 extract 候选(应走 AUTO_DUPLICATE 跳过路径)
+    writer.persist_turn("再确认一次,张三", "已记", turn_index=1)
+
+    # 极低 auto_threshold:只要 vec query top1 sim ≥ 0.5 就跳过
+    writer.dedup_config.auto_threshold = 0.5
+
+    def dup_extractor(messages):
+        return [ExtractionCandidate(
+            type="user", title="我叫谁",
+            body="用户叫张三", source_quote="再确认一次,张三",
+            tags=[], score=0.9,
+        )]
+
+    with caplog.at_level(logging.INFO, logger="memory.dual_channel"):
+        f2 = writer.extract_candidates(
+            [TurnMessage(1, "再确认一次,张三", "已记")],
+            llm_extractor=dup_extractor,
+        )
+        result2 = f2.result(timeout=5)
+
+    # 期望:这条候选没被写盘(AUTO_DUPLICATE 跳过)
+    # 期望:log 含"语义重复" + "已有 '姓名'"(从 MemoryStore frontmatter 读)
+    msgs = "\n".join(r.message for r in caplog.records)
+    assert "语义重复" in msgs, f"缺 AUTO_DUPLICATE 日志:\n{msgs}"
+    assert "已有 '姓名'" in msgs or '已有 "姓名"' in msgs, (
+        f"AUTO_DUPLICATE log 应含 top1 title '姓名',实际:\n{msgs}"
+    )
