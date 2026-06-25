@@ -24,7 +24,7 @@ def _make_writer(tmp_path, **overrides):
     from agent_core.memory.dual_channel_writer import DualChannelWriter
     from agent_core.memory.meta_db import MetaDB
     from agent_core.memory.memory_store import MemoryStore
-    from tests.test_dual_channel_concurrent import FakeEmbedFn
+    from conftest import FakeEmbedFn
 
     db = MetaDB(":memory:")
     store = MemoryStore(tmp_path / "memory")

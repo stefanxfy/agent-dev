@@ -41,85 +41,9 @@ from agent_core.memory.memory_store import MemoryStore
 from agent_core.memory.meta_db import MetaDB
 
 
-# ──────────────────────────────────────────────────────────────────
-# 假 EmbedFn —— 确定性 1024 维向量,无模型加载
-# ──────────────────────────────────────────────────────────────────
-
-class FakeEmbedFn:
-    """确定性伪嵌入(用于并发测试,避免 bge-m3 模型加载开销)
-
-    同样的 text 产生同样的向量(hash → 展开成 1024 维)
-    """
-    dimension = 1024
-
-    def encode(self, text: str) -> list[float]:
-        digest = hashlib.sha256(text.encode("utf-8")).digest()
-        # 32 字节 → 扩展到 1024 维(每字节重复 32 次)
-        vec = []
-        for _ in range(32):
-            for b in digest:
-                vec.append(b / 255.0)
-        return vec
-
-
-# ──────────────────────────────────────────────────────────────────
-# Fixtures
-# ──────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def memory_root(tmp_path):
-    root = tmp_path / "memory"
-    root.mkdir()
-    return root
-
-
-@pytest.fixture
-def logs_dir(tmp_path):
-    """logs 是 memory_root.parent 的子目录(双通道写入器约定)"""
-    d = tmp_path / "logs"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture
-def meta_db_path(tmp_path):
-    return tmp_path / "meta.db"
-
-
-@pytest.fixture
-def chroma_dir(tmp_path):
-    d = tmp_path / "chroma"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture
-def meta_db(meta_db_path):
-    return MetaDB(meta_db_path)
-
-
-@pytest.fixture
-def memory_store(memory_root):
-    return MemoryStore(memory_root)
-
-
-@pytest.fixture
-def writer(meta_db, memory_store, memory_root, chroma_dir):
-    """DualChannelWriter with FakeEmbedFn + Ephemeral chroma"""
-    db = meta_db
-    store = memory_store
-    embed = FakeEmbedFn()
-    chroma_path = chroma_dir / f"concurrent_{os.getpid()}_{threading.get_ident()}"
-    with ChromaVectorStore(str(chroma_path), collection="concurrent_test") as vec:
-        w = DualChannelWriter("s1", db, store, vec, embed)
-        yield w
-        w.shutdown(timeout=3)
-        vec.close()
-
-
-@pytest.fixture
-def config():
-    return DistillationConfig()
+# FakeEmbedFn / 8 fixture → conftest.py(Phase 4 / Step 4.4.7)
+# pytest 自动发现 conftest;FakeEmbedFn 在测试函数里显式 import:
+from conftest import FakeEmbedFn  # noqa: E402
 
 
 def _make_old_last_distill(memory_root: Path, hours_ago: float = 25.0):

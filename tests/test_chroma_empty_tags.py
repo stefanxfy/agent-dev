@@ -28,50 +28,9 @@ from agent_core.memory.memory_store import MemoryStore
 from agent_core.memory.meta_db import MetaDB
 
 
-# ──────────────────────────────────────────────────────────────────
-# 假 EmbedFn
-# ──────────────────────────────────────────────────────────────────
-
-class FakeEmbedFn:
-    dimension = 1024
-
-    def encode(self, text: str) -> list[float]:
-        digest = hashlib.sha256(text.encode("utf-8")).digest()
-        vec = []
-        for _ in range(32):
-            for b in digest:
-                vec.append(b / 255.0)
-        return vec
-
-
-# ──────────────────────────────────────────────────────────────────
-# Fixtures
-# ──────────────────────────────────────────────────────────────────
-
-@pytest.fixture
-def chroma_dir(tmp_path):
-    d = tmp_path / "chroma"
-    d.mkdir()
-    return d
-
-
-@pytest.fixture
-def memory_root(tmp_path):
-    root = tmp_path / "memory"
-    root.mkdir()
-    return root
-
-
-@pytest.fixture
-def meta_db_path(tmp_path):
-    return tmp_path / "meta.db"
-
-
-@pytest.fixture
-def logs_dir(tmp_path):
-    d = tmp_path / "logs"
-    d.mkdir()
-    return d
+# FakeEmbedFn / 4 fixture → conftest.py(Phase 4 / Step 4.4.7)
+# pytest 自动发现 conftest;FakeEmbedFn 在测试函数里显式 import:
+from conftest import FakeEmbedFn  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────
