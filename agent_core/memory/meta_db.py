@@ -43,47 +43,6 @@ class MetaDBError(StorageError):
 # ──────────────────────────────────────────────────────────────────
 
 _DDL = """
-CREATE TABLE IF NOT EXISTS cursors (
-    session_id   TEXT NOT NULL,
-    cursor_kind  TEXT NOT NULL,
-    value        INTEGER NOT NULL,
-    updated_at   REAL NOT NULL,
-    PRIMARY KEY (session_id, cursor_kind)
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS pending_writes (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id   TEXT NOT NULL,
-    payload      TEXT NOT NULL,           -- JSON 序列化
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    created_at   REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_pending_session
-    ON pending_writes (session_id, created_at);
-
-CREATE TABLE IF NOT EXISTS candidates (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id   TEXT NOT NULL,
-    item_hash    TEXT NOT NULL,           -- SHA-256 hex (A5 幂等去重)
-    type         TEXT NOT NULL,           -- 4 类之一
-    status       TEXT NOT NULL,           -- L6: pending|accepted|rejected|written
-    payload      TEXT NOT NULL,           -- JSON: {title, body, source_quote, tags}
-    score        REAL,                    -- LLM 自评 (0-1)
-    created_at   REAL NOT NULL,
-    UNIQUE (session_id, item_hash)        -- A5: 同 session 同 hash 不重复
-);
-
-CREATE INDEX IF NOT EXISTS idx_candidates_status
-    ON candidates (session_id, status, created_at);
-
-CREATE TABLE IF NOT EXISTS candidate_decisions (
-    cand_key    TEXT NOT NULL,           -- compute_candidate_key(type, body) (M10 C4.4)
-    decision    TEXT NOT NULL,           -- accepted | rejected
-    decided_at  REAL NOT NULL,
-    PRIMARY KEY (cand_key)
-);
-
 -- M11: memory_tasks 表 —— 单表收编 turn 原文 + 状态机 + candidates + 重试信息
 -- 替代旧 cursors / pending_writes / JSONL 三源架构
 -- 五态:NONE / PENDING / INFLIGHT / DONE / FAILED
@@ -115,6 +74,35 @@ CREATE INDEX IF NOT EXISTS idx_tasks_session_turn
 
 CREATE INDEX IF NOT EXISTS idx_tasks_compaction
     ON memory_tasks (state, updated_at);
+
+CREATE TABLE IF NOT EXISTS candidates (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id   TEXT NOT NULL,
+    item_hash    TEXT NOT NULL,           -- SHA-256 hex (A5 幂等去重)
+    type         TEXT NOT NULL,           -- 4 类之一
+    status       TEXT NOT NULL,           -- L6: pending|accepted|rejected|written
+    payload      TEXT NOT NULL,           -- JSON: {title, body, source_quote, tags}
+    score        REAL,                    -- LLM 自评 (0-1)
+    created_at   REAL NOT NULL,
+    UNIQUE (session_id, item_hash)        -- A5: 同 session 同 hash 不重复
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidates_status
+    ON candidates (session_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS candidate_decisions (
+    cand_key    TEXT NOT NULL,           -- compute_candidate_key(type, body) (M10 C4.4)
+    decision    TEXT NOT NULL,           -- accepted | rejected
+    decided_at  REAL NOT NULL,
+    PRIMARY KEY (cand_key)
+);
+
+-- Phase 4 / Step 4.4.1:迁移 — 旧 cursors / pending_writes 表彻底删除。
+-- 这两张表在 Phase 1-3 期间由 Channel A / B 双写保留(向后兼容旧测试),
+-- Phase 4 后不再 CREATE;DROP TABLE 兜底已有 db 文件。
+DROP TABLE IF EXISTS cursors;
+DROP TABLE IF EXISTS pending_writes;
+DROP INDEX IF EXISTS idx_pending_session;
 """
 
 
