@@ -112,7 +112,6 @@ def test_extraction_gate_emits_memory_extract_gate_span(in_memory_exporter):
         cumulative_tokens=20_000,  # 超 MIN_TOKENS_TO_INIT,过 gate1
         cumulative_tool_calls=0,
         last_messages=[{"role": "user", "content": "记住 X"}],
-        gate1_period_start_turn=0,
     )
     gate.should_extract(ctx)
 

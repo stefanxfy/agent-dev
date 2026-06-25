@@ -187,6 +187,85 @@ class TestScenario02CursorBoundary:
 
 
 # ──────────────────────────────────────────────────────────────────
+# 日志可观测性: channel B 提取关键流程发 INFO 日志
+# ──────────────────────────────────────────────────────────────────
+
+class TestChannelBLogging:
+
+    def test_channel_b_emits_info_logs(self, writer, caplog):
+        """提取成功路径应发 "提取完成" + "已持久化" INFO 日志
+
+        排查 "记忆没存" 这类问题时,日志要能看出提取到底跑没跑、写没写。
+        """
+        import logging
+
+        # A 写 1 个 turn
+        writer.channel_a_inline_write("我喜欢看书", "已记", turn_index=0)
+
+        def extractor(messages):
+            return [ExtractionCandidate(
+                type="user",
+                title="爱好",
+                body="用户喜欢看书",
+                source_quote="我喜欢看书",
+                tags=["hobby"],
+                score=0.9,
+            )]
+
+        with caplog.at_level(logging.INFO, logger="memory.dual_channel"):
+            f = writer.channel_b_background_extract(
+                [TurnMessage(0, "我喜欢看书", "已记")],
+                llm_extractor=extractor,
+            )
+            result = f.result(timeout=5)
+
+        assert result["written"] == 1
+        msgs = "\n".join(r.message for r in caplog.records)
+        assert "channel B 提取完成" in msgs, f"缺提取完成日志:\n{msgs}"
+        assert "已持久化" in msgs, f"缺持久化日志:\n{msgs}"
+
+
+class TestChannelBMultiCandidate:
+    """Bug 1c 回归:单 turn、多 candidate —— 全部落盘,不被 zip 截断。"""
+
+    def test_all_candidates_written_not_just_first(self, writer):
+        """extractor 对 1 个 turn 返回 3 条 candidate(gate 对整段对话的产物)。
+
+        修复前:zip(to_process[1], candidates[3]) 只取 candidates[0](最旧那条),
+        当前消息对应的 candidate 被静默截断 → 用户看到"只存了上一条记忆"。
+        修复后:3 条全部写盘,且都盖当前 turn 的 turn_index。
+        """
+        # A 写 1 个 turn(turn_index=0)
+        writer.channel_a_inline_write("我不喜欢英国人", "已记", turn_index=0)
+
+        # extractor 返回 3 条(顺序模拟 LLM 按对话顺序:旧→新)
+        def extractor(messages):
+            return [
+                ExtractionCandidate(type="user", title="桃子", body="喜欢吃桃子",
+                                    source_quote="桃子", tags=[], score=0.9),
+                ExtractionCandidate(type="user", title="日本", body="不喜欢日本人",
+                                    source_quote="日本", tags=[], score=0.9),
+                ExtractionCandidate(type="user", title="英国", body="不喜欢英国人",
+                                    source_quote="英国", tags=[], score=0.9),
+            ]
+
+        f = writer.channel_b_background_extract(
+            [TurnMessage(0, "我不喜欢英国人", "已记")],
+            llm_extractor=extractor,
+        )
+        result = f.result(timeout=5)
+
+        assert result["written"] == 3, f"3 条 candidate 应全部落盘,实际 {result}"
+
+        # 当前消息(英国)必须在,且 3 条都盖 turn_index=0
+        md_files = list((writer.memory_store.root / "user").glob("*.md"))
+        bodies = "\n".join(p.read_text(encoding="utf-8") for p in md_files)
+        assert "不喜欢英国人" in bodies, f"当前 turn 的记忆缺失:\n{bodies}"
+        assert "不喜欢日本人" in bodies and "喜欢吃桃子" in bodies, "backlog 也应一并落盘"
+        assert "turn_index: 0" in bodies, "candidate 应盖当前处理的 turn_index"
+
+
+# ──────────────────────────────────────────────────────────────────
 # 场景 5: 蒸馏锁强占 (PID 已死)
 # ──────────────────────────────────────────────────────────────────
 

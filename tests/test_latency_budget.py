@@ -83,8 +83,6 @@ def test_bridge_emits_timeout_event_on_latency_timeout():
         assistant_resp="reply",
         turn_index=0,
         input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
-        last_messages=[{"role": "user", "content": "记住我喜欢 Python"}],
-        recent_turns=[],
     ))
     kinds = [e.kind for e in events]
     assert MemoryEventKind.TIMEOUT in kinds

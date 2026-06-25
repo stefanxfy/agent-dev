@@ -12,7 +12,7 @@ import sys
 import uuid
 from pathlib import Path
 
-# ── 配置日志（在加载任何模块之前）──────────────────────────────
+# ── 解析 --log-level（在加载任何模块之前）──────────────────────
 # 用法: python3 -m streamlit run web/app.py -- --log-level=DEBUG
 #       python3 -m streamlit run web/app.py -- --log-level debug
 #       不传默认 INFO
@@ -28,24 +28,17 @@ for i, arg in enumerate(_argv):
         _log_level = getattr(logging, _val.upper(), logging.INFO)
         break
 
-logging.basicConfig(
-    level=_log_level,
-    format='[%(asctime)s] [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%H:%M:%S',
-)
-# 安静第三方库（DEBUG 模式下避免刷屏）
-if _log_level <= logging.DEBUG:
-    for _noisy in ("httpx", "httpcore", "urllib3", "openai", "anthropic",
-                   "watchdog", "git"):
-        logging.getLogger(_noisy).setLevel(logging.WARNING)
-
-# ── 加载 .env 文件（必须在最前面）────────────────────────────
-from dotenv import load_dotenv
-load_dotenv()
-
-# ── 项目根目录加入 sys.path ────────────────────────────────────
+# ── 项目根目录加入 sys.path（须在 import agent_core 之前）────────
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()  # 使用绝对路径
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ── 配置日志：控制台 + 按小时切分的本地文件 logs/app/agent.log ──
+from agent_core.logging_setup import setup_logging
+setup_logging(level=_log_level, log_dir=PROJECT_ROOT / "logs" / "app")
+
+# ── 加载 .env 文件 ────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── 全局常量（必须在 sidebar 之外定义）──────────────────────────
 DATA_DIR = str(PROJECT_ROOT / "data" / "sessions")
@@ -95,7 +88,7 @@ if "memory_stats" not in st.session_state:
         "stored_total": 0,
     }
 if "memory_enabled" not in st.session_state:
-    st.session_state.memory_enabled = False
+    st.session_state.memory_enabled = True  # 默认启用记忆检索(2026-06-24 改)
 if "current_thinking" not in st.session_state:
     st.session_state.current_thinking = ""
 if "tool_logs" not in st.session_state:
@@ -261,45 +254,24 @@ with st.sidebar:
     st.divider()
     st.header("⚙️ LLM 配置")
 
-    # 从 .env 读取默认厂商
-    default_provider = os.getenv("DEFAULT_PROVIDER", "zhipu").lower()
-    provider_index = 2  # 默认 zhipu
-    if default_provider in ["anthropic", "openai", "zhipu"]:
-        provider_index = ["anthropic", "openai", "zhipu"].index(default_provider)
+    # provider/model/env_key 列表由 LLMProvider enum 派生,加新厂商无需改 UI
+    from web.llm_options import (
+        get_default_provider_index,
+        get_env_key_for_provider,
+        get_models_for_provider,
+        get_provider_options,
+    )
 
     provider = st.selectbox(
         "厂商",
-        options=["anthropic", "openai", "zhipu"],
-        index=provider_index,
+        options=get_provider_options(),
+        index=get_default_provider_index(),
     )
 
-    model_options = {
-        "anthropic": [
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-            "claude-haiku-4-20250514",
-        ],
-        "openai": [
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "o3-mini",
-        ],
-        "zhipu": [
-            "GLM-5.1",
-            "glm-5-turbo",
-            "GLM-4.7",
-        ],
-    }
-    model = st.selectbox("模型", options=model_options[provider])
+    model = st.selectbox("模型", options=get_models_for_provider(provider))
 
     # API Key
-    env_key_map = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "zhipu": "ZHIPU_API_KEY",
-    }
-    env_key_var = env_key_map.get(provider, "OPENAI_API_KEY")
+    env_key_var = get_env_key_for_provider(provider)
     default_key = os.getenv(env_key_var, "")
     api_key = st.text_input(
         "API Key（留空则使用 .env）",
@@ -680,6 +652,10 @@ def get_agent(session_id=None):
                 session_id=session_id or "default",
                 cost_tracker=_cost_tracker,
             )
+            # 语义去重:向量召回 + LLM 判定(≥auto_threshold 直接判重复,省 token)
+            # judge 复用 extractor_router(可疑带才会触发一次 LLM 调用)
+            from agent_core.memory.dedup import make_llm_dedup_judge
+            _dedup_judge = make_llm_dedup_judge(extractor_router)
             # M10 C1.2: 先构造 dual_channel,后构造 bridge,然后再装上 event_callback
             # (bridge 构造需 dual_channel 已就绪,所以 dual_channel 先造)
             dual_channel = DualChannelWriter(
@@ -688,6 +664,8 @@ def get_agent(session_id=None):
                 memory_store=memory_store,
                 vector_store=vec_store,
                 embed_fn=memory_embed_fn,
+                dedup_config=memory_config.dedup,
+                dedup_judge=_dedup_judge,
             )
             react_memory_bridge = ReactMemoryBridge(
                 dual_channel=dual_channel,

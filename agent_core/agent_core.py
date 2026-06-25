@@ -55,6 +55,11 @@ except ImportError:  # pragma: no cover
 # 创建 logger（使用单例模式防止重复配置）
 _logger = logging.getLogger("react_agent")
 
+# Bug 1e:表示「回答被截断、未完整收尾」的终止原因(跨 provider)。
+# Anthropic 用 max_tokens,OpenAI 兼容用 length。命中这些 → 本轮回答不完整,
+# 不提取记忆(避免把半句话存成记忆)。未知/None 的 stop_reason 不拦(向后兼容)。
+_TRUNCATED_STOP_REASONS = {"max_tokens", "length"}
+
 # 日志统一走 root handler（由 web/app.py basicConfig 配置）
 # agent_core 不再自建 handler，避免 propagate 导致重复输出
 _logger.setLevel(logging.DEBUG)  # 自己放开 DEBUG，由 root handler 的 level 控制是否输出
@@ -475,6 +480,14 @@ class ReactAgent:
         last_input_tokens: int = 0
         last_output_tokens: int = 0
         last_tool_calls: list = []
+        # Bug 1e 修复(2026-06-24):只有本轮真正走到"最终文本回答"分支(无 tool_call、
+        # 正常收尾)才记下这条文本。None 表示本轮没有完整回答(还在工具循环里被
+        # max_turns 截断 / 中断),此时末尾不调 on_turn_end,避免拿 reversed 扫描误配
+        # 到上一轮的回答。
+        final_answer: Optional[str] = None
+        # 收尾那一轮的终止原因(end_turn/stop=正常,max_tokens/length=被截断)。
+        # 用于在「无 tool_call 但被 max_tokens 截断」时也跳过提取。
+        final_stop_reason: Optional[str] = None
 
         for turn in range(1, self.max_turns + 1):
             yield ("system", f"🔄 Turn {turn}/{self.max_turns}")
@@ -533,6 +546,7 @@ class ReactAgent:
             tool_calls = []  # list of ToolCallDelta
             full_text = ""
             thinking_text = ""
+            stop_reason_this_turn: Optional[str] = None  # 本轮 LLM 终止原因
 
             # === 日志：发送给 LLM 的原始消息 ===
             _logger.debug("\n" + "=" * 60)
@@ -585,6 +599,10 @@ class ReactAgent:
                     # 工具调用 → 收集（不立即执行，等本轮 LLM 响应结束）
                     if chunk.tool_call:
                         tool_calls.append(chunk.tool_call)
+
+                    # 终止原因(流末尾 yield 一次)→ 记下本轮的
+                    if getattr(chunk, "stop_reason", None):
+                        stop_reason_this_turn = chunk.stop_reason
 
                     # Token 消耗 → 转发给 UI + 回传给 context manager
                     if chunk.usage:
@@ -646,6 +664,10 @@ class ReactAgent:
                     "role": "assistant",
                     "content": full_text,
                 })
+                # Bug 1e:本轮正常收尾,记下这条文本作为 on_turn_end 的 assistant_resp
+                # (直接用 full_text,不靠末尾 reversed 扫描,避免误配上一轮)
+                final_answer = full_text
+                final_stop_reason = stop_reason_this_turn
                 # Day 4: 保存最终回答到 session（含本轮累积的全部 thinking/tool_logs）
                 if self._session_manager:
                     try:
@@ -804,31 +826,32 @@ class ReactAgent:
 
         # Task 7: run 末尾调 bridge.on_turn_end(取代 Option C 同步提取)
         # 失败不阻断:try/except 兜底,只 log + yield 错误事件
-        if self.react_memory_bridge and last_turn > 0 and len(self.messages) >= 2:
+        #
+        # Bug 1e 修复(2026-06-24):只在本轮「正常产出完整文本回答」时才提取。
+        # - final_answer 为空 → 本轮在工具循环里被 max_turns 截断、或流式中断
+        #   (中断路径已提前 return),此时没有本轮的完整回答,跳过提取,
+        #   绝不退回去拿 reversed 扫描误配上一轮的回答。
+        # - final_stop_reason 命中 max_tokens/length → 回答被 token 上限切断、不完整,
+        #   跳过提取(避免把半句话存成记忆)。end_turn/stop/未知 → 视为正常收尾。
+        # - user_msg 直接用本 run 的入参 user_message,assistant_resp 用 final_answer,
+        #   两者都来自「本轮」,不再做全局 reversed 扫描。
+        if (
+            self.react_memory_bridge
+            and last_turn > 0
+            and final_answer
+            and user_message
+            and final_stop_reason not in _TRUNCATED_STOP_REASONS
+        ):
             try:
-                # 收集本 run 最后一对的 user/assistant 文本(只取最后一对,避免对历史反复提取)
-                last_user = next(
-                    (m["content"] for m in reversed(self.messages)
-                     if m.get("role") == "user" and isinstance(m.get("content"), str)),
-                    None,
-                )
-                last_assistant = next(
-                    (m["content"] for m in reversed(self.messages)
-                     if m.get("role") == "assistant" and isinstance(m.get("content"), str)),
-                    None,
-                )
-                if last_user and last_assistant:
-                    for event in self.react_memory_bridge.on_turn_end(
-                        user_msg=last_user,
-                        assistant_resp=last_assistant,
-                        turn_index=last_turn,
-                        input_tokens=last_input_tokens,
-                        output_tokens=last_output_tokens,
-                        tool_calls_in_turn=len(last_tool_calls),
-                        last_messages=self.messages[-6:],
-                        recent_turns=[],  # 简化:从本 run 只产一对,recent_turns 由 bridge 内部维护
-                    ):
-                        yield ("memory_event", event)
+                for event in self.react_memory_bridge.on_turn_end(
+                    user_msg=user_message,
+                    assistant_resp=final_answer,
+                    turn_index=last_turn,
+                    input_tokens=last_input_tokens,
+                    output_tokens=last_output_tokens,
+                    tool_calls_in_turn=len(last_tool_calls),
+                ):
+                    yield ("memory_event", event)
             except Exception as e:
                 _logger.warning(f"Memory bridge failed: {e}")
 

@@ -14,6 +14,10 @@ from typing import Generator, Optional
 
 from pydantic import BaseModel, Field
 
+# 内部模块
+from .thinking_splitter import _ThinkTagSplitter  # noqa: F401  保留 re-export 给测试/外部使用
+
+
 logger = logging.getLogger("llm.router")
 
 
@@ -49,6 +53,43 @@ class LLMModel(str, Enum):
     MINIMAX_M3 = "MiniMax-M3"  # 主线生产模型
     MINIMAX_TEXT_01 = "MiniMax-Text-01"  # 旧版通用文本(留作兼容)
     MINIMAX_TEXT_01_PREVIEW = "MiniMax-Text-01-preview"  # 预览版(留作兼容)
+
+
+# ── Provider 元数据(给 UI / 配置使用)───────────────────────────────────
+# 把每个 provider 暴露的 model 集中起来,新增 model 时只改这里,UI 自动同步。
+# 不放 LLMModel enum 内是因为 enum 应该只表达"模型名",UI 列表是另一回事。
+
+MODELS_BY_PROVIDER: dict[LLMProvider, list[str]] = {
+    LLMProvider.ANTHROPIC: [
+        LLMModel.CLAUDE_SONNET_4,
+        LLMModel.CLAUDE_OPUS_4,
+        LLMModel.CLAUDE_HAIKU_4,
+    ],
+    LLMProvider.OPENAI: [
+        LLMModel.GPT_4O,
+        LLMModel.GPT_4O_MINI,
+        LLMModel.GPT_41,
+        LLMModel.O3_MINI,
+    ],
+    LLMProvider.ZHIPU: [
+        LLMModel.GLM_5,
+        LLMModel.GLM_5_TURBO,
+        LLMModel.GLM_4_7,
+    ],
+    LLMProvider.MINIMAX: [
+        LLMModel.MINIMAX_M3,
+        LLMModel.MINIMAX_TEXT_01,
+        LLMModel.MINIMAX_TEXT_01_PREVIEW,
+    ],
+}
+
+# 每个 provider 对应的 API Key 环境变量名(从 agent_core.config.ENV_VAR_REGISTRY 推得)
+PROVIDER_ENV_KEY: dict[LLMProvider, str] = {
+    LLMProvider.ANTHROPIC: "ANTHROPIC_API_KEY",
+    LLMProvider.OPENAI: "OPENAI_API_KEY",
+    LLMProvider.ZHIPU: "ZHIPU_API_KEY",
+    LLMProvider.MINIMAX: "MINIMAX_API_KEY",
+}
 
 
 class ThinkingConfig(BaseModel):
@@ -295,98 +336,11 @@ class StreamChunk:
     thinking_delta: Optional[ThinkingDelta] = None
     tool_call: Optional[ToolCallDelta] = None  # 工具调用（完整返回，非增量）
     usage: Optional[UsageStats] = None
-
-
-class _ThinkTagSplitter:
-    """把含 `` 标签的 text 切成 (text_delta, thinking_delta) 序列
-
-    背景：MiniMax-M3 等 provider 把 thinking 内容直接放在
-    text_delta 里(包在 <think>...</think> 标签中),不像 GLM 那样有
-    独立的 reasoning_content 字段。本 splitter 状态机把这种
-    格式转成统一的 StreamChunk.thinking_delta,让 UI 能区分显示。
-
-    状态机:
-        NORMAL  ──(见 <think>)──▶ THINKING
-        THINKING ──(见 </think>)──▶ NORMAL
-
-    关键能力:
-    1. 标签跨 chunk 切片:`<thi` + `nk>...` + `</thin` + `king>`
-       都能正确解析(用 _buf 缓冲未完成的部分)
-    2. 多对标签:`<think>a</think> hello <think>b</think> world`
-    3. 流末尾收尾:flush() 兜底未完成的缓冲区
-    4. 失败降级:任何异常路径都保留原文(不丢内容)
-
-    简单嵌套(<think><think>x</think></think>)不处理 — MiniMax
-    实际输出没有嵌套,过度工程化无收益。
-    """
-    OPEN_TAG = "<think>"
-    CLOSE_TAG = "</think>"
-    NORMAL = "normal"
-    THINKING = "thinking"
-
-    def __init__(self) -> None:
-        self._state = self.NORMAL
-        self._buf = ""  # 缓冲可能是不完整标签的后缀
-
-    def feed(self, text: str) -> list[StreamChunk]:
-        """喂入一段 text,产出 0+ 个 StreamChunk(可能是空的,如果还在缓冲)
-
-        Streaming 策略:每 chunk emit 已确定的内容(不卡整段),
-        只缓冲最后 6 字符(可能是不完整的 <think> / </think>)。
-        """
-        if not text:
-            return []
-        s = self._buf + text
-        self._buf = ""
-        out: list[StreamChunk] = []
-        i = 0
-        while i < len(s):
-            tag = self.OPEN_TAG if self._state == self.NORMAL else self.CLOSE_TAG
-            idx = s.find(tag, i)
-            if idx == -1:
-                # 没找到完整标签 — 保留最后 6 字符在 _buf(可能是不完整标签)
-                # 其余 emit 出去(保留 streaming 体验)
-                tail = s[i:]
-                keep = len(tag) - 1  # 6
-                if len(tail) > keep:
-                    out.append(self._emit(tail[:-keep]))
-                    self._buf = tail[-keep:]
-                else:
-                    self._buf = tail
-                break
-            else:
-                # 标签前的内容
-                if idx > i:
-                    out.append(self._emit(s[i:idx]))
-                i = idx + len(tag)
-                self._state = self.THINKING if self._state == self.NORMAL else self.NORMAL
-                # </think> 后跳过一个换行(MiniMax 实测紧跟 \n)
-                if (self._state == self.NORMAL
-                        and i < len(s)
-                        and s[i] == "\n"):
-                    i += 1
-        return out
-
-    def flush(self) -> list[StreamChunk]:
-        """流结束时调用,把残留 buffer 兜底输出(不丢内容)"""
-        if not self._buf:
-            return []
-        chunk = self._emit(self._buf)
-        self._buf = ""
-        return [chunk]
-
-    def _emit(self, text: str) -> StreamChunk:
-        if self._state == self.THINKING:
-            return StreamChunk(thinking_delta=ThinkingDelta(thinking=text))
-        return StreamChunk(text_delta=TextDelta(text=text))
-
-    def _looks_like_partial_tag(self, s: str) -> bool:
-        """s 末尾是否可能是 OPEN_TAG 或 CLOSE_TAG 的前缀(需要继续缓冲)"""
-        for tag in (self.OPEN_TAG, self.CLOSE_TAG):
-            for k in range(1, len(tag)):
-                if s.endswith(tag[:k]):
-                    return True
-        return False
+    # 本次响应的终止原因(流末尾 yield 一次)。统一透传 provider 原值:
+    #   Anthropic: end_turn / tool_use / max_tokens / stop_sequence
+    #   OpenAI 兼容: stop / tool_calls / length / content_filter
+    # 上层据此判断回答是否「完整收尾」——尤其区分 max_tokens/length 截断。
+    stop_reason: Optional[str] = None
 
 
 # ── LLM Router ───────────────────────────────────────────────────────────────
@@ -399,10 +353,9 @@ class LLMRouter:
 
     def __init__(self, config: LLMConfig):
         self.config = config
-        self._anthropic_client = None
-        self._openai_client = None
-        self._zhipu_client = None
-        self._minimax_client = None  # MiniMax (OpenAI 兼容)
+        self._anthropic_client = None  # 懒加载,见 _get_anthropic_client()
+        # OpenAI 兼容 provider 的 client 在 OpenAICompatibleProvider 里懒加载
+        # (OpenAI / Zhipu / MiniMax 各有独立实例,由 _get_openai_provider() 创建)
 
     # ── 懒加载客户端 ────────────────────────────────────────────────────────
 
@@ -414,17 +367,6 @@ class LLMRouter:
             api_key = self.config.api_key or _config.anthropic_api_key
             self._anthropic_client = anthropic.Anthropic(api_key=api_key)
         return self._anthropic_client
-
-    def _get_openai_client(self):
-        if self._openai_client is None:
-            import openai
-            from ..config import config as _config
-            api_key = self.config.api_key or _config.openai_api_key
-            kwargs = {"api_key": api_key}
-            if self.config.base_url:
-                kwargs["base_url"] = self.config.base_url
-            self._openai_client = openai.OpenAI(**kwargs)
-        return self._openai_client
 
     # ── 流式调用入口 ─────────────────────────────────────────────────────────
 
@@ -479,8 +421,9 @@ class LLMRouter:
                 lambda: self._chat_anthropic(filtered_messages, tools, system_message, tool_choice, cache_namespace),
                 provider=provider,
             )
-        elif provider == "openai":
-            # OpenAI/Zhipu 保留 system 在 messages 中
+        elif provider in ("openai", "zhipu", "minimax"):
+            # 3 个 OpenAI 兼容 provider 共用同一调度路径
+            # OpenAI 兼容协议保留 system 在 messages 中
             # Fork 模式：需要用 override 替换/注入 system
             # ⚠️ Bug 修复：使用真值判断（`if system_prompt_override`）而不是 `is not None`
             #    空字符串也是 is not None True，会被注入空 system message，
@@ -490,51 +433,41 @@ class LLMRouter:
                 final_messages = [{"role": "system", "content": system_prompt_override}]
                 final_messages.extend(filtered_messages)
             if cache_namespace:
-                logger.warning(
-                    "cache_namespace=%r passed but openai provider doesn't "
-                    "support explicit cache_control; implicit caching may apply",
-                    cache_namespace,
-                )
+                if provider == "openai":
+                    logger.warning(
+                        "cache_namespace=%r passed but openai provider doesn't "
+                        "support explicit cache_control; implicit caching may apply",
+                        cache_namespace,
+                    )
+                elif provider == "zhipu":
+                    logger.warning(
+                        "cache_namespace=%r passed but zhipu doesn't support "
+                        "cache_control; ignored",
+                        cache_namespace,
+                    )
+                else:  # minimax
+                    # 实测(2026-06-24 smoke test):MiniMax-M3 支持 implicit prompt cache
+                    # (cached=114 / input=186 = 61.3% 命中率),不需要显式 cache_control 块
+                    logger.info(
+                        "cache_namespace=%r passed to minimax; implicit caching may apply",
+                        cache_namespace,
+                    )
+            openai_provider = self._get_openai_provider()
             yield from self._stream_with_retry(
-                lambda: self._chat_openai(final_messages, tools, tool_choice),
-                provider=provider,
-            )
-        elif provider == "zhipu":
-            final_messages = messages
-            if system_prompt_override:
-                final_messages = [{"role": "system", "content": system_prompt_override}]
-                final_messages.extend(filtered_messages)
-            if cache_namespace:
-                logger.warning(
-                    "cache_namespace=%r passed but zhipu doesn't support "
-                    "cache_control; ignored",
-                    cache_namespace,
-                )
-            yield from self._stream_with_retry(
-                lambda: self._chat_zhipu(final_messages, tools, tool_choice),
-                provider=provider,
-            )
-        elif provider == "minimax":
-            # MiniMax:OpenAI 兼容,与 zhipu 行为对齐
-            # 实测(2026-06-24 smoke test):MiniMax-M3 支持 implicit prompt cache
-            # (cached=114 / input=186 = 61.3% 命中率),不需要显式 cache_control 块
-            final_messages = messages
-            if system_prompt_override:
-                final_messages = [{"role": "system", "content": system_prompt_override}]
-                final_messages.extend(filtered_messages)
-            if cache_namespace:
-                # explicit cache_control 块暂未验证;只记 info,不影响调用
-                logger.info(
-                    "cache_namespace=%r passed to minimax; implicit caching may apply",
-                    cache_namespace,
-                    cache_namespace,
-                )
-            yield from self._stream_with_retry(
-                lambda: self._chat_minimax(final_messages, tools, tool_choice),
+                lambda: openai_provider.chat(final_messages, tools, tool_choice),
                 provider=provider,
             )
         else:
             raise ValueError(f"不支持的厂商: {self.config.provider}")
+
+    def _get_openai_provider(self):
+        """懒加载当前 provider 对应的 OpenAICompatibleProvider 实例。
+
+        替换原 _get_openai_client / _get_zhipu_client / _get_minimax_client 三个方法,
+        统一收敛到一个分发点。
+        """
+        from .openai_compatible import create_openai_compatible_provider
+        return create_openai_compatible_provider(self.config)
 
     def _stream_with_retry(
         self,
@@ -719,361 +652,16 @@ class LLMRouter:
             )
             yield StreamChunk(usage=usage)
 
-    # ── OpenAI 流式实现 ────────────────────────────────────────────────────
+            # 终止原因(Anthropic): end_turn / tool_use / max_tokens / stop_sequence
+            stop_reason = getattr(final_message, "stop_reason", None)
+            if stop_reason:
+                yield StreamChunk(stop_reason=stop_reason)
 
-    def _chat_openai(
-        self,
-        messages: list[dict],
-        tools: Optional[list[dict]],
-        tool_choice: Optional[str] = None,  # Fork 压缩：传 "none" 禁调工具
-    ) -> Generator[StreamChunk, None, None]:
-        """OpenAI GPT 流式调用（同步，支持 tool_calls 解析）"""
-        client = self._get_openai_client()
-
-        kwargs: dict = {
-            "model": self.config.model,
-            "max_tokens": self.config.max_tokens,
-            "messages": messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tools:
-            kwargs["tools"] = [{"type": "function", "function": t} for t in tools]
-            if tool_choice is not None:
-                # OpenAI 接受: "auto" / "none" / "required" / {"type": "function", "function": {"name": "..."}}
-                kwargs["tool_choice"] = tool_choice
-        if self.config.temperature > 0:
-            kwargs["temperature"] = self.config.temperature
-
-        stream = client.chat.completions.create(**kwargs)
-
-        # 收集 tool_calls（流式响应中可能分散在多个 chunk）
-        tool_calls_buffer = {}  # index -> {"id": ..., "name": ..., "arguments": ...}
-
-        for chunk in stream:
-            delta = chunk.choices[0].delta
-
-            # 文本增量
-            if delta.content:
-                yield StreamChunk(text_delta=TextDelta(text=delta.content))
-
-            # 工具调用增量（OpenAI 格式）
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_buffer:
-                        tool_calls_buffer[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc.id:
-                        tool_calls_buffer[idx]["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        tool_calls_buffer[idx]["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        tool_calls_buffer[idx]["arguments"] += tc.function.arguments
-
-            # Token 消耗（最后一个 chunk 携带，自动适配字段名）
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage = UsageStats.from_chunk_usage(chunk.usage)
-                logger.debug(f"[OpenAI] usage: {usage.summary('OpenAI')}")
-                yield StreamChunk(usage=usage)
-
-        # 流式结束后，yield 完整的 thinking（GLM reasoning_content）
-        if reasoning_buffer:
-            full_thinking = "".join(reasoning_buffer)
-            yield StreamChunk(thinking_delta=ThinkingDelta(thinking=full_thinking))
-
-        # 流式结束后，如果有完整的 tool_calls，yield 它们
-        for idx in sorted(tool_calls_buffer.keys()):
-            tc = tool_calls_buffer[idx]
-            if tc["id"] and tc["name"]:
-                import json
-                try:
-                    tool_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                except json.JSONDecodeError:
-                    tool_input = {"raw_arguments": tc["arguments"]}
-                yield StreamChunk(
-                    tool_call=ToolCallDelta(
-                        tool_name=tc["name"],
-                        tool_input=tool_input,
-                        tool_use_id=tc["id"],
-                        is_final=True,
-                    )
-                )
-
-    # ── 智谱 GLM 流式实现 ───────────────────────────────────────────────
-
-    def _get_zhipu_client(self):
-        """获取智谱客户端（Coding Plan 专用，复用 Anthropic 兼容协议）"""
-        if self._zhipu_client is None:
-            import openai
-            from ..config import config as _config
-            api_key = self.config.api_key or _config.zhipu_api_key
-            # Coding Plan 专用端点
-            base_url = self.config.base_url or "https://open.bigmodel.cn/api/coding/paas/v4"
-            self._zhipu_client = openai.OpenAI(
-                api_key=api_key,
-                base_url=base_url,
-            )
-        return self._zhipu_client
-
-    def _get_minimax_client(self):
-        """获取 MiniMax 客户端（OpenAI 兼容端点,文档:platform.minimaxi.com/docs/api-reference/text-openai-api）
-
-        注意:URL 路径名是 text-openai-api,说明其 chat completions 端点完全
-        兼容 OpenAI 协议,直接用 openai.OpenAI SDK + base_url 覆盖即可。
-        401/429 等 HTTP 错误由 _stream_with_retry 统一处理。
-        """
-        if self._minimax_client is None:
-            import openai
-            from ..config import config as _config
-            api_key = self.config.api_key or _config.minimax_api_key
-            # 官方文档 base_url:https://api.minimaxi.com/v1
-            # 也可由 LLMConfig.base_url 覆盖(便于私有部署 / 代理)
-            base_url = self.config.base_url or "https://api.minimaxi.com/v1"
-            self._minimax_client = openai.OpenAI(
-                api_key=api_key,
-                base_url=base_url,
-            )
-        return self._minimax_client
-
-    def _chat_zhipu(
-        self,
-        messages: list[dict],
-        tools: Optional[list[dict]],
-        tool_choice: Optional[str] = None,  # Fork 压缩：传 "none" 禁调工具
-    ) -> Generator[StreamChunk, None, None]:
-        """智谱 GLM 流式调用（Coding Plan 专用端点）"""
-        client = self._get_zhipu_client()
-
-        # 转换 messages 格式：智谱要求 role 为小写，content 为 string
-        zhipu_messages = []
-        for m in messages:
-            role = m["role"].lower()
-            content = m["content"]
-            # 如果 content 是 list（Anthropic 格式），转换为 string
-            if isinstance(content, list):
-                # 提取 text 内容，忽略 tool_result 等
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif item.get("type") == "tool_result":
-                            # tool_result 转为文本描述
-                            text_parts.append(f"[Tool Result: {item.get('content', '')}]")
-                content = "\n".join(text_parts)
-            zhipu_messages.append({"role": role, "content": content})
-
-        kwargs: dict = {
-            "model": self.config.model,
-            "messages": zhipu_messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tools:
-            # Zhipu 需要 OpenAI 格式：{"type": "function", "function": {...}}
-            # 输入的 tools 可能是 Anthropic 格式，需要转换
-            openai_tools = []
-            for t in tools:
-                if "type" in t and t.get("type") == "function":
-                    # 已经是 OpenAI 格式
-                    openai_tools.append(t)
-                else:
-                    # Anthropic 格式：{"name": ..., "description": ..., "input_schema": ...}
-                    openai_tools.append({
-                        "type": "function",
-                        "function": {
-                            "name": t.get("name", ""),
-                            "description": t.get("description", ""),
-                            "parameters": t.get("input_schema", {}),
-                        }
-                    })
-            kwargs["tools"] = openai_tools
-            if tool_choice is not None:
-                # GLM (OpenAI 兼容) 接受: "auto" / "none" / "required"
-                kwargs["tool_choice"] = tool_choice
-        if self.config.temperature > 0:
-            kwargs["temperature"] = self.config.temperature
-
-        stream = client.chat.completions.create(**kwargs)
-
-        # 收集 tool_calls（流式响应中可能分散在多个 chunk）
-        tool_calls_buffer = {}  # index -> {"id": ..., "name": ..., "arguments": ...}
-
-        # P3 优化：GLM thinking 改为实时流式 yield（之前缓存后在流结束一次性 yield，
-        # 导致 UI 看到'先出回答，后出思考'。现在逐块 yield 就能真正流式）
-        for chunk in stream:
-            if chunk.choices:
-                delta = chunk.choices[0].delta
-
-                # 文本增量
-                if delta.content:
-                    yield StreamChunk(text_delta=TextDelta(text=delta.content))
-
-                # GLM thinking 实时流式（reasoning_content 字段逐块到达）
-                # 与 Anthropic 不同：Anthropic SDK 不提供 thinking streaming delta，
-                # 只能在 get_final_message() 后一次性拿到。GLM 原生支持流式。
-                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                    yield StreamChunk(
-                        thinking_delta=ThinkingDelta(thinking=delta.reasoning_content)
-                    )
-                # 工具调用增量（OpenAI 格式）
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_buffer:
-                            tool_calls_buffer[idx] = {"id": "", "name": "", "arguments": ""}
-                        if tc.id:
-                            tool_calls_buffer[idx]["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            tool_calls_buffer[idx]["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            tool_calls_buffer[idx]["arguments"] += tc.function.arguments
-
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage = UsageStats.from_chunk_usage(chunk.usage)
-                yield StreamChunk(usage=usage)
-
-        # P3：thinking 已在流式循环内逐块 yield（router.py:557-563），
-        # 这里不再需要流结束后一次性 yield。
-
-        # 流式结束后，如果有完整的 tool_calls，yield 它们
-        for idx in sorted(tool_calls_buffer.keys()):
-            tc = tool_calls_buffer[idx]
-            if tc["id"] and tc["name"]:
-                import json
-                try:
-                    tool_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                except json.JSONDecodeError:
-                    tool_input = {"raw_arguments": tc["arguments"]}
-                yield StreamChunk(
-                    tool_call=ToolCallDelta(
-                        tool_name=tc["name"],
-                        tool_input=tool_input,
-                        tool_use_id=tc["id"],
-                        is_final=True,
-                    )
-                )
-
-    # ── MiniMax (MiniMax) 流式实现 ────────────────────────────────────
-    #
-    # 协议：OpenAI 兼容(参考 docs/platform.minimaxi.com/docs/api-reference/text-openai-api)
-    # 端点：https://api.minimaxi.com/v1/chat/completions
-    # 鉴权：Authorization: Bearer <MINIMAX_API_KEY>
-    # 行为对齐 _chat_zhipu：Anthropic-style content list → string 转换
-    #   + reasoning_content 流式 thinking(若 model 支持) + tool_calls 解析
-    # 注意：tool_choice "none" / "auto" / "required" 由 MiniMax 自行映射
-
-    def _chat_minimax(
-        self,
-        messages: list[dict],
-        tools: Optional[list[dict]],
-        tool_choice: Optional[str] = None,
-    ) -> Generator[StreamChunk, None, None]:
-        """MiniMax (MiniMax) 流式调用 — OpenAI 兼容协议"""
-        client = self._get_minimax_client()
-
-        # 转换 messages 格式：MiniMax 要求 role 为小写，content 为 string
-        minimax_messages = []
-        for m in messages:
-            role = m["role"].lower()
-            content = m["content"]
-            # 如果 content 是 list（Anthropic 格式），转换为 string
-            if isinstance(content, list):
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif item.get("type") == "tool_result":
-                            text_parts.append(f"[Tool Result: {item.get('content', '')}]")
-                content = "\n".join(text_parts)
-            minimax_messages.append({"role": role, "content": content})
-
-        kwargs: dict = {
-            "model": self.config.model,
-            "messages": minimax_messages,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if tools:
-            openai_tools = []
-            for t in tools:
-                if "type" in t and t.get("type") == "function":
-                    openai_tools.append(t)
-                else:
-                    # Anthropic 格式 → OpenAI 格式
-                    openai_tools.append({
-                        "type": "function",
-                        "function": {
-                            "name": t.get("name", ""),
-                            "description": t.get("description", ""),
-                            "parameters": t.get("input_schema", {}),
-                        }
-                    })
-            kwargs["tools"] = openai_tools
-            if tool_choice is not None:
-                # OpenAI 兼容协议：接受 "auto" / "none" / "required"
-                kwargs["tool_choice"] = tool_choice
-        if self.config.temperature > 0:
-            kwargs["temperature"] = self.config.temperature
-
-        stream = client.chat.completions.create(**kwargs)
-
-        tool_calls_buffer: dict = {}  # index -> {"id", "name", "arguments"}
-        think_splitter = _ThinkTagSplitter()  # M3 等模型把 thinking 包在 <think> 标签里
-
-        for chunk in stream:
-            if chunk.choices:
-                delta = chunk.choices[0].delta
-
-                # MiniMax reasoning_content（若支持,优先于 text 标签解析,GLM 风格）
-                if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                    yield StreamChunk(
-                        thinking_delta=ThinkingDelta(thinking=delta.reasoning_content)
-                    )
-                # 文本增量:用 splitter 分离 <think>...</think>(M3 风格)
-                elif delta.content:
-                    for sc in think_splitter.feed(delta.content):
-                        yield sc
-
-                # 工具调用增量（OpenAI 格式）
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_buffer:
-                            tool_calls_buffer[idx] = {"id": "", "name": "", "arguments": ""}
-                        if tc.id:
-                            tool_calls_buffer[idx]["id"] = tc.id
-                        if tc.function and tc.function.name:
-                            tool_calls_buffer[idx]["name"] = tc.function.name
-                        if tc.function and tc.function.arguments:
-                            tool_calls_buffer[idx]["arguments"] += tc.function.arguments
-
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage = UsageStats.from_chunk_usage(chunk.usage)
-                yield StreamChunk(usage=usage)
-
-        # 流式结束后，yield 完整的 tool_calls
-        for idx in sorted(tool_calls_buffer.keys()):
-            tc = tool_calls_buffer[idx]
-            if tc["id"] and tc["name"]:
-                import json
-                try:
-                    tool_input = json.loads(tc["arguments"]) if tc["arguments"] else {}
-                except json.JSONDecodeError:
-                    tool_input = {"raw_arguments": tc["arguments"]}
-                yield StreamChunk(
-                    tool_call=ToolCallDelta(
-                        tool_name=tc["name"],
-                        tool_input=tool_input,
-                        tool_use_id=tc["id"],
-                        is_final=True,
-                    )
-                )
-
-        # 流式结束后,把 think_splitter 残留 buffer 兜底输出(不丢内容)
-        for sc in think_splitter.flush():
-            yield sc
+# ── OpenAI 兼容 provider 已抽到 openai_compatible.py ──────────────────
+# (OpenAI / Zhipu / MiniMax 走 OpenAICompatibleProvider 基类 + 3 个子类)
+# 客户端懒加载在 OpenAICompatibleProvider.client 属性里,
+# 初始化逻辑在对应子类的 _resolve_api_key() + default_base_url 里。
+# 增加第 4 个 OpenAI 兼容 provider 只需新建一个 ~20 行的子类。
 
 
 # ── 便捷工厂函数 ────────────────────────────────────────────────────────────

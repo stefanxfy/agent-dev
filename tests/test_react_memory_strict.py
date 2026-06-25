@@ -60,8 +60,6 @@ def test_channel_a_writes_daily_log():
         list(bridge.on_turn_end(
             user_msg="hello", assistant_resp="hi",
             turn_index=1, input_tokens=100, output_tokens=50, tool_calls_in_turn=0,
-            last_messages=[{"role": "user", "content": "hello"}],
-            recent_turns=[],
         ))
         assert log_path.exists()
         assert log_path.read_text().count("\n") == 1
@@ -83,8 +81,6 @@ def test_gate1_clears_counter_after_extract():
         list(bridge.on_turn_end(
             user_msg="Python 协程", assistant_resp="asyncio",
             turn_index=0, input_tokens=6000, output_tokens=6000, tool_calls_in_turn=0,
-            last_messages=[{"role": "user", "content": "Python 协程"}],
-            recent_turns=[],
         ))
         # 跑完后累计应清零
         assert bridge.cumulative_tokens == 0
@@ -107,8 +103,6 @@ def test_gate2_does_not_clear_counter():
         list(bridge.on_turn_end(
             user_msg="记住我叫张三", assistant_resp="好",
             turn_index=0, input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
-            last_messages=[{"role": "user", "content": "记住我叫张三"}],
-            recent_turns=[],
         ))
         # 累计应保留(门2 跑完不清零)
         assert bridge.cumulative_tokens == 200
@@ -119,16 +113,18 @@ def test_gate2_does_not_clear_counter():
         shutil.rmtree(tmp)
 
 
-def test_dedup_via_prompt():
-    """门1 跑 LLM 评分时,prompt 含 <existing_memories_in_this_period>"""
+def test_extract_prompt_has_no_existing_memories_block():
+    """旧去重逻辑已移除:提取 prompt 不再注入「已有记忆」。
+
+    去重统一下沉到写盘前的语义去重(向量召回 + 阈值/LLM 判定),
+    所以即便库里已有记忆,提取 LLM 的 prompt 里也不含它、不含 existing 块。
+    """
     captured_prompts = []
 
     bridge, dual, store, tmp = _make_bridge(
         '{"should_extract": false, "confidence": 0, "candidates": []}'
     )
-    # 替换 llm_router.chat 捕获 prompt
     router = bridge.gate.llm_router
-    original_chat = router.chat
     def fake_chat_capture(messages, **kw):
         captured_prompts.append(messages)
         chunk = MagicMock()
@@ -137,23 +133,20 @@ def test_dedup_via_prompt():
     router.chat = fake_chat_capture
 
     try:
-        # 先写一条记忆(模拟"本周期已提过")
+        # 库里先有一条记忆 —— 旧逻辑会把它塞进 prompt,新逻辑不会
         store.write(
-            type="user", title="已有", body="已有记忆",
+            type="user", title="已有", body="已有记忆XYZ",
             source_quote="turn 1", tags=[],
             extra={"session_id": "s1", "turn_index": 1},
         )
-        # 累计 12K 触发门1
         list(bridge.on_turn_end(
             user_msg="Python", assistant_resp="解释",
             turn_index=5, input_tokens=6000, output_tokens=6000, tool_calls_in_turn=0,
-            last_messages=[{"role": "user", "content": "Python"}],
-            recent_turns=[],
         ))
-        # 检查 LLM 调用的 prompt 含 <existing_memories_in_this_period>
         assert len(captured_prompts) > 0
-        user_msg = captured_prompts[0][-1]["content"]  # 最后一条 user 消息
-        assert "<existing_memories_in_this_period>" in user_msg
+        user_msg = captured_prompts[0][-1]["content"]
+        assert "existing_memories" not in user_msg, "提取 prompt 不应再含 existing 块"
+        assert "已有记忆XYZ" not in user_msg, "已有记忆不应再被注入提取 prompt"
     finally:
         bridge.shutdown(timeout=5)
         dual.shutdown(timeout=5)

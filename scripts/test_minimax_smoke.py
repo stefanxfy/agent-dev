@@ -48,7 +48,9 @@ def main() -> int:
         temperature=0.0,  # 关掉随机性,易复现
     )
     router = LLMRouter(cfg)
-    client = router._get_minimax_client()
+    # 用新 API:走 OpenAICompatibleProvider.base_url 路径
+    # (旧 _get_minimax_client 已在 M10 抽到 openai_compatible.py 删除)
+    client = router._get_openai_provider().client
     print(f"   base_url = {client.base_url}")
     assert "api.minimaxi.com" in str(client.base_url), \
         f"base_url 异常: {client.base_url}"
@@ -102,20 +104,26 @@ def main() -> int:
     # ── Test 4: system_prompt_override 注入 ──
     print("\n[4/4] system_prompt_override 注入...")
     captured_msgs = None
-    original = LLMRouter._chat_minimax
-    def _capture(self, msgs, tools, tool_choice=None):
-        nonlocal captured_msgs
-        captured_msgs = msgs
-        # 返回最小可用 chunk,避免真发请求
-        return iter([StreamChunk(text_delta=__import__("agent_core.llm.router", fromlist=["TextDelta"]).TextDelta(text="ok"))])
-    LLMRouter._chat_minimax = _capture
+    # M10 重构:3 个 OpenAI 兼容 provider 共用 _get_openai_provider 工厂
+    # 所以 monkey-patch 改在 _get_openai_provider 上,而不是 _chat_minimax
+    original = LLMRouter._get_openai_provider
+    def _capture_get_provider(self):
+        class _FakeProvider:
+            provider_name = "fake-minimax"
+            def chat(self_, msgs, tools, tool_choice=None):
+                nonlocal captured_msgs
+                captured_msgs = msgs
+                # 返回最小可用 chunk,避免真发请求
+                return iter([StreamChunk(text_delta=__import__("agent_core.llm.router", fromlist=["TextDelta"]).TextDelta(text="ok"))])
+        return _FakeProvider()
+    LLMRouter._get_openai_provider = _capture_get_provider
     try:
         list(router.chat(
             messages=[{"role": "user", "content": "hi"}],
             system_prompt_override="你是一只猫,叫 Mia,只回答喵喵相关的问题。",
         ))
     finally:
-        LLMRouter._chat_minimax = original
+        LLMRouter._get_openai_provider = original
     assert captured_msgs is not None, "override 路径没被调用"
     assert captured_msgs[0]["role"] == "system", \
         f"override 必须注入到首位,实际: {captured_msgs[0]}"

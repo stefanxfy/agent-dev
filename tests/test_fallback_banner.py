@@ -43,8 +43,6 @@ def test_bridge_emits_budget_exceeded_event():
         assistant_resp="reply",
         turn_index=0,
         input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
-        last_messages=[{"role": "user", "content": "记住我喜欢 Python"}],
-        recent_turns=[],
     ))
     kinds = [e.kind for e in events]
     assert MemoryEventKind.BUDGET_EXCEEDED in kinds
@@ -92,8 +90,6 @@ def test_bridge_emits_budget_exceeded_from_should_extract_e2e():
         assistant_resp="reply",
         turn_index=3,
         input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
-        last_messages=[{"role": "user", "content": "记住我喜欢 Python"}],
-        recent_turns=[],
     ))
     budget_events = [e for e in events if e.kind == MemoryEventKind.BUDGET_EXCEEDED]
     assert len(budget_events) == 1
@@ -125,8 +121,6 @@ def test_bridge_emits_timeout_from_should_extract_e2e():
         assistant_resp="reply",
         turn_index=5,
         input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
-        last_messages=[{"role": "user", "content": "test"}],
-        recent_turns=[],
     ))
     timeout_events = [e for e in events if e.kind == MemoryEventKind.TIMEOUT]
     assert len(timeout_events) == 1
@@ -171,7 +165,6 @@ def test_extraction_gate_should_extract_propagates_budget_or_timeout():
         cumulative_tokens=20000,  # > MIN_TOKENS_TO_INIT → gate1 pass
         cumulative_tool_calls=0,
         last_messages=[{"role": "user", "content": "test"}],
-        gate1_period_start_turn=0,
     )
 
     # 修复前:should_extract 吞掉 LatencyTimeout,返回 Decision(llm_call_error(LatencyTimeout))

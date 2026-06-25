@@ -228,6 +228,37 @@ class MetaDB:
         except sqlite3.Error as e:
             raise MetaDBError(f"remove_pending 失败: {e}", cause=e)
 
+    def bump_pending_attempts(self, pending_id: int) -> int:
+        """C 修复:失败后递增 attempts 计数(原代码只设 0,从不递增)
+
+        Returns: 递增后的 attempts 值
+        """
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    "UPDATE pending_writes SET attempts = attempts + 1 WHERE id = ?",
+                    (pending_id,),
+                )
+                row = conn.execute(
+                    "SELECT attempts FROM pending_writes WHERE id = ?",
+                    (pending_id,),
+                ).fetchone()
+                return int(row["attempts"]) if row else 0
+        except sqlite3.Error as e:
+            raise MetaDBError(f"bump_pending_attempts 失败: {e}", cause=e)
+
+    def update_pending_payload(self, pending_id: int, payload: dict[str, Any]) -> None:
+        """重试时更新 payload(如 attempts 用尽后改为 drop 标记)"""
+        import json
+        try:
+            with self.transaction() as conn:
+                conn.execute(
+                    "UPDATE pending_writes SET payload = ? WHERE id = ?",
+                    (json.dumps(payload, ensure_ascii=False), pending_id),
+                )
+        except sqlite3.Error as e:
+            raise MetaDBError(f"update_pending_payload 失败: {e}", cause=e)
+
     def list_pending(self, session_id: Optional[str] = None) -> list[dict]:
         """列出 pending writes（用于崩溃恢复 / 调试）"""
         import json

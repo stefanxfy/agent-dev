@@ -22,13 +22,44 @@ from agent_core.memory.tracing import tracer
 logger = logging.getLogger("memory.extraction_gate")
 
 
+def _strip_code_fence(text: str) -> str:
+    """剥掉 LLM 输出的 ```json ... ``` markdown 代码块 fence。
+
+    背景:即使 prompt 明确要求"严格按 schema 输出 JSON",
+    LLM(GPT-4 / Claude / GLM) 仍倾向于把 JSON 包在 ```json ... ``` 里。
+    不剥掉的话 json.loads 在首个反引号字符处 fail。
+
+    容忍 3 种格式:
+    1. ```json\\n{...}\\n```        带语言标签
+    2. ```\\n{...}\\n```            无语言标签
+    3. 纯 JSON(无 fence)            原样返回
+
+    边界:
+    - 多余的前后空白仍 strip
+    - 嵌套的 ``` 不处理(LLM 不会输出嵌套 fence)
+    """
+    s = text.strip()
+    # 模式 1/2:以 ``` 开头且以 ``` 结尾
+    if s.startswith("```") and s.endswith("```"):
+        # 去掉首尾 3 反引号(中间可带语言标签如 "json")
+        inner = s[3:-3]
+        # 去掉首行的语言标签(例如 "json\n")
+        if "\n" in inner:
+            first_line, rest = inner.split("\n", 1)
+            # 若是语言标签(单词字符,无空格/标点),整行丢掉
+            if first_line.strip() and first_line.strip().replace("-", "").replace("+", "").isalnum():
+                inner = rest
+        return inner.strip()
+    # 模式 3:无 fence,原样返回(去掉首尾空白)
+    return s
+
+
 @dataclass
 class TurnContext:
     session_id: str
     cumulative_tokens: int
     cumulative_tool_calls: int
     last_messages: list[dict]
-    gate1_period_start_turn: int = 0
 
 
 @dataclass
@@ -95,6 +126,13 @@ class ExtractionGate:
             gate2_pass = self._keyword_filter(ctx.last_messages)
             span.set_attribute("memory.gate.gate1_pass", gate1_pass)
             span.set_attribute("memory.gate.gate2_pass", gate2_pass)
+            logger.debug(
+                f"gate: session={ctx.session_id} "
+                f"gate1(阈值)={gate1_pass} "
+                f"(tokens={ctx.cumulative_tokens}>={self.MIN_TOKENS_TO_INIT} "
+                f"or tools={ctx.cumulative_tool_calls}>={self.MIN_TOOL_CALLS}) "
+                f"| gate2(关键词)={gate2_pass}"
+            )
 
             if not (gate1_pass or gate2_pass):
                 decision = Decision(
@@ -104,10 +142,16 @@ class ExtractionGate:
                 )
             else:
                 # 门3:LLM 评分
+                logger.debug("gate: 门1/2 触发 → 进入门3 LLM 评分")
                 decision = self._llm_score(ctx, via_gate1=gate1_pass and not gate2_pass)
 
             span.set_attribute("memory.gate.should_extract", decision.should_extract)
             span.set_attribute("memory.gate.reason", decision.reason)
+            logger.debug(
+                f"gate: 决策 should_extract={decision.should_extract} "
+                f"reason={decision.reason!r} confidence={decision.confidence} "
+                f"candidates={len(decision.candidates)}"
+            )
             return decision
 
     def _keyword_filter(self, last_messages: list[dict]) -> bool:
@@ -119,24 +163,18 @@ class ExtractionGate:
         return any(kw in text for kw in self.KEYWORDS)
 
     def _llm_score(self, ctx: TurnContext, *, via_gate1: bool) -> Decision:
-        """门3:LLM 一次调用,既评分又提取(§3.3 L1 合并)"""
-        # 拼 turns_text(取 gate1 周期内的 turn)
+        """门3:LLM 一次调用,既评分又提取(§3.3 L1 合并)
+
+        去重已下沉到写盘前的语义去重(向量召回 + 阈值/LLM 判定),
+        这里不再拉「已有记忆」喂 prompt —— LLM 只管从本轮对话提取。
+        """
         turns_text = "\n".join(
             f"[turn {i}] {m.get('content', '')[:200]}"
             for i, m in enumerate(ctx.last_messages)
         )
 
-        # 拼已有记忆(门1 触发时让 LLM 看到已提过的,避免重复)
-        try:
-            existing = self.memory_store.list_by_session(
-                session_id=ctx.session_id,
-                since_turn=ctx.gate1_period_start_turn,
-            )
-        except Exception as e:
-            logger.warning(f"list_by_session 失败,降级为空: {e}")
-            existing = []
-
-        prompt = build_extract_prompt(turns_text, existing)
+        prompt = build_extract_prompt(turns_text)
+        logger.debug(f"门3: 调 LLM 评分 prompt[{len(prompt)}] chars")
 
         # 调 LLM(用 cache_namespace 隔离)
         try:
@@ -154,8 +192,10 @@ class ExtractionGate:
             )
 
         # 解析 JSON
+        # LLM 常把 JSON 包在 ```json ... ``` 代码块里(即使 prompt 要求"严格按 schema 输出 JSON")。
+        # 剥掉外层 fence 后再 parse,容忍 fence / 无 fence 两种格式。
         try:
-            data = json.loads(text.strip())
+            data = json.loads(_strip_code_fence(text))
         except json.JSONDecodeError as e:
             logger.warning(f"LLM 评分解析失败: {e}, raw={text[:200]!r}")
             return Decision(
@@ -167,6 +207,11 @@ class ExtractionGate:
         confidence = float(data.get("confidence", 0.0))
         should = bool(data.get("should_extract", False))
         raw_candidates = data.get("candidates", [])
+        logger.debug(
+            f"门3: LLM 返回 confidence={confidence:.2f} should_extract={should} "
+            f"raw_candidates={len(raw_candidates)} "
+            f"(MIN_CONFIDENCE={self.MIN_CONFIDENCE})"
+        )
 
         candidates = [
             ExtractionCandidate(

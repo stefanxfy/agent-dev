@@ -220,6 +220,14 @@ class ChromaVectorStore:
         self._validate_embedding_dim(embedding)
 
         metadata = doc.get("metadata", {})
+        # ChromaDB 约束:list 类型 metadata value 必须非空
+        # 移除空 list 值,避免 upsert 报
+        # "Expected metadata list value for key 'X' to be non-empty in upsert"
+        if metadata:
+            metadata = {
+                k: v for k, v in metadata.items()
+                if not (isinstance(v, list) and len(v) == 0)
+            }
         document = doc.get("document", "")
 
         with self._lock:

@@ -80,34 +80,23 @@ with st.sidebar:
     # ━━━ LLM 配置 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     st.header("⚙️ LLM 配置")
 
-    default_provider = os.getenv("DEFAULT_PROVIDER", "zhipu").lower()
-    provider_index = 2  # 默认 zhipu
-    if default_provider in ["anthropic", "openai", "zhipu"]:
-        provider_index = ["anthropic", "openai", "zhipu"].index(default_provider)
+    # provider/model/env_key 列表由 LLMProvider enum 派生,加新厂商无需改 UI
+    from web.llm_options import (
+        get_default_provider_index,
+        get_env_key_for_provider,
+        get_models_for_provider,
+        get_provider_options,
+    )
 
     provider = st.selectbox(
         "厂商",
-        options=["anthropic", "openai", "zhipu"],
-        index=provider_index,
+        options=get_provider_options(),
+        index=get_default_provider_index(),
     )
 
-    model_options = {
-        "anthropic": [
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-            "claude-haiku-4-20250514",
-        ],
-        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3-mini"],
-        "zhipu": ["GLM-5.1", "glm-5-turbo", "GLM-4.7"],
-    }
-    model = st.selectbox("模型", options=model_options[provider])
+    model = st.selectbox("模型", options=get_models_for_provider(provider))
 
-    env_key_map = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "zhipu": "ZHIPU_API_KEY",
-    }
-    env_key_var = env_key_map.get(provider, "OPENAI_API_KEY")
+    env_key_var = get_env_key_for_provider(provider)
     default_key = os.getenv(env_key_var, "")
     api_key = st.text_input(
         "API Key（留空则使用 .env）",

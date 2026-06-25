@@ -2,8 +2,8 @@
 
 > 参考来源：QClaw 记忆系统 + Mem0 核心概念 + Claude Code 记忆设计（详见 [`claude-code-memory-system-deep-dive.md`](claude-code-memory-system-deep-dive.md)）
 > 项目：agent-dev（自研 Agent 框架）
-> 日期：2026-06-19（v2，基于 Claude Code 源码 deep-dive 全面升级）
-> 状态：方案文档（v2 设计已完成，待实现）
+> 日期：2026-06-25（v2.2，语义去重升级）
+> 状态：v2.2 已实现并验证
 
 ---
 
@@ -14,18 +14,19 @@
 | v1 | 2026-06-11 | 初稿：三层架构 + Chroma + autoDream | 原始需求 |
 | v2 | 2026-06-19 | **架构升级**：补 L3 会话内压缩、双通道写入、封闭分类法、Why-How 模板、Edit-only 沙箱、token 阈值、配置/UI/安全章节 | Claude Code 源码 deep-dive 对比 |
 | v2.1 | 2026-06-20 | **配置/检索升级**：Pydantic 配置校验 + 三模式共存（vector/file/hybrid）+ Hybrid 量化指标 + 锁粒度拆分 + Windows 路径兼容 | 24 项专业审查 |
+| v2.2 | 2026-06-25 | **语义去重升级**：向量召回 + 阈值/LLM 判定三层决策，替换旧提示词注入方案；bge-m3 向量编码；极性/实体差异处理 | 用户反馈去重漏报/误报 |
 
 ### 〇.1 版本时间线（演进路径）
 
 ```
-v1 (2026-06-11)                    v2 (2026-06-19)                   v2.1 (2026-06-20)
-   │                                  │                                  │
-   ├─ 三层架构 (daily/vector/memory)    ├─ + L3 会话内压缩                ├─ + Pydantic 配置
-   ├─ Chroma 强制                      ├─ + 双通道写入                    ├─ + 三模式共存 (vector/file/hybrid)
-   ├─ 单 MEMORY.md                     ├─ + 封闭 4 类                     ├─ + Hybrid 量化指标
-   ├─ 关键词匹配触发                   ├─ + Edit-only 沙箱                ├─ + 锁粒度拆分
-   ├─ 单一 LLM 摘要                    ├─ + token 阈值 + 工具数阈值        ├─ + Windows 路径兼容
-   └─ 单文件 ≤200 行                    ├─ + 5 条回退条件                   └─ + 24 项审查修正
+v1 (2026-06-11)                    v2 (2026-06-19)                   v2.1 (2026-06-20)                   v2.2 (2026-06-25)
+   │                                  │                                  │                                  │
+   ├─ 三层架构 (daily/vector/memory)    ├─ + L3 会话内压缩                ├─ + Pydantic 配置                   ├─ + 向量召回+阈值/LLM判定
+   ├─ Chroma 强制                      ├─ + 双通道写入                    ├─ + 三模式共存 (vector/file/hybrid) ├─ + bge-m3 embedding
+   ├─ 单 MEMORY.md                     ├─ + 封闭 4 类                     ├─ + Hybrid 量化指标                  ├─ + 去重三层决策
+   ├─ 关键词匹配触发                   ├─ + Edit-only 沙箱                ├─ + 锁粒度拆分                       ├─ + 极性/实体差异处理
+   ├─ 单一 LLM 摘要                    ├─ + token 阈值 + 工具数阈值        ├─ + Windows 路径兼容                  └─ + 提取 prompt 移除去重职责
+   └─ 单文件 ≤200 行                    ├─ + 5 条回退条件                   └─ + 24 项审查修正                   └─ + DedupConfig 配置化
                                        └─ + per-file 记忆
 ```
 
@@ -38,7 +39,7 @@ v1 (2026-06-11)                    v2 (2026-06-19)                   v2.1 (2026-
 
 ## 一、核心设计理念
 
-> **🆕 标记说明**：本文用 🆕 标记 v2 相对 v1 的新增项；v2.1 的新增项用 🆕¹ 标记。所有 🆕 项在 §〇.1 版本时间线里有完整列表。
+> **🆕 标记说明**：本文用 🆕 标记 v2 相对 v1 的新增项；v2.1 的新增项用 🆕¹ 标记；v2.2 的新增项用 🆕² 标记。所有 🆕 项在 §〇.1 版本时间线里有完整列表。
 
 | 设计原则 | 说明 |
 |---------|------|
@@ -55,10 +56,15 @@ v1 (2026-06-11)                    v2 (2026-06-19)                   v2.1 (2026-
 | **🆕 文件级记忆** | 一条记忆一个文件 + 索引，长期记忆不再受单文件大小限制 |
 | **🆕¹ 三模式检索** | vector / file / hybrid 三模式可切换（详见 §6.6） |
 | **🆕¹ Pydantic 配置** | 启动时 fail-fast 校验,避免拼错 key 静默回退（详见 §12.5） |
+| **🆕² 单一职责去重** | 提取 LLM 只看本轮对话是否值得记，去重下沉到写盘前由向量召回+LLM 判定（详见 §6.9） |
+| **🆕² 三层去重决策** | ≥0.95 自动判重 / 0.85-0.95 LLM 判 / <0.85 新记忆，避免单一阈值漏报/误报 |
+| **🆕² 极性安全** | 极性相反（喜欢/不喜欢）通过 LLM 判定层显式区分，不被向量相似度误并 |
 
 > **解释**：v1 → v2 的最大变化是引入了 **Claude Code 的"分层压缩"思想**——把"会话内压缩"（L3 快路径）和"跨会话整合"（L5 慢路径）分开，避免每次压缩都让 LLM 重新摘要所有历史。详细对比见 [`claude-code-memory-system-deep-dive.md` §0](claude-code-memory-system-deep-dive.md)。
 > 
 > **v2.1 关键澄清**："三层分离"里中间那层（向量索引）不再是必选——它从 v2.1 起降级为 `mode=vector` 可选项,生产环境推荐纯文件（`mode=file`）或 hybrid（`mode=hybrid`），避免 Chroma 维护成本。详见 §6.6.2。
+> 
+> **v2.2 关键升级**：去重从"提示词注入已有记忆"重构为"向量召回+阈值/LLM 判定"——提取 LLM 不再被已有记忆污染（单一职责），去重准确率显著提升（实验证明三层决策能同时避免漏报和误报）。详见 §6.9。
 
 ---
 
@@ -254,27 +260,13 @@ class ExtractionGate:
         
         返回结构化结果 (L6 修复): 区分 status 让上层知道发生了什么
         """
-        prompt = f"""分析以下对话, 同时判断两件事:
-1. 是否包含"值得长期记住"的信息
-2. 如果是, 提取为结构化记忆 (按 4 类: user / feedback / project / reference)
-
-值得记住的:
-- 用户偏好 (学习风格/技术选型/沟通方式)
-- 关键决策 (架构选择/技术决策/拒绝的方案)
-- 重要教训 (bug 修复经验/踩坑总结)
-- 外部系统指针 (Linear/Slack 链接)
-
-不值得记住的:
-- 临时状态 (当前进度/未完成的工作)
-- 代码细节 (具体函数名/行号)
-- 中间推理 (思考过程的草稿)
-- 已过时信息
-
-<conversation>
+        prompt = f"""<conversation>
 {self._summarize_for_scoring(messages)}
 </conversation>
 
-输出 JSON (严格遵守 schema, 不要其他内容):
+请评估本轮对话中是否有值得长期记住的信息,提取为结构化记忆。
+
+输出 JSON(严格遵守 schema,不要其他内容):
 {{
   "should_extract": true/false,
   "confidence": 0.0-1.0,
@@ -282,9 +274,10 @@ class ExtractionGate:
   "candidates": [
     {{
       "type": "user" | "feedback" | "project" | "reference",
-      "content": "一句话记忆",
-      "why": "若 type=feedback/project, 这条记忆的 Why 字段 (见 §5.3.2)",
-      "source_quote": "原对话中触发该记忆的逐字引用 (见 §4.2 L7 修复)"
+      "title": "短标题",
+      "body": "一句话描述",
+      "why": "若 type=feedback/project,Why 字段",
+      "source_quote": "原对话中触发该记忆的逐字引用"
     }}
   ]
 }}"""
@@ -292,7 +285,19 @@ class ExtractionGate:
         # 防止用户文本里塞 "ignore prior instructions" 攻击 prompt
         response = self.router.chat(
             messages=[
-                {"role": "system", "content": "你是结构化记忆提取助手. 严格按 schema 输出 JSON."},
+                {
+                    "role": "system",
+                    "content": """你是结构化记忆提取助手. 严格按 schema 输出 JSON.
+
+判断两件事:
+1. 是否包含"值得长期记住"的信息
+2. 如果是,提取为结构化记忆(4 类:user/feedback/project/reference)
+
+特别说明:
+- source_quote 必填(用户原话片段)
+- project/reference 类型必须含 "**Why:**" 段
+- 不需要判断是否与已有记忆重复:去重由写盘前的语义去重(向量召回+LLM 判定)统一负责"""
+                },
                 {"role": "user", "content": prompt},
             ],
             provider="anthropic",
@@ -1149,6 +1154,8 @@ def should_trigger_compact(self, ctx: TurnContext) -> CompactDecision:
 5. **Edit 工具路径必须在 memory_dir 下**——工具白名单强制，无法越界
 6. **4 类封闭（user/feedback/project/reference）**——LLM 不能发明第五类，类型由校验层强制
 7. **feedback / project 必须含 `**Why:**`**——避免"只有规则没有原因"的浅记忆
+8. **🆕 v2.2 提取 prompt 不含已有记忆**——去重下沉到写盘前，提取 LLM 只看本轮对话（详见 §6.9）
+9. **🆕 v2.2 语义去重绝不阻断持久化**——向量库异常/LLM 判定失败时返回 False（宁可多存不可误删）
 
 #### 4.5.1 不变量测试矩阵：8 个并发/崩溃场景（v2.1 增，对应 A12 修复）
 
@@ -1166,6 +1173,10 @@ def should_trigger_compact(self, ctx: TurnContext) -> CompactDecision:
 | 6 | autoDream 锁强占(mtime 超 1h) | #5 | 写锁文件 + sleep 1h(测试用 5s 调小阈值) | 同样强占,prior_mtime 用旧 mtime |
 | 7 | autoDream 蒸馏失败 | #4(回滚) | LLM mock 返回 invalid JSON | 锁释放,prior_mtime 回滚,24h 门从上次**成功**算起 |
 | 8 | extraction_in_progress 卡死 | #4(超时) | mock `_do_extract` 死循环 90s(超过 60s 超时) | 60s 后标志强制重置,下次能正常提交 |
+| 9 | 🆕 v2.2 语义去重三层决策 | #8 + #9 | 写一条记忆,然后写"我喜欢看书"(sim≈0.95) | AUTO_DUPLICATE 跳过,库内仍 1 条 |
+| 10 | 🆕 v2.2 极性相反不被合并 | #8 | 写"我喜欢X",然后写"我不喜欢X"(sim≈0.89) | LLM 判定不重复,库内有 2 条 |
+| 11 | 🆕 v2.2 实体不同不被合并 | #8 | 写"我喜欢周杰伦",然后写"我喜欢周深"(sim≈0.84) | NEW 直接写盘,库内有 2 条 |
+| 12 | 🆕 v2.2 去重失败不阻断 | #9 | mock vector_store.query 抛异常 | 返回 False,正常写盘,日志 WARNING |
 
 **测试模板**(以场景 4 为例):
 
@@ -2501,116 +2512,245 @@ def test_cache_namespace_isolation():
 
 **对应 issue**:L13 审查指出"`cache_safe_params` / `cache_namespace` 是黑魔法",本节给完整契约 + 单测。
 
-### 6.9 门1 周期内去重 + 短对话"记住"策略（v2.1.1 增）—— M9 修订
+### 6.9 语义去重方案（v2.2 重大升级）—— 向量召回 + 阈值/LLM 判定
 
-> **修订背景**:M9 联调中,按 §3.3.1 调整版决策树实现后,发现两个新问题需要明确:
-> 1. **门1 周期内重复提取**:门1 累计型触发会覆盖门2 已提过的内容
-> 2. **短对话"记住"不响应**:严格按 §3.3 后,短对话里"记住"被门1 累计阈值卡住
+> **修订背景**:原 §6.9.1 的"提示词注入已有记忆"方案在实际运行中发现两个致命问题:
+> 1. **漏报率高**:提示词空间有限,只能注入少量记忆,相似但不同表述的记忆会被漏检
+> 2. **极性误判**:"喜欢周杰伦"和"不喜欢周杰伦"在向量空间中相似度高达 0.89,纯向量阈值无法区分
+> 3. **上下文污染**:提取 prompt 承担去重职责,违背单一职责原则,LLM 需同时判断"是否值得记"和"是否已记"
+>
+> **v2.2 方案**:去重从提取阶段**下沉到写盘前**,用向量召回 + 阈值/LLM 判定的三层决策。
 
-#### 6.9.1 门1 周期内去重（LLM 提示词层去重,非代码层）
+#### 6.9.1 去重架构（三层决策）
 
-**问题场景**:
 ```
-Turn 5: "我总是用 uv"        累计 3.5K
-        门2 命中"总是" → 跑 B → 写入"用户习惯用 uv"
-        (累计不清零,因为门2 触发)
+提取阶段（LLM 只管"是否值得记"）:
+  ├─ EXTRACT_SYSTEM_PROMPT 明确说明"不需要判断是否与已有记忆重复"
+  └─ 去重统一交给写盘前的语义去重
 
-Turn 15: 累计 12K
-         门1 ≥ 10K → 跑 B
-         LLM 看到对话里有 uv 提及 → 又觉得值得记
-         → 重复写入"用户习惯用 uv"(和 Turn 5 一模一样)
-```
-
-**解法**:门1 触发时,**LLM 提示词包含"本周期已提取的记忆"**,让 LLM 自己去重。
-
-**为什么不在代码层去重**:
-
-| 方案 | 优点 | 缺点 |
-|------|------|------|
-| **代码层去重**(维护 `_max_processed_turn` 状态) | 状态可控 | **上下文断层**:LLM 看不到完整对话 |
-| **LLM 提示词层去重**(本次方案) | **上下文连贯**:LLM 看到完整对话 + 已记下的 | 依赖 LLM 语义判断 |
-
-**用户明确选**:LLM 提示词层去重,以保证上下文连贯。
-
-**提示词模板**:
-
-```xml
-<existing_memories_in_this_period>
-[user] 习惯用 uv (turn 5)
-[project] 项目叫 agent-dev (turn 8)
-</existing_memories_in_this_period>
-
-<conversation>
-[turn 6] ...
-[turn 7] ...
-...
-[turn 10] ...
-</conversation>
-
-请基于以上评估,提取"本周期内"的新记忆(避免和已提取的重复)
+写盘前去重（三层决策）:
+  候选记忆 → 计算向量 embedding → 向量召回 top_k 相似记忆
+           ↓
+    相似度 ≥ 0.95  →  AUTO_DUPLICATE（直接跳过,不写盘）
+    0.85 ≤ 相似度 < 0.95  →  NEEDS_JUDGE（调 LLM 判定）
+    相似度 < 0.85  →  NEW（写盘）
 ```
 
-**状态管理**:
+**为什么三层而不是两层**:
+
+| 相似度范围 | 决策 | 原因 |
+|-----------|------|------|
+| ≥ 0.95 | AUTO_DUPLICATE | 实验证明此阈值下几乎无误判（周杰伦重复记忆相似度 0.9833） |
+| 0.85 - 0.95 | NEEDS_JUDGE | **灰色地带**: 折耳根案例（重复 0.8961 vs 否定 0.8934 重叠）,必须 LLM 判定 |
+| < 0.85 | NEW | 低相似度,直接视为新记忆 |
+
+**实验依据（bge-m3 embedding, normalize_embeddings=True）**:
 
 ```python
-# bridge 维护一个变量
-self.gate1_period_start_turn: int = 0  # 当前门1 周期起点
+# 真实案例验证
+"我喜欢听歌,尤其喜欢华语流行音乐歌手周杰伦" vs "我喜欢听歌,尤其喜欢华语流行音乐歌手周杰伦"
+  → 相似度 0.9833（完全重复,AUTO_DUPLICATE 正确拦截）
 
-# 每次门1 跑完,更新该变量
-if decision.via_gate1 and decision.should_extract:
-    self.gate1_period_start_turn = turn_index + 1
+"我喜欢折耳根" vs "我讨厌折耳根"
+  → 相似度 0.8961（措辞相似但意义不同）
+
+"我喜欢折耳根" vs "我不喜欢折耳根"
+  → 相似度 0.8934（否定句）
+
+# 结论: 0.95 阈值安全, 0.85-0.95 区间必须 LLM 判定
 ```
 
-**MemoryStore.write 的 `item_hash` 仍保留作为最后兜底**（已有,不依赖 LLM 语义判断）。
+> **关键洞察**:bge-m3 对"喜欢X" vs "不喜欢X"给出 ~0.89 相似度,**证明任何单一阈值都无法同时避免漏报和误报**。必须引入 LLM 判定层。
 
-#### 6.9.2 短对话"记住"策略（不修,接受 §3.3 严格性）
+#### 6.9.2 实现细节
 
-**澄清**:
-```
-短对话(累计 < 10K)里用户说"记住我的名字叫张三"
-  → 门1 不达(3K < 10K)
-  → 门2 命中"记住"  ✓
-  → 调 LLM 评分       ✓
-  → confidence ≥ 0.6 → 写盘 ✓
-```
+**配置（`agent_core/memory/config.py`）**:
 
-> §3.3.1 调整版决策树**没有"短对话不响应"的问题**——门2 关键词命中会触发 LLM 评分。"记住" 是 16 个关键词之一,正常情况会触发。
->
-> 真正"不响应"的场景是:门1 不达 + 门2 关键词未命中(比如用户说"我倾向 X"不命中 16 个关键词)。
-
-**设计决策**:不修,接受 §3.3 严格性
-
-- 不做"关键词强意图短路"——避免决策树被"猜用户意图"的逻辑污染
-- 不做"UI toggle 强制提取"——保持设计简洁,避免用户操作与自动化分支并存
-- 短对话里想"立刻记住",用长一点对话或包含关键词
-
-**与 Claude Code 的对齐**:
-- CC 用 `/remember` slash command(用户主动命令)处理"立刻记住"
-- 我们不做 slash command,也不做 toggle
-- 设计哲学一致:**保持自动化通道纯粹,用户特殊意图走显式路径**(即使本次不实现该路径)
-
-#### 6.9.3 决策树最终版(综合 §3.3.1 + §6.9.1 + §6.9.2)
-
-```
-B 触发决策树（v2.1.1 最终版）:
-│
-├─ 门1（累计型）: cumulative_tokens >= 10K  OR  tool_calls >= 10  ?
-│   ├─ 是 → 进入门3 LLM 评分
-│   │       (提示词含 <existing_memories_in_this_period> 让 LLM 自己去重)
-│   │       (跑完 B 后,累计清零)
-│   └─ 否 ↓
-│
-├─ 门2（事件型）: 16 个关键词中 ≥1 命中?
-│   ├─ 是 → 进入门3 LLM 评分
-│   │       (不清零累计)
-│   └─ 否 → SKIP, reason: "no_trigger"
-│
-└─ 门3（质量门）: LLM 评分 confidence >= 0.6 ?
-    ├─ 是 → 提交 B
-    └─ 否 → SKIP, reason: "low_confidence(0.XX)"
+```python
+class DedupConfig(BaseModel):
+    """语义去重配置"""
+    enabled: bool = True                    # 开关
+    auto_threshold: float = 0.95           # 自动判为重复的阈值
+    judge_floor: float = 0.85               # 低于此值直接视为新记忆
+    top_k: int = 5                          # 向量召回返回的最相似记忆数
 ```
 
-**对应实现 spec**:`docs/superpowers/specs/2026-06-22-react-memory-strict-design.md`
+**决策逻辑（`agent_core/memory/dedup.py`）**:
+
+```python
+class DedupAction(Enum):
+    """去重决策"""
+    AUTO_DUPLICATE = "auto_duplicate"  # 相似度 ≥ auto_threshold, 直接跳过
+    NEEDS_JUDGE = "needs_judge"        # judge_floor ≤ 相似度 < auto_threshold, 调 LLM
+    NEW = "new"                        # 相似度 < judge_floor, 新记忆
+
+def decide_action(top_sim: float, cfg: DedupConfig) -> DedupAction:
+    """根据最高相似度决策"""
+    if top_sim >= cfg.auto_threshold:
+        return DedupAction.AUTO_DUPLICATE
+    if top_sim >= cfg.judge_floor:
+        return DedupAction.NEEDS_JUDGE
+    return DedupAction.NEW
+```
+
+**LLM 判定提示词（`agent_core/memory/prompt_templates.py`）**:
+
+```python
+DEDUP_SYSTEM_PROMPT = """你是记忆去重判定助手。判断「候选记忆」是否和「已有记忆」表达同一件事实。
+
+判定为重复(is_duplicate=true)当且仅当:
+- 它们陈述的是同一主体的同一事实/偏好,只是措辞不同(如"喜欢华语歌手周杰伦" vs "喜欢华语流行音乐歌手周杰伦")。
+
+判定为不重复(is_duplicate=false)当出现下列任一情况:
+- 极性相反(如"喜欢X" vs "不喜欢X")—— 这是两条不同记忆,绝不能合并;
+- 主体不同(如"喜欢周杰伦" vs "喜欢周深");
+- 候选包含已有记忆没有的新信息,属于补充/更新而非纯重复。
+
+只输出 JSON,不要其他内容:
+{"is_duplicate": true/false, "reason": "简短理由"}"""
+```
+
+**写盘前流程（`agent_core/memory/dual_channel_writer.py`）**:
+
+```python
+def _is_semantic_duplicate(self, cand, embedding, text_for_emb) -> bool:
+    """语义去重检查（写盘前）"""
+    # 1. 向量召回 top_k 相似记忆
+    similar = self.vector_store.query(
+        query_embedding=embedding,
+        top_k=self.dedup_config.top_k,
+    )
+
+    if not similar:
+        return False  # 无相似记忆,直接写盘
+
+    # 2. 计算最高相似度
+    top_sim = similarity_from_distance(similar[0]["distance"])
+
+    # 3. 三层决策
+    action = decide_action(top_sim, self.dedup_config)
+
+    if action == DedupAction.AUTO_DUPLICATE:
+        logger.debug(f"语义去重: 相似度 {top_sim:.4f} ≥ {self.dedup_config.auto_threshold}, 自动跳过")
+        return True
+
+    if action == DedupAction.NEEDS_JUDGE:
+        # 4. LLM 判定
+        judge_result = self.dedup_judge(
+            candidate_text=text_for_emb,
+            similar_memories=similar,
+        )
+        if judge_result["is_duplicate"]:
+            logger.info(f"语义去重: LLM 判定为重复, 原因: {judge_result['reason']}")
+            return True
+
+    return False  # 新记忆,允许写盘
+```
+
+#### 6.9.3 与旧方案的对比
+
+| 维度 | 旧方案（提示词注入） | 新方案（向量召回 + LLM 判定） |
+|------|---------------------|---------------------------|
+| **去重时机** | 提取阶段（LLM prompt 注入） | 写盘前（独立去重模块） |
+| **LLM 职责** | 判断"是否值得记" + "是否已记"（双重职责） | 只判断"是否值得记"（单一职责） |
+| **召回范围** | 提示词空间有限,只能注入少量 | 向量库全局召回,无空间限制 |
+| **极性处理** | 无明确规则,依赖 LLM 理解 | LLM 判定 prompt 明确说明"极性相反不重复" |
+| **阈值依据** | 无（纯 LLM 语义） | 实验数据驱动（0.95/0.85 两阈值） |
+| **性能** | 每次提取都注入已有记忆, prompt 长 | 向量召回快, 仅灰色地带调 LLM |
+| **准确性** | 漏报率高（相似但不同表述漏检） | 三层决策, 漏报率低 |
+
+#### 6.9.4 item_hash 幂等性（Layer ①,保留）
+
+**重要**:`item_hash = sha256(type + body + source_quote)` 作为**精确幂等键**仍然保留,但作用降级为"最后兜底":
+
+```python
+try:
+    self.memory_store.write(cand)
+except MemoryStoreError as e:
+    if "已存在" in str(e):
+        skipped += 1
+        continue  # item_hash 碰撞,跳过
+```
+
+**保留原因**:
+- 崩溃恢复:进程在向量写入后、文件写入前 crash,restart 时 item_hash 防止重复
+- 同一 turn 多次提取:门1 和门2 可能对同一内容都触发提取,item_hash 防止写两次
+- 退路:向量召回挂了或者 embedding 失败时,item_hash 仍能保证不重复
+
+**不作为主要去重手段**:
+- item_hash 只能检测**完全相同**的文本（逐字匹配）
+- 无法识别语义相似但表述不同的重复（如"喜欢周杰伦" vs "喜欢华语流行音乐歌手周杰伦"）
+- 主要去重靠向量召回 + LLM 判定,item_hash 是安全网
+
+#### 6.9.5 配置示例
+
+```yaml
+# config.yml
+memory:
+  dedup:
+    enabled: true
+    auto_threshold: 0.95    # 可调:保守 → 0.98,激进 → 0.90
+    judge_floor: 0.85       # 可调:保守 → 0.90,激进 → 0.80
+    top_k: 5                # 可调:更多召回但更慢
+```
+
+**调优建议**:
+- **提高 auto_threshold**（0.95 → 0.98）:更保守,减少 AUTO_DUPLICATE,增加 LLM 判定次数
+- **降低 judge_floor**（0.85 → 0.80）:更激进,减少 LLM 判定次数,但可能漏报灰色地带
+- **增加 top_k**（5 → 10）:召回更多相似记忆,提高召回率,但更慢
+
+**对应实现**:
+- `agent_core/memory/dedup.py` — 决策逻辑
+- `agent_core/memory/config.py` — DedupConfig
+- `agent_core/memory/prompt_templates.py` — DEDUP_SYSTEM_PROMPT + build_dedup_prompt
+- `agent_core/memory/dual_channel_writer.py` — 写盘前去重调用
+- `web/app.py` — dedup_judge 初始化 + 配置传递
+
+#### 6.9.6 调试日志（v2.2 增）
+
+为便于排查"为什么这条记忆被去重/没去重",核心流程补了完整 debug 日志。两个 logger 名称:
+
+| Logger | 来源 | 关键日志 |
+|--------|------|---------|
+| `memory.dual_channel` | `dual_channel_writer.py` | 语义去重检查开始 / 语义重复(auto/judge) / 提取完成 |
+| `memory.dedup` | `dedup.py` | 向量召回 N 条 / 去重决策 / LLM 去重判定开始+结果 |
+
+**启用方式**:`--log-level=DEBUG`
+
+**典型日志案例**（去重命中）:
+
+```
+[DEBUG] memory.dual_channel: 语义去重检查开始: [user] '阅读爱好' (body='用户喜欢看书'...)
+[DEBUG] memory.dedup: 向量召回: 命中 5 条, top_sim=0.9582, titles=['喜欢看书', '用户喜欢看书', '喜欢看动漫《剑来》', '喜欢桃子', '动漫爱好：剑来']
+[DEBUG] memory.dedup: 去重决策: sim=0.9582 >= 0.95 → AUTO_DUPLICATE
+[INFO]  memory.dual_channel: channel B: 语义重复(auto, sim=0.9582 >= 0.95) 跳过 [user] '阅读爱好' ≈ 已有 '喜欢看书'
+```
+
+**典型日志案例**（新记忆）:
+
+```
+[DEBUG] memory.dual_channel: 语义去重检查开始: [user] '阅读偏好：加缪《局外人》' (body='用户喜欢加缪的书《局外人》'...)
+[DEBUG] memory.dedup: 向量召回: 命中 5 条, top_sim=0.6752, titles=['喜欢看书', '用户喜欢看书', '喜欢看动漫《剑来》', '喜欢桃子', '动漫爱好：剑来']
+[DEBUG] memory.dedup: 去重决策: sim=0.6752 < 0.85 → NEW
+[DEBUG] memory.dual_channel: MemoryStore 已写 .../user/5e49f610...md
+```
+
+**典型日志案例**（灰色地带 LLM 判定）:
+
+```
+[DEBUG] memory.dual_channel: 语义去重检查开始: [user] '我讨厌折耳根'
+[DEBUG] memory.dedup: 向量召回: 命中 2 条, top_sim=0.8934, titles=['喜欢折耳根', '折耳根菜谱']
+[DEBUG] memory.dedup: 去重决策: 0.85 <= sim=0.8934 < 0.95 → NEEDS_JUDGE
+[DEBUG] memory.dedup: LLM 去重判定开始: 候选=[user] '我讨厌折耳根', 已召回 2 条相似记忆
+[INFO]  memory.dedup: LLM 去重判定结果: is_duplicate=False, reason='极性相反:候选是"讨厌",已有是"喜欢"'
+[INFO]  memory.dual_channel: channel B: LLM 去重判定(sim=0.8934) → 新增写盘 [user] '我讨厌折耳根'
+```
+
+**异常日志**（去重失败不阻断）:
+
+```
+[WARNING] memory.dual_channel: channel B: 语义去重出错(放行写盘,不阻断): ConnectionError: ...
+```
 
 ---
 

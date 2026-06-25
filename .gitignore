@@ -35,3 +35,10 @@ env/
 # Session 备份文件（recover_uncompressed.py 生成的）
 *.jsonl.recovery-backup
 *.jsonl.bak
+
+# E2E 测试产物
+tests/e2e/reports/
+tests/e2e/.pytest_cache/
+
+# 运行日志（web/app.py 按小时切分写入）
+logs/

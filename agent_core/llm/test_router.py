@@ -159,20 +159,27 @@ class TestForkSystemPromptOverride:
         )
         return LLMRouter(cfg)
 
-    def _capture_zhipu_messages(self, router, messages, system_prompt_override):
-        """Monkey-patch _chat_zhipu 捕获实际发给 zhipu 的 messages"""
+    def _capture_provider_messages(self, router, messages, system_prompt_override):
+        """Monkey-patch _get_openai_provider 捕获实际发给 OpenAI 兼容 provider 的 messages。
+        M10 重构后,3 个 OpenAI 兼容 provider 共用同一个 dispatch 路径 + _get_openai_provider()
+        工厂,所以只需 patch 这一个分发点。
+        """
         captured = {}
         from agent_core.llm import router as router_module
         RouterClass = router_module.LLMRouter
-        original = RouterClass._chat_zhipu
+        original = RouterClass._get_openai_provider
 
-        def mock_chat_zhipu(self, msgs, tools, tool_choice=None):
-            captured["messages"] = msgs
-            captured["tools"] = tools
-            captured["tool_choice"] = tool_choice
-            return iter([])  # 空生成器
+        def mock_get_openai_provider(self):
+            class _FakeProvider:
+                provider_name = "fake"
+                def chat(self_, msgs, tools, tool_choice=None):
+                    captured["messages"] = msgs
+                    captured["tools"] = tools
+                    captured["tool_choice"] = tool_choice
+                    return iter([])  # 空生成器
+            return _FakeProvider()
 
-        RouterClass._chat_zhipu = mock_chat_zhipu
+        RouterClass._get_openai_provider = mock_get_openai_provider
         try:
             list(router.chat(
                 messages=messages,
@@ -180,32 +187,14 @@ class TestForkSystemPromptOverride:
                 system_prompt_override=system_prompt_override,
             ))
         finally:
-            RouterClass._chat_zhipu = original
+            RouterClass._get_openai_provider = original
         return captured
+
+    def _capture_zhipu_messages(self, router, messages, system_prompt_override):
+        return self._capture_provider_messages(router, messages, system_prompt_override)
 
     def _capture_openai_messages(self, router, messages, system_prompt_override):
-        """Monkey-patch _chat_openai 捕获实际发给 openai 的 messages"""
-        captured = {}
-        from agent_core.llm import router as router_module
-        RouterClass = router_module.LLMRouter
-        original = RouterClass._chat_openai
-
-        def mock_chat_openai(self, msgs, tools, tool_choice=None):
-            captured["messages"] = msgs
-            captured["tools"] = tools
-            captured["tool_choice"] = tool_choice
-            return iter([])
-
-        RouterClass._chat_openai = mock_chat_openai
-        try:
-            list(router.chat(
-                messages=messages,
-                tools=None,
-                system_prompt_override=system_prompt_override,
-            ))
-        finally:
-            RouterClass._chat_openai = original
-        return captured
+        return self._capture_provider_messages(router, messages, system_prompt_override)
 
     def test_zhipu_empty_override_does_not_inject_system(self):
         """zhipu: 空 system_prompt_override 不应注入空 system message（保持与主 agent 路径一致）"""
@@ -285,7 +274,9 @@ class TestMinimaxProvider:
         assert cfg.model == "MiniMax-Text-01"
 
     def test_minimax_routes_to_chat_minimax(self):
-        """chat() 收到 provider='minimax' 必须路由到 _chat_minimax(而不是 zhipu/openai)"""
+        """chat() 收到 provider='minimax' 必须路由到 MiniMaxProvider(而不是 zhipu/openai)
+        M10 重构后:走 _get_openai_provider() → create_openai_compatible_provider(LLMProvider.MINIMAX)
+        """
         cfg = LLMConfig(
             provider="minimax",
             model="MiniMax-Text-01",
@@ -293,22 +284,26 @@ class TestMinimaxProvider:
         )
         router = LLMRouter(cfg)
 
-        # Monkey-patch _chat_minimax,验证 chat() 实际调用了它
+        # Monkey-patch _get_openai_provider,验证 chat() 实际调用了工厂
         from agent_core.llm import router as router_module
         RouterClass = router_module.LLMRouter
         called = {"flag": False, "provider": None}
-        original = RouterClass._chat_minimax
+        original = RouterClass._get_openai_provider
 
-        def mock_chat_minimax(self, msgs, tools, tool_choice=None):
+        def mock_get_openai_provider(self):
             called["flag"] = True
-            return iter([])
+            class _FakeProvider:
+                provider_name = "fake"
+                def chat(self_, msgs, tools, tool_choice=None):
+                    return iter([])
+            return _FakeProvider()
 
-        RouterClass._chat_minimax = mock_chat_minimax
+        RouterClass._get_openai_provider = mock_get_openai_provider
         try:
             list(router.chat(messages=[{"role": "user", "content": "hi"}]))
         finally:
-            RouterClass._chat_minimax = original
-        assert called["flag"] is True, "chat() 没把 provider='minimax' 路由到 _chat_minimax"
+            RouterClass._get_openai_provider = original
+        assert called["flag"] is True, "chat() 没把 provider='minimax' 路由到 _get_openai_provider()"
 
     def test_minimax_empty_override_does_not_inject_system(self):
         """minimax: 空 system_prompt_override 不应注入空 system(与 zhipu 行为一致,保持 cache prefix 对齐)"""
@@ -322,20 +317,24 @@ class TestMinimaxProvider:
         from agent_core.llm import router as router_module
         RouterClass = router_module.LLMRouter
         captured = {}
-        original = RouterClass._chat_minimax
+        original = RouterClass._get_openai_provider
 
-        def mock_chat_minimax(self, msgs, tools, tool_choice=None):
-            captured["messages"] = msgs
-            return iter([])
+        def mock_get_openai_provider(self):
+            class _FakeProvider:
+                provider_name = "fake"
+                def chat(self_, msgs, tools, tool_choice=None):
+                    captured["messages"] = msgs
+                    return iter([])
+            return _FakeProvider()
 
-        RouterClass._chat_minimax = mock_chat_minimax
+        RouterClass._get_openai_provider = mock_get_openai_provider
         try:
             list(router.chat(
                 messages=[{"role": "user", "content": "hi"}],
                 system_prompt_override="",
             ))
         finally:
-            RouterClass._chat_minimax = original
+            RouterClass._get_openai_provider = original
         # 第一个 message 仍是 user(空 override 不注入)
         assert captured["messages"][0] == {"role": "user", "content": "hi"}, \
             f"minimax 空 override 不应注入 system,实际收到: {captured['messages']}"
@@ -351,36 +350,45 @@ class TestMinimaxProvider:
         from agent_core.llm import router as router_module
         RouterClass = router_module.LLMRouter
         captured = {}
-        original = RouterClass._chat_minimax
+        original = RouterClass._get_openai_provider
 
-        def mock_chat_minimax(self, msgs, tools, tool_choice=None):
-            captured["messages"] = msgs
-            return iter([])
+        def mock_get_openai_provider(self):
+            class _FakeProvider:
+                provider_name = "fake"
+                def chat(self_, msgs, tools, tool_choice=None):
+                    captured["messages"] = msgs
+                    return iter([])
+            return _FakeProvider()
 
-        RouterClass._chat_minimax = mock_chat_minimax
+        RouterClass._get_openai_provider = mock_get_openai_provider
         try:
             list(router.chat(
                 messages=[{"role": "user", "content": "hi"}],
                 system_prompt_override="You are helpful",
             ))
         finally:
-            RouterClass._chat_minimax = original
+            RouterClass._get_openai_provider = original
         assert captured["messages"][0] == {"role": "system", "content": "You are helpful"}
         assert captured["messages"][1] == {"role": "user", "content": "hi"}
 
     def test_minimax_client_default_base_url(self):
-        """_get_minimax_client() 默认 base_url 必须是 https://api.minimaxi.com/v1
+        """MiniMaxProvider.default_base_url 必须是 https://api.minimaxi.com/v1
         源码级校验(.venv 没装 openai,不能 import openai)
         """
         import inspect
-        from agent_core.llm import router as router_module
-        src = inspect.getsource(router_module.LLMRouter._get_minimax_client)
+        from agent_core.llm.openai_compatible import MiniMaxProvider, OpenAICompatibleProvider
+        src = inspect.getsource(MiniMaxProvider)
         assert "https://api.minimaxi.com/v1" in src, (
-            "_get_minimax_client 默认 base_url 应该是 https://api.minimaxi.com/v1,"
+            "MiniMaxProvider.default_base_url 应该是 https://api.minimaxi.com/v1,"
             f"实际源码:\n{src}"
         )
-        # 允许 base_url 覆盖(LLMConfig.base_url 字段)
-        assert "self.config.base_url" in src, "需要支持 base_url 覆盖"
+        # base_url 覆盖逻辑在基类 OpenAICompatibleProvider._get_base_url() 里
+        # (config.base_url or default_base_url)
+        base_src = inspect.getsource(OpenAICompatibleProvider._get_base_url)
+        assert "self.config.base_url" in base_src, (
+            "OpenAICompatibleProvider._get_base_url 必须支持 base_url 覆盖,"
+            f"实际源码:\n{base_src}"
+        )
 
     def test_minimax_config_registers_api_key(self):
         """config.minimax_api_key 必须能从 MINIMAX_API_KEY env 读出"""
@@ -616,3 +624,45 @@ class TestThinkTagSplitter:
         if text_chunks:
             assert not text_chunks[0].text_delta.text.startswith("\n"), \
                 f"</think> 后的 \\n 应被吃掉,实际: {text_chunks[0].text_delta.text!r}"
+
+
+class TestStopReasonPlumbing:
+    """Bug 1e:provider 必须把 finish_reason / stop_reason 透传成 StreamChunk.stop_reason"""
+
+    def _make_provider(self):
+        from unittest.mock import MagicMock
+        from agent_core.llm.openai_compatible import OpenAIProvider
+        cfg = LLMConfig(provider="openai", model="gpt-4o", api_key="x")
+        prov = OpenAIProvider(cfg)
+        prov._client = MagicMock()  # 注入 mock,绕过 lazy import openai
+        return prov
+
+    @staticmethod
+    def _chunk(content=None, finish=None, usage=None):
+        from unittest.mock import MagicMock
+        ch = MagicMock()
+        delta = MagicMock(); delta.content = content; delta.tool_calls = None
+        choice = MagicMock(); choice.delta = delta; choice.finish_reason = finish
+        ch.choices = [choice]
+        ch.usage = usage
+        return ch
+
+    def test_openai_compat_emits_stop_reason_from_finish_reason(self):
+        prov = self._make_provider()
+        prov._client.chat.completions.create.return_value = iter([
+            self._chunk(content="半句被切"),
+            self._chunk(finish="length"),   # max_tokens 截断
+        ])
+        chunks = list(prov.chat([{"role": "user", "content": "hi"}], tools=None))
+        stops = [c.stop_reason for c in chunks if c.stop_reason]
+        assert stops == ["length"], f"应透传 finish_reason=length,实际 {stops}"
+
+    def test_openai_compat_emits_stop_for_normal_finish(self):
+        prov = self._make_provider()
+        prov._client.chat.completions.create.return_value = iter([
+            self._chunk(content="完整回答"),
+            self._chunk(finish="stop"),
+        ])
+        chunks = list(prov.chat([{"role": "user", "content": "hi"}], tools=None))
+        stops = [c.stop_reason for c in chunks if c.stop_reason]
+        assert stops == ["stop"]

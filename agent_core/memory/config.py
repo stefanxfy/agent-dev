@@ -197,6 +197,23 @@ class CostConfig(BaseModel):
     per_extract_budget_usd: float = Field(default=0.05, ge=0.0)
 
 
+class DedupConfig(BaseModel):
+    """语义去重配置(向量召回 + LLM 判定)
+
+    写盘前用候选记忆的向量在库里召回最相似的几条:
+      - 相似度 >= auto_threshold        → 直接判重复,跳过(不调 LLM,省 token)
+      - judge_floor <= 相似度 < auto    → 调一次 LLM 判「重复/新增」
+      - 相似度 < judge_floor            → 视为新记忆,正常写盘
+    auto_threshold 默认 0.95(实测:否定/近义事实都 < 0.90,逐字改写 > 0.95,安全)。
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True)
+    auto_threshold: float = Field(default=0.95, ge=0.0, le=1.0)
+    judge_floor: float = Field(default=0.85, ge=0.0, le=1.0)
+    top_k: int = Field(default=5, ge=1)
+
+
 class SafetyConfig(BaseModel):
     """
     安全策略（§14 安全模型）
@@ -238,6 +255,7 @@ class MemoryConfig(BaseModel):
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     compact: CompactConfig = Field(default_factory=CompactConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
+    dedup: DedupConfig = Field(default_factory=DedupConfig)
 
     # 全局开关
     enabled: bool = Field(default=True, description="总开关")

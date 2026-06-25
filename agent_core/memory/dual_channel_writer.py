@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Protocol, TYPE_CHECKING, Union
 
 from agent_core.exceptions import AgentError
+from agent_core.memory.dedup import DedupAction, decide_action, top_similarity
 from agent_core.memory.embeddings import EmbedFn
 from agent_core.memory.ipc_lock import IPCLock, LockBusy, make_daily_lock, make_extract_lock
 from agent_core.memory.memory_store import (
@@ -168,11 +169,16 @@ class DualChannelWriter:
         extraction_timeout_seconds: int = 60,
         executor_workers: int = 2,
         event_callback: Optional[Callable[["MemoryEvent"], None]] = None,  # M10 C1.2
+        dedup_config: Optional[Any] = None,   # DedupConfig;None → 不做语义去重(向后兼容)
+        dedup_judge: Optional[Callable[[Any, list[dict]], bool]] = None,  # 可疑带 LLM 判定器
     ):
         self.session_id = session_id
         self.meta_db = meta_db
         self.memory_store = memory_store
         self.vector_store = vector_store
+        # 语义去重(向量召回 + LLM 判定)。dedup_config=None 时整体关闭,行为同旧版。
+        self.dedup_config = dedup_config
+        self.dedup_judge = dedup_judge
         # embed_fn 必须非 None:channel B 写入 vector_store 需要先编码
         # 失败时立即 EmbeddingError,不静默(不再有 Mock 兜底)
         if embed_fn is None:
@@ -225,22 +231,41 @@ class DualChannelWriter:
         self,
         user_msg: str,
         assistant_resp: str,
-        turn_index: int,
+        turn_index: Optional[int] = None,
     ) -> int:
         """
         通道 A：内联写一条 turn 到 daily log
+
+        Args:
+            user_msg: 用户消息
+            assistant_resp: 助手响应
+            turn_index: turn 在 session 内的全局索引。
+                传 None(默认)= 用 daily_cursor + 1(推荐,避免 per-run 计数冲突);
+                显式传 int= 用 caller 提供的值(向后兼容)。
 
         Returns:
             写入后的 daily_cursor
 
         不变量 #3: 不调 LLM，必须同步 + 快速（< 10ms）
         不变量 #4: 推进 cursor 前必须成功写盘（A10 transactional）
+
+        Bug 1 修复(2026-06-24):
+        原代码要求 caller 传 turn_index,导致 per-run turn 计数 vs session-global
+        daily_cursor 冲突 — 每次新 run 的 turn 1 都被 idempotent no-op 拦下,
+        新 turn 的 user_msg 完全没进 daily log。
+        修法:turn_index 默认 None → channel A 内部用 daily_cursor + 1,
+        保证每次调用都真正写一条新 turn,不依赖 caller 传对。
         """
         if self._shutdown:
             raise DualChannelError("writer 已 shutdown，禁止写入")
 
+        # Bug 1 修复:turn_index 缺省时用 daily_cursor + 1
+        # 这样每个 on_turn_end 调用都自然推进 cursor,不再被 idempotent 拦下
+        if turn_index is None:
+            turn_index = self.daily_cursor + 1
+
         if turn_index <= self.daily_cursor:
-            # 幂等：同 turn 已写过
+            # 幂等：同 turn 已写过(caller 显式传了重复 turn_index)
             return self.daily_cursor
 
         # A10 transactional: 先记 pending
@@ -264,6 +289,9 @@ class DualChannelWriter:
             else:
                 # 成功：删除 pending
                 self.meta_db.remove_pending(pending_id)
+        logger.debug(
+            f"channel A: turn {turn_index} 写入 daily log (daily_cursor={self.daily_cursor})"
+        )
         return self.daily_cursor
 
     def _do_channel_a_write(self, user_msg: str, assistant_resp: str, turn_index: int) -> None:
@@ -291,6 +319,7 @@ class DualChannelWriter:
         messages: list[TurnMessage],
         *,
         llm_extractor: Optional[Callable[[list[TurnMessage]], list[ExtractionCandidate]]] = None,
+        advance_cursor: bool = True,
     ) -> Future:
         """
         通道 B：后台异步提取
@@ -298,6 +327,11 @@ class DualChannelWriter:
         Args:
             messages: 要处理的 turn 列表（通常 [extract_cursor+1, daily_cursor]）
             llm_extractor: LLM 提取函数(M3 接 router;不传则用空列表占位)
+            advance_cursor: 成功后是否推进 extract_cursor 到 daily_cursor + 1
+                - True(默认):真实 extract,推进 cursor
+                - False:recovery 重试,只清 stuck pending 不推进 cursor
+                  (Bug 2 修复:否则会把 extract_cursor 推到 daily+1,
+                  下次真实 extract 看到 to_process=[] 就 no-op)
 
         Returns:
             Future（调用方 shutdown(timeout=) 等完成）
@@ -331,21 +365,87 @@ class DualChannelWriter:
             self._do_channel_b_extract,
             messages,
             llm_extractor or (lambda _msgs: []),  # 默认空列表
+            advance_cursor,  # Bug 2 修复
         )
         self._inflight.add(future)
         future.add_done_callback(self._on_extract_done)
         return future
 
+    def _is_semantic_duplicate(
+        self, cand: ExtractionCandidate, embedding: list[float], cand_text: str
+    ) -> bool:
+        """语义去重:用候选 embedding 在库里召回最相似记忆,判断是否重复。
+
+        三档(见 dedup.decide_action):
+          - 相似度 >= auto_threshold      → 直接判重复(不调 LLM,省 token)
+          - judge_floor <= 相似度 < auto  → 调 dedup_judge(LLM)判重复/新增
+          - 否则                          → 不是重复,正常写盘
+        去重失败(向量库异常等)绝不阻断持久化:返回 False(宁可多存,不可丢)。
+        """
+        cfg = self.dedup_config
+        if cfg is None or not getattr(cfg, "enabled", False):
+            logger.debug(f"语义去重: 功能未启用, 放行 [{cand.type}] {cand.title!r}")
+            return False
+        query_fn = getattr(self.vector_store, "query", None)
+        if query_fn is None:
+            logger.debug(f"语义去重: 向量库不支持 query, 放行 [{cand.type}] {cand.title!r}")
+            return False
+
+        logger.debug(
+            f"语义去重检查开始: [{cand.type}] {cand.title!r} "
+            f"(body={cand.body[:50]!r}...)"
+        )
+
+        try:
+            hits = query_fn(embedding, getattr(cfg, "top_k", 5))
+            sim = top_similarity(hits)
+            action = decide_action(sim, cfg)
+            _sim_str = f"{sim:.4f}" if sim is not None else "none"
+
+            if action is DedupAction.AUTO_DUPLICATE:
+                _top_title = (hits[0].get("metadata") or {}).get("title", "?")
+                logger.info(
+                    f"channel B: 语义重复(auto, sim={_sim_str} >= "
+                    f"{cfg.auto_threshold}) 跳过 [{cand.type}] {cand.title!r} "
+                    f"≈ 已有 {_top_title!r}"
+                )
+                return True
+
+            if action is DedupAction.NEEDS_JUDGE:
+                if self.dedup_judge is None:
+                    logger.debug(
+                        f"channel B: 可疑相似(sim={_sim_str})但无 dedup_judge,放行写盘"
+                    )
+                    return False
+                is_dup = bool(self.dedup_judge(cand, hits))
+                logger.info(
+                    f"channel B: LLM 去重判定(sim={_sim_str}) → "
+                    f"{'重复跳过' if is_dup else '新增写盘'} [{cand.type}] {cand.title!r}"
+                )
+                return is_dup
+
+            return False  # NEW
+        except Exception as e:
+            logger.warning(
+                f"channel B: 语义去重出错(放行写盘,不阻断): {type(e).__name__}: {e}"
+            )
+            return False
+
     def _do_channel_b_extract(
         self,
         messages: list[TurnMessage],
         extractor: Callable[[list[TurnMessage]], list[ExtractionCandidate]],
+        advance_cursor: bool = True,
     ) -> dict[str, Any]:
         """
         实际执行提取（在 executor 线程）
 
         A4: 取 extract_lock
         A10: 先记 pending → 提取 → 成功后逐条写 MemoryStore → 推进 extract_cursor
+
+        advance_cursor=False(Bug 2 修复):
+        recovery 重试路径,只清 stuck pending 不推进 cursor。
+        让下次真实 extract 能自然处理被 recovery 跳过的 turn range。
         """
         # 1. 计算待处理范围（[extract_cursor, daily_cursor] inclusive）
         #    extract_cursor 是 "下一个待处理 turn"（exclusive 下界）
@@ -353,13 +453,28 @@ class DualChannelWriter:
         start = self.extract_cursor
         to_process = [m for m in messages if start <= m.turn_index <= self.daily_cursor]
         if not to_process:
+            # 被显式 dispatch 却没有可处理 turn = 一次提取被丢弃,属异常,升到 WARNING。
+            # (DEBUG 级别会在 INFO 生产日志里完全隐身,Bug 1b 当初就是这样漏掉的)
+            _incoming = [m.turn_index for m in messages]
+            logger.warning(
+                f"channel B: to_process 为空,提取被跳过 — "
+                f"窗口=[{start},{self.daily_cursor}] (extract_cursor..daily_cursor), "
+                f"传入 turn_index={_incoming}。"
+                f"传入 turn 不在窗口内 → 该轮记忆不会被提取"
+            )
             return {"extracted": 0, "written": 0, "skipped": 0}
+
+        logger.info(
+            f"channel B 提取开始: session={self.session_id}, "
+            f"turn_range=[{start},{self.daily_cursor}], {len(to_process)} turns"
+        )
 
         # A10 transactional
         pending_id = self.meta_db.add_pending(self.session_id, {
             "action": "channel_b_extract",
             "session_id": self.session_id,
             "turn_range": [start, self.daily_cursor],
+            "created_in_recovery": False,  # B 修复:标记来源,便于诊断
         })
 
         written = 0
@@ -369,22 +484,37 @@ class DualChannelWriter:
             with self._ipc_extract:
                 # 2. LLM 提取（M3 接 router）
                 candidates = extractor(to_process)
+                logger.debug(
+                    f"channel B: extractor 返回 {len(candidates)} candidates"
+                )
 
-                # M9 review: defensive pairing guard before zip().
-                # 当前 extractor 契约是 1:1（to_process[i] ↔ candidates[i]）,
-                # 但 LLM 契约允许 0-N,zip() 会在长度不齐时静默截断。
-                # 一旦 extractor 改为多 candidate/turn,需同步更新此处配对逻辑。
-                if len(to_process) != len(candidates):
-                    logger.warning(
-                        f"channel_b pairing mismatch: {len(to_process)} messages "
-                        f"vs {len(candidates)} candidates — truncating"
-                    )
+                # 2026-06-24 Bug 1c 修复:candidates 与 to_process 不是 1:1。
+                # bridge 的 extractor 忽略入参 messages,直接返回 gate 对"本轮整段最近
+                # 对话"评出的 0-N 条 candidates —— 它们全是本次提取事件的产物,与
+                # to_process 里的 turn 没有位置对应关系。
+                # 旧代码 zip(to_process, candidates) 按位置配对:to_process 通常只有 1 条
+                # (当前 turn)时,zip 只取 candidates[0](LLM 按对话顺序返回 → 最旧的
+                # 未持久化项),其余 candidates 被静默截断 → 表现为"每轮都只存上一条/最旧
+                # 的记忆,当前消息永远丢失"。
+                # 正解:写入全部 candidates,统一盖上本次实际处理的最新 turn_index。
+                stamp_turn = max(m.turn_index for m in to_process)
 
                 # 3. 逐条写 MemoryStore（A5 幂等）
                 #    将 session_id + turn_index 写入 frontmatter extra,
                 #    供 list_by_session 查询
-                for m, cand in zip(to_process, candidates):
+                for cand in candidates:
                     try:
+                        # 候选记忆全貌(DEBUG):type / title / tags / score
+                        # + body/source_quote 预览,排查"存的是什么"
+                        _body_preview = cand.body[:80].replace("\n", " ")
+                        _quote_preview = (cand.source_quote or "")[:60].replace("\n", " ")
+                        logger.debug(
+                            f"channel B: 候选记忆 turn={stamp_turn} type={cand.type!r} "
+                            f"title={cand.title!r} tags={cand.tags} score={cand.score} "
+                            f"| body[{len(cand.body)}]={_body_preview!r} "
+                            f"| source_quote={_quote_preview!r}"
+                        )
+
                         # M10 C1.4: §14.1 防御纵深 — Channel B 入口 path validator
                         # 用占位符 .md 构造 rel_path,只验证 type 是否在白名单 + 类型检查
                         rel_path = f"{cand.type}/__channel_b_preflight__.md"
@@ -418,12 +548,40 @@ class DualChannelWriter:
                                 )
                                 if self.event_callback:
                                     try:
-                                        self.event_callback(_make_secret_event(m.turn_index))
+                                        self.event_callback(_make_secret_event(stamp_turn))
                                     except Exception as cb_err:
                                         logger.error(f"event_callback 抛错: {cb_err}")
                                 skipped += 1
                                 continue
+                            logger.debug(
+                                f"channel B: candidate {cand.title!r} 命中 secret,"
+                                f"已 redact body 后继续写盘"
+                            )
                             cand = replace(cand, body=redacted_body)
+
+                        # ── 先向量化(候选 embedding,既用于语义去重召回,也用于写 vector store)──
+                        #    计算 embedding 失败 → 整个 candidate 失败(此时尚未写 .md,无残留)
+                        try:
+                            text_for_emb = f"{cand.title}\n{cand.body}"
+                            _emb_model = getattr(
+                                self.embed_fn, "model_name", type(self.embed_fn).__name__
+                            )
+                            logger.debug(
+                                f"channel B: 向量化中 model={_emb_model} "
+                                f"text[{len(text_for_emb)}] chars (title={cand.title!r})"
+                            )
+                            embedding = self.embed_fn.encode(text_for_emb)
+                        except Exception as enc_err:
+                            raise DualChannelError(
+                                f"向量化失败(candidate={cand.title}): {enc_err}",
+                                cause=enc_err,
+                            )
+
+                        # ── 语义去重(向量召回 + LLM 判定)——写盘前拦重复 ──
+                        #    dedup_config 为空 → 整段跳过,行为同旧版(只靠 item_hash 精确幂等)
+                        if self._is_semantic_duplicate(cand, embedding, text_for_emb):
+                            skipped += 1
+                            continue
 
                         item_hash = self.memory_store.write(
                             type=cand.type,
@@ -433,20 +591,23 @@ class DualChannelWriter:
                             tags=cand.tags,
                             extra={
                                 "session_id": self.session_id,
-                                "turn_index": m.turn_index,
+                                "turn_index": stamp_turn,
                             },
                         )
-                        # 4. 写 vector store —— 必须含 embedding(ChromaVectorStore 强制)
-                        #    计算 embedding 失败 → 整个 candidate 失败,MemoryStore 已写不撤回
-                        #    (caller 可通过 cold_start 重新向量化,见 cold_start.py M5 重索引逻辑)
-                        try:
-                            text_for_emb = f"{cand.title}\n{cand.body}"
-                            embedding = self.embed_fn.encode(text_for_emb)
-                        except Exception as enc_err:
-                            raise DualChannelError(
-                                f"向量化失败(candidate={cand.title}): {enc_err}",
-                                cause=enc_err,
-                            )
+                        # 落盘位置(DEBUG):.md 的绝对路径,排查"存在哪里"
+                        md_path = self.memory_store.root / cand.type / f"{item_hash}.md"
+                        logger.debug(
+                            f"channel B: MemoryStore 已写 {md_path} "
+                            f"(hash={item_hash[:12]}, body[{len(cand.body)}] chars)"
+                        )
+
+                        # 4. 写 vector store(复用上面算好的 embedding)
+                        logger.debug(
+                            f"channel B: 向量化完成 dim={len(embedding)} → chroma "
+                            f"path={getattr(self.vector_store, '_path', '?')} "
+                            f"collection={getattr(self.vector_store, '_collection_name', '?')} "
+                            f"id={item_hash[:12]}"
+                        )
                         self.vector_store.add({
                             "id": item_hash,
                             "embedding": embedding,
@@ -458,33 +619,86 @@ class DualChannelWriter:
                             },
                             "document": text_for_emb,
                         })
+                        logger.debug(
+                            f"channel B: 向量已写入 chroma (id={item_hash[:12]})"
+                        )
                         written += 1
+                        logger.info(
+                            f"channel B: 已持久化 [{cand.type}] {cand.title!r} "
+                            f"(hash={item_hash[:8]}, turn={stamp_turn})"
+                        )
                     except MemoryStoreError as e:
                         # A5: 同 hash 已存在 → skip（幂等）
                         if "已存在" in str(e):
                             skipped += 1
+                            logger.debug(
+                                f"channel B: [{cand.type}] {cand.title!r} 已存在, 跳过(幂等)"
+                            )
                             continue
                         raise
 
                 # 4. 推进 extract_cursor（不变量 #4：仅在成功后）
-                #    推进到 daily_cursor + 1（下一个待处理 turn）
-                self.extract_cursor = self.daily_cursor + 1
-                self.meta_db.set_cursor(self.session_id, "extract", self.extract_cursor)
+                #    推进到"本次实际处理的最大 turn_index + 1"
+                # Bug 2 修复:recovery 路径 advance_cursor=False,这里不推进
+                # → 让下次真实 extract 能处理被 recovery 跳过的 turn range
+                #
+                # 2026-06-24 race 修复:原来推到 daily_cursor + 1。正常流里
+                # daily_cursor == 当前 turn,两者相等。但 deferred turn 排队后
+                # 串行 flush 时,daily_cursor 可能已被后续 turn 推到更高:
+                #   turn2,turn3 同时 defer(daily=3)→ flush turn2 推 cursor 到
+                #   daily+1=4 → flush turn3 时 [4,3] 空集 → turn3 被静默丢弃。
+                # 改用 max(to_process)+1 → flush turn2 只推到 3,turn3 仍在 [3,3]
+                # 范围内,不丢。batch 场景 max==daily 等价,无回归。
+                if advance_cursor:
+                    max_processed = max(m.turn_index for m in to_process)
+                    self.extract_cursor = max_processed + 1
+                    self.meta_db.set_cursor(self.session_id, "extract", self.extract_cursor)
+                    logger.debug(f"channel B: extract_cursor → {self.extract_cursor}")
 
             # 成功 → 删 pending
             self.meta_db.remove_pending(pending_id)
+            logger.info(
+                f"channel B 提取完成: extracted={len(candidates)}, "
+                f"written={written}, skipped={skipped}"
+            )
             return {"extracted": len(candidates), "written": written, "skipped": skipped}
 
         except Exception as e:
             # 失败：保留 pending（崩溃恢复时扫描）
+            # C 修复:失败时 bump attempts 计数 — 原代码 attempts 永远 = 0,
+            # 导致重试次数不可见,recover_pending 无法做退避策略
+            logger.error(
+                f"channel B 提取失败 turn_range=[{start},{self.daily_cursor}]: {e}"
+            )
+            try:
+                self.meta_db.bump_pending_attempts(pending_id)
+            except Exception as bump_err:
+                logger.error(f"bump_pending_attempts 失败: {bump_err}")
             raise DualChannelError(f"channel B extract 失败: {e}", cause=e)
 
     def _on_extract_done(self, future: Future) -> None:
-        """提取完成回调（无论成功失败，释放 in_progress 标志）"""
+        """提取完成回调（无论成功失败，释放 in_progress 标志）
+
+        D 修复:原代码只 discard future,不读 future.exception() —
+        导致任何在 executor 线程抛的异常都被静默吞掉,正是 3 条 stuck pending_writes
+        永远 attempts=0 的根因。这里读 exception 并 log,
+        让沉默的失败重新可见。
+        """
         self._inflight.discard(future)
         with self._extraction_in_progress_lock:
             self._extraction_in_progress = False
             self._extraction_started_at = None
+
+        # D 修复:fire-and-forget 的异常必须 log,否则 caller 完全看不见
+        exc = future.exception()
+        if exc is not None:
+            logger.error(
+                f"channel B extract future 异常(已被 fire-and-forget 吞掉): "
+                f"{type(exc).__name__}: {exc}",
+                exc_info=exc,
+            )
+        else:
+            logger.debug("channel B extract future 正常完成")
 
     # ──────────────────────────────────────────────────────
     # A9: 优雅 shutdown
@@ -541,18 +755,190 @@ class DualChannelWriter:
             "shutdown": self._shutdown,
         }
 
-    def recover_pending(self) -> dict[str, Any]:
-        """
-        启动时调用：扫描 pending_writes，决定是重试还是丢弃
+    # 重试上限:连续失败 N 次后放弃,删除 pending 行避免永久卡住
+    MAX_RETRY_ATTEMPTS = 3
 
-        M2 阶段：仅 report（不重做），M3+ 加 retry 策略
+    def recover_pending(self) -> dict[str, Any]:
+        """启动时调用：扫描 pending_writes,实际重试或丢弃
+
+        B 修复:原实现仅返回 report,从来不重试,导致
+        - 任何 channel B 异常残留的 pending 行永远卡住 attempts=0
+        - 用户体感:"记了但永远检索不出来"(vector_store 是空的)
+
+        新行为:
+        1. 列出 session 全部 pending
+        2. 对 channel_b_extract 类型:
+           - attempts < MAX:重新提交一个空 extractor 的 _do_channel_b_extract
+             (重新走 extract_cursor 推进 + remove_pending 的成功路径)
+           - attempts >= MAX:log error + remove_pending(放弃)
+        3. channel_a_write 类型:仅 report(因为 log 文件已经写了,cursor 没推进,
+           真正重试需要重新解析 log + 重写 .md,超出本修复 scope)
+
+        注意:无 LLM extractor 时重试 = no-op extract(空 candidates)+ 推进 cursor +
+        删除 pending。等价于"跳过这段 stuck 区间",损失的只是这段区间的 candidates,
+        但能把 cursor 推进过去,系统不再永久卡住。
         """
         pending = self.meta_db.list_pending(self.session_id)
-        return {
+
+        report: dict[str, Any] = {
             "session_id": self.session_id,
             "pending_count": len(pending),
-            "pending": pending,
+            "retried": [],
+            "dropped": [],
+            "skipped": [],  # channel_a_write 或其他 action
         }
+
+        # 防御性重置 _extraction_in_progress:
+        # 启动时调 recover_pending,旧 future 的 _on_extract_done callback 可能
+        # 还没跑(线程池未及时调度),导致 flag 仍为 True → channel_b_background_extract
+        # 抛 ExtractionInProgressError → retry 失败。
+        # 不变:只在 _inflight 已空(没有 in-flight 任务)时重置,绝不覆盖真实运行中任务。
+        with self._extraction_in_progress_lock:
+            if not self._inflight and self._extraction_in_progress:
+                logger.warning(
+                    "recover_pending: _extraction_in_progress=True 但 _inflight 已空,"
+                    "防御性重置(对应旧 future 的 _on_extract_done 未及时跑)"
+                )
+                self._extraction_in_progress = False
+                self._extraction_started_at = None
+
+        for p in pending:
+            payload = p["payload"]
+            action = payload.get("action")
+
+            if action != "channel_b_extract":
+                report["skipped"].append({
+                    "id": p["id"],
+                    "action": action,
+                    "reason": "暂不重试(只支持 channel_b_extract)",
+                })
+                continue
+
+            # 检查 attempts 上限
+            if p["attempts"] >= self.MAX_RETRY_ATTEMPTS:
+                logger.error(
+                    f"channel_b_extract pending#{p['id']} 已重试 {p['attempts']} 次,"
+                    f"超过上限 {self.MAX_RETRY_ATTEMPTS},放弃 → remove_pending"
+                )
+                self.meta_db.remove_pending(p["id"])
+                report["dropped"].append({
+                    "id": p["id"],
+                    "attempts": p["attempts"],
+                    "reason": "max_retries_exceeded",
+                })
+                continue
+
+            # 重试:走一遍 _do_channel_b_extract(用空 extractor,等价于 no-op)
+            # 副作用:extract_cursor 推进到 daily_cursor + 1,pending 删除
+            #
+            # Bug 2 修复(2026-06-24):recovery 路径 advance_cursor=False,
+            # 否则 extract_cursor 推进到 daily_cursor+1 会让下次真实 extract 看到
+            # to_process=[] → no-op,新 turn 永远没机会被处理。
+            #
+            # 重要:先 remove_pending(old_id) 再 re-submit。原因是
+            # _do_channel_b_extract 在成功路径只会 remove_pending 它自己 add 的新行,
+            # 不会清旧的。所以不先 remove,旧的 stuck 行永远清不掉。
+            try:
+                # 重新构造 TurnMessage(从 daily log 读;读不到就用占位)
+                msgs = self._load_messages_for_retry(payload)
+                # 删旧 pending(无它 _do_channel_b_extract 不会知道要清它)
+                self.meta_db.remove_pending(p["id"])
+                future = self.channel_b_background_extract(
+                    msgs,
+                    llm_extractor=lambda _m: [],  # 空 → 等价于跳过 stuck 区间
+                    advance_cursor=False,  # Bug 2 修复:recovery 不推进 cursor
+                )
+                future.add_done_callback(
+                    lambda f, pid=p["id"]: self._on_recovery_done(f, pid, report)
+                )
+                report["retried"].append({
+                    "id": p["id"],
+                    "previous_attempts": p["attempts"],
+                })
+            except ExtractionInProgressError:
+                # 别的 extract 正在跑,跳过这次 retry,下轮 recover_pending 再试
+                logger.warning(
+                    f"channel_b_extract pending#{p['id']} 重试跳过:extract_in_progress"
+                )
+                report["skipped"].append({
+                    "id": p["id"],
+                    "action": action,
+                    "reason": "extraction_in_progress",
+                })
+
+        return report
+
+    def _load_messages_for_retry(
+        self, payload: dict[str, Any],
+    ) -> list[TurnMessage]:
+        """从 daily log 重新加载 messages(给 recovery 用)
+
+        payload 里只有 turn_range,真实数据在 ~/.agent_data/logs/{session_id}.jsonl。
+        读不到 → 返回占位(extract 会 no-op,但 pending 仍会被清掉)。
+        """
+        log_path = self.memory_store.root.parent / "logs" / f"{self.session_id}.jsonl"
+        if not log_path.exists():
+            # log 没了 — 用占位 TurnMessage 跑 no-op extract,清掉 pending
+            turn_range = payload.get("turn_range", [0, 0])
+            return [
+                TurnMessage(
+                    turn_index=turn_range[0],
+                    user_msg="[recovery: log missing]",
+                    assistant_resp="[recovery: log missing]",
+                ),
+            ]
+
+        # 读 daily log,取 payload.turn_range 内的 turn
+        import json as _json
+        turn_range = payload.get("turn_range", [0, self.daily_cursor])
+        start, end = turn_range
+        msgs: list[TurnMessage] = []
+        try:
+            with open(log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = _json.loads(line)
+                    idx = entry.get("turn_index", -1)
+                    if start <= idx <= end:
+                        msgs.append(TurnMessage(
+                            turn_index=idx,
+                            user_msg=entry.get("user_msg", ""),
+                            assistant_resp=entry.get("assistant_resp", ""),
+                            timestamp=entry.get("ts", 0.0),
+                        ))
+        except Exception as e:
+            logger.warning(f"recovery 读 log 失败: {e},用占位")
+            return [
+                TurnMessage(
+                    turn_index=start,
+                    user_msg="[recovery: log read error]",
+                    assistant_resp="[recovery: log read error]",
+                ),
+            ]
+        return msgs
+
+    def _on_recovery_done(
+        self,
+        future: Future,
+        pending_id: int,
+        report: dict[str, Any],
+    ) -> None:
+        """recovery 重试完成回调 — 给 report 打结果
+
+        成功:pending 已被 _do_channel_b_extract remove_pending
+        失败:attempts 已 bump +1,下一轮 recover_pending 接着试
+        """
+        exc = future.exception()
+        if exc is None:
+            logger.info(
+                f"recovery pending#{pending_id} 重试成功(cursor 推进 + pending 删除)"
+            )
+        else:
+            logger.warning(
+                f"recovery pending#{pending_id} 重试仍失败:{type(exc).__name__}: {exc}"
+            )
 
 
 __all__ = [
