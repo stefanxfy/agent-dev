@@ -29,6 +29,8 @@ from pydantic import (
     model_validator,
 )
 
+from agent_core.memory.wal_config import TaskWALConfig
+
 
 # ──────────────────────────────────────────────────────────────────
 # 1. 子配置：检索权重 / 蒸馏阈值 / 路径
@@ -256,6 +258,7 @@ class MemoryConfig(BaseModel):
     compact: CompactConfig = Field(default_factory=CompactConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
     dedup: DedupConfig = Field(default_factory=DedupConfig)
+    wal: TaskWALConfig = Field(default_factory=TaskWALConfig)
 
     # 全局开关
     enabled: bool = Field(default=True, description="总开关")
@@ -297,7 +300,7 @@ class MemoryConfig(BaseModel):
                 continue
             # 嵌套字段
             section, field = parts[0], "__".join(parts[1:])
-            if section in ("retrieval", "distillation", "paths", "safety", "compact", "cost"):
+            if section in ("retrieval", "distillation", "paths", "safety", "compact", "cost", "dedup", "wal"):
                 data.setdefault(section, {})[field] = _coerce_env_value(v)
         return cls.model_validate(data)
 
