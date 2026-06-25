@@ -1,16 +1,16 @@
 """
 Channel B 走 memory_tasks 测试
 
-Phase 2 / Step 2.2.2 — TDD 红 → 绿
+Phase 2 / Step 2.2.2 + Phase 4 适配 — TDD 红 → 绿
 
-- 调 _do_channel_b_extract 后,所有处理过的 task state → DONE,candidates_payload 落盘
-- 不再 add_pending(channel_b_extract)
-- 不再 remove_pending
-- 仍 set_cursor("extract", ...) — Phase 4 才删
+- 调 channel_b_background_extract 后,所有处理过的 task state → DONE,candidates_payload 落盘
+- 不再 add_pending / remove_pending / bump_pending_attempts
+- 不再 set_cursor("extract", ...)(Phase 4 已删)
 - LLM 失败时 task state → FAILED,extraction_error 落盘,attempts 自增
-- LLM 失败的 task 不会被旧 recover_pending 看到(它只读 pending_writes 表)
+- channel_b_background_extract 不再有 advance_cursor 参数(recover_pending 已删)
 """
 import json
+import sqlite3
 import time
 import threading
 import pytest
@@ -69,10 +69,14 @@ def _list_tasks(db, session_id="s1"):
 
 
 def _count_pending(db, session_id="s1"):
-    with db.transaction() as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM pending_writes WHERE session_id=?", (session_id,)
-        ).fetchone()[0]
+    """Phase 4:pending_writes 表已 DROP,总是返回 0"""
+    try:
+        with db.transaction() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM pending_writes WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0  # 表不存在 → 等价 0 行
 
 
 # ─── Step 2.2.2 测试 ───
@@ -91,30 +95,18 @@ class TestChannelBMarksDoneWithCandidates:
         # 改用 PENDING(走 channel_b 的 CAS 起点)
         db.update_task_state(tid, "PENDING")
 
-        def fake_extractor(messages):
-            return [_FakeCandidate(type_="user", title="姓名", body="张三")]
+        # 直接调 channel_b_background_extract — Phase 4 无 advance_cursor 参数
+        from agent_core.memory.dual_channel_writer import TurnMessage, ExtractionCandidate
+        messages = [TurnMessage(turn_index=1, user_msg="我叫张三", assistant_resp="记住了")]
 
-        # 直接调 _do_channel_b_extract 内部方法,跳过 extract_cursor 复杂逻辑
-        # 但 _do_channel_b_extract 设计上是 private,且需要 to_process / extract_cursor 参数
-        # 实际生产中 channel_b_background_extract 入口已封装,我们改用 _do_channel_b_extract 直接测
-        from agent_core.memory.dual_channel_writer import TurnMessage
-        to_process = [TurnMessage(turn_index=1, user_msg="我叫张三", assistant_resp="记住了")]
-        writer.extract_cursor = 0
-        writer.daily_cursor = 1  # window = [0, 1] inclusive, 包含 to_process[0]
-
-        # 写一个最小可工作的 _do_channel_b_extract 调用 — 但需要 vector_store
-        # 这里我们用 channel_b_background_extract 入口
-        from agent_core.memory.dual_channel_writer import ExtractionCandidate
-        # 用 list comprehension 让 extractor 返回 ExtractionCandidate 实例
-        def real_extractor(messages):
+        def real_extractor(_msgs):
             return [ExtractionCandidate(
                 type="user", title="姓名", body="张三",
                 source_quote="我叫张三", tags=[], score=0.5,
             )]
 
         fut = writer.channel_b_background_extract(
-            messages=to_process, llm_extractor=real_extractor,
-            advance_cursor=True,
+            messages=messages, llm_extractor=real_extractor,
         )
         result = fut.result(timeout=5)
 
@@ -136,26 +128,24 @@ class TestChannelBMarksDoneWithCandidates:
             state="PENDING", max_attempts=3,
         )
         from agent_core.memory.dual_channel_writer import TurnMessage, ExtractionCandidate
-        to_process = [TurnMessage(turn_index=1, user_msg="x", assistant_resp="y")]
-        writer.extract_cursor = 0
-        writer.daily_cursor = 1
+        messages = [TurnMessage(turn_index=1, user_msg="x", assistant_resp="y")]
 
-        def real_extractor(messages):
+        def real_extractor(_msgs):
             return [ExtractionCandidate(
                 type="user", title="t", body="b",
                 source_quote="x", tags=[], score=0.5,
             )]
 
         fut = writer.channel_b_background_extract(
-            messages=to_process, llm_extractor=real_extractor, advance_cursor=True,
+            messages=messages, llm_extractor=real_extractor,
         )
         fut.result(timeout=5)
 
         # pending_writes 表保持空
         assert _count_pending(db) == 0
 
-    def test_extract_still_sets_extract_cursor(self, tmp_path):
-        """set_cursor('extract', ...) 仍写,Phase 4 才删 cursor 表"""
+    def test_extract_does_not_write_to_cursors_table(self, tmp_path):
+        """Phase 4:set_cursor 已删,Channel B 不再写 cursors 表"""
         writer, db, _ = _make_writer(tmp_path)
         tid = db.insert_task(
             session_id="s1", turn_index=5,
@@ -163,30 +153,30 @@ class TestChannelBMarksDoneWithCandidates:
             state="PENDING", max_attempts=3,
         )
         from agent_core.memory.dual_channel_writer import TurnMessage, ExtractionCandidate
-        to_process = [TurnMessage(turn_index=5, user_msg="x", assistant_resp="y")]
-        writer.extract_cursor = 0
-        writer.daily_cursor = 5
+        messages = [TurnMessage(turn_index=5, user_msg="x", assistant_resp="y")]
 
-        def real_extractor(messages):
+        def real_extractor(_msgs):
             return [ExtractionCandidate(
                 type="user", title="t", body="b",
                 source_quote="x", tags=[], score=0.5,
             )]
 
         fut = writer.channel_b_background_extract(
-            messages=to_process, llm_extractor=real_extractor, advance_cursor=True,
+            messages=messages, llm_extractor=real_extractor,
         )
         fut.result(timeout=5)
 
-        # extract_cursor 仍写入 cursors 表
-        with db.transaction() as conn:
-            row = conn.execute(
-                "SELECT cursor_kind, value FROM cursors WHERE session_id=?",
-                ("s1",),
-            ).fetchall()
-        kinds = {r[0]: r[1] for r in row}
-        assert "extract" in kinds
-        assert kinds["extract"] == 6  # max_processed(5) + 1
+        # cursors 表无任何行(Phase 4 表已 DROP,任何写都不可能)
+        try:
+            with db.transaction() as conn:
+                cursor_count = conn.execute(
+                    "SELECT COUNT(*) FROM cursors WHERE session_id=?",
+                    ("s1",),
+                ).fetchone()[0]
+            assert cursor_count == 0, f"Channel B 不应再写 cursors,实际 {cursor_count}"
+        except sqlite3.OperationalError:
+            # 表已 DROP → 表不存在等价 0 行 ✅
+            pass
 
 
 class TestChannelBFailureMarksTaskFailed:
@@ -201,25 +191,16 @@ class TestChannelBFailureMarksTaskFailed:
         )
         from agent_core.memory.dual_channel_writer import TurnMessage, DualChannelError
         messages = [TurnMessage(turn_index=1, user_msg="x", assistant_resp="y")]
-        writer.extract_cursor = 0
-        writer.daily_cursor = 1
 
-        def boom(messages):
+        def boom(_msgs):
             raise RuntimeError("simulated LLM crash")
 
-        # channel_b_background_extract 是 fire-and-forget,需要 try/except
-        # 实际它的 future 会 raise,但 writer 已用 .result() 抛
-        # 我们用直接调 _do_channel_b_extract 测失败路径更干净
         with pytest.raises(Exception):
-            # _do_channel_b_extract 新签名: messages / extractor / advance_cursor
-            writer._do_channel_b_extract(
-                messages=messages, extractor=boom, advance_cursor=True,
-            )
+            # Phase 4 新签名: messages / extractor(无 advance_cursor)
+            writer._do_channel_b_extract(messages=messages, extractor=boom)
 
         # 验证:task state → FAILED,extraction_error 含 LLM 错误
         task = db.get_task(tid)
-        # Phase 2.2.10b:失败时 mark_failed — state=FAILED, attempts+1,
-        # extraction_error 落盘, next_at 设退避
         assert task["state"] == "FAILED"
         assert task["attempts"] >= 1, f"attempts 应该自增但实际 {task['attempts']}"
         assert task["extraction_error"] is not None

@@ -23,7 +23,6 @@ def test_bridge_emits_budget_exceeded_event():
 
     # Mock dual_channel(通道 A 成功)
     dual = MagicMock()
-    dual.extract_cursor = 0
     dual.channel_a_inline_write = MagicMock()
 
     # Mock gate.should_extract 抛 BudgetExceeded
@@ -71,7 +70,6 @@ def test_bridge_emits_budget_exceeded_from_should_extract_e2e():
     assert budget_err is not None  # sanity check
 
     dual = MagicMock()
-    dual.extract_cursor = 0
     dual.channel_a_inline_write = MagicMock()
 
     gate = MagicMock()
@@ -102,7 +100,6 @@ def test_bridge_emits_timeout_from_should_extract_e2e():
     from agent_core.memory.react_memory_bridge import ReactMemoryBridge
 
     dual = MagicMock()
-    dual.extract_cursor = 0
     dual.channel_a_inline_write = MagicMock()
 
     gate = MagicMock()

@@ -62,7 +62,6 @@ def test_bridge_emits_timeout_event_on_latency_timeout():
 
     # Mock dual_channel(通道 A 成功)
     dual = MagicMock()
-    dual.extract_cursor = 0
     dual.channel_a_inline_write = MagicMock()  # 不抛异常
     dual.channel_b_background_extract = MagicMock()
 

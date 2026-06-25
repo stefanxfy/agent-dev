@@ -118,13 +118,12 @@ class MetaDB:
         db = MetaDB(":memory:")                  # 测试
         db = MetaDB("~/.agent_data/meta.db")     # 生产
 
-        # Cursor 操作（A3）
-        db.set_cursor("s1", "daily", 5)
-        v = db.get_cursor("s1", "daily")  # 5
-
-        # Pending writes（A10）
-        pid = db.add_pending("s1", {"action": "write", "path": "user/foo.md"})
-        db.remove_pending(pid)
+        # memory_tasks (M11 单表 WAL 状态机 — Phase 4 single source of truth)
+        tid = db.insert_task(session_id="s1", turn_index=1,
+                             user_msg="hi", assistant_resp="hello",
+                             state="NONE", max_attempts=3)
+        db.cas_grab_task(tid, ["NONE", "PENDING"], "INFLIGHT")
+        db.mark_done_with_candidates(tid, "[]")
 
         # Candidates（L6 + A5）
         cid = db.add_candidate("s1", "abc123", "user", "pending",
@@ -213,125 +212,6 @@ class MetaDB:
             self._local.conn.close()
             self._local.conn = None
 
-    # ── Cursor（A3 持久化） ───────────────────────────────────
-
-    def set_cursor(self, session_id: str, kind: str, value: int) -> None:
-        """UPSERT cursor（原子，覆盖式）"""
-        try:
-            with self.transaction() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO cursors (session_id, cursor_kind, value, updated_at)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT (session_id, cursor_kind) DO UPDATE SET
-                        value = excluded.value,
-                        updated_at = excluded.updated_at
-                    """,
-                    (session_id, kind, value, time.time()),
-                )
-        except sqlite3.Error as e:
-            raise MetaDBError(f"set_cursor 失败: {e}", cause=e)
-
-    def get_cursor(self, session_id: str, kind: str, default: int = 0) -> int:
-        """读取 cursor，不存在返回 default"""
-        try:
-            row = self._conn().execute(
-                "SELECT value FROM cursors WHERE session_id = ? AND cursor_kind = ?",
-                (session_id, kind),
-            ).fetchone()
-            return int(row["value"]) if row else default
-        except sqlite3.Error as e:
-            raise MetaDBError(f"get_cursor 失败: {e}", cause=e)
-
-    # ── Pending writes（A10 transactional） ─────────────────
-
-    def add_pending(self, session_id: str, payload: dict[str, Any]) -> int:
-        """
-        记录一次 pending write（A10：先记 pending → 实际操作 → 成功后删 pending）
-
-        Returns: pending row id
-        """
-        import json
-        try:
-            with self.transaction() as conn:
-                cur = conn.execute(
-                    """
-                    INSERT INTO pending_writes (session_id, payload, attempts, created_at)
-                    VALUES (?, ?, 0, ?)
-                    """,
-                    (session_id, json.dumps(payload, ensure_ascii=False), time.time()),
-                )
-                return int(cur.lastrowid)
-        except sqlite3.Error as e:
-            raise MetaDBError(f"add_pending 失败: {e}", cause=e)
-
-    def remove_pending(self, pending_id: int) -> None:
-        """成功后删除 pending 行"""
-        try:
-            with self.transaction() as conn:
-                conn.execute("DELETE FROM pending_writes WHERE id = ?", (pending_id,))
-        except sqlite3.Error as e:
-            raise MetaDBError(f"remove_pending 失败: {e}", cause=e)
-
-    def bump_pending_attempts(self, pending_id: int) -> int:
-        """C 修复:失败后递增 attempts 计数(原代码只设 0,从不递增)
-
-        Returns: 递增后的 attempts 值
-        """
-        try:
-            with self.transaction() as conn:
-                conn.execute(
-                    "UPDATE pending_writes SET attempts = attempts + 1 WHERE id = ?",
-                    (pending_id,),
-                )
-                row = conn.execute(
-                    "SELECT attempts FROM pending_writes WHERE id = ?",
-                    (pending_id,),
-                ).fetchone()
-                return int(row["attempts"]) if row else 0
-        except sqlite3.Error as e:
-            raise MetaDBError(f"bump_pending_attempts 失败: {e}", cause=e)
-
-    def update_pending_payload(self, pending_id: int, payload: dict[str, Any]) -> None:
-        """重试时更新 payload(如 attempts 用尽后改为 drop 标记)"""
-        import json
-        try:
-            with self.transaction() as conn:
-                conn.execute(
-                    "UPDATE pending_writes SET payload = ? WHERE id = ?",
-                    (json.dumps(payload, ensure_ascii=False), pending_id),
-                )
-        except sqlite3.Error as e:
-            raise MetaDBError(f"update_pending_payload 失败: {e}", cause=e)
-
-    def list_pending(self, session_id: Optional[str] = None) -> list[dict]:
-        """列出 pending writes（用于崩溃恢复 / 调试）"""
-        import json
-        try:
-            if session_id is not None:
-                rows = self._conn().execute(
-                    "SELECT id, session_id, payload, attempts, created_at FROM pending_writes "
-                    "WHERE session_id = ? ORDER BY created_at",
-                    (session_id,),
-                ).fetchall()
-            else:
-                rows = self._conn().execute(
-                    "SELECT id, session_id, payload, attempts, created_at FROM pending_writes "
-                    "ORDER BY created_at"
-                ).fetchall()
-            return [
-                {
-                    "id": r["id"],
-                    "session_id": r["session_id"],
-                    "payload": json.loads(r["payload"]),
-                    "attempts": r["attempts"],
-                    "created_at": r["created_at"],
-                }
-                for r in rows
-            ]
-        except sqlite3.Error as e:
-            raise MetaDBError(f"list_pending 失败: {e}", cause=e)
-
     # ── memory_tasks（M11 单表 WAL 状态机） ───────────
 
     def insert_task(
@@ -407,19 +287,20 @@ class MetaDB:
         Returns:dict(含 task_id / state / candidates_payload / ...) 或 None。
         """
         try:
-            with self.transaction() as conn:
-                row = conn.execute(
-                    "SELECT task_id, session_id, turn_index, state, attempts, "
-                    "       max_attempts, next_at, inflight_at, user_msg, "
-                    "       assistant_resp, turn_metadata, candidates_payload, "
-                    "       extraction_error, created_at, updated_at "
-                    "FROM memory_tasks "
-                    "WHERE session_id = ? AND turn_index = ?",
-                    (session_id, turn_index),
-                ).fetchone()
-                if not row:
-                    return None
-                return dict(row)
+            # 读操作用 _conn() 直接拿连接,不 start 新 transaction
+            # (避免跨线程冲突:executor 线程可能持 transaction 写 memory_tasks)
+            row = self._conn().execute(
+                "SELECT task_id, session_id, turn_index, state, attempts, "
+                "       max_attempts, next_at, inflight_at, user_msg, "
+                "       assistant_resp, turn_metadata, candidates_payload, "
+                "       extraction_error, created_at, updated_at "
+                "FROM memory_tasks "
+                "WHERE session_id = ? AND turn_index = ?",
+                (session_id, turn_index),
+            ).fetchone()
+            if not row:
+                return None
+            return dict(row)
         except sqlite3.Error as e:
             raise MetaDBError(f"get_task_by_turn 失败: {e}", cause=e)
 

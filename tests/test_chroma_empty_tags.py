@@ -177,13 +177,22 @@ class TestBug3FixEmptyTagsMetadata:
                 f"Bug 3 修复失败:tags=[] 应被允许,实际 written={result}"
             )
 
-            # 4. 没有 pending 残留(成功路径会清 pending)
-            pending = meta_db.list_pending("s1")
-            assert pending == [], (
-                f"成功路径不应留 pending,实际 {pending}"
+            # 4. Phase 4:无 pending 残留 — memory_tasks 走 CAS,无 pending 表
+            with meta_db.transaction() as conn:
+                pending_rows = conn.execute(
+                    "SELECT COUNT(*) FROM memory_tasks WHERE session_id=? AND state='INFLIGHT'",
+                    ("s1",),
+                ).fetchone()[0]
+            assert pending_rows == 0, (
+                f"成功路径不应留 INFLIGHT,实际 {pending_rows}"
             )
 
-            # 5. extract_cursor 已推进
-            assert writer.extract_cursor == 2  # daily_cursor(1) + 1
+            # 5. Phase 4:task 已 DONE(cursors 表已 DROP,看 memory_tasks)
+            with meta_db.transaction() as conn:
+                task_state = conn.execute(
+                    "SELECT state FROM memory_tasks WHERE session_id=? AND turn_index=1",
+                    ("s1",),
+                ).fetchone()[0]
+            assert task_state == "DONE"
 
             writer.shutdown(timeout=3)

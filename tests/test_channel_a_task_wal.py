@@ -1,15 +1,15 @@
 """
 channel_a_inline_write 走 memory_tasks 表测试
 
-Phase 1 / Step 1.2.6 — TDD 红 → 绿
+Phase 1 / Step 1.2.6 + Phase 4 适配 — TDD 红 → 绿
 
 - 调用 channel_a_inline_write → memory_tasks 新增一行(state=NONE)
 - 不再写 JSONL 文件
 - 不再 add_pending / remove_pending
 - 不再 set_cursor
-- self.daily_cursor 仍维护(同旧语义,Phase 4 删)
-- 显式 turn_index < 旧 cursor → 幂等跳过(不调 insert_task)
-- turn_index=None → 内部用 daily_cursor + 1
+- 不再有 self.daily_cursor(Phase 4 删,cursors 表已 DROP)
+- 显式 turn_index < max(已写 turn_index) → 幂等跳过(不调 insert_task)
+- turn_index=None → 内部用 max(已写 turn_index) + 1
 - 同 (session, turn) 二次调用 → 幂等不抛
 """
 import json
@@ -58,17 +58,25 @@ def _list_tasks(db, session_id="s-wal-a"):
 
 
 def _count_pending(db, session_id="s-wal-a"):
-    with db.transaction() as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM pending_writes WHERE session_id=?", (session_id,)
-        ).fetchone()[0]
+    """Phase 4:pending_writes 表已 DROP,总是返回 0"""
+    try:
+        with db.transaction() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM pending_writes WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0  # 表不存在 → 等价 0 行
 
 
 def _count_cursors(db, session_id="s-wal-a"):
-    with db.transaction() as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM cursors WHERE session_id=?", (session_id,)
-        ).fetchone()[0]
+    """Phase 4:cursors 表已 DROP,总是返回 0"""
+    try:
+        with db.transaction() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM cursors WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0  # 表不存在 → 等价 0 行
 
 
 class TestChannelAWritesToNewTable:
@@ -98,19 +106,11 @@ class TestChannelAWritesToNewTable:
         writer.channel_a_inline_write("hi", "hello")
         assert _count_pending(db) == 0
 
-    def test_cursor_table_written_for_backward_compat(self, tmp_path):
-        """Phase 1.6:写双源 — memory_tasks + cursors,Phase 4 才删 cursor"""
+    def test_no_cursor_table_writes(self, tmp_path):
+        """Phase 4:cursors 表已 DROP,Channel A 不再写 cursor 行"""
         writer, db = _make_writer(tmp_path)
         writer.channel_a_inline_write("hi", "hello")
-        # cursors 表有 daily 行(保证重启时 daily_cursor 能恢复)
-        assert _count_cursors(db) == 1
-        with db.transaction() as conn:
-            row = conn.execute(
-                "SELECT cursor_kind, value FROM cursors WHERE session_id=?",
-                ("s-wal-a",),
-            ).fetchone()
-        assert row[0] == "daily"
-        assert row[1] == 1
+        assert _count_cursors(db) == 0
 
     def test_returns_new_turn_index(self, tmp_path):
         writer, _ = _make_writer(tmp_path)
@@ -148,28 +148,31 @@ class TestChannelAWritesToNewTable:
 class TestChannelAIdempotency:
     """幂等去重 / 跳过"""
 
-    def test_explicit_turn_index_below_cursor_noop(self, tmp_path):
-        """传 turn_index <= daily_cursor → 跳过,不入表"""
+    def test_explicit_turn_index_below_max_noop(self, tmp_path):
+        """传 turn_index <= max(已写 turn_index) → 跳过,不入表"""
         writer, db = _make_writer(tmp_path)
         writer.channel_a_inline_write("first", "1st")
         # 再用显式小 turn_index 调
         idx = writer.channel_a_inline_write("dup", "dup", turn_index=0)
-        assert idx == 1  # 返回当前 cursor
+        assert idx == 1  # 返回已存在的 max
         assert _count_tasks(db) == 1  # 没有新行
         # 验证表里还是 1 行(Step 1.2.7 的 UNIQUE 冲突测试是底层 insert_task 的)
 
 
-class TestChannelAMaintainsDailyCursor:
-    """为 Phase 4 删前兼容,writer.daily_cursor 仍同步推进"""
+class TestChannelANoDailyCursorAttribute:
+    """Phase 4:writer 不再有 daily_cursor 属性(cursors 表已 DROP)"""
 
-    def test_daily_cursor_attribute_exists(self, tmp_path):
+    def test_no_daily_cursor_attribute(self, tmp_path):
         writer, _ = _make_writer(tmp_path)
-        assert hasattr(writer, "daily_cursor")
-        assert writer.daily_cursor == 0  # 初始
+        assert not hasattr(writer, "daily_cursor"), (
+            "writer.daily_cursor 应在 Phase 4 删"
+        )
 
-    def test_daily_cursor_advances_after_write(self, tmp_path):
+    def test_sequential_writes_track_max_turn_index(self, tmp_path):
+        """连续写入时,从 max(memory_tasks.turn_index) 派生下一个 turn_index"""
         writer, _ = _make_writer(tmp_path)
-        writer.channel_a_inline_write("a", "A")
-        assert writer.daily_cursor == 1
-        writer.channel_a_inline_write("b", "B")
-        assert writer.daily_cursor == 2
+        # 不传 turn_index → 内部用 max+1
+        i1 = writer.channel_a_inline_write("a", "A")
+        i2 = writer.channel_a_inline_write("b", "B")
+        i3 = writer.channel_a_inline_write("c", "C")
+        assert (i1, i2, i3) == (1, 2, 3)

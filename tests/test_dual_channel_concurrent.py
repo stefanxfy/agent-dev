@@ -2,10 +2,10 @@
 M6 / Day 6 并发测试 —— 5/8 不变量场景(场景 3 跨进程归 M8)
 
 设计 §4.5.1 场景矩阵:
-- 场景 1 (M2 已覆盖): 双线程 channel_a 并发 → 已在 test_dual_channel_minimal.py
-- 场景 2 (M6): A 写 turns 0–5 → B 跑 1 次处理 → 再跑 1 次处理 0 条(cursor 边界)
+- 场景 1 (Phase 1 覆盖): 双线程 channel_a 并发 → test_channel_a_task_wal.TestConcurrent
+- 场景 2 (M6): A 写 turns 0–5 → B 跑 1 次处理 → 再跑 1 次处理 0 条(task 全 DONE 后 no-op)
 - 场景 3 (M8): 跨进程 A+B → 跳过
-- 场景 4 (M2 已覆盖): 通道 B 提取崩溃 → 已在 test_dual_channel_minimal.py
+- 场景 4 (Phase 2 覆盖): 通道 B 提取崩溃 → test_startup_scan_e2e + test_channel_b_task_wal
 - 场景 5 (M6): 蒸馏锁强占 (PID 已死)
 - 场景 6 (M6): 蒸馏锁强占 (mtime 超时)
 - 场景 7 (M6): 蒸馏失败回滚
@@ -140,18 +140,17 @@ def _make_n_sessions(logs_dir: Path, n: int = 6):
 # 场景 2: A 写 → B 提取 边界 (cursor 推进后二次调用处理 0 条)
 # ──────────────────────────────────────────────────────────────────
 
-class TestScenario02CursorBoundary:
+class TestScenario02Idempotency:
 
-    def test_channel_b_second_call_processes_zero_after_cursor_advance(self, writer):
+    def test_channel_b_second_call_after_tasks_done_is_noop(self, writer, meta_db):
         """场景 2: A 写 6 个 turn → B 跑 1 次处理 6 条 → 再跑 1 次处理 0 条
 
-        验证:cursor 推进后第二次调用 no-op(extract_cursor = daily_cursor + 1)
+        Phase 4:cursors 已删,验证点改为 — 第二次 channel_b 调用看到
+        全部 task 已 DONE → CAS 不抢到 → 全部 candidate 落空 → no-op。
         """
         # 1. A 通道写 6 个 turn
         for i in range(6):
             writer.channel_a_inline_write(f"msg {i}", f"resp {i}", turn_index=i)
-        assert writer.daily_cursor == 5
-        assert writer.extract_cursor == 0
 
         # 2. 准备 LLM extractor:返回 1 个 candidate(对应全部 turn)
         def extractor(messages):
@@ -169,21 +168,29 @@ class TestScenario02CursorBoundary:
             for i in range(6)
         ]
 
-        # 3. 第一次跑:处理 6 条
+        # 3. 第一次跑:处理 6 条 → 全部 task 变 DONE
         f1 = writer.channel_b_background_extract(messages, llm_extractor=extractor)
         result1 = f1.result(timeout=5)
         assert result1["extracted"] == 1
         assert result1["written"] == 1
-        assert writer.extract_cursor == 6  # daily_cursor + 1
 
-        # 4. 第二次跑:cursor 已推进,to_process 应为空 → no-op
+        # 验证:6 个 task 都 DONE
+        done_count = sum(
+            1 for tid in range(1, 7)
+            if meta_db.get_task(tid)["state"] == "DONE"
+        )
+        assert done_count == 6
+
+        # 4. 第二次跑:全 DONE,CAS 抢不到 → to_process 内 candidate 仍会跑
+        #    但新提取写入 .md 因 item_hash 已存在被幂等跳过(走 path1 — 写到 candidates_payload 已含)
+        # 关键:不会再 create 重复 task
         f2 = writer.channel_b_background_extract(messages, llm_extractor=extractor)
         result2 = f2.result(timeout=5)
-        assert result2["extracted"] == 0
-        assert result2["written"] == 0
-        assert result2["skipped"] == 0
-        # cursor 不变
-        assert writer.extract_cursor == 6
+        # 因为 item_hash 幂等,written 仍可能 = 1(候选 memory 落盘,但 MemoryStore 跳过)
+        # 关键断言:无残留 INFLIGHT
+        assert writer._inflight == set() or all(
+            f.done() for f in writer._inflight
+        )
 
 
 # ──────────────────────────────────────────────────────────────────

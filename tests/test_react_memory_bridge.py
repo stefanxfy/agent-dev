@@ -162,11 +162,12 @@ def test_gate_extraction_context_is_current_turn_only():
         shutil.rmtree(tmp)
 
 
-def _wait_extract_done(dual, prev_cursor, timeout=5.0):
-    """轮询等 channel B 后台提取完成(extract_cursor 推过 prev_cursor)。"""
+def _wait_extract_done(meta, session_id, target_turn, timeout=5.0):
+    """轮询等 channel B 完成 — Phase 4:看 memory_tasks.state 是否变 DONE/FAILED"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if dual.extract_cursor > prev_cursor:
+        row = meta.get_task_by_turn(session_id, target_turn)
+        if row and row["state"] in ("DONE", "FAILED"):
             return True
         time.sleep(0.02)
     return False
@@ -225,17 +226,18 @@ def test_second_turn_persists_when_run_local_turn_index_resets():
             turn_index=1,
             input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
         ))
-        assert _wait_extract_done(dual, prev_cursor=0), "第 1 轮提取应完成"
+        assert _wait_extract_done(meta, "s_bug1b", target_turn=1), \
+            "第 1 轮提取应完成"
 
         # ── 第 2 轮:run-local turn_index 又是 1(关键:模拟 run 计数重置)──
-        cursor_after_t1 = dual.extract_cursor
         list(bridge.on_turn_end(
             user_msg="我不喜欢日本人,请记住",
             assistant_resp="好的,已记",
             turn_index=1,  # ← 仍是 1,复现 bug 触发条件
             input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
         ))
-        assert _wait_extract_done(dual, prev_cursor=cursor_after_t1), \
+        # turn 2 在 memory_tasks(看 bridge 内部 channel_a 自动推到 2)
+        assert _wait_extract_done(meta, "s_bug1b", target_turn=2), \
             "第 2 轮提取应完成(修复前会因 to_process=[] 静默丢弃)"
 
         bridge.shutdown(timeout=5)
