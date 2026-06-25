@@ -157,7 +157,32 @@ class MetaDB:
     # ── 连接管理（per-thread） ────────────────────────────────
 
     def _conn(self) -> sqlite3.Connection:
-        """获取当前线程的连接（懒创建）"""
+        """获取当前线程的连接（懒创建）
+
+        Phase 2 / Step 2.2.10b 修复::memory: 模式跨线程共享同一 conn。
+        默认 SQLite :memory: 给每线程开独立 in-memory db,导致 Channel B
+        在 executor 线程看到的 db 是空的 → get_task_by_turn 返 None →
+        CAS 跳过 → candidates 不落盘。:memory: 是单文件库,跨线程共享
+        无锁风险(单测用);生产是文件模式不受影响。
+        """
+        if self._is_memory:
+            # :memory: 模式:所有线程共享同一 conn — 通过 threading.local
+            # 缓存 + 跨线程传递的"主 conn" 机制实现。
+            if not hasattr(self, "_shared_mem_conn") or self._shared_mem_conn is None:
+                # 第一个进 :memory: 的线程创建主 conn
+                conn = sqlite3.connect(
+                    ":memory:",
+                    timeout=30.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA foreign_keys=ON")
+                conn.executescript(_DDL)
+                self._shared_mem_conn = conn
+            return self._shared_mem_conn
+        # 文件模式:per-thread conn(原行为)
         if not hasattr(self._local, "conn") or self._local.conn is None:
             conn = sqlite3.connect(
                 self.path,

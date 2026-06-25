@@ -479,13 +479,35 @@ class DualChannelWriter:
             f"turn_range=[{start},{self.daily_cursor}], {len(to_process)} turns"
         )
 
-        # A10 transactional
+        # A10 transactional(Phase 4 才删,新表状态机是 single source of truth)
         pending_id = self.meta_db.add_pending(self.session_id, {
             "action": "channel_b_extract",
             "session_id": self.session_id,
             "turn_range": [start, self.daily_cursor],
             "created_in_recovery": False,  # B 修复:标记来源,便于诊断
         })
+
+        # M11 / Phase 2.2.10b:新表状态机 — 抢占每个 turn 的 task → INFLIGHT
+        # (per-turn CAS,不抢到也不阻断 — 可能别的 writer 已在 INFLIGHT,
+        # 失败由 startup_scan 的 melt_stuck_inflight 兜底)
+        wal_inflight_ids: list[int] = []
+        for m in to_process:
+            task_row = self.meta_db.get_task_by_turn(self.session_id, m.turn_index)
+            if task_row is None:
+                # 没注册过的 turn(理论上 Channel A 写后必有,容错 skip)
+                logger.debug(
+                    f"channel B: turn={m.turn_index} 不在 memory_tasks(可能未走 Channel A),跳过 CAS"
+                )
+                continue
+            if self.meta_db.cas_grab_task(
+                task_row["task_id"], ["PENDING", "NONE"], "INFLIGHT"
+            ):
+                wal_inflight_ids.append(task_row["task_id"])
+            else:
+                logger.debug(
+                    f"channel B: turn={m.turn_index} task#{task_row['task_id']} "
+                    f"state={task_row['state']} 不在 (PENDING/NONE),跳过 CAS"
+                )
 
         written = 0
         skipped = 0
@@ -667,6 +689,35 @@ class DualChannelWriter:
 
             # 成功 → 删 pending
             self.meta_db.remove_pending(pending_id)
+
+            # M11 / Phase 2.2.10b:写新表状态机 — 抢占过的 turn → DONE
+            # candidates JSON 写到本次处理的最大 turn_index(对应 stamp_turn)的 task。
+            # 退避公式用 _calc_next_at(虽然成功路径不写 next_at,留作 mark_failed 用)。
+            if wal_inflight_ids and candidates is not None:
+                try:
+                    candidates_json = json.dumps(
+                        [c.model_dump() if hasattr(c, "model_dump") else c.__dict__
+                         for c in candidates],
+                        ensure_ascii=False,
+                    )
+                except Exception as dump_err:
+                    logger.warning(f"channel B: candidates JSON 序列化失败: {dump_err}")
+                    candidates_json = "[]"
+                # 优先:把 candidates 写到 stamp_turn 对应的 task(INFLIGHT 状态)
+                stamp_task = self.meta_db.get_task_by_turn(self.session_id, stamp_turn)
+                if stamp_task and stamp_task["state"] == "INFLIGHT" \
+                        and stamp_task["task_id"] in wal_inflight_ids:
+                    self.meta_db.mark_done_with_candidates(
+                        stamp_task["task_id"], candidates_json
+                    )
+                # 其余抢到 INFLIGHT 的 turn 没 candidates → 也标 DONE(空 candidates)
+                for tid in wal_inflight_ids:
+                    if stamp_task and tid == stamp_task["task_id"]:
+                        continue
+                    task_now = self.meta_db.get_task(tid)
+                    if task_now and task_now["state"] == "INFLIGHT":
+                        self.meta_db.mark_done_with_candidates(tid, "[]")
+
             logger.info(
                 f"channel B 提取完成: extracted={len(candidates)}, "
                 f"written={written}, skipped={skipped}"
@@ -684,6 +735,28 @@ class DualChannelWriter:
                 self.meta_db.bump_pending_attempts(pending_id)
             except Exception as bump_err:
                 logger.error(f"bump_pending_attempts 失败: {bump_err}")
+
+            # M11 / Phase 2.2.10b:写新表状态机 — 抢占过的 turn → FAILED
+            # 用退避公式计算 next_at(下次 startup_scan 步骤 3 才会重排)
+            for tid in wal_inflight_ids:
+                task_now = self.meta_db.get_task(tid)
+                if task_now and task_now["state"] == "INFLIGHT":
+                    new_attempts = (task_now["attempts"] or 0) + 1
+                    next_at = self._calc_next_at(
+                        new_attempts, self.task_wal_config.retry_backoff_seconds
+                    )
+                    try:
+                        self.meta_db.mark_failed(
+                            tid,
+                            attempts=new_attempts,
+                            next_at=next_at,
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                    except Exception as mf_err:
+                        logger.error(
+                            f"mark_failed 失败 task#{tid}: {mf_err}"
+                        )
+
             raise DualChannelError(f"channel B extract 失败: {e}", cause=e)
 
     def _on_extract_done(self, future: Future) -> None:
