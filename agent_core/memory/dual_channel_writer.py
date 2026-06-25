@@ -915,6 +915,27 @@ class DualChannelWriter:
         before_ts = time.time() - retention
         return self.meta_db.delete_done_tasks(before_timestamp=before_ts)
 
+    def cleanup_failed_tasks(self, retention_seconds: Optional[int] = None) -> int:
+        """公开封装:清理终态 FAILED 行(attempts >= max_attempts)。
+
+        Phase 3 / Step 3.3.4:用 self.task_wal_config.failed_retention_seconds 计算
+        before_timestamp,调 meta_db.delete_failed_tasks。退避中 FAILED
+        (attempts < max_attempts)保留,等下次重试。
+
+        Args:
+            retention_seconds: 覆盖默认 retention(可选)。
+
+        Returns:
+            删除行数。
+        """
+        retention = (
+            retention_seconds
+            if retention_seconds is not None
+            else self.task_wal_config.failed_retention_seconds
+        )
+        before_ts = time.time() - retention
+        return self.meta_db.delete_failed_tasks(before_timestamp=before_ts)
+
     def stats(self) -> dict[str, Any]:
         """运行统计（用于 UI / 日志）"""
         return {
