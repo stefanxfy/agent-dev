@@ -73,12 +73,7 @@ def populated(workspace):
             data = store.read(rel)
             text = f"{data['frontmatter'].get('title','')}\n{data['body']}"
             emb = embed.encode(text)
-            vec.add({
-                "id": it["hash"],
-                "embedding": emb,
-                "metadata": {"type": type_, "title": it["title"]},
-                "document": text,
-            })
+            vec.add(it["hash"], emb)
     return workspace
 
 
@@ -199,12 +194,7 @@ class TestSecretFilter:
             for it in store.list_by_type("reference"):
                 data = store.read(it["path"])
                 text = f"{data['frontmatter'].get('title','')}\n{data['body']}"
-                vec.add({
-                    "id": it["hash"],
-                    "embedding": embed.encode(text),
-                    "metadata": {"type": "reference", "title": it["title"]},
-                    "document": text,
-                })
+                vec.add(it["hash"], embed.encode(text))
 
             retriever = MemoryRetriever(store, vec, embed)
             report = retriever.search("config", top_k=5, mode="keyword")
@@ -306,3 +296,36 @@ class TestSemanticFallback:
             # 纯 semantic:vec 空 → 空报告(降级只在 hybrid 模式自动发生)
             report = retriever.search("用户", top_k=1, mode="semantic")
             assert len(report) == 0   # semantic 模式不主动融合 keyword
+
+
+def test_semantic_hit_metadata_from_memory_store_only(workspace):
+    """retriever 的 MemoryHit.title/tags/importance 必须从 MemoryStore 读,
+    Chroma 不再存这些字段也必须正常工作。
+    """
+    from agent_core.memory import compute_item_hash
+    from agent_core.memory.memory_store import MemoryStore
+
+    store = workspace["store"]
+    vec = workspace["vec"]
+    embed = workspace["embed"]
+
+    # 写一条 memory 到 MemoryStore(frontmatter 含 tags/importance)
+    item_hash = compute_item_hash("user", "我叫张三", "我叫张三")
+    store.write(
+        type="user", title="姓名",
+        body="张三", source_quote="我叫张三",
+        tags=["person"], extra={"importance": 8},
+    )
+    vec.add(item_hash, embed.encode("姓名 张三"))
+
+    # 检索
+    r = MemoryRetriever(
+        memory_store=store, vector_store=vec,
+        embed_fn=embed, config=workspace["config"],
+    )
+    report = r.search("张三", top_k=1)
+    hit = report.hits[0]
+    assert hit.title == "姓名"
+    assert hit.tags == ["person"]
+    assert hit.importance == 8
+    assert hit.type == "user"

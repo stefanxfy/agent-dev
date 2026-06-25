@@ -310,54 +310,72 @@ class MemoryRetriever:
     def _semantic_search(
         self, query: str, top_k: int, types: Optional[list[str]]
     ) -> list[MemoryHit]:
-        """向量检索(依赖 vector_store.query)"""
-        # 检查 vector_store 是否实现 query
+        """向量检索(依赖 vector_store.query)。
+
+        Chroma 只返回 {id, distance};MemoryHit 的其他字段全部从 MemoryStore
+        .md frontmatter 读(参见 MemoryStore.read 契约)。
+        """
         if not hasattr(self.vector_store, "query"):
             logger.warning("vector_store 不支持 query(),降级为 keyword 模式")
             return self._keyword_search(query, top_k, types)
 
-        # 1) 编码 query
         q_emb = self.embed_fn.encode(query)
 
-        # 2) vector query
         try:
             raw = self.vector_store.query(q_emb, top_k=top_k * 2)
         except Exception as e:
             logger.warning(f"vector_store.query 失败: {e},降级 keyword")
             return self._keyword_search(query, top_k, types)
 
-        # 3) 转换为 MemoryHit
         hits: list[MemoryHit] = []
         for doc in raw:
-            meta = doc.get("metadata", {})
             item_hash = doc.get("id", "")
-            type_ = meta.get("type", "user")
+            if not item_hash:
+                continue
+            # Chroma 不再存 type,需遍历常见 type 找到对应 .md
+            type_ = self._resolve_type(item_hash, types)
+            if type_ is None:
+                continue
             if types and type_ not in types:
                 continue
-            # 从 file 读最新 body(向量库可能 stale)
             rel_path = f"{type_}/{item_hash}.md"
             try:
                 data = self.memory_store.read(rel_path)
-                body = data.get("body", "")
-                title = meta.get("title", data.get("frontmatter", {}).get("title", ""))
             except Exception:
                 # 文件已被删,跳过
                 continue
-            # 相似度 = 1 - distance (chroma 默认 L2)
+            fm = data.get("frontmatter", {}) or {}
+            body = data.get("body", "")
+            title = fm.get("title", "")
+            hit_type = fm.get("type", type_)
+            hit_tags = fm.get("tags", []) or []
+            hit_importance = fm.get("importance", 5)
             distance = doc.get("distance", 0.0)
-            sim = max(0.0, 1.0 - distance / 2.0)  # 粗略归一化
+            sim = max(0.0, 1.0 - distance / 2.0)
             hits.append(MemoryHit(
                 item_hash=item_hash,
-                type=type_,
+                type=hit_type,
                 title=title,
                 body=body,
                 rel_path=rel_path,
                 score=sim,
                 breakdown={"semantic": sim},
-                tags=meta.get("tags", []),
-                importance=meta.get("importance", 5),
+                tags=hit_tags,
+                importance=hit_importance,
             ))
         return hits
+
+    def _resolve_type(self, item_hash: str, types: Optional[list[str]]) -> Optional[str]:
+        """在标准 5 type 中扫描,找到 .md 存在的 type。
+
+        Chroma 不再存 type 字段,retriever 需遍历常见 type 找到对应 .md。
+        慢路径,但语义搜索本来就在 top_k 小集合上跑;只 stat 文件,不读内容。
+        """
+        candidates = types or ["user", "feedback", "event", "project", "reference"]
+        for t in candidates:
+            if (self.memory_store.root / t / f"{item_hash}.md").exists():
+                return t
+        return None
 
     def _keyword_search(
         self, query: str, top_k: int, types: Optional[list[str]]
