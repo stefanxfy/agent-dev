@@ -98,11 +98,19 @@ class TestChannelAWritesToNewTable:
         writer.channel_a_inline_write("hi", "hello")
         assert _count_pending(db) == 0
 
-    def test_no_cursor_table_written(self, tmp_path):
-        """不再 set_cursor(cursors 表不增加行)"""
+    def test_cursor_table_written_for_backward_compat(self, tmp_path):
+        """Phase 1.6:写双源 — memory_tasks + cursors,Phase 4 才删 cursor"""
         writer, db = _make_writer(tmp_path)
         writer.channel_a_inline_write("hi", "hello")
-        assert _count_cursors(db) == 0
+        # cursors 表有 daily 行(保证重启时 daily_cursor 能恢复)
+        assert _count_cursors(db) == 1
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT cursor_kind, value FROM cursors WHERE session_id=?",
+                ("s-wal-a",),
+            ).fetchone()
+        assert row[0] == "daily"
+        assert row[1] == 1
 
     def test_returns_new_turn_index(self, tmp_path):
         writer, _ = _make_writer(tmp_path)

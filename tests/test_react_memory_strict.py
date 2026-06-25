@@ -45,24 +45,29 @@ def _make_bridge(llm_json_response: str, session_id: str = "s1"):
 
 
 def test_channel_a_writes_daily_log():
-    """turn 末尾 ~/.agent_data/logs/<session>.jsonl 有 1 行"""
+    """turn 末尾 memory_tasks 表新增 1 行(state=NONE)"""
     bridge, dual, store, tmp = _make_bridge(
         '{"should_extract": false, "confidence": 0, "candidates": []}'
     )
     try:
-        # 注:DualChannelWriter 的日志路径 = memory_store.root.parent / "logs",
-        # 跨用例共用 ~/.agent_data 父目录时会撞路径. 这里清掉上次残留.
+        # M11:不再写 JSONL,直接查 memory_tasks 表
         # 又:DualChannelWriter 的幂等检查是 turn_index <= daily_cursor,
         # daily_cursor 初始为 0,turn_index=0 会被短路;这里用 1 绕过.
-        log_path = store.root.parent / "logs" / f"{bridge.session_id}.jsonl"
-        if log_path.exists():
-            log_path.unlink()
         list(bridge.on_turn_end(
             user_msg="hello", assistant_resp="hi",
             turn_index=1, input_tokens=100, output_tokens=50, tool_calls_in_turn=0,
         ))
-        assert log_path.exists()
-        assert log_path.read_text().count("\n") == 1
+        with dual.meta_db.transaction() as conn:
+            row = conn.execute(
+                "SELECT turn_index, user_msg, assistant_resp, state "
+                "FROM memory_tasks WHERE session_id=? ORDER BY turn_index",
+                (bridge.session_id,),
+            ).fetchall()
+        assert len(row) == 1
+        assert row[0][0] == 1
+        assert row[0][1] == "hello"
+        assert row[0][2] == "hi"
+        assert row[0][3] == "NONE"
     finally:
         bridge.shutdown(timeout=5)
         dual.shutdown(timeout=5)

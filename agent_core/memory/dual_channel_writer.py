@@ -279,8 +279,10 @@ class DualChannelWriter:
             max_attempts=self.task_wal_config.max_retry,
         )
 
-        # 同步推进 daily_cursor 属性(Phase 4 删 cursor 前保持兼容)
+        # 同步推进 daily_cursor 属性 + 持久化到 cursors 表
+        # (Phase 4 删 cursor 前保持兼容 — 旧测试期望重启时 daily_cursor 仍能恢复)
         self.daily_cursor = turn_index
+        self.meta_db.set_cursor(self.session_id, "daily", turn_index)
 
         logger.debug(
             f"channel A: turn {turn_index} 写入 memory_tasks "

@@ -483,18 +483,17 @@ class TestBug1FixChannelAAutoTurnIndex:
         assert result == 1
         assert writer.daily_cursor == 1
 
-        # 验证 daily log 真的有这条记录
-        log_path = memory_root.parent / "logs" / "s1.jsonl"
-        assert log_path.exists()
-        lines = [
-            line for line in log_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        assert len(lines) == 1
-        import json as _json
-        entry = _json.loads(lines[0])
-        assert entry["turn_index"] == 1
-        assert entry["user_msg"] == "测试消息 1"
+        # M11:验证 memory_tasks 表有这条记录(不再验 JSONL)
+        with meta_db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT turn_index, user_msg, assistant_resp, state "
+                "FROM memory_tasks WHERE session_id='s1' ORDER BY turn_index"
+            ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == 1
+        assert rows[0][1] == "测试消息 1"
+        assert rows[0][2] == "已记"
+        assert rows[0][3] == "NONE"  # Channel A 刚落盘
 
     def test_subsequent_calls_advance_turn_index(
         self, writer, meta_db, memory_root, logs_dir,
@@ -509,17 +508,13 @@ class TestBug1FixChannelAAutoTurnIndex:
         writer.channel_a_inline_write("msg 3", "resp 3")
         assert writer.daily_cursor == 3
 
-        # 验证 log 文件有 3 条,turn_index 1/2/3
-        log_path = memory_root.parent / "logs" / "s1.jsonl"
-        lines = [
-            line for line in log_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        assert len(lines) == 3
-        import json as _json
-        for i, line in enumerate(lines):
-            entry = _json.loads(line)
-            assert entry["turn_index"] == i + 1
+        # M11:验证 memory_tasks 表有 3 条,turn_index 1/2/3
+        with meta_db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT turn_index FROM memory_tasks "
+                "WHERE session_id='s1' ORDER BY turn_index"
+            ).fetchall()
+        assert [r[0] for r in rows] == [1, 2, 3]
 
     def test_explicit_duplicate_turn_index_is_idempotent(
         self, writer, meta_db, memory_root,
