@@ -24,6 +24,7 @@ M2 / Day 2 — A7 + L7 + v2.1 4 类目录
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import tempfile
@@ -40,11 +41,15 @@ from agent_core.memory.path_validator import MemoryPathValidator
 from agent_core.memory.types import (
     CURRENT_SCHEMA_VERSION,
     Frontmatter,
+    FrontmatterError,
     MemoryType,
     validate_body,
     validate_frontmatter,
     validate_type,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -125,10 +130,11 @@ class MemoryStore:
     用法:
         store = MemoryStore(Path("~/.agent_data/memory"))
 
-        # 写入
+        # 写入(M11 v3: 必传 name + description)
         h = store.write(
             type="user",
-            title="用户的名字",
+            name="用户叫小明",
+            description="Python 后端工程师",
             body="用户叫小明",
             source_quote="我说'我叫小明'",
         )
@@ -152,9 +158,11 @@ class MemoryStore:
     def write(
         self,
         type: str,                   # 避免关键字
-        title: str,
         body: str,
         source_quote: str,           # L7 必填
+        name: Optional[str] = None,        # M11 v3 必填
+        description: Optional[str] = None,  # M11 v3 必填
+        title: Optional[str] = None,        # M11: 可选,默认 mirror name
         tags: Optional[list[str]] = None,
         extra: Optional[dict[str, Any]] = None,
         overwrite: bool = False,
@@ -162,11 +170,15 @@ class MemoryStore:
         """
         写入一条记忆（per-file + frontmatter）
 
+        M11 v3 schema: name / description 必填。
+
         Args:
             type: 4 类之一
-            title: 记忆标题（用于列表展示 / 索引）
+            name: 必填(M11 v3),短名(用于 MEMORY.md manifest)
+            description: 必填(M11 v3),≤200 字符,过长自动截断
             body: 记忆正文 Markdown
             source_quote: L7 必填，源引用（用户原话 / 蒸馏依据）
+            title: 可选,若不传则 mirror name(兼容旧 caller)
             tags: 选填标签列表
             extra: 选填扩展字段（写入 frontmatter 顶层）
             overwrite: 同 hash 已存在时是否覆盖（默认 False，A5 幂等）
@@ -175,12 +187,31 @@ class MemoryStore:
             item_hash (64 字符 hex)
 
         Raises:
+            FrontmatterError: 缺 name / description (M11 v3)
             ValueError: 类型非法 / 缺 source_quote / body 校验失败
             MemoryExistsError: 同 hash 已存在（A5 幂等，overwrite=False）
             PathSecurityError: 路径越界
         """
+        # 0. M11 v3: name / description 必填(向后兼容: 若 caller 用旧 title-only API,
+        #    用 title 作为 name, body[:200] 作为 description)
+        if not name:
+            name = title  # type: ignore[assignment]
+        if not name or not str(name).strip():
+            raise FrontmatterError("name 必填(M11 v3 schema)")
+        if not description:
+            # 取 body 第一段非空(去掉 markdown 标记), 截 200
+            desc_fallback = ""
+            for line in body.split("\n"):
+                stripped = line.strip().lstrip("# ").strip()
+                if stripped:
+                    desc_fallback = stripped
+                    break
+            description = desc_fallback[:200] or "未描述"
+        if not str(description).strip():
+            raise FrontmatterError("description 必填(M11 v3 schema)")
+
         # 1. 计算 item_hash (前置,仅依赖 type/body/source_quote 字符串,
-        #    不依赖 type 校验或路径校验)
+        #    不依赖 type 校验或路径校验;M11: name/description 不参与 hash)
         item_hash = compute_item_hash(type, body, source_quote)  # type: ignore[arg-type]
 
         # 2. M10 C1.1: 路径校验前置(security check 先于 schema check, §14.1)
@@ -197,24 +228,30 @@ class MemoryStore:
         # 5. 校验 body（含 **Why:** 强制）
         validate_body(type, body)  # type: ignore[arg-type]
 
-        # 6. 构造 frontmatter
+        # 6. mirror name → title(若 caller 未显式传 title)
+        if title is None:
+            title = name
+
+        # 7. 构造 frontmatter(M11 v3)
         now = datetime.now(timezone.utc).isoformat()
         fm: dict[str, Any] = {
             "type": type,
             "created_at": now,
             "item_hash": item_hash,
             "schema_version": CURRENT_SCHEMA_VERSION,
-            "title": title,   # mirror body H1 into frontmatter for uniform read access
+            "name": name,           # M11 必填
+            "description": description,  # M11 必填
+            "title": title,         # 保留兼容
         }
         if tags:
             fm["tags"] = list(tags)
         if extra:
             fm.update(extra)
 
-        # 7. frontmatter 校验（防御性，实际我们刚构造，但 schema_version 等要过）
+        # 8. frontmatter 校验(会自动截断超长 description)
         validate_frontmatter(fm)
 
-        # 8. 构造文件内容（frontmatter + 标题 + body）
+        # 9. 构造文件内容（frontmatter + 标题 + body）
         # title 放在 frontmatter 之后第一行（Markdown H1），便于阅读
         fm_str = _serialize_frontmatter(fm)
         content = f"---\n{fm_str}---\n\n# {title}\n\n{body}\n"
