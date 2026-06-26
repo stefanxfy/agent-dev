@@ -175,9 +175,24 @@ class MemoryRetriever:
             span.set_attribute("memory.search.top_k", top_k)
             span.set_attribute("memory.search.mode", str(mode) if not isinstance(mode, str) else mode)
 
+            # ── DEBUG:入口全参数 + config snapshot ──
+            embed_model = getattr(self.embed_fn, "model_name", type(self.embed_fn).__name__)
+            cfg_min = self.config.retrieval.min_score
+            cfg_top_k = self.config.retrieval.top_k
+            cfg_mode = self.config.retrieval.mode
+            vec_count = self.vector_store.count() if hasattr(self.vector_store, "count") else -1
+            logger.debug(
+                f"[retriever.search] ENTER query={query!r} "
+                f"top_k_arg={top_k} mode_arg={mode!r} types={types} "
+                f"min_score_arg={min_score} already_surfaced={already_surfaced} | "
+                f"config(retrieval): mode={cfg_mode!r} top_k={cfg_top_k} min_score={cfg_min} | "
+                f"embed_fn={embed_model} vec.count={vec_count}"
+            )
+
             if not query or not query.strip():
                 empty = RetrievalReport(query=query, mode=RetrievalMode(mode), hits=[])
                 span.set_attribute("memory.search.hits_count", 0)
+                logger.debug(f"[retriever.search] EXIT (空 query) hits=0")
                 return empty
 
             if isinstance(mode, str):
@@ -188,10 +203,34 @@ class MemoryRetriever:
 
             t0 = time.time()
             # 多召 → 重排 → L4 过滤 → 截 top_k
+            logger.debug(f"[retriever.search] STAGE 1 retrieve_candidates mode={mode.value}")
             candidates = self._retrieve_candidates(query, top_k, mode, types, already_surfaced)
+            logger.debug(
+                f"[retriever.search] STAGE 1 done: "
+                f"candidates={len(candidates)} → "
+                f"{[h.rel_path for h in candidates[:5]]}"
+            )
+
+            logger.debug(f"[retriever.search] STAGE 2 rerank")
             ranked = self._rerank(candidates, mode)
+            logger.debug(
+                f"[retriever.search] STAGE 2 done: ranked={len(ranked)} → "
+                f"top3 by score: {[(h.title[:20], round(h.score, 3)) for h in ranked[:3]]}"
+            )
+
+            logger.debug(f"[retriever.search] STAGE 3 secret_filter")
             filtered = self._filter_secrets(ranked)
+            secret_n = len(ranked) - len(filtered)
+            logger.debug(
+                f"[retriever.search] STAGE 3 done: filtered={len(filtered)} "
+                f"(secret_marked={secret_n})"
+            )
+
             final = filtered[:top_k]
+            logger.debug(
+                f"[retriever.search] STAGE 4 slice top_k={top_k}: "
+                f"final={len(final)} titles={[h.title[:20] for h in final]}"
+            )
 
             elapsed_ms = (time.time() - t0) * 1000
 
@@ -206,9 +245,10 @@ class MemoryRetriever:
             span.set_attribute("memory.search.hits_count", len(final))
             span.set_attribute("memory.search.elapsed_ms", elapsed_ms)
             logger.debug(
-                f"retriever.search({query!r}, {mode.value}, top_k={top_k}) → "
-                f"{len(final)} hits ({report.secret_filtered} secret-filtered, "
-                f"{elapsed_ms:.1f}ms)"
+                f"[retriever.search] EXIT → {len(final)} hits "
+                f"({report.secret_filtered} secret-filtered, {elapsed_ms:.1f}ms) "
+                f"final_titles={[h.title for h in final]} "
+                f"final_scores={[round(h.score, 3) for h in final]}"
             )
             return report
 
@@ -258,7 +298,15 @@ class MemoryRetriever:
             logger.warning("vector_store 不支持 query(),返空")
             return []
 
+        t0 = time.time()
         q_emb = self.embed_fn.encode(query)
+        emb_norm = sum(x * x for x in q_emb) ** 0.5
+        logger.debug(
+            f"[_semantic_search] query={query!r} (len={len(query)} chars) | "
+            f"embed_fn={getattr(self.embed_fn, 'model_name', type(self.embed_fn).__name__)} | "
+            f"q_emb: dim={len(q_emb)} l2_norm={emb_norm:.4f} "
+            f"first5={[round(x, 4) for x in q_emb[:5]]}"
+        )
 
         try:
             raw = self.vector_store.query(q_emb, top_k=top_k * 2)
@@ -266,21 +314,42 @@ class MemoryRetriever:
             logger.warning(f"vector_store.query 失败: {e},返空")
             return []
 
+        logger.debug(
+            f"[_semantic_search] vector_store.query top_k={top_k * 2} → "
+            f"raw={len(raw)} candidates (按 distance 升序):"
+        )
+        for i, doc in enumerate(raw):
+            logger.debug(
+                f"  raw[{i}] id={doc.get('id', '')[:12]}... "
+                f"distance={doc.get('distance', 0.0):.4f}"
+            )
+
         hits: list[MemoryHit] = []
-        for doc in raw:
+        min_score_thr = self.config.retrieval.min_score
+        for i, doc in enumerate(raw):
             item_hash = doc.get("id", "")
             if not item_hash:
+                logger.debug(f"  raw[{i}] SKIP: id 为空")
                 continue
             # Chroma 不再存 type,需遍历常见 type 找到对应 .md
             type_ = self._resolve_type(item_hash, types)
             if type_ is None:
+                logger.debug(
+                    f"  raw[{i}] SKIP: id={item_hash[:12]}... 5 个 type dir 都找不到 .md"
+                )
                 continue
             if types and type_ not in types:
+                logger.debug(
+                    f"  raw[{i}] SKIP: type={type_!r} 不在 types={types} 过滤范围"
+                )
                 continue
             rel_path = f"{type_}/{item_hash}.md"
             try:
                 data = self.memory_store.read(rel_path)
-            except Exception:
+            except Exception as e:
+                logger.debug(
+                    f"  raw[{i}] SKIP: id={item_hash[:12]}... read({rel_path}) 失败: {e}"
+                )
                 # 文件已被删,跳过
                 continue
             fm = data.get("frontmatter", {}) or {}
@@ -294,8 +363,18 @@ class MemoryRetriever:
             # M11 (2026-06-26 修复):min_score 从 MemoryConfig 读
             # 之前 search() 收了 min_score 但 _semantic_search 没用,dead param
             # (导致 "我是谁" 跟 "我喜欢斗破苍穹" 距离不算近也被召回)
-            if sim < self.config.retrieval.min_score:
+            pass_min_score = sim >= min_score_thr
+            if not pass_min_score:
+                logger.debug(
+                    f"  raw[{i}] SKIP: sim={sim:.4f} < min_score={min_score_thr:.4f} "
+                    f"(title={title!r} rel_path={rel_path})"
+                )
                 continue
+            logger.debug(
+                f"  raw[{i}] KEEP: sim={sim:.4f} >= min_score={min_score_thr:.4f} "
+                f"title={title!r} type={hit_type!r} importance={hit_importance} "
+                f"tags={hit_tags} body_chars={len(body)}"
+            )
             hits.append(MemoryHit(
                 item_hash=item_hash,
                 type=hit_type,
@@ -307,6 +386,11 @@ class MemoryRetriever:
                 tags=hit_tags,
                 importance=hit_importance,
             ))
+        elapsed_ms = (time.time() - t0) * 1000
+        logger.debug(
+            f"[_semantic_search] DONE: kept {len(hits)}/{len(raw)} raw → "
+            f"{elapsed_ms:.1f}ms"
+        )
         return hits
 
     def _resolve_type(self, item_hash: str, types: Optional[list[str]]) -> Optional[str]:
@@ -317,7 +401,13 @@ class MemoryRetriever:
         """
         candidates = types or ["user", "feedback", "event", "project", "reference"]
         for t in candidates:
-            if (self.memory_store.root / t / f"{item_hash}.md").exists():
+            p = self.memory_store.root / t / f"{item_hash}.md"
+            exists = p.exists()
+            logger.debug(
+                f"[_resolve_type] id={item_hash[:12]}... stat({p.relative_to(self.memory_store.root)}) "
+                f"→ {exists}"
+            )
+            if exists:
                 return t
         return None
 
@@ -344,37 +434,90 @@ class MemoryRetriever:
             self.config.retrieval, "side_query_max_select", top_k
         )
 
+        logger.debug(
+            f"[_side_query_search] ENTER query={query!r} top_k={top_k} "
+            f"max_files={max_files} max_select={max_select} "
+            f"types={types} already_surfaced_count={len(already_surfaced or set())}"
+        )
+
+        t0 = time.time()
         entries = scan_memory_files(
             self.memory_store.root, max_files=max_files,
             types_filter=types,
         )
+        scan_ms = (time.time() - t0) * 1000
+        logger.debug(
+            f"[_side_query_search] scan_memory_files → {len(entries)} entries "
+            f"({scan_ms:.1f}ms)"
+        )
+        # 列前 10 条给个概览
+        for i, e in enumerate(entries[:10]):
+            logger.debug(
+                f"  entry[{i}] rel_path={e.rel_path} "
+                f"title={getattr(e, 'title', '?')!r} "
+                f"type={getattr(e, 'type', '?')!r}"
+            )
+        if len(entries) > 10:
+            logger.debug(f"  ... and {len(entries) - 10} more entries")
+
         if already_surfaced:
+            before = len(entries)
             entries = [e for e in entries if e.rel_path not in already_surfaced]
+            logger.debug(
+                f"[_side_query_search] already_surfaced filter: "
+                f"{before} → {len(entries)} (-{before - len(entries)})"
+            )
         if not entries:
+            logger.debug(f"[_side_query_search] EXIT: 0 entries after filter,返空")
             return []
 
         manifest = format_memory_manifest(entries)
+        logger.debug(
+            f"[_side_query_search] manifest built: {len(manifest)} chars "
+            f"(max ~{max_files * 80} expected)"
+        )
+        # 列 manifest 头部 800 字,方便看 LLM 实际看到的内容
+        logger.debug(
+            f"[_side_query_search] manifest preview (前 800 chars):\n"
+            f"{manifest[:800]}{'...[truncated]' if len(manifest) > 800 else ''}"
+        )
+
         selected = self._call_side_query(query, manifest, max_select)
+        logger.debug(
+            f"[_side_query_search] LLM 选了 {len(selected)} 个 path: {selected}"
+        )
 
         hits: list[MemoryHit] = []
         for path in selected:
             try:
                 data = self.memory_store.read(path)
-            except Exception:
+            except Exception as e:
+                logger.debug(
+                    f"[_side_query_search] SKIP path={path!r} read 失败: {e}"
+                )
                 continue
             fm = data.get("frontmatter", {}) or {}
             body = data.get("body", "")
-            hits.append(MemoryHit(
+            title = fm.get("name") or fm.get("title", "")
+            hit = MemoryHit(
                 item_hash=fm.get("item_hash", ""),
                 type=fm.get("type", "user"),
-                title=fm.get("name") or fm.get("title", ""),
+                title=title,
                 body=body,
                 rel_path=path,
                 score=1.0,
                 breakdown={"side_query": 1.0},
                 tags=fm.get("tags", []) or [],
                 importance=fm.get("importance", 5),
-            ))
+            )
+            logger.debug(
+                f"[_side_query_search]   KEEP path={path} title={title!r} "
+                f"body_chars={len(body)} tags={hit.tags} importance={hit.importance}"
+            )
+            hits.append(hit)
+        logger.debug(
+            f"[_side_query_search] DONE: {len(hits)}/{len(selected)} path 读全文成功"
+        )
         return hits
 
     def _call_side_query(
@@ -391,7 +534,19 @@ class MemoryRetriever:
             )
             return []
         prompt = build_side_query_prompt(query, manifest, max_select)
+        logger.debug(
+            f"[_call_side_query] query={query!r} max_select={max_select} | "
+            f"manifest_chars={len(manifest)} prompt_chars={len(prompt)}"
+        )
+        logger.debug(
+            f"[_call_side_query] SIDE_QUERY_SYSTEM_PROMPT (full):\n"
+            f"{SIDE_QUERY_SYSTEM_PROMPT}"
+        )
+        logger.debug(
+            f"[_call_side_query] user prompt (full {len(prompt)} chars):\n{prompt}"
+        )
         text = ""
+        t0 = time.time()
         try:
             # llm_router.chat 是 stream 协议
             for chunk in self.llm_router.chat(
@@ -403,10 +558,30 @@ class MemoryRetriever:
             ):
                 if getattr(chunk, "text_delta", None):
                     text += chunk.text_delta.text
+            llm_ms = (time.time() - t0) * 1000
+            logger.debug(
+                f"[_call_side_query] LLM 流式返回完成 ({llm_ms:.1f}ms) "
+                f"raw_text_chars={len(text)}"
+            )
+            logger.debug(
+                f"[_call_side_query] LLM raw response (full):\n{text}"
+            )
             data = json.loads(_strip_code_fence(text))
-            return data.get("selected_paths", [])[:max_select]
+            logger.debug(
+                f"[_call_side_query] parsed JSON: {data}"
+            )
+            selected = data.get("selected_paths", [])[:max_select]
+            logger.debug(
+                f"[_call_side_query] selected_paths (sliced to max_select={max_select}): "
+                f"{selected}"
+            )
+            return selected
         except Exception as e:
-            logger.warning(f"sideQuery 失败,降级返空: {e}")
+            llm_ms = (time.time() - t0) * 1000
+            logger.warning(
+                f"sideQuery 失败 ({llm_ms:.1f}ms),降级返空: {e}\n"
+                f"  raw_text={text!r}"
+            )
             return []
 
     def _rerank(

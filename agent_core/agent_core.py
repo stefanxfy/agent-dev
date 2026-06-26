@@ -356,13 +356,24 @@ class ReactAgent:
         Returns:
             retriever.search() 返回值(通常是 RetrievalReport)
         """
+        import logging
+        logger = logging.getLogger(__name__)
         if self.memory_config is not None:
             mode = self.memory_config.retrieval.mode
             top_k = self.memory_config.retrieval.top_k
+            cfg_min_score = self.memory_config.retrieval.min_score
         else:
             # 向后兼容:老 caller 不传 memory_config
             mode = "semantic"
             top_k = 5
+            cfg_min_score = 0.3
+        logger.debug(
+            f"[_call_memory_retriever] query={query!r} (len={len(query)}) | "
+            f"resolved mode={mode!r} top_k={top_k} min_score={cfg_min_score} | "
+            f"already_surfaced_count={len(self._surfaced_memories)} "
+            f"already_surfaced_paths={list(self._surfaced_memories)[:5]}"
+            f"{'...' if len(self._surfaced_memories) > 5 else ''}"
+        )
         return self.memory_retriever.search(
             query,
             top_k=top_k,
