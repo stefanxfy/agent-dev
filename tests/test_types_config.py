@@ -88,6 +88,8 @@ def _good_frontmatter() -> dict:
         "created_at": "2026-06-20T10:00:00Z",
         "item_hash": "a" * 64,
         "schema_version": CURRENT_SCHEMA_VERSION,
+        "name": "默认名",
+        "description": "默认描述",
     }
 
 
@@ -125,6 +127,80 @@ class TestValidateFrontmatter:
         bad2["item_hash"] = "Z" * 64  # 非 hex
         with pytest.raises(ValueError, match="64 字符 hex"):
             validate_frontmatter(bad2)
+
+    # ───────────────────────────────────────────────
+    # M11 v3 新增字段 name / description 校验
+    # ───────────────────────────────────────────────
+
+    def test_validate_frontmatter_v3_requires_name(self):
+        """M11 schema v3 必填 name"""
+        from agent_core.memory.types import FrontmatterError
+        fm = {
+            "type": "user",
+            "created_at": "2026-06-26T00:00:00+00:00",
+            "item_hash": "a" * 64,
+            "schema_version": 3,
+            "description": "desc",  # 缺 name
+        }
+        with pytest.raises(FrontmatterError, match="name"):
+            validate_frontmatter(fm)
+
+    def test_validate_frontmatter_v3_requires_description(self):
+        """M11 schema v3 必填 description"""
+        from agent_core.memory.types import FrontmatterError
+        fm = {
+            "type": "user",
+            "created_at": "2026-06-26T00:00:00+00:00",
+            "item_hash": "a" * 64,
+            "schema_version": 3,
+            "name": "x",  # 缺 description
+        }
+        with pytest.raises(FrontmatterError, match="description"):
+            validate_frontmatter(fm)
+
+    def test_validate_frontmatter_v3_accepts_full(self):
+        """M11 v3 6 字段必填齐全 → 通过"""
+        fm = {
+            "type": "user",
+            "created_at": "2026-06-26T00:00:00+00:00",
+            "item_hash": "a" * 64,
+            "schema_version": 3,
+            "name": "用户叫小明",
+            "description": "Python 后端工程师",
+        }
+        validate_frontmatter(fm)  # 不抛
+
+    def test_description_too_long_truncated_with_warning(self, caplog):
+        """description > 200 字符 → 截断 + warning(caplog)"""
+        import logging
+        fm = {
+            "type": "user",
+            "created_at": "2026-06-26T00:00:00+00:00",
+            "item_hash": "a" * 64,
+            "schema_version": 3,
+            "name": "x",
+            "description": "a" * 500,
+        }
+        with caplog.at_level(logging.WARNING, logger="agent_core.memory.types"):
+            validate_frontmatter(fm)
+        assert len(fm["description"]) == 200
+        assert ("description 截断" in caplog.text
+                or "truncated" in caplog.text.lower()
+                or "过长" in caplog.text)
+
+    def test_schema_version_below_3_rejected(self):
+        """M11:schema_version < 3 被拒"""
+        from agent_core.memory.types import FrontmatterError
+        fm = {
+            "type": "user",
+            "created_at": "2026-06-26T00:00:00+00:00",
+            "item_hash": "a" * 64,
+            "schema_version": 2,  # M10
+            "name": "x",
+            "description": "d",
+        }
+        with pytest.raises(FrontmatterError, match=">=3"):
+            validate_frontmatter(fm)
 
 
 class TestValidateBody:

@@ -2,20 +2,31 @@
 记忆系统类型定义
 
 M1 / Day 1 — O8 修复 + v2.1 §5.3.1 封闭分类
+M11 — schema 升 v3 (name / description 必填)
 
 设计要点：
 1. 4 类封闭（user / feedback / project / reference）—— LLM 不能发明第 5 类
 2. frontmatter schema 编译期硬约束，违反直接 ValueError
 3. feedback / project 必须含 **Why:** —— 防止"只有规则没有原因"的浅记忆
 4. 所有校验为纯函数（不依赖外部状态），便于测试 + 跨进程复用
+5. M11 v3 新增 name / description 必填(对齐 Claude Code MEMORY.md manifest)
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from datetime import datetime
 from typing import Any, Literal, TypedDict
+
+
+# ──────────────────────────────────────────────────────────────────
+# 0. M11 错误类型（子类化 ValueError 兼容旧 caller）
+# ──────────────────────────────────────────────────────────────────
+
+class FrontmatterError(ValueError):
+    """M11:frontmatter 校验失败的专用异常类型(子类化 ValueError 兼容旧 caller)"""
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -106,9 +117,10 @@ class Frontmatter(TypedDict, total=False):
     schema_version: int
 
 
-# 必填字段清单
+# 必填字段清单(M11 v3: name / description 新增必填)
 _REQUIRED_FRONTMATTER: frozenset[str] = frozenset({
     "type", "created_at", "item_hash", "schema_version",
+    "name", "description",  # M11 新增
 })
 
 # 选填字段清单
@@ -124,8 +136,12 @@ _OPTIONAL_FRONTMATTER: frozenset[str] = frozenset({
 # 哪些类型必须含 **Why:** 段落（v2.1 §4.5 #7 不变量）
 _TYPES_REQUIRING_WHY: frozenset[str] = frozenset({"feedback", "project"})
 
-# schema_version 当前值（升级时 +1）
-CURRENT_SCHEMA_VERSION: int = 2
+# schema_version 当前值（升级时 +1）— M11 = 3
+CURRENT_SCHEMA_VERSION: int = 3
+
+# M11 description 长度约束
+DESCRIPTION_MAX_LEN = 200
+DESCRIPTION_MIN_LEN = 1  # < 5 也允许(只 warning)
 
 
 def _is_iso8601(s: Any) -> bool:
@@ -146,6 +162,8 @@ def validate_frontmatter(data: Any) -> Frontmatter:
     """
     校验 frontmatter dict
 
+    M11 v3 schema: name / description 必填。
+
     Args:
         data: 任意 dict（通常来自 YAML 解析）
 
@@ -153,18 +171,18 @@ def validate_frontmatter(data: Any) -> Frontmatter:
         合法的 Frontmatter（TypedDict，运行时当 dict 用）
 
     Raises:
-        ValueError: 字段缺失 / 类型错误 / schema_version 过旧
+        FrontmatterError: 字段缺失 / 类型错误 / schema_version 过旧
     """
     if not isinstance(data, dict):
-        raise ValueError(
+        raise FrontmatterError(
             f"frontmatter 必须是 dict，实际为 {type(data).__name__}"
         )
 
     # 1. 必填字段检查
     missing = _REQUIRED_FRONTMATTER - set(data.keys())
     if missing:
-        raise ValueError(
-            f"frontmatter 缺少必填字段: {sorted(missing)}"
+        raise FrontmatterError(
+            f"缺少必填字段: {', '.join(sorted(missing))}"
         )
 
     # 2. type 校验
@@ -172,11 +190,11 @@ def validate_frontmatter(data: Any) -> Frontmatter:
 
     # 3. created_at / updated_at ISO 8601
     if not _is_iso8601(data["created_at"]):
-        raise ValueError(
+        raise FrontmatterError(
             f"created_at 必须是 ISO 8601 字符串，实际为 {data['created_at']!r}"
         )
     if "updated_at" in data and not _is_iso8601(data["updated_at"]):
-        raise ValueError(
+        raise FrontmatterError(
             f"updated_at 必须是 ISO 8601 字符串，实际为 {data['updated_at']!r}"
         )
 
@@ -184,41 +202,61 @@ def validate_frontmatter(data: Any) -> Frontmatter:
     if not isinstance(data["item_hash"], str) or not re.fullmatch(
         r"[0-9a-f]{64}", data["item_hash"]
     ):
-        raise ValueError(
+        raise FrontmatterError(
             f"item_hash 必须是 64 字符 hex（SHA-256），实际为 {data['item_hash']!r}"
         )
 
-    # 5. schema_version 检查
-    if not isinstance(data["schema_version"], int) or data["schema_version"] < 1:
-        raise ValueError(
-            f"schema_version 必须是 >=1 的整数，实际为 {data['schema_version']!r}"
+    # 5. schema_version 检查(M11 v3 要求 ≥3)
+    if not isinstance(data["schema_version"], int) or data["schema_version"] < 3:
+        raise FrontmatterError(
+            f"schema_version 必须是 >=3 的整数(M11 v3)，实际为 {data['schema_version']!r}"
         )
     if data["schema_version"] > CURRENT_SCHEMA_VERSION:
-        raise ValueError(
+        raise FrontmatterError(
             f"schema_version {data['schema_version']} 高于当前支持版本 "
             f"{CURRENT_SCHEMA_VERSION}，请升级 agent-dev"
         )
 
-    # 6. tags 必须是字符串列表
+    # 6. M11 v3 name 必填且非空
+    if not isinstance(data["name"], str) or not data["name"].strip():
+        raise FrontmatterError("name 必填且非空(M11 v3)")
+
+    # 7. M11 v3 description 必填 + 长度约束(1-200,太长截断,太短 warning)
+    desc = data["description"]
+    if not isinstance(desc, str):
+        raise FrontmatterError(
+            f"description 必须是 str,实际为 {type(desc).__name__}"
+        )
+    if len(desc) < DESCRIPTION_MIN_LEN:
+        logging.getLogger(__name__).warning(
+            f"description 过短(<{DESCRIPTION_MIN_LEN} 字符): {desc!r}"
+        )
+    elif len(desc) > DESCRIPTION_MAX_LEN:
+        logging.getLogger(__name__).warning(
+            f"description 过长(>{DESCRIPTION_MAX_LEN} 字符),截断到 {DESCRIPTION_MAX_LEN}"
+        )
+        data["description"] = desc[:DESCRIPTION_MAX_LEN]
+
+    # 8. tags 必须是字符串列表
     if "tags" in data:
         if not isinstance(data["tags"], list):
-            raise ValueError(
+            raise FrontmatterError(
                 f"tags 必须是字符串列表，实际为 {type(data['tags']).__name__}"
             )
         for tag in data["tags"]:
             if not isinstance(tag, str) or not tag.strip():
-                raise ValueError(
+                raise FrontmatterError(
                     f"tags 元素必须是非空字符串，实际为 {tag!r}"
                 )
 
-    # 7. source 必须是已知值
+    # 9. source 必须是已知值
     if "source" in data:
         if data["source"] not in {"user_input", "extracted", "manual"}:
-            raise ValueError(
+            raise FrontmatterError(
                 f"source 必须是 user_input/extracted/manual 之一，实际为 {data['source']!r}"
             )
 
-    # 8. 未知字段警告（不阻断，但记录）
+    # 10. 未知字段警告（不阻断，但记录）
     known = _REQUIRED_FRONTMATTER | _OPTIONAL_FRONTMATTER
     unknown = set(data.keys()) - known
     if unknown:
@@ -283,6 +321,7 @@ def compute_candidate_key(type_: str, body: str) -> str:
 __all__ = [
     "MemoryType",
     "Frontmatter",
+    "FrontmatterError",
     "validate_type",
     "all_types",
     "type_description",
@@ -290,4 +329,6 @@ __all__ = [
     "validate_body",
     "compute_candidate_key",
     "CURRENT_SCHEMA_VERSION",
+    "DESCRIPTION_MAX_LEN",
+    "DESCRIPTION_MIN_LEN",
 ]
