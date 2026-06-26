@@ -303,52 +303,102 @@ last_compacted_at: null
         Returns:
             CompactDecision(strategy, reason, timeout_ms)
         """
+        # ── DEBUG L3:入口快照 + 触发条件 0 ──
+        logger.debug(
+            f"[sm.should_trigger] ENTER session_id={self.session_id} "
+            f"sm_path={self.sm_path} | "
+            f"ctx: msgs={len(ctx.messages)} total_tokens={ctx.total_tokens} tool_count={ctx.tool_count} | "
+            f"config: enabled={self.config.enabled} "
+            f"sm_token_threshold={self.config.sm_token_threshold} "
+            f"tool_count_threshold={self.config.tool_count_threshold} "
+            f"max_sm_tokens_for_compact={self.config.max_sm_tokens_for_compact} "
+            f"sm_insufficient_buffer_ratio={self.config.sm_insufficient_buffer_ratio}"
+        )
+
         # 0. 基础触发条件(token > 阈值 OR tool > 阈值)
         trigger_by_token = ctx.total_tokens >= self.config.sm_token_threshold
         trigger_by_tool = ctx.tool_count >= self.config.tool_count_threshold
         if not (trigger_by_token or trigger_by_tool):
-            return CompactDecision(
+            decision = CompactDecision(
                 strategy="traditional",
                 reason=f"未达触发阈值(token={ctx.total_tokens} < {self.config.sm_token_threshold}, "
                        f"tool={ctx.tool_count} < {self.config.tool_count_threshold})",
             )
+            logger.debug(
+                f"[sm.should_trigger] COND 0 not triggered (token={trigger_by_token} tool={trigger_by_tool}) "
+                f"→ {decision.strategy} ({decision.reason})"
+            )
+            return decision
 
         # 1. gate 关
         if not self.config.enabled:
-            return CompactDecision(strategy="traditional", reason="gate_disabled")
+            decision = CompactDecision(strategy="traditional", reason="gate_disabled")
+            logger.debug(f"[sm.should_trigger] COND 1 gate_disabled → {decision.strategy}")
+            return decision
 
         # 2. SM 文件不存在或还是 template
-        if not self.sm_exists() or self.sm_is_template():
-            return CompactDecision(strategy="traditional", reason="no_sm_file")
+        sm_exists = self.sm_exists()
+        sm_is_tpl = self.sm_is_template() if sm_exists else None
+        if not sm_exists or sm_is_tpl:
+            decision = CompactDecision(strategy="traditional", reason="no_sm_file")
+            logger.debug(
+                f"[sm.should_trigger] COND 2 no_sm_file (exists={sm_exists} is_template={sm_is_tpl}) "
+                f"→ {decision.strategy}"
+            )
+            return decision
 
         # 3. SM 文件过大
         sm_tokens = self.sm_token_count()
         if sm_tokens > self.config.max_sm_tokens_for_compact:
-            return CompactDecision(
+            decision = CompactDecision(
                 strategy="traditional",
                 reason=f"sm_too_large({sm_tokens} > {self.config.max_sm_tokens_for_compact})",
             )
+            logger.debug(
+                f"[sm.should_trigger] COND 3 sm_too_large "
+                f"sm_tokens={sm_tokens} > max={self.config.max_sm_tokens_for_compact} "
+                f"→ {decision.strategy}"
+            )
+            return decision
 
         # 4. extraction 正在跑 → 等
         if self._extraction_in_progress:
-            return CompactDecision(
+            decision = CompactDecision(
                 strategy="wait",
                 reason="extract_running",
                 timeout_ms=self.config.extraction_wait_timeout_ms,
             )
+            logger.debug(
+                f"[sm.should_trigger] COND 4 extract_running "
+                f"timeout_ms={decision.timeout_ms} → {decision.strategy}"
+            )
+            return decision
 
         # 5. SM-compact 后预估仍超阈值
         #    用 sm_token_threshold 作为目标线,buffer_ratio 留余量
         projected = self._estimate_post_compact_tokens(ctx, sm_tokens)
         threshold = self.config.sm_token_threshold * self.config.sm_insufficient_buffer_ratio
         if projected >= threshold:
-            return CompactDecision(
+            decision = CompactDecision(
                 strategy="traditional",
                 reason=f"sm_insufficient(projected={projected} >= {threshold:.0f})",
             )
+            logger.debug(
+                f"[sm.should_trigger] COND 5 sm_insufficient "
+                f"sm_tokens={sm_tokens} kept_tokens={projected - sm_tokens - 50} "
+                f"overhead=50 projected={projected} threshold={threshold:.0f} "
+                f"→ {decision.strategy}"
+            )
+            return decision
 
         # 所有检查通过 → 走 SM-compact
-        return CompactDecision(strategy="sm_compact", reason="ok")
+        decision = CompactDecision(strategy="sm_compact", reason="ok")
+        logger.debug(
+            f"[sm.should_trigger] PASS all conditions → {decision.strategy} | "
+            f"sm_tokens={sm_tokens} projected_post_compact={projected} "
+            f"threshold={threshold:.0f} buffer={self.config.sm_insufficient_buffer_ratio}"
+        )
+        return decision
 
     def _estimate_post_compact_tokens(self, ctx: TurnContext, sm_tokens: int) -> int:
         """预估 SM-compact 后的总 token 数
@@ -429,13 +479,37 @@ last_compacted_at: null
             span.set_attribute("memory.sm.input_count", len(messages))
             span.set_attribute("memory.sm.context_window", context_window)
 
+            # ── DEBUG L3:compact 入口 ──
+            logger.debug(
+                f"[sm.compact] ENTER session_id={self.session_id} | "
+                f"input_count={len(messages)} context_window={context_window} | "
+                f"last_compacted_msg_id={self._last_compacted_msg_id} | "
+                f"sm_path={self.sm_path}"
+            )
+
             if not self.sm_exists() or self.sm_is_template():
                 span.set_attribute("memory.sm.result", "no_sm_file")
+                logger.debug(
+                    f"[sm.compact] EXIT early: SM file missing or template "
+                    f"(exists={self.sm_exists()} is_template={self.sm_is_template() if self.sm_exists() else 'N/A'})"
+                )
                 return None
 
+            # 1. 读 SM 文件 + 截断
             sm_content = self.read_sm() or ""
+            sm_tokens_before = self.sm_token_count()
             truncated = self._truncate_sections(sm_content, self.config.max_per_section_chars)
+            truncated_tokens = self._estimate_post_compact_tokens(
+                TurnContext(messages=messages, total_tokens=0, tool_count=0),
+                sm_tokens_before,
+            )
+            logger.debug(
+                f"[sm.compact] STEP 1 read+truncate: "
+                f"sm_file_chars={len(sm_content)} sm_tokens={sm_tokens_before} | "
+                f"after_truncate_chars={len(truncated)} max_per_section_chars={self.config.max_per_section_chars}"
+            )
 
+            # 2. 拼 summary 消息
             summary_message = {
                 "role": "user",
                 "content": (
@@ -445,12 +519,24 @@ last_compacted_at: null
                     f"{truncated}"
                 ),
             }
+            logger.debug(
+                f"[sm.compact] STEP 2 built summary_message: "
+                f"role={summary_message['role']!r} content_chars={len(summary_message['content'])}"
+            )
 
+            # 3. kept_messages + token 估算
             kept_messages = self._slice_kept_messages(messages)
             used_tokens_estimate = (
                 self.sm_token_count()
                 + self._estimate_messages_tokens(kept_messages)
                 + 50  # summary overhead
+            )
+            logger.debug(
+                f"[sm.compact] STEP 3 slice kept: "
+                f"input_count={len(messages)} kept_count={len(kept_messages)} "
+                f"dropped={len(messages) - len(kept_messages)} (last_id={self._last_compacted_msg_id}) | "
+                f"used_tokens_estimate={used_tokens_estimate} "
+                f"(sm={self.sm_token_count()} + kept={self._estimate_messages_tokens(kept_messages)} + 50)"
             )
 
             result = CompactResult(
@@ -460,12 +546,23 @@ last_compacted_at: null
                 strategy="sm_compact",
             )
 
-            # M10 C2.2: 持久化 compact 结果(.md frontmatter 更新 + .json snapshot)
+            # 4. 持久化
             self._persist_compact_result(result)
+            logger.debug(
+                f"[sm.compact] STEP 4 persist_compact_result done "
+                f"(frontmatter last_compacted_at 推进)"
+            )
 
             span.set_attribute("memory.sm.kept_count", len(result.kept_messages))
             span.set_attribute("memory.sm.used_tokens_estimate", result.used_tokens_estimate)
             span.set_attribute("memory.sm.strategy", result.strategy)
+            logger.debug(
+                f"[sm.compact] EXIT success: "
+                f"kept={len(result.kept_messages)}/{len(messages)} "
+                f"used_tokens_estimate={result.used_tokens_estimate} "
+                f"context_window={context_window} "
+                f"compression_ratio={used_tokens_estimate / max(1, len(messages) * 100):.2f}"
+            )
             return result
 
     def _persist_compact_result(self, result: CompactResult) -> None:
@@ -579,23 +676,38 @@ last_compacted_at: null
 
         future: Future = Future()
 
+        # ── DEBUG L3:extract 入口 ──
+        logger.debug(
+            f"[sm.extract_incremental] ENTER session_id={self.session_id} | "
+            f"input_count={len(messages)} last_id={self._last_compacted_msg_id} | "
+            f"has_callback={llm_callback is not None} "
+            f"in_progress_before={self._extraction_in_progress}"
+        )
+
         def _runner() -> None:
             with self._extraction_lock:
                 self._extraction_in_progress = True
+            logger.debug(f"[sm.extract._runner] thread start, in_progress=True")
             try:
                 self._do_extract(messages, llm_callback)
                 future.set_result(True)
+                logger.debug(f"[sm.extract._runner] thread done, set_result(True)")
             except Exception as e:
                 logger.warning(f"sm extract failed: {e}")
                 future.set_exception(e)
             finally:
                 with self._extraction_lock:
                     self._extraction_in_progress = False
+                logger.debug(f"[sm.extract._runner] thread cleanup, in_progress=False")
 
         # 后台 thread 跑(daemon,不阻塞主线程)
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sm-extract")
         executor.submit(_runner)
         executor.shutdown(wait=False)
+        logger.debug(
+            f"[sm.extract_incremental] EXIT: thread submitted, future returned to caller "
+            f"(主线程不阻塞)"
+        )
         return future
 
     def _do_extract(
@@ -608,33 +720,65 @@ last_compacted_at: null
         注意:这里不直接调 LLM,而是构造 prompt + 调用 callback
         让 caller(M5+ 集成)提供具体的 LLM 实现 + Edit 工具
         """
+        logger.debug(
+            f"[sm._do_extract] ENTER session_id={self.session_id} | "
+            f"input_count={len(messages)} sm_exists={self.sm_exists()}"
+        )
+
         if not self.sm_exists():
+            logger.debug(f"[sm._do_extract] SM file 不存在,写 template → {self.sm_path}")
             self.write_sm_template()
+            logger.debug(f"[sm._do_extract] template 写完")
 
         new_messages = self._slice_kept_messages(messages)
+        logger.debug(
+            f"[sm._do_extract] slice: input={len(messages)} new={len(new_messages)} "
+            f"dropped_by_last_id={len(messages) - len(new_messages)} "
+            f"last_id={self._last_compacted_msg_id}"
+        )
         if not new_messages:
-            logger.debug("sm extract: 无新消息,跳过")
+            logger.debug("sm._do_extract: 无新消息,跳过")
             return
 
         # 构造 prompt
         sm_content = self.read_sm() or ""
         prompt = self._build_extract_prompt(sm_content, new_messages)
+        logger.debug(
+            f"[sm._do_extract] prompt built: sm_chars={len(sm_content)} new_msgs={len(new_messages)} "
+            f"prompt_chars={len(prompt)}"
+        )
 
         if llm_callback is None:
             # 无 callback → 仅推进 last_id,不实际调 LLM(测试路径)
-            logger.debug("sm extract: 无 llm_callback,仅推进 last_id")
+            logger.debug("sm._do_extract: 无 llm_callback,仅推进 last_id(测试路径)")
         else:
+            import time as _t
+            _t0 = _t.time()
+            logger.debug(
+                f"[sm._do_extract] STEP LLM: 调 callback(prompt) (prompt_chars={len(prompt)})..."
+            )
             response = llm_callback(prompt)
-            logger.debug(f"sm extract: LLM response received ({len(response)} chars)")
+            _llm_ms = (_t.time() - _t0) * 1000
+            logger.debug(
+                f"[sm._do_extract] STEP LLM done ({_llm_ms:.1f}ms) "
+                f"response_chars={len(response)}"
+            )
+            # ── DEBUG L3:LLM 真实响应(前 500 字符)──
+            logger.debug(
+                f"[sm._do_extract] LLM response (前 500 chars):\n"
+                f"{response[:500]}{'...[truncated]' if len(response) > 500 else ''}"
+            )
             # 生产环境:response 应该是 LLM 调用 memory_editor.edit_memory() 的结果
             # SM 文件已被 Edit 工具改完,我们只需更新 last_compacted_msg_id
 
         # 推进 last_compacted_msg_id(不变量 #4:推进前必须成功)
         if new_messages:
             last_msg = new_messages[-1]
+            old_id = self._last_compacted_msg_id
             self._last_compacted_msg_id = last_msg.get("id")
-            logger.info(
-                f"sm extract: 推进 last_compacted_msg_id → {self._last_compacted_msg_id}"
+            logger.debug(
+                f"[sm._do_extract] 推进 last_compacted_msg_id: {old_id} → {self._last_compacted_msg_id} "
+                f"(last_msg.role={last_msg.get('role')!r} content_chars={len(str(last_msg.get('content','')))})"
             )
 
     def _build_extract_prompt(self, current_sm: str, new_messages: list[dict]) -> str:
@@ -643,7 +787,7 @@ last_compacted_at: null
             f"[{m.get('role', 'user')}] {m.get('content', '')}"
             for m in new_messages
         )
-        return (
+        prompt = (
             f"# Session Memory Extract Task\n\n"
             f"## Current SM file\n\n{current_sm}\n\n"
             f"## New messages to integrate\n\n{new_text}\n\n"
@@ -652,6 +796,12 @@ last_compacted_at: null
             f"Do NOT rewrite the file — only add new information to appropriate sections. "
             f"Preserve existing content unless it's been contradicted.\n"
         )
+        # ── DEBUG L3:prompt 内容(给看 LLM 实际看到什么)──
+        logger.debug(
+            f"[sm._build_extract_prompt] built prompt: chars={len(prompt)} "
+            f"new_messages_count={len(new_messages)} sm_content_chars={len(current_sm)}"
+        )
+        return prompt
 
     # ──────────────────────────────────────────────
     # 状态查询(供 caller 决策)
