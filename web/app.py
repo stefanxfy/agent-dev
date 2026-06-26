@@ -216,67 +216,10 @@ with st.sidebar:
                 # 老 Streamlit 无 page_link → link_button 兜底
                 st.link_button("查看全部 →", "/Candidate_Review")
 
-    # M10 C6.4: Runtime Config(运行时切换不重建 agent)
-    with st.expander("🎛 Runtime Config", expanded=False):
-        _rt_agent = st.session_state.get("agent")
-        if not _rt_agent:
-            st.caption("⚠️ Agent 未就绪")
-        elif not getattr(_rt_agent, "react_memory_bridge", None):
-            st.caption("⚠️ 记忆系统未启用")
-        else:
-            # memory_config / _memory_config 两种属性名都试(brief Step D 验证:实际都不存在)
-            _rt_config = getattr(_rt_agent, "memory_config", None) \
-                or getattr(_rt_agent, "_memory_config", None)
-            if _rt_config is None:
-                st.caption("⚠️ 找不到 memory_config 属性")
-            else:
-                _current_budget = _rt_config.cost.daily_budget_usd
-                _new_budget = st.number_input(
-                    "Daily budget (USD)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(_current_budget),
-                    step=0.1,
-                    key="runtime_daily_budget",
-                )
-                if st.button("Apply", key="apply_runtime_budget"):
-                    # 改 config(运行时,不会触发 agent 重建)
-                    _rt_config.set_runtime("cost.daily_budget_usd", _new_budget)
-                    # 替换 gate 的 cost_tracker 实例
-                    from agent_core.memory.cost_tracker import CostTracker as _CT
-                    _rt_gate = _rt_agent.react_memory_bridge.gate
-                    _rt_gate.set_cost_tracker(_CT(
-                        daily_budget_usd=_new_budget,
-                        enabled=_rt_config.cost.enabled,
-                    ))
-                    st.success(f"✅ Budget 改为 ${_new_budget:.2f}")
-                    st.rerun()
-
-                # M11: 检索模式 (semantic / side_query) + sideQuery 选 N
-                _mode = _rt_config.retrieval.mode
-                _new_mode = st.selectbox(
-                    "检索模式 (M11)",
-                    options=["semantic", "side_query"],
-                    index=0 if _mode == "semantic" else 1,
-                    key="runtime_retrieval_mode",
-                    help="semantic = 向量召回;side_query = MEMORY.md manifest 让 LLM 二次精选",
-                )
-                _new_max_select = st.slider(
-                    "sideQuery max select",
-                    min_value=1, max_value=10,
-                    value=int(_rt_config.retrieval.side_query_max_select),
-                    step=1, key="runtime_side_query_max_select",
-                    help="sideQuery 一次 LLM 选 N 个 path",
-                )
-                if st.button("Apply (M11)", key="apply_runtime_m11"):
-                    _rt_config.set_runtime("retrieval.mode", _new_mode)
-                    _rt_config.set_runtime(
-                        "retrieval.side_query_max_select", int(_new_max_select)
-                    )
-                    st.success(
-                        f"✅ 检索模式 → {_new_mode}, max_select={_new_max_select}"
-                    )
-                    st.rerun()
+    # 注(2026-06-26):Runtime Config 改读 .env,详见 .env 中
+    #   MEMORY_RETRIEVAL__MODE / __TOP_K / __SIDE_QUERY_MAX_SELECT
+    #   MEMORY_COST__DAILY_BUDGET_USD
+    # 改完 .env 后重启 streamlit 生效。
 
     st.divider()
     st.header("⚙️ LLM 配置")
@@ -633,7 +576,10 @@ def get_agent(session_id=None):
     react_memory_bridge = None
     # M10 C7.1: 单一 MemoryConfig 实例必须 hoist 到 memory_enabled 块之前
     # 因为 ReactAgent(memory_config=...) 在 if 块外(line 719)使用
-    memory_config = MemoryConfig()
+    # M11 (2026-06-26):改用 from_env() 读 .env,改完 .env 需重启 streamlit 生效
+    #   MEMORY_RETRIEVAL__MODE / __TOP_K / __SIDE_QUERY_MAX_SELECT
+    #   MEMORY_COST__DAILY_BUDGET_USD
+    memory_config = MemoryConfig.from_env()
     if st.session_state.get("memory_enabled", False):
         try:
             from web.memory_wiring import build_memory_system
