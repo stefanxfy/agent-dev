@@ -193,6 +193,17 @@ class ReactAgent:
         self.session_memory = session_memory
         # M10 C6.4: 运行时配置切换 hook — UI expander 用 set_runtime 改字段不重建 agent
         self.memory_config = memory_config  # type: ignore[assignment]
+        # M11: MEMORY.md 物理索引(L1 启动加载 + 写盘后异步 rebuild)
+        self.memory_index = None
+        if memory_store is not None:
+            try:
+                from agent_core.memory.memory_index import MemoryIndex
+                self.memory_index = MemoryIndex(memory_store.root)
+                self.memory_index.rebuild()  # lazy rebuild 兜底
+            except Exception as e:
+                _logger.warning(f"MEMORY.md lazy rebuild 失败: {e}")
+        # M11: 已展示过的记忆 rel_path 集合(用于 sideQuery 去重)
+        self._surfaced_memories: set[str] = set()
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
         if session_id:
@@ -290,6 +301,28 @@ class ReactAgent:
             _logger.debug("🔄 [Restore] no usage in history, baseline stays 0")
         except Exception as e:
             _logger.debug(f"🔄 [Restore] failed (silent fallback): {e}")
+
+    # ── M11 L1: MEMORY.md 启动加载 ────────────────────────────────
+
+    def _build_system_prompt_with_memory(self) -> str:
+        """M11 L1:启动加载 MEMORY.md + 拼到 system prompt(独立 H1 段)
+
+        借鉴 Claude Code appendSystemPrompt:
+        - base system prompt 在前
+        - MEMORY.md 内容作为独立 H1 段追加
+        - 加载失败 → 仅 base,不抛
+        """
+        base = self.system_prompt or ""
+        if self.memory_index is None:
+            return base
+        try:
+            index_content = self.memory_index.load_index()
+        except Exception as e:
+            _logger.warning(f"MEMORY.md 加载失败,跳过: {e}")
+            return base
+        if not index_content:
+            return base
+        return f"{base}\n\n{index_content}"
 
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
@@ -511,8 +544,17 @@ class ReactAgent:
                 )
                 if last_user_msg and isinstance(last_user_msg.get("content"), str):
                     try:
-                        report = self.memory_retriever.search(last_user_msg["content"], top_k=5)
+                        # M11: 传 already_surfaced 让 retriever 过滤已展示过的
+                        report = self.memory_retriever.search(
+                            last_user_msg["content"],
+                            top_k=5,
+                            already_surfaced=self._surfaced_memories,
+                        )
                         hits = report.hits if hasattr(report, "hits") else []
+                        # 记录已展示的 hit(用于下一轮去重)
+                        for h in hits:
+                            if hasattr(h, "rel_path") and h.rel_path:
+                                self._surfaced_memories.add(h.rel_path)
                         if hits:
                             mem_block = "\n\n[记忆库 / {} hits]\n".format(len(hits))
                             for h in hits:
