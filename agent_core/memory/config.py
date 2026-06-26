@@ -26,7 +26,6 @@ from pydantic import (
     ConfigDict,
     Field,
     field_validator,
-    model_validator,
 )
 
 from agent_core.memory.wal_config import TaskWALConfig
@@ -38,25 +37,16 @@ from agent_core.memory.wal_config import TaskWALConfig
 
 class RetrievalConfig(BaseModel):
     """
-    检索相关配置（§6 检索策略）
+    检索相关配置(M11 二选一,switchable)
 
     mode:
-        - vector:    仅向量检索
-        - file:      仅文件名 / 元数据 grep
-        - hybrid:    两者融合（默认）
+        - semantic: 向量相似度召回
+        - side_query: LLM 二次精选(用 MEMORY.md manifest)
     """
     model_config = ConfigDict(extra="forbid", frozen=False)
 
-    mode: Literal["vector", "file", "hybrid"] = "hybrid"
-    top_k: int = Field(default=8, ge=1, le=50, description="返回的最大记忆条数")
-    semantic_weight: float = Field(
-        default=0.7, ge=0.0, le=1.0,
-        description="hybrid 模式下向量分权重",
-    )
-    lexical_weight: float = Field(
-        default=0.3, ge=0.0, le=1.0,
-        description="hybrid 模式下 BM25 权重",
-    )
+    mode: Literal["semantic", "side_query"] = "semantic"
+    top_k: int = Field(default=5, ge=1, le=20, description="返回的最大记忆条数")
     min_score: float = Field(
         default=0.3, ge=0.0, le=1.0,
         description="低于此分的记忆丢弃",
@@ -66,18 +56,15 @@ class RetrievalConfig(BaseModel):
         description="注入到 prompt 的记忆总 token 上限（v2.1 L8）",
     )
 
-    @model_validator(mode="after")
-    def _weights_sum_to_one(self) -> "RetrievalConfig":
-        # v2.1 §6.4 hybrid 模式权重必须归一化
-        if self.mode == "hybrid":
-            total = self.semantic_weight + self.lexical_weight
-            if abs(total - 1.0) > 1e-6:
-                raise ValueError(
-                    f"hybrid 模式下 semantic_weight ({self.semantic_weight}) "
-                    f"+ lexical_weight ({self.lexical_weight}) 必须 = 1.0，"
-                    f"当前 = {total}"
-                )
-        return self
+    # M11 新增:sideQuery 模式参数
+    side_query_max_select: int = Field(
+        default=5, ge=1, le=10,
+        description="sideQuery 模式单次最多选几个 path",
+    )
+    side_query_max_files: int = Field(
+        default=200, ge=10, le=1000,
+        description="sideQuery 模式扫描 MEMORY.md 的最大条目数",
+    )
 
 
 class DistillationConfig(BaseModel):

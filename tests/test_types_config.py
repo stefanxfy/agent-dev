@@ -232,30 +232,43 @@ class TestValidateBody:
 # ──────────────────────────────────────────────────────────────────
 
 class TestRetrievalConfig:
-    """RetrievalConfig + 跨字段校验（weights sum = 1）"""
+    """RetrievalConfig + M11 二选一"""
 
-    def test_default_weights_sum_to_one(self):
-        """默认 hybrid 模式权重之和 = 1"""
+    def test_default_mode_is_semantic(self):
+        """M11 默认 mode = semantic"""
         cfg = RetrievalConfig()
-        assert cfg.mode == "hybrid"
-        assert abs(cfg.semantic_weight + cfg.lexical_weight - 1.0) < 1e-6
+        assert cfg.mode == "semantic"
 
-    def test_weights_must_sum_to_one(self):
-        """hybrid 模式权重 != 1 被拒"""
-        with pytest.raises(ValidationError, match="必须 = 1.0"):
-            RetrievalConfig(mode="hybrid", semantic_weight=0.5, lexical_weight=0.3)
+    def test_retrieval_config_old_modes_rejected(self):
+        """M11:旧 mode='vector'/'file'/'hybrid'/'keyword' 必抛 ValidationError"""
+        for old_mode in ("vector", "file", "hybrid", "keyword"):
+            with pytest.raises(ValidationError):
+                RetrievalConfig(mode=old_mode)
 
-    def test_non_hybrid_mode_skips_weight_check(self):
-        """非 hybrid 模式不要求权重之和 = 1（vector/file 单独走）"""
-        # 不应抛异常
-        RetrievalConfig(mode="vector", semantic_weight=0.0, lexical_weight=0.0)
+    def test_retrieval_config_new_modes_accepted(self):
+        """M11:新 mode='semantic'/'side_query' 通过"""
+        assert RetrievalConfig(mode="semantic").mode == "semantic"
+        assert RetrievalConfig(mode="side_query").mode == "side_query"
+
+    def test_retrieval_config_no_weight_fields(self):
+        """M11:删 semantic_weight / lexical_weight (extra='forbid' 拒)"""
+        with pytest.raises(ValidationError):
+            RetrievalConfig(semantic_weight=0.7)
+        with pytest.raises(ValidationError):
+            RetrievalConfig(lexical_weight=0.3)
+
+    def test_retrieval_config_side_query_defaults(self):
+        """M11 新增 side_query_max_select / side_query_max_files 默认值"""
+        cfg = RetrievalConfig()
+        assert cfg.side_query_max_select == 5
+        assert cfg.side_query_max_files == 200
 
     def test_top_k_bounds_enforced(self):
         """top_k 越界被拒"""
         with pytest.raises(ValidationError):
             RetrievalConfig(top_k=0)        # ge=1
         with pytest.raises(ValidationError):
-            RetrievalConfig(top_k=100)      # le=50
+            RetrievalConfig(top_k=100)      # le=20
 
 
 class TestMemoryConfig:
@@ -265,7 +278,7 @@ class TestMemoryConfig:
         """默认构造（全部子 config 用默认值）"""
         cfg = MemoryConfig()
         assert cfg.enabled is True
-        assert cfg.retrieval.mode == "hybrid"
+        assert cfg.retrieval.mode == "semantic"  # M11: 默认 semantic
         assert cfg.distillation.enabled is True
         assert cfg.embed_model == "BAAI/bge-m3"  # v2.1 §九.1 默认
 
