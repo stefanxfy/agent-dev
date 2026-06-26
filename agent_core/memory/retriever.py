@@ -1,35 +1,27 @@
 """
-记忆检索器（v2.1 §九.2）
-
-M3 / Day 3 — 检索 + 安全
+记忆检索器(M11)
 
 设计要点：
-1. **三模式**（设计 §九.2）：
+1. **二选一模式**(M11):
    - semantic: 向量相似度
-   - keyword: 关键词/全文匹配（BM25 / LIKE）
-   - hybrid: 加权融合（默认）
-2. **L4**: 检索时即时跑 SecretScanner → 命中即过滤掉
+   - side_query: LLM 二次精选(见 T7)
+2. **L4**: 检索时即时跑 SecretScanner → 命中即标记 has_secret
 3. **L8**: 检索结果含 secret 字段时报警
-4. **降级链**：
-   hybrid → semantic → keyword → 兜底全量
-5. **可观测**：
-   - 返回 score 解释（每个 hit 的各模式得分）
+4. **可观测**:
+   - 返回 score 解释(每个 hit 的模式得分)
    - 检索耗时、过滤数
 
 调用入口:
     retriever = MemoryRetriever(store, vec, embed_fn, config)
-    hits = retriever.search("用户叫什么", top_k=5, mode="hybrid")
-    # → [MemoryHit(type, title, body, score, breakdown), ...]
+    report = retriever.search("用户叫什么", top_k=5, mode="semantic")
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
 from typing import Optional, Protocol
 
 from agent_core.exceptions import StorageError
@@ -54,10 +46,9 @@ class RetrievalError(StorageError):
 
 
 class RetrievalMode(str, Enum):
-    """检索模式"""
+    """检索模式(M11 二选一)"""
     SEMANTIC = "semantic"
-    KEYWORD = "keyword"
-    HYBRID = "hybrid"
+    # SIDE_QUERY = "side_query"  # T7 加
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -120,77 +111,20 @@ class VectorSearchable(Protocol):
 
 
 # ──────────────────────────────────────────────────────────────────
-# 关键词打分（轻量 BM25 简化版）
-# ──────────────────────────────────────────────────────────────────
-
-def _tokenize(text: str) -> list[str]:
-    """中英混合分词:
-    - 英文: 单词
-    - 中文: 单字 + 二元 bigram
-    """
-    text = text.lower().strip()
-    tokens: list[str] = []
-
-    # 1) 英文/数字/下划线
-    for m in re.finditer(r"[a-z0-9_]+", text):
-        tokens.append(m.group(0))
-
-    # 2) 中文字符: 单字 + 二元
-    zh_chars = re.findall(r"[一-鿿]", text)
-    tokens.extend(zh_chars)
-    for i in range(len(zh_chars) - 1):
-        tokens.append(zh_chars[i] + zh_chars[i+1])
-
-    return tokens
-
-
-def _keyword_score(query_tokens: list[str], doc_text: str) -> float:
-    """
-    简化 BM25: 计算 query 在 doc 中的覆盖度
-
-    score = matched_query_tokens / total_query_tokens (0-1)
-    加权: 重复出现得更高分
-    """
-    if not query_tokens:
-        return 0.0
-    doc_tokens = _tokenize(doc_text)
-    if not doc_tokens:
-        return 0.0
-    doc_set = set(doc_tokens)
-    doc_count = {t: doc_tokens.count(t) for t in doc_set}
-
-    matched = 0
-    weight = 0.0
-    for qt in query_tokens:
-        if qt in doc_set:
-            matched += 1
-            # log(1 + tf) 加权
-            weight += 1.0 + (doc_count[qt] - 1) * 0.1
-
-    if matched == 0:
-        return 0.0
-    # 归一化: matched 比例 * 平均 tf weight
-    coverage = matched / len(query_tokens)
-    avg_weight = weight / matched
-    return min(1.0, coverage * (0.5 + 0.5 * min(avg_weight, 1.0)))
-
-
-# ──────────────────────────────────────────────────────────────────
 # MemoryRetriever
 # ──────────────────────────────────────────────────────────────────
 
 class MemoryRetriever:
     """
-    记忆检索器（v2.1 §九.2）
+    记忆检索器(M11 二选一)
 
-    三模式：
-    - semantic:  cos similarity
-    - keyword:   简化 BM25
-    - hybrid:    weighted sum, 默认 0.7 * semantic + 0.3 * keyword
+    模式:
+    - semantic: 向量相似度
+    - side_query: LLM 二次精选(T7 接入)
 
     用法:
         retriever = MemoryRetriever(store, vec, embed_fn, config)
-        report = retriever.search("用户叫什么", top_k=5, mode="hybrid")
+        report = retriever.search("用户叫什么", top_k=5, mode="semantic")
         for hit in report:
             print(hit.title, hit.score, hit.breakdown)
     """
@@ -215,9 +149,10 @@ class MemoryRetriever:
         self,
         query: str,
         top_k: int = 5,
-        mode: str | RetrievalMode = "hybrid",
+        mode: str | RetrievalMode = "semantic",
         types: Optional[list[str]] = None,
         min_score: float = 0.0,
+        already_surfaced: Optional[set[str]] = None,  # M11 新增
     ) -> RetrievalReport:
         """
         检索记忆
@@ -225,9 +160,10 @@ class MemoryRetriever:
         Args:
             query: 查询文本
             top_k: 返回 top N
-            mode: semantic | keyword | hybrid
+            mode: semantic | side_query
             types: 限定类型(user/feedback/event/project/reference), None=全部
             min_score: 最低分阈值(过滤低相关)
+            already_surfaced: M11:已展示过的 rel_path 集合,用于 side_query 去重
 
         Returns:
             RetrievalReport(hits=sorted by score desc)
@@ -249,8 +185,8 @@ class MemoryRetriever:
                     raise RetrievalError(f"未知检索模式: {mode!r}")
 
             t0 = time.time()
-            # 多召 → 融合 → 重排 → L4 过滤 → 截 top_k
-            candidates = self._retrieve_candidates(query, top_k * 3, mode, types)
+            # 多召 → 重排 → L4 过滤 → 截 top_k
+            candidates = self._retrieve_candidates(query, top_k, mode, types, already_surfaced)
             ranked = self._rerank(candidates, mode)
             filtered = self._filter_secrets(ranked)
             final = filtered[:top_k]
@@ -299,17 +235,14 @@ class MemoryRetriever:
         top_k: int,
         mode: RetrievalMode,
         types: Optional[list[str]],
+        already_surfaced: Optional[set[str]] = None,
     ) -> list[MemoryHit]:
-        """根据 mode 选择召回调,返回候选列表"""
+        """根据 mode 选择召回调,返回候选列表(M11 二选一)"""
         if mode == RetrievalMode.SEMANTIC:
             return self._semantic_search(query, top_k, types)
-        if mode == RetrievalMode.KEYWORD:
-            return self._keyword_search(query, top_k, types)
-        # HYBRID: 两个模式都跑,合并去重
-        sem = self._semantic_search(query, top_k, types)
-        kw = self._keyword_search(query, top_k, types)
-        merged = self._merge_hits(sem, kw)
-        return merged
+        if mode == RetrievalMode.SIDE_QUERY:
+            return self._side_query_search(query, top_k, types, already_surfaced)
+        raise RetrievalError(f"未知检索模式: {mode!r}")
 
     def _semantic_search(
         self, query: str, top_k: int, types: Optional[list[str]]
@@ -320,16 +253,16 @@ class MemoryRetriever:
         .md frontmatter 读(参见 MemoryStore.read 契约)。
         """
         if not hasattr(self.vector_store, "query"):
-            logger.warning("vector_store 不支持 query(),降级为 keyword 模式")
-            return self._keyword_search(query, top_k, types)
+            logger.warning("vector_store 不支持 query(),返空")
+            return []
 
         q_emb = self.embed_fn.encode(query)
 
         try:
             raw = self.vector_store.query(q_emb, top_k=top_k * 2)
         except Exception as e:
-            logger.warning(f"vector_store.query 失败: {e},降级 keyword")
-            return self._keyword_search(query, top_k, types)
+            logger.warning(f"vector_store.query 失败: {e},返空")
+            return []
 
         hits: list[MemoryHit] = []
         for doc in raw:
@@ -381,92 +314,20 @@ class MemoryRetriever:
                 return t
         return None
 
-    def _keyword_search(
-        self, query: str, top_k: int, types: Optional[list[str]]
+    def _side_query_search(
+        self, query: str, top_k: int, types: Optional[list[str]],
+        already_surfaced: Optional[set[str]],
     ) -> list[MemoryHit]:
-        """关键词检索（基于简化 BM25）"""
-        # 1) 列出所有 memory(只拿 frontmatter 索引)
-        all_items: list[tuple[str, str, dict]] = []  # (type, hash, listing)
-        for t in (types or ["user", "feedback", "event", "project", "reference"]):
-            try:
-                items = self.memory_store.list_by_type(t)
-            except Exception:
-                continue
-            for it in items:
-                all_items.append((t, it.get("hash", ""), it))
+        """side_query 模式:扫描 MEMORY.md manifest → LLM 选 path → 读全文
 
-        if not all_items:
-            return []
-
-        # 2) 分词 query
-        q_tokens = _tokenize(query)
-
-        # 3) 打分(对每个 item 读取完整 body)
-        hits: list[MemoryHit] = []
-        for type_, h, listing in all_items:
-            # list_by_type 不带 body,需要 read
-            rel_path = listing.get("path", f"{type_}/{h}.md")
-            try:
-                data = self.memory_store.read(rel_path)
-            except Exception:
-                continue
-            body = data.get("body", "")
-            title = listing.get("title", "") or data.get("frontmatter", {}).get("title", "")
-            text = f"{title}\n{body}"
-            score = _keyword_score(q_tokens, text)
-            if score <= 0:
-                continue
-            hits.append(MemoryHit(
-                item_hash=h,
-                type=type_,
-                title=title,
-                body=body,
-                rel_path=rel_path,
-                score=score,
-                breakdown={"keyword": score},
-                tags=listing.get("tags", []),
-                importance=data.get("frontmatter", {}).get("importance", 5),
-            ))
-        # 排序
-        hits.sort(key=lambda x: x.score, reverse=True)
-        return hits[:top_k]
-
-    def _merge_hits(
-        self, sem_hits: list[MemoryHit], kw_hits: list[MemoryHit]
-    ) -> list[MemoryHit]:
+        T7 实现细节,这里先 stub 返空(避免循环 import)。
         """
-        合并 semantic + keyword 候选(按 hash 去重, 累加 breakdown)
-        """
-        by_hash: dict[str, MemoryHit] = {}
-        for h in sem_hits:
-            by_hash[h.item_hash] = h
-        for h in kw_hits:
-            if h.item_hash in by_hash:
-                # 已有 semantic,补 keyword score
-                existing = by_hash[h.item_hash]
-                existing.breakdown["keyword"] = h.score
-            else:
-                by_hash[h.item_hash] = h
-        return list(by_hash.values())
+        return []
 
     def _rerank(
         self, candidates: list[MemoryHit], mode: RetrievalMode
     ) -> list[MemoryHit]:
-        """
-        重排: 按 mode 算最终 score
-
-        - hybrid: 0.7 * semantic + 0.3 * keyword (config 可调)
-        - semantic/keyword: 保持原 score
-        """
-        if mode != RetrievalMode.HYBRID:
-            return sorted(candidates, key=lambda h: h.score, reverse=True)
-
-        sem_w = self.config.retrieval.semantic_weight  # 0.7
-        kw_w = self.config.retrieval.lexical_weight    # 0.3
-        for h in candidates:
-            sem_s = h.breakdown.get("semantic", 0.0)
-            kw_s = h.breakdown.get("keyword", 0.0)
-            h.score = sem_w * sem_s + kw_w * kw_s
+        """M11 简化:所有模式都用原 score 排序(无 hybrid 加权)"""
         return sorted(candidates, key=lambda h: h.score, reverse=True)
 
     def _filter_secrets(
