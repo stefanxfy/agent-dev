@@ -381,6 +381,23 @@ class ReactAgent:
             already_surfaced=self._surfaced_memories,
         )
 
+    def _messages_with_ids(self) -> list[dict]:
+        """M11 (2026-06-26):给 self.messages 注入 stable id(仅当 m 无 id)。
+
+        背景:sm_layer._slice_kept_messages 通过 m.get("id") 找 last_id,
+        但 self.messages 只有 {role, content} 没有 id,导致 _slice_kept
+        永远走 last_id is None 全返路径,SM 实际上丢不掉任何消息。
+
+        实现:enumerate 索引当 id ("m0", "m1", ...)。纯运行时,不写盘不持久化。
+        caller 拿到结果后用完即弃,id 字段不要回写到 self.messages。
+        """
+        out = []
+        for i, m in enumerate(self.messages):
+            if "id" not in m:
+                m = {**m, "id": f"m{i}"}
+            out.append(m)
+        return out
+
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
     def _estimate_tokens(self, text: str) -> int:
@@ -500,11 +517,7 @@ class ReactAgent:
                 # 但 self.messages 里只有 {role, content} 没有 id,导致 _slice_kept
                 # 永远走 last_id is None 全返路径,SM 实际上无法丢消息
                 # 修复:在传给 SM 之前用 enumerate 注入 stable id(仅当 m 无 id)
-                msgs_with_id = []
-                for _i, _m in enumerate(self.messages):
-                    if "id" not in _m:
-                        _m = {**_m, "id": f"m{_i}"}
-                    msgs_with_id.append(_m)
+                msgs_with_id = self._messages_with_ids()
 
                 total_tokens = sum(
                     self._estimate_message_tokens(m) for m in self.messages
@@ -993,6 +1006,36 @@ class ReactAgent:
                     yield ("memory_event", event)
             except Exception as e:
                 _logger.warning(f"Memory bridge failed: {e}")
+
+        # M10 C2.2 (2026-06-26):L3 SessionMemory extract 触发点
+        # turn 结束后把 messages 喂给 sm_layer.extract_incremental
+        # 走后台 ThreadPoolExecutor,不阻塞主对话(零延迟)
+        #
+        # 本期(2026-06-26 测试学习阶段):llm_callback=None 走测试路径
+        #   → 仅推进 last_id,SM 文件写 template 但 sections 空
+        #   → 目的:打通完整 lifecycle(extract_incremental 入口 → 推进
+        #     last_id → 下次 should_trigger_compact 走 COND 2 no_sm_file
+        #     fallback,验证 wiring 正常)
+        # 下一期:实现 LLM callback + Edit 工具,真正 Edit SM 的 5 个 section
+        if self.session_memory is not None and last_turn > 0 and final_answer:
+            try:
+                _msgs_with_id = self._messages_with_ids()
+                _logger.debug(
+                    f"[L3 SM extract trigger] run() 末尾触发 extract_incremental | "
+                    f"msgs={len(_msgs_with_id)} last_turn={last_turn} | "
+                    f"sm.last_id(before)={self.session_memory.last_compacted_msg_id} | "
+                    f"llm_callback=None (test path: 写 template + 推进 last_id,不调 LLM)"
+                )
+                future = self.session_memory.extract_incremental(
+                    _msgs_with_id, llm_callback=None,
+                )
+                # 不 .result() block(后台线程,主流程不等)
+                # 但记录 future 引用,方便测试或后续 block 等待
+                self._pending_sm_extract_future = future
+            except Exception as e:
+                _logger.warning(
+                    f"[L3 SM extract trigger] 失败(不影响主流程): {e}"
+                )
 
         # Day 4: run 结束后 flush session
         if self._session_manager:
