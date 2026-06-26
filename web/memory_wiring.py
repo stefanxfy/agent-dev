@@ -99,20 +99,23 @@ def build_memory_system(
         # 3. Embed fn(默认 MiniLM,无 bge 下载)
         memory_embed_fn = make_embed_fn()
 
-        # 4. Retriever(读 .md frontmatter + Chroma k-NN 混合打分)
+        # 4. 独立 router 实例(避免主 agent 路由的 retry/backoff 干扰)
+        #    同时供给 retriever(sideQuery 二次精选)+ gate(extraction 决策)
+        extractor_router = LLMRouter(llm_config)
+
+        # 5. Retriever(读 .md frontmatter + Chroma k-NN 混合打分)
+        #    M11: 注入 llm_router,否则 side_query 模式降级返空(2026-06-26 反馈)
         memory_retriever = MemoryRetriever(
             memory_store=memory_store,
             vector_store=vec_store,
             embed_fn=memory_embed_fn,
+            llm_router=extractor_router,
         )
 
-        # 5. MetaDB + CostTracker + Gate
+        # 6. MetaDB + CostTracker + Gate
         agent_data_dir = resolve_agent_data_dir()
         meta_db_path = agent_data_dir / "meta.db"
         meta_db = MetaDB(meta_db_path)
-
-        # 独立 router 实例避免主 agent 路由(retry/backoff)干扰
-        extractor_router = LLMRouter(llm_config)
 
         from agent_core.memory.cost_tracker import CostTracker
         cost_tracker = CostTracker(
@@ -127,15 +130,15 @@ def build_memory_system(
             cost_tracker=cost_tracker,
         )
 
-        # 6. 语义去重 judge(可选)
+        # 7. 语义去重 judge(可选)
         dedup_judge = make_llm_dedup_judge(extractor_router)
 
-        # 7. MemoryIndex —— 关键:必须 hoist 并传给 DualChannelWriter,
+        # 8. MemoryIndex —— 关键:必须 hoist 并传给 DualChannelWriter,
         #    否则写盘后 mark_dirty() 守卫失败,MEMORY.md 不会自动更新
         memory_index = MemoryIndex(memory_root)
         memory_index.rebuild()  # 兜底:首次启动 MEMORY.md 可能不存在
 
-        # 8. DualChannelWriter(双通道脊柱,异步提取)
+        # 9. DualChannelWriter(双通道脊柱,异步提取)
         dual_channel = DualChannelWriter(
             session_id=session_id,
             meta_db=meta_db,
@@ -147,7 +150,7 @@ def build_memory_system(
             memory_index=memory_index,  # M11: 写盘后 mark_dirty → 1s 内异步 rebuild
         )
 
-        # 9. ReactMemoryBridge(严格双通道事件桥)
+        # 10. ReactMemoryBridge(严格双通道事件桥)
         react_memory_bridge = ReactMemoryBridge(
             dual_channel=dual_channel,
             gate=gate,
@@ -155,7 +158,7 @@ def build_memory_system(
             session_id=session_id,
         )
 
-        # 10. event_callback 绑定(让 bridge 能接收 secret/edit/precondition 事件)
+        # 11. event_callback 绑定(让 bridge 能接收 secret/edit/precondition 事件)
         dual_channel.event_callback = (
             lambda evt: react_memory_bridge._enqueue_secret_event(evt)
             if react_memory_bridge

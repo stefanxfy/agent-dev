@@ -114,6 +114,28 @@ class TestBuildMemorySystemWiring:
         _store, _vec, _embed, _retr, _dual, _bridge, idx = bundle
         assert idx.root.resolve() == mem_root.resolve()
 
+    def test_retriever_has_llm_router(
+        self, tmp_agent_data, fake_llm_config, memory_config
+    ):
+        """retriever.llm_router 必须非空 —— 否则 sideQuery 模式降级返空
+
+        2026-06-26 反馈:用户 .env 配 MEMORY_RETRIEVAL__MODE=side_query,但日志出现
+        'sideQuery 需要 llm_router,当前为 None,降级返空',因为之前没把 router 注入。
+        """
+        from web.memory_wiring import build_memory_system
+
+        bundle = build_memory_system(
+            memory_root=tmp_agent_data / "memory",
+            chroma_path=tmp_agent_data / "chroma",
+            llm_config=fake_llm_config,
+            memory_config=memory_config,
+            session_id="s_router",
+        )
+        _store, _vec, _embed, retriever, _dual, _bridge, _idx = bundle
+        assert retriever.llm_router is not None, (
+            "MemoryRetriever.llm_router 必须非空,否则 sideQuery 模式会降级返空"
+        )
+
 
 class TestWriteTriggersMemoryIndexRebuild:
     """端到端:dual_channel 暴露的 memory_index 调用 mark_dirty 后,MEMORY.md 必须更新
