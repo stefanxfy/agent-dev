@@ -452,9 +452,12 @@ class MemoryRetriever:
         )
         # 列前 10 条给个概览
         for i, e in enumerate(entries[:10]):
+            # MemoryFileEntry 字段叫 name(对应 frontmatter.name 或 .title)不是 title
+            # 之前用 getattr(e, 'title', '?') 永远返 '?',side_query 模式 debug log 看不到
+            # 真实标题,排查时不便(2026-06-26 用户反馈)
             logger.debug(
                 f"  entry[{i}] rel_path={e.rel_path} "
-                f"title={getattr(e, 'title', '?')!r} "
+                f"name={getattr(e, 'name', '?')!r} "
                 f"type={getattr(e, 'type', '?')!r}"
             )
         if len(entries) > 10:
