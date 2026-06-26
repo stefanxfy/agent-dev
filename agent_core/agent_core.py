@@ -340,6 +340,36 @@ class ReactAgent:
             return base + "\n" + TRUSTING_RECALL_SECTION
         return f"{base}\n\n{index_content}\n\n{TRUSTING_RECALL_SECTION}"
 
+    # ── M11: 检索 wiring(从 .env → memory_config → retriever.search) ──
+
+    def _call_memory_retriever(self, query: str):
+        """调 memory_retriever.search(),mode/top_k 从 self.memory_config 读。
+
+        为什么独立成方法(2026-06-26 修复):
+        - 之前直接 inline 在 run() 里 hardcode top_k=5、不传 mode,
+          导致 .env 里 MEMORY_RETRIEVAL__MODE / __TOP_K 改了不生效
+        - 抽成方法后单测可验证 wiring,且未来加 side_query 二次精选 hook 也有落点
+
+        Args:
+            query: 用户消息文本
+
+        Returns:
+            retriever.search() 返回值(通常是 RetrievalReport)
+        """
+        if self.memory_config is not None:
+            mode = self.memory_config.retrieval.mode
+            top_k = self.memory_config.retrieval.top_k
+        else:
+            # 向后兼容:老 caller 不传 memory_config
+            mode = "semantic"
+            top_k = 5
+        return self.memory_retriever.search(
+            query,
+            top_k=top_k,
+            mode=mode,
+            already_surfaced=self._surfaced_memories,
+        )
+
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
     def _estimate_tokens(self, text: str) -> int:
@@ -560,11 +590,11 @@ class ReactAgent:
                 )
                 if last_user_msg and isinstance(last_user_msg.get("content"), str):
                     try:
+                        # M11 (2026-06-26 修复):mode/top_k 从 memory_config 读
+                        # (.env → MemoryConfig.from_env()),不再硬编码
                         # M11: 传 already_surfaced 让 retriever 过滤已展示过的
-                        report = self.memory_retriever.search(
+                        report = self._call_memory_retriever(
                             last_user_msg["content"],
-                            top_k=5,
-                            already_surfaced=self._surfaced_memories,
                         )
                         hits = report.hits if hasattr(report, "hits") else []
                         # 记录已展示的 hit(用于下一轮去重)
