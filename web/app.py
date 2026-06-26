@@ -251,6 +251,32 @@ with st.sidebar:
                     st.success(f"✅ Budget 改为 ${_new_budget:.2f}")
                     st.rerun()
 
+                # M11: 检索模式 (semantic / side_query) + sideQuery 选 N
+                _mode = _rt_config.retrieval.mode
+                _new_mode = st.selectbox(
+                    "检索模式 (M11)",
+                    options=["semantic", "side_query"],
+                    index=0 if _mode == "semantic" else 1,
+                    key="runtime_retrieval_mode",
+                    help="semantic = 向量召回;side_query = MEMORY.md manifest 让 LLM 二次精选",
+                )
+                _new_max_select = st.slider(
+                    "sideQuery max select",
+                    min_value=1, max_value=10,
+                    value=int(_rt_config.retrieval.side_query_max_select),
+                    step=1, key="runtime_side_query_max_select",
+                    help="sideQuery 一次 LLM 选 N 个 path",
+                )
+                if st.button("Apply (M11)", key="apply_runtime_m11"):
+                    _rt_config.set_runtime("retrieval.mode", _new_mode)
+                    _rt_config.set_runtime(
+                        "retrieval.side_query_max_select", int(_new_max_select)
+                    )
+                    st.success(
+                        f"✅ 检索模式 → {_new_mode}, max_select={_new_max_select}"
+                    )
+                    st.rerun()
+
     st.divider()
     st.header("⚙️ LLM 配置")
 
