@@ -105,10 +105,14 @@ def build_memory_system(
 
         # 5. Retriever(读 .md frontmatter + Chroma k-NN 混合打分)
         #    M11: 注入 llm_router,否则 side_query 模式降级返空(2026-06-26 反馈)
+        #    2026-06-26 二次反馈:必须把 memory_config 一起注入,否则
+        #    retriever.config 走默认 MemoryConfig(min_score=0.3),
+        #    .env 的 MEMORY_RETRIEVAL__MIN_SCORE=0.7 完全不生效
         memory_retriever = MemoryRetriever(
             memory_store=memory_store,
             vector_store=vec_store,
             embed_fn=memory_embed_fn,
+            config=memory_config,
             llm_router=extractor_router,
         )
 

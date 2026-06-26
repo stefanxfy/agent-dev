@@ -136,6 +136,39 @@ class TestBuildMemorySystemWiring:
             "MemoryRetriever.llm_router 必须非空,否则 sideQuery 模式会降级返空"
         )
 
+    def test_retriever_config_matches_memory_config(
+        self, tmp_agent_data, fake_llm_config, memory_config
+    ):
+        """retriever.config 必须就是 caller 传入的 memory_config —— 否则
+        .env 里的 MEMORY_RETRIEVAL__MIN_SCORE / __TOP_K / __MODE 全部失效
+
+        2026-06-26 二次反馈:用户 .env 配 MEMORY_RETRIEVAL__MIN_SCORE=0.7,
+        但 19:18:12 跑 "我叫什么名字" 仍返 5 hits(应该是 3 hits),原因就是
+        retriever 用了默认 MemoryConfig(min_score=0.3)。
+        """
+        from agent_core.memory.config import RetrievalConfig
+        from web.memory_wiring import build_memory_system
+
+        # 用一个非默认 min_score 的 config,验证它能传过去
+        custom_cfg = type(memory_config)(
+            retrieval=RetrievalConfig(min_score=0.42),
+        )
+        bundle = build_memory_system(
+            memory_root=tmp_agent_data / "memory",
+            chroma_path=tmp_agent_data / "chroma",
+            llm_config=fake_llm_config,
+            memory_config=custom_cfg,
+            session_id="s_cfg",
+        )
+        _store, _vec, _embed, retriever, _dual, _bridge, _idx = bundle
+        assert retriever.config is custom_cfg, (
+            "MemoryRetriever.config 必须就是传入的 memory_config,否则 .env "
+            "里的 min_score/top_k/mode 全部失效"
+        )
+        assert retriever.config.retrieval.min_score == 0.42, (
+            f"min_score 应是 0.42,实际 {retriever.config.retrieval.min_score}"
+        )
+
 
 class TestWriteTriggersMemoryIndexRebuild:
     """端到端:dual_channel 暴露的 memory_index 调用 mark_dirty 后,MEMORY.md 必须更新
