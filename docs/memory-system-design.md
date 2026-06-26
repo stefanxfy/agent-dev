@@ -2,8 +2,8 @@
 
 > 参考来源：QClaw 记忆系统 + Mem0 核心概念 + Claude Code 记忆设计（详见 [`claude-code-memory-system-deep-dive.md`](claude-code-memory-system-deep-dive.md)）
 > 项目：agent-dev（自研 Agent 框架）
-> 日期：2026-06-25（v2.2，语义去重升级）
-> 状态：v2.2 已实现并验证
+> 日期：2026-06-26（v2.3，frontmatter + MEMORY.md 物理索引 + sideQuery 模式）
+> 状态：v2.3 已实现并验证
 
 ---
 
@@ -15,6 +15,7 @@
 | v2 | 2026-06-19 | **架构升级**：补 L3 会话内压缩、双通道写入、封闭分类法、Why-How 模板、Edit-only 沙箱、token 阈值、配置/UI/安全章节 | Claude Code 源码 deep-dive 对比 |
 | v2.1 | 2026-06-20 | **配置/检索升级**：Pydantic 配置校验 + 三模式共存（vector/file/hybrid）+ Hybrid 量化指标 + 锁粒度拆分 + Windows 路径兼容 | 24 项专业审查 |
 | v2.2 | 2026-06-25 | **语义去重升级**：向量召回 + 阈值/LLM 判定三层决策，替换旧提示词注入方案；bge-m3 向量编码；极性/实体差异处理 | 用户反馈去重漏报/误报 |
+| v2.3 | 2026-06-26 | **M11 frontmatter + MEMORY.md 物理索引 + sideQuery 二选一**：`name`/`description` 必填；MEMORY.md 物理索引（200 行 / 25KB 上限，写盘后 1s 异步 rebuild）；删除 keyword/hybrid 模式，只保留 `semantic` + `side_query` 二选一；L1 启动加载 + L2 sideQuery LLM 精选 + `already_surfaced` 去重；新增 TRUSTING_RECALL_SECTION 提示 LLM 验证记忆新鲜度 | 对齐 Claude Code memory 模式 |
 
 ### 〇.1 版本时间线（演进路径）
 
