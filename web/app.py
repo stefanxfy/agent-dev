@@ -615,6 +615,28 @@ def get_agent(session_id=None):
 
     # Day 4: 传入 session_id 实现历史持久化
     # M10 C6.4: 传入 MemoryConfig,UI expander 才能 set_runtime in-place 改字段
+    # M10 C2.2 (2026-06-26):wire SessionMemoryLayer(L3 SM 快路径)
+    #   sm_path = DATA_DIR/<session_id>/sm.md,每个 session 独立
+    #   注入失败 → None fallback,不阻断 agent(测试/学习阶段)
+    session_memory = None
+    if session_id:
+        try:
+            from agent_core.memory.sm_layer import SessionMemoryLayer
+            _sm_dir = Path(DATA_DIR) / session_id
+            _sm_dir.mkdir(parents=True, exist_ok=True)
+            session_memory = SessionMemoryLayer(
+                session_id=session_id,
+                sm_path=_sm_dir / "sm.md",
+                config=memory_config.compact,
+            )
+            logging.info(
+                f"[L3 SM] SessionMemoryLayer 构造成功 session_id={session_id} "
+                f"sm_path={_sm_dir / 'sm.md'} enabled={memory_config.compact.enabled}"
+            )
+        except Exception as e:
+            logging.warning(f"[L3 SM] SessionMemoryLayer 构造失败,fallback 无 L3: {e}")
+            session_memory = None
+
     agent = ReactAgent(
         router, registry,
         max_turns=max_turns,
@@ -624,6 +646,7 @@ def get_agent(session_id=None):
         memory_store=memory_store,             # M7 ported: 库内计数
         react_memory_bridge=react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
         memory_config=memory_config,           # M10 C6.4 + C7.1: 共享 MemoryConfig 实例
+        session_memory=session_memory,         # M10 C2.2: L3 SM 快路径
     )
 
     # M10 C3.1: 启动 DistillationLoop(后台 daemon,10 分钟检查 4 重门)
