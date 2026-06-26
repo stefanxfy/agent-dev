@@ -115,14 +115,7 @@ from .extraction_gate import ExtractionGate, TurnContext, Decision
 from .react_memory_bridge import ReactMemoryBridge, MemoryEvent, MemoryEventKind
 from .prompt_templates import build_extract_prompt, EXTRACT_SYSTEM_PROMPT
 
-# M7: Schema 迁移
-from .migration import (
-    MigrationRegistry,
-    MigrationError,
-    MigrationReport,
-    migrate_file,
-    migrate_all,
-)
+# M11: 已删除 migration 模块(不再兼容旧 schema,旧 .md 文件由 validate_frontmatter 拒)
 
 # M8: A6 Data Lifecycle (上线运维)
 from .lifecycle import (
@@ -239,12 +232,7 @@ __all__ = [
     "MemoryEventKind",
     "build_extract_prompt",
     "EXTRACT_SYSTEM_PROMPT",
-    # M7: Schema 迁移
-    "MigrationRegistry",
-    "MigrationError",
-    "MigrationReport",
-    "migrate_file",
-    "migrate_all",
+    # M11: migration 模块已删除,不再兼容旧 schema
     # M8: Lifecycle
     "BackupReport",
     "CapacityReport",

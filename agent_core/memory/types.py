@@ -106,7 +106,7 @@ class Frontmatter(TypedDict, total=False):
         tags:       选填，字符串列表（用于分类过滤）
         source:     选填，来源（"user_input" / "extracted" / "manual"）
         item_hash:  必填，item 内容哈希（用于幂等去重，A5）
-        schema_version: 必填，整数（用于 schema migration，A7）
+        schema_version: 必填，整数（当前为 M11 v3；validate_frontmatter 拒 > current）
     """
     type: MemoryType
     created_at: str

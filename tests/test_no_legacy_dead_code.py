@@ -14,7 +14,7 @@ Phase 4 / Step 4.4.2-4.4.6 bundled — 死代码清理断言
 - DualChannelWriter.recover_pending 整个方法删
 - DualChannelWriter._load_messages_for_retry / _on_recovery_done 删
 - DualChannelWriter 不再 import make_daily_lock / make_extract_lock
-  (但 IPCLock 类本身仍被 distiller/migration 用 — 不动)
+  (但 IPCLock 类本身仍被 distiller 用 — 不动)
 - DualChannelWriter.daily_cursor / extract_cursor 属性删
   (extract_cursor 本来就是 _do_extract_candidates 局部用)
 - DualChannelWriter.extract_candidates 删 advance_cursor 参数
