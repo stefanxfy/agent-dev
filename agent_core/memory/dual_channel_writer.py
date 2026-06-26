@@ -172,6 +172,7 @@ class DualChannelWriter:
         dedup_config: Optional[Any] = None,   # DedupConfig;None → 不做语义去重(向后兼容)
         dedup_judge: Optional[Callable[[Any, list[dict]], bool]] = None,  # 可疑带 LLM 判定器
         task_wal_config: TaskWALConfig = TaskWALConfig(),  # M11: WAL 状态机配置
+        memory_index: Optional[Any] = None,  # M11: MemoryIndex(异步 rebuild MEMORY.md)
     ):
         if task_wal_config is None:
             raise ValueError("task_wal_config 不能为 None,使用 TaskWALConfig() 取默认")
@@ -184,6 +185,8 @@ class DualChannelWriter:
         self.dedup_judge = dedup_judge
         # M11: WAL 状态机配置(Phase 1/2 用,Phase 3 env 接入)
         self.task_wal_config = task_wal_config
+        # M11: MEMORY.md 索引(写盘后 mark_dirty → 1s 内异步 rebuild)
+        self.memory_index = memory_index
         # embed_fn 必须非 None:extract_candidates 写入 vector_store 需要先编码
         # 失败时立即 EmbeddingError,不静默(不再有 Mock 兜底)
         if embed_fn is None:
@@ -636,6 +639,8 @@ class DualChannelWriter:
 
                     item_hash = self.memory_store.write(
                         type=cand.type,
+                        name=cand.title or "(无名)",
+                        description=(cand.body[:200] if cand.body else cand.title or "(无描述)"),
                         title=cand.title,
                         body=cand.body,
                         source_quote=cand.source_quote,
@@ -650,6 +655,15 @@ class DualChannelWriter:
                         f"extract:  MemoryStore 已写 {md_path} "
                         f"(hash={item_hash[:12]}, body[{len(cand.body)}] chars)"
                     )
+
+                    # M11: 写盘后触发 MEMORY.md 异步 rebuild(1s 合并窗口)
+                    if self.memory_index is not None:
+                        try:
+                            self.memory_index.mark_dirty()
+                        except Exception as idx_err:
+                            logger.warning(
+                                f"extract:  MemoryIndex.mark_dirty 失败: {idx_err}"
+                            )
 
                     self.vector_store.add(item_hash, embedding)
                     written += 1

@@ -575,3 +575,109 @@ def test_auto_duplicate_log_includes_top_title_from_memory_store(writer, caplog)
     assert "已有 '姓名'" in msgs or '已有 "姓名"' in msgs, (
         f"AUTO_DUPLICATE log 应含 top1 title '姓名',实际:\n{msgs}"
     )
+
+# ──────────────────────────────────────────────────────────────────
+# M11 v3: dual_channel_writer integration tests
+# ──────────────────────────────────────────────────────────────────
+
+def test_dual_channel_write_emits_v3_frontmatter(tmp_path, meta_db_path, chroma_dir):
+    """M11 v3: channel A 写盘后 .md frontmatter 含 name + description + schema_version=3"""
+    import re
+    import yaml
+    from agent_core.memory.dual_channel_writer import DualChannelWriter
+    from agent_core.memory.memory_store import MemoryStore
+    from agent_core.memory.meta_db import MetaDB
+    from agent_core.memory.chroma_store import ChromaVectorStore
+    from tests.conftest import FakeEmbedFn
+
+    memory_root = tmp_path / "memory"
+    memory_root.mkdir()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    db = MetaDB(meta_db_path)
+    store = MemoryStore(memory_root)
+    embed = FakeEmbedFn()
+    chroma_path = chroma_dir / f"v3frontmatter_{os.getpid()}"
+    with ChromaVectorStore(str(chroma_path), collection="v3fm") as vec:
+        w = DualChannelWriter("s1", db, store, vec, embed)
+        try:
+            w.persist_turn("用户叫小明", "ok", turn_index=0)
+            from tests.test_dual_channel_concurrent import (
+                ExtractionCandidate, TurnMessage,
+            )
+
+            def seed(messages):
+                return [ExtractionCandidate(
+                    type="user", title="姓名",
+                    body="用户叫小明", source_quote="用户叫小明",
+                    tags=[], score=0.9,
+                )]
+
+            f = w.extract_candidates(
+                [TurnMessage(0, "用户叫小明", "ok")],
+                llm_extractor=seed,
+            )
+            f.result(timeout=5)
+
+            # 读 .md 验证 v3 frontmatter
+            md_files = list((memory_root / "user").glob("*.md"))
+            assert md_files
+            md_text = md_files[0].read_text(encoding="utf-8")
+            m = re.match(r"\A---\n(.*?)\n---", md_text, re.DOTALL)
+            assert m, f"no frontmatter in:\n{md_text}"
+            fm = yaml.safe_load(m.group(1)) or {}
+            assert fm.get("schema_version") == 3, fm
+            assert fm.get("name"), f"missing name: {fm}"
+            assert fm.get("description"), f"missing description: {fm}"
+        finally:
+            w.shutdown(timeout=3)
+            vec.close()
+
+
+def test_dual_channel_write_triggers_memory_index_mark_dirty(tmp_path, meta_db_path, chroma_dir):
+    """M11: 写盘后 MemoryIndex 被 mark_dirty(MEMORY.md 1.2s 后出现)"""
+    import time
+    from agent_core.memory.dual_channel_writer import DualChannelWriter
+    from agent_core.memory.memory_store import MemoryStore
+    from agent_core.memory.memory_index import MemoryIndex
+    from agent_core.memory.meta_db import MetaDB
+    from agent_core.memory.chroma_store import ChromaVectorStore
+    from tests.conftest import FakeEmbedFn
+
+    memory_root = tmp_path / "memory"
+    memory_root.mkdir()
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    db = MetaDB(meta_db_path)
+    store = MemoryStore(memory_root)
+    embed = FakeEmbedFn()
+    index = MemoryIndex(memory_root)
+    chroma_path = chroma_dir / f"m11index_{os.getpid()}"
+    with ChromaVectorStore(str(chroma_path), collection="m11idx") as vec:
+        w = DualChannelWriter("s1", db, store, vec, embed, memory_index=index)
+        try:
+            w.persist_turn("用户叫张三", "ok", turn_index=0)
+            from tests.test_dual_channel_concurrent import (
+                ExtractionCandidate, TurnMessage,
+            )
+
+            def seed(messages):
+                return [ExtractionCandidate(
+                    type="user", title="姓名",
+                    body="用户叫张三", source_quote="用户叫张三",
+                    tags=[], score=0.9,
+                )]
+
+            f = w.extract_candidates(
+                [TurnMessage(0, "用户叫张三", "ok")],
+                llm_extractor=seed,
+            )
+            f.result(timeout=5)
+            # 等异步 rebuild
+            time.sleep(1.2)
+            assert (memory_root / "MEMORY.md").exists()
+            content = (memory_root / "MEMORY.md").read_text(encoding="utf-8")
+            assert "姓名" in content
+        finally:
+            w.shutdown(timeout=3)
+            vec.close()
