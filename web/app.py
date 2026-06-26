@@ -64,6 +64,7 @@ from agent_core.llm.router import (
     UsageStats,
 )
 from agent_core.agent_core import ReactAgent
+from agent_core.config import config as _agent_config  # 解析 AGENT_DATA_DIR
 from agent_core.memory.config import MemoryConfig  # M10 C7.1: 共享实例,line 648 + 719
 from agent_core.session.manager import SessionManager
 from agent_core.session.storage import SessionStorage
@@ -635,75 +636,30 @@ def get_agent(session_id=None):
     memory_config = MemoryConfig()
     if st.session_state.get("memory_enabled", False):
         try:
-            from agent_core.memory import (
-                MemoryStore, ChromaVectorStore, MemoryRetriever,
-                make_embed_fn,
-                MetaDB, DualChannelWriter, ExtractionGate,
-                ReactMemoryBridge,
-            )
-            from agent_core.config import config as _agent_config
-            # AGENT_DATA_DIR 为空时 fallback 到 ~/.agent_data(与 config.py 默认约定一致)
+            from web.memory_wiring import build_memory_system
             agent_data_dir = _agent_config.agent_data_dir or str(Path.home() / ".agent_data")
             mem_root = Path(agent_data_dir) / "memory"
-            mem_root.mkdir(parents=True, exist_ok=True)
-            memory_store = MemoryStore(mem_root)
             chroma_path = Path(agent_data_dir) / "chroma"
-            chroma_path.mkdir(parents=True, exist_ok=True)
-            vec_store = ChromaVectorStore(str(chroma_path), collection="react_demo")
-            memory_embed_fn = make_embed_fn()  # 默认 MiniLM(无 bge 下载)
-            memory_retriever = MemoryRetriever(
-                memory_store=memory_store,
-                vector_store=vec_store,
-                embed_fn=memory_embed_fn,
-            )
-
-            # ── Task 8: 严格双通道 wiring ────────────────────────────
-            # meta.db 放 agent 数据根目录(避免污染 data/sessions/ 里的 jsonl)
-            meta_db_path = Path(agent_data_dir) / "meta.db"
-            meta_db = MetaDB(meta_db_path)
-            # M10 C5.4: 给 extraction gate 独立 router 实例,避免主 agent 路由
-            # (retry/backoff/未来 cost tracker)的干扰。cache_namespace 由 gate
-            # 默认 "memory_extract_score" 隔离,不需要在 router 层设。
-            extractor_router = LLMRouter(config)
-            # M10 C7.1 final review fix: 默认启用 cost guard(spec §13.7)
-            # 从 memory_config 读 budget;UI Runtime Config 可运行时替换
-            from agent_core.memory.cost_tracker import CostTracker as _DefaultCT
-            _cost_tracker = _DefaultCT(
-                daily_budget_usd=memory_config.cost.daily_budget_usd,
-                enabled=memory_config.cost.enabled,
-            )
-            gate = ExtractionGate(
-                llm_router=extractor_router,
-                memory_store=memory_store,
-                session_id=session_id or "default",
-                cost_tracker=_cost_tracker,
-            )
-            # 语义去重:向量召回 + LLM 判定(≥auto_threshold 直接判重复,省 token)
-            # judge 复用 extractor_router(可疑带才会触发一次 LLM 调用)
-            from agent_core.memory.dedup import make_llm_dedup_judge
-            _dedup_judge = make_llm_dedup_judge(extractor_router)
-            # M10 C1.2: 先构造 dual_channel,后构造 bridge,然后再装上 event_callback
-            # (bridge 构造需 dual_channel 已就绪,所以 dual_channel 先造)
-            dual_channel = DualChannelWriter(
-                session_id=session_id or "default",
-                meta_db=meta_db,
-                memory_store=memory_store,
-                vector_store=vec_store,
-                embed_fn=memory_embed_fn,
-                dedup_config=memory_config.dedup,
-                dedup_judge=_dedup_judge,
-            )
-            react_memory_bridge = ReactMemoryBridge(
-                dual_channel=dual_channel,
-                gate=gate,
-                memory_store=memory_store,
+            # M11 修复(2026-06-26):build_memory_system 内部已 hoist MemoryIndex
+            # 并传给 DualChannelWriter,确保写盘后 mark_dirty 触发异步 rebuild
+            bundle = build_memory_system(
+                memory_root=mem_root,
+                chroma_path=chroma_path,
+                llm_config=config,
+                memory_config=memory_config,
                 session_id=session_id or "default",
             )
-            # M10 C1.2: 把 event_callback 绑到 dual_channel(bridge 已就绪,可引用其方法)
-            dual_channel.event_callback = (
-                lambda evt: react_memory_bridge._enqueue_secret_event(evt)
-                if react_memory_bridge else None
-            )
+            if bundle is None:
+                raise RuntimeError("build_memory_system 返回 None,见上方 warning")
+            (
+                memory_store,
+                vec_store,
+                memory_embed_fn,
+                memory_retriever,
+                dual_channel,
+                react_memory_bridge,
+                _memory_index,
+            ) = bundle
         except Exception as e:
             logging.warning(f"Memory system init failed: {e}")
             memory_retriever = None
