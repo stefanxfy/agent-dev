@@ -114,6 +114,10 @@ def _parse_frontmatter(content: str) -> tuple[Frontmatter, str]:
     return data, body  # type: ignore[return-value]
 
 
+# M11:对外暴露 parse_frontmatter(供 memory_index.scan_memory_files 复用)
+parse_frontmatter = _parse_frontmatter
+
+
 def _serialize_frontmatter(data: dict[str, Any]) -> str:
     """YAML 序列化（保证 key 顺序稳定，便于 diff）"""
     return yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)

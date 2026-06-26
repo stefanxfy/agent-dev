@@ -34,18 +34,28 @@ _VALID_TYPES = ("user", "feedback", "event", "project", "reference")
 
 
 def _parse_frontmatter_head(head: str) -> dict:
-    """极简 frontmatter 解析(T9 会替换为复用 store 的正式版)"""
-    fm: dict = {}
-    in_fm = False
-    for line in head.splitlines():
-        if line.strip() == "---":
-            if in_fm:
-                break
-            in_fm = True
-            continue
-        if in_fm and ":" in line:
-            key, _, val = line.partition(":")
-            fm[key.strip()] = val.strip().strip('"').strip("'")
+    """复用 MemoryStore 的 parse_frontmatter(更准, 支持 quoted / multiline)
+
+    T9:从极简版升级到正式版(YAML 解析)
+    """
+    # head 是文件前 N 行,可能只含 frontmatter 部分
+    # parse_frontmatter 期望完整 --- 包裹
+    from agent_core.memory.memory_store import parse_frontmatter
+    try:
+        fm, _ = parse_frontmatter(head if head.startswith("---\n") else f"---\n{head}\n---\n")
+    except Exception:
+        # 回退到极简版
+        fm = {}
+        in_fm = False
+        for line in head.splitlines():
+            if line.strip() == "---":
+                if in_fm:
+                    break
+                in_fm = True
+                continue
+            if in_fm and ":" in line:
+                key, _, val = line.partition(":")
+                fm[key.strip()] = val.strip().strip('"').strip("'")
     return fm
 
 

@@ -150,6 +150,43 @@ def test_scan_memory_files_sorted_by_mtime_desc(tmp_path):
     assert [e.name for e in entries] == ["new", "mid", "old"]
 
 
+def test_scan_memory_files_quoted_description(tmp_path):
+    """T9:quoted description 用 yaml 解析正确(T4 极简版会失败)"""
+    from agent_core.memory.memory_index import scan_memory_files
+    root = tmp_path / "memory"
+    user_dir = root / "user"
+    user_dir.mkdir(parents=True)
+    (user_dir / "a.md").write_text(
+        f"""---
+type: user
+name: 'has: colon'
+description: "含 冒号 : 和 #hash 都不应截断"
+schema_version: 3
+item_hash: {'q'*64}
+created_at: 2026-06-26T00:00:00+00:00
+---
+body""",
+        encoding="utf-8",
+    )
+    entries = scan_memory_files(root)
+    assert len(entries) == 1
+    assert entries[0].name == "has: colon"
+    assert "含 冒号" in entries[0].description
+
+
+def test_format_memory_manifest_in_memory_index_module():
+    """T9:format_memory_manifest 可从 memory_index 模块直接 import"""
+    from agent_core.memory.memory_index import (
+        MemoryFileEntry, format_memory_manifest,
+    )
+    entries = [
+        MemoryFileEntry(rel_path="user/abc.md", name="用户",
+                        description="小明", type="user", mtime_ms=0),
+    ]
+    out = format_memory_manifest(entries)
+    assert out == "- [用户](user/abc.md) — 小明"
+
+
 def test_format_memory_manifest_renders_correctly():
     """format_memory_manifest 渲染格式对齐 CC"""
     from agent_core.memory.memory_index import MemoryFileEntry, format_memory_manifest
