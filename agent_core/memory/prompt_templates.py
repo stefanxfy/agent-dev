@@ -94,3 +94,34 @@ def build_dedup_prompt(candidate_text: str, similar_memories: list[dict]) -> str
 
 输出 JSON:
 {{"is_duplicate": true/false, "reason": "简短理由"}}"""
+
+
+# ──────────────────────────────────────────────────────────────────
+# M11: sideQuery 模式 LLM 选 path(对齐 Claude Code MEMORY.md manifest)
+# ──────────────────────────────────────────────────────────────────
+
+SIDE_QUERY_SYSTEM_PROMPT = """你是 memory recall selector。
+用户给了一个 query 和一份 manifest(记忆索引), 请从 manifest 中选出 ≤{max_select} 个最相关的 path。
+
+规则:
+- 只输出 JSON, 严格按 schema
+- 不要选完全无关的(描述不匹配的)
+- 少于 {max_select} 个也行(强制过滤)
+- 如果都不相关, selected_paths = []
+- 不要解释, 不要 markdown fence
+
+JSON schema:
+{{"selected_paths": ["user/abc.md", "feedback/xyz.md", ...]}}"""
+
+
+def build_side_query_prompt(query: str, manifest: str, max_select: int) -> str:
+    """拼 sideQuery prompt(注入到 user message)"""
+    return f"""<query>
+{query}
+</query>
+
+<memory_manifest>
+{manifest}
+</memory_manifest>
+
+请从 manifest 中选 ≤{max_select} 个最相关的 path, 输出 JSON。"""
