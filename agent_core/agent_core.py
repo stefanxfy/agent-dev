@@ -496,40 +496,80 @@ class ReactAgent:
         sm_compact_used = False
         if self.session_memory is not None:
             try:
+                # M11 (2026-06-26):_slice_kept_messages 通过 m.get("id") 找 last_id
+                # 但 self.messages 里只有 {role, content} 没有 id,导致 _slice_kept
+                # 永远走 last_id is None 全返路径,SM 实际上无法丢消息
+                # 修复:在传给 SM 之前用 enumerate 注入 stable id(仅当 m 无 id)
+                msgs_with_id = []
+                for _i, _m in enumerate(self.messages):
+                    if "id" not in _m:
+                        _m = {**_m, "id": f"m{_i}"}
+                    msgs_with_id.append(_m)
+
                 total_tokens = sum(
                     self._estimate_message_tokens(m) for m in self.messages
                 )
                 tool_count = getattr(self, "cumulative_tool_calls", 0)
                 ctx = _TurnContext(
-                    messages=self.messages,
+                    messages=msgs_with_id,
                     total_tokens=total_tokens,
                     tool_count=tool_count,
                 )
+                _logger.debug(
+                    f"[L3 SM] 决策入口: msgs={len(msgs_with_id)} total_tokens={total_tokens} "
+                    f"tool_count={tool_count} | "
+                    f"sm_path={self.session_memory.sm_path} | "
+                    f"sm.last_compacted_msg_id={self.session_memory.last_compacted_msg_id}"
+                )
                 decision = self.session_memory.should_trigger_compact(ctx)
                 _logger.debug(
-                    f"SM decision: strategy={decision.strategy}, reason={decision.reason}"
+                    f"[L3 SM] 决策结果: strategy={decision.strategy} reason={decision.reason!r} "
+                    f"timeout_ms={decision.timeout_ms}"
                 )
                 if decision.strategy == "sm_compact":
                     sm_result = self.session_memory.compact(
-                        self.messages,
+                        msgs_with_id,
                         context_window=self.max_context_tokens,
                     )
                     if sm_result is not None:
                         # SM 压缩成功:替换 messages
-                        self.messages = [sm_result.summary_message] + list(sm_result.kept_messages)
+                        # kept_messages 是 msgs_with_id 的子集,剥离注入的 id(避免污染
+                        # 后续 self.messages 持久化逻辑;id 是 SM 内部用)
+                        kept = [
+                            {k: v for k, v in m.items() if k != "id"}
+                            for m in sm_result.kept_messages
+                        ]
+                        self.messages = [sm_result.summary_message] + kept
                         sm_compact_used = True
                         _logger.info(
                             f"SM-compact OK: ~{sm_result.used_tokens_estimate} tokens estimated"
+                        )
+                        _logger.debug(
+                            f"[L3 SM] 应用 compact 结果: "
+                            f"summary_message.role={sm_result.summary_message['role']!r} "
+                            f"summary_chars={len(sm_result.summary_message['content'])} | "
+                            f"kept_count={len(sm_result.kept_messages)} "
+                            f"self.messages 新长度={len(self.messages)}"
                         )
                         yield (
                             "system",
                             f"📦 [L3 fast path] 上下文已压缩(SM 文件): ~{sm_result.used_tokens_estimate} tokens",
                         )
+                    else:
+                        _logger.debug(
+                            f"[L3 SM] compact() 返 None(SM 文件不可用),fallback ContextManager"
+                        )
                     # else: SM 返回 None → fallback 走 ContextManager
                 elif decision.strategy == "wait":
                     # 等 extraction 完成(本期简化:记 log,fallback ContextManager)
                     _logger.info(
-                        f"SM wait: {decision.reason}, fallback ContextManager"
+                        f"[L3 SM] wait: {decision.reason} timeout_ms={decision.timeout_ms}, "
+                        f"fallback ContextManager"
+                    )
+                elif decision.strategy == "traditional":
+                    _logger.debug(
+                        f"[L3 SM] strategy=traditional fallback ContextManager "
+                        f"(reason={decision.reason!r})"
                     )
             except Exception as e:
                 # SM 决策/压缩异常 → 安全回退到 ContextManager
