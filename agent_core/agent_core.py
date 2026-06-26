@@ -65,6 +65,21 @@ _TRUNCATED_STOP_REASONS = {"max_tokens", "length"}
 _logger.setLevel(logging.DEBUG)  # 自己放开 DEBUG，由 root handler 的 level 控制是否输出
 
 
+# M11: TRUSTING_RECALL_SECTION 独立 H2 段
+# 借鉴 Claude Code: 提醒 LLM 在依据记忆做推荐前,先验证文件/函数/flag 是否仍存在。
+# 记忆是过去的快照,不能假定当下仍为真。
+TRUSTING_RECALL_SECTION = """
+## Before recommending from memory
+
+A memory that names a specific function, file, or flag is a claim that it existed *when the memory was written*. It may have been renamed, removed, or never merged. Before recommending it:
+- If the memory names a file path: check the file exists.
+- If the memory names a function or flag: grep for it.
+- If the user is about to act on your recommendation (not just asking about history), verify first.
+
+"The memory says X exists" is not the same as "X exists now."
+"""
+
+
 def _format_messages_for_log(messages: list) -> str:
     """格式化 messages 用于日志输出（JSON 美化）"""
     try:
@@ -309,20 +324,21 @@ class ReactAgent:
 
         借鉴 Claude Code appendSystemPrompt:
         - base system prompt 在前
-        - MEMORY.md 内容作为独立 H1 段追加
-        - 加载失败 → 仅 base,不抛
+        - MEMORY.md 内容作为独立 H1 段追加(若有)
+        - 末尾追加 TRUSTING_RECALL_SECTION H2 段(无论是否有 index 都加)
+        - 加载失败 → base + TRUSTING_RECALL_SECTION,不抛
         """
         base = self.system_prompt or ""
         if self.memory_index is None:
-            return base
+            return base + "\n" + TRUSTING_RECALL_SECTION
         try:
             index_content = self.memory_index.load_index()
         except Exception as e:
             _logger.warning(f"MEMORY.md 加载失败,跳过: {e}")
-            return base
+            return base + "\n" + TRUSTING_RECALL_SECTION
         if not index_content:
-            return base
-        return f"{base}\n\n{index_content}"
+            return base + "\n" + TRUSTING_RECALL_SECTION
+        return f"{base}\n\n{index_content}\n\n{TRUSTING_RECALL_SECTION}"
 
     # ── Token 估算（粗略）──────────────────────────────────────────────
 

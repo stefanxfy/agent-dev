@@ -80,11 +80,32 @@ def test_agent_core_build_system_prompt_with_memory(tmp_path):
     assert "[小明]" in prompt
 
 
-def test_agent_core_build_system_prompt_no_index_returns_base(tmp_path):
-    """无 memory_index → 仅 base prompt"""
+def test_agent_core_build_system_prompt_no_index_returns_base_plus_trust(tmp_path):
+    """无 memory_index → base + TRUSTING_RECALL_SECTION H2 段"""
     agent = _build_agent(tmp_path, store=None)
     prompt = agent._build_system_prompt_with_memory()
-    assert prompt == "BASE"
+    assert prompt.startswith("BASE")
+    assert "## Before recommending from memory" in prompt
+
+
+def test_agent_core_build_system_prompt_contains_trust_section_with_index(tmp_path):
+    """有 index 时,prompt 仍含 TRUSTING_RECALL_SECTION"""
+    from agent_core.memory.memory_store import MemoryStore
+    store = MemoryStore(tmp_path / "memory")
+    store.write(
+        type="user", name="小明", description="Python 工程师",
+        body="小明是 Python 工程师",
+        source_quote="我说'我是小明'",
+    )
+    agent = _build_agent(tmp_path, store=store)
+    agent.memory_index.rebuild()
+    prompt = agent._build_system_prompt_with_memory()
+    assert "## Before recommending from memory" in prompt
+    assert "[小明]" in prompt
+    # H1 (MEMORY.md) 出现在 H2 (Before recommending) 之前
+    assert prompt.index("# Agent Memory") < prompt.index(
+        "## Before recommending from memory"
+    )
 
 
 def test_agent_core_initial_surfaced_memories_empty(tmp_path):
