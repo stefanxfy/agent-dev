@@ -19,6 +19,7 @@ import threading
 import pytest
 
 from agent_core.memory import (
+    MemoryConfig,
     MemoryRetriever,
     MemoryHit,
     RetrievalReport,
@@ -445,3 +446,74 @@ def test_side_query_uses_cache_namespace(memory_root_with_llm_stub):
     retriever.search("user", top_k=1, mode=RetrievalMode.SIDE_QUERY)
     assert llm_router.calls
     assert llm_router.calls[0]["cache_namespace"] == "memory_side_query"
+
+
+# ──────────────────────────────────────────────────────────────────
+# min_score 阈值过滤 (2026-06-26 修复: 之前是 dead param)
+# ──────────────────────────────────────────────────────────────────
+
+class TestMinScoreFilter:
+    """min_score 从 MemoryConfig.retrieval.min_score 读,过滤低相关 hit
+
+    修复前: search() 收 min_score 但 _semantic_search 完全没用,任何距离都返回
+    修复后: _semantic_search 在算完 sim 后,sim < min_score 直接 skip
+    """
+
+    def test_min_score_default_keeps_all_hits(self, populated):
+        """min_score=0.3 (默认) — FakeEmbedFn 4 条全部 sim > 0.3,全保留"""
+        from agent_core.memory.retriever import RetrievalMode
+        ms, vec, embed = populated["store"], populated["vec"], populated["embed"]
+        r = MemoryRetriever(
+            memory_store=ms, vector_store=vec, embed_fn=embed,
+            config=MemoryConfig(),
+        )
+        rep = r.search("用户", top_k=10, mode=RetrievalMode.SEMANTIC)
+        # 默认 min_score=0.3 不应该把现有测试的 hit 过滤掉
+        assert len(rep.hits) == 4, f"默认 0.3 应保留全部 4 条,实际 {len(rep.hits)}"
+
+    def test_min_score_high_filters_all(self, populated):
+        """min_score=0.99 — 全部 hit 被过滤"""
+        from agent_core.memory.config import RetrievalConfig
+        from agent_core.memory.retriever import RetrievalMode
+        ms, vec, embed = populated["store"], populated["vec"], populated["embed"]
+        r = MemoryRetriever(
+            memory_store=ms, vector_store=vec, embed_fn=embed,
+            config=MemoryConfig(retrieval=RetrievalConfig(min_score=0.99)),
+        )
+        rep = r.search("用户", top_k=10, mode=RetrievalMode.SEMANTIC)
+        assert len(rep.hits) == 0, (
+            f"min_score=0.99 应过滤全部,实际剩 {len(rep.hits)} hits: "
+            f"{[h.title for h in rep.hits]}"
+        )
+
+    def test_min_score_partial_filter(self, populated):
+        """min_score=0.5 — 介于 0 和 0.99 之间,只保留部分 hit"""
+        from agent_core.memory.config import RetrievalConfig
+        from agent_core.memory.retriever import RetrievalMode
+        ms, vec, embed = populated["store"], populated["vec"], populated["embed"]
+        r_low = MemoryRetriever(
+            memory_store=ms, vector_store=vec, embed_fn=embed,
+            config=MemoryConfig(retrieval=RetrievalConfig(min_score=0.0)),
+        )
+        r_high = MemoryRetriever(
+            memory_store=ms, vector_store=vec, embed_fn=embed,
+            config=MemoryConfig(retrieval=RetrievalConfig(min_score=0.5)),
+        )
+        rep_low = r_low.search("用户", top_k=10, mode=RetrievalMode.SEMANTIC)
+        rep_high = r_high.search("用户", top_k=10, mode=RetrievalMode.SEMANTIC)
+        # 0.5 一定 ≤ 全量 0.0
+        assert len(rep_high.hits) <= len(rep_low.hits)
+        # 留下来的每一个 score 都 >= 0.5
+        for h in rep_high.hits:
+            assert h.score >= 0.5, (
+                f"min_score=0.5 时 score={h.score} < 0.5 的 hit 漏过来了"
+            )
+
+    def test_min_score_from_env(self, tmp_path, monkeypatch):
+        """MEMORY_RETRIEVAL__MIN_SCORE=0.5 从 .env 读到并生效"""
+        from agent_core.memory.config import MemoryConfig
+        monkeypatch.setenv("MEMORY_RETRIEVAL__MIN_SCORE", "0.5")
+        cfg = MemoryConfig.from_env()
+        assert cfg.retrieval.min_score == 0.5, (
+            f"env 应读到 0.5,实际 {cfg.retrieval.min_score}"
+        )

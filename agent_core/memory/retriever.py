@@ -291,6 +291,11 @@ class MemoryRetriever:
             hit_importance = fm.get("importance", 5)
             distance = doc.get("distance", 0.0)
             sim = max(0.0, 1.0 - distance / 2.0)
+            # M11 (2026-06-26 修复):min_score 从 MemoryConfig 读
+            # 之前 search() 收了 min_score 但 _semantic_search 没用,dead param
+            # (导致 "我是谁" 跟 "我喜欢斗破苍穹" 距离不算近也被召回)
+            if sim < self.config.retrieval.min_score:
+                continue
             hits.append(MemoryHit(
                 item_hash=item_hash,
                 type=hit_type,
