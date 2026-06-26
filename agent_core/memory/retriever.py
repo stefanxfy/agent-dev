@@ -48,7 +48,7 @@ class RetrievalError(StorageError):
 class RetrievalMode(str, Enum):
     """检索模式(M11 二选一)"""
     SEMANTIC = "semantic"
-    # SIDE_QUERY = "side_query"  # T7 加
+    SIDE_QUERY = "side_query"  # M11 新增
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -136,12 +136,14 @@ class MemoryRetriever:
         embed_fn,
         config: Optional[MemoryConfig] = None,
         secret_scanner: Optional[SecretScanner] = None,
+        llm_router=None,  # M11 新增(sideQuery 用)
     ):
         self.memory_store = memory_store
         self.vector_store = vector_store
         self.embed_fn = embed_fn
         self.config = config or MemoryConfig()
         self.secret_scanner = secret_scanner or get_default_scanner()
+        self.llm_router = llm_router  # M11:sideQuery 模式注入主 LLM router
 
     # ── 公开 API ─────────────────────────────────────────
 
@@ -320,9 +322,87 @@ class MemoryRetriever:
     ) -> list[MemoryHit]:
         """side_query 模式:扫描 MEMORY.md manifest → LLM 选 path → 读全文
 
-        T7 实现细节,这里先 stub 返空(避免循环 import)。
+        M11 设计: 不走向量召回, 直接读 <memory_root>/MEMORY.md manifest,
+        让 LLM 从 manifest 里挑 ≤ max_select 个最相关的 path, 然后读全文。
         """
-        return []
+        from agent_core.memory.memory_index import (
+            scan_memory_files, format_memory_manifest,
+        )
+        from agent_core.memory.prompt_templates import (
+            SIDE_QUERY_SYSTEM_PROMPT, build_side_query_prompt,
+        )
+
+        max_files = getattr(
+            self.config.retrieval, "side_query_max_files", 200
+        )
+        max_select = getattr(
+            self.config.retrieval, "side_query_max_select", top_k
+        )
+
+        entries = scan_memory_files(
+            self.memory_store.root, max_files=max_files,
+            types_filter=types,
+        )
+        if already_surfaced:
+            entries = [e for e in entries if e.rel_path not in already_surfaced]
+        if not entries:
+            return []
+
+        manifest = format_memory_manifest(entries)
+        selected = self._call_side_query(query, manifest, max_select)
+
+        hits: list[MemoryHit] = []
+        for path in selected:
+            try:
+                data = self.memory_store.read(path)
+            except Exception:
+                continue
+            fm = data.get("frontmatter", {}) or {}
+            body = data.get("body", "")
+            hits.append(MemoryHit(
+                item_hash=fm.get("item_hash", ""),
+                type=fm.get("type", "user"),
+                title=fm.get("name") or fm.get("title", ""),
+                body=body,
+                rel_path=path,
+                score=1.0,
+                breakdown={"side_query": 1.0},
+                tags=fm.get("tags", []) or [],
+                importance=fm.get("importance", 5),
+            ))
+        return hits
+
+    def _call_side_query(
+        self, query: str, manifest: str, max_select: int
+    ) -> list[str]:
+        """调 LLM router 选 path(LLM 失败时降级返空)"""
+        import json
+        from agent_core.memory.prompt_templates import (
+            SIDE_QUERY_SYSTEM_PROMPT, build_side_query_prompt,
+        )
+        if not self.llm_router:
+            logger.warning(
+                "sideQuery 需要 llm_router,当前为 None,降级返空"
+            )
+            return []
+        prompt = build_side_query_prompt(query, manifest, max_select)
+        text = ""
+        try:
+            # llm_router.chat 是 stream 协议
+            for chunk in self.llm_router.chat(
+                messages=[
+                    {"role": "system", "content": SIDE_QUERY_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                cache_namespace="memory_side_query",
+            ):
+                if getattr(chunk, "text_delta", None):
+                    text += chunk.text_delta.text
+            data = json.loads(_strip_code_fence(text))
+            return data.get("selected_paths", [])[:max_select]
+        except Exception as e:
+            logger.warning(f"sideQuery 失败,降级返空: {e}")
+            return []
 
     def _rerank(
         self, candidates: list[MemoryHit], mode: RetrievalMode
@@ -354,6 +434,19 @@ class MemoryRetriever:
                 )
             out.append(h)
         return out
+
+
+def _strip_code_fence(text: str) -> str:
+    """剥掉 LLM 输出外的 ``` ``` markdown fence"""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
 
 
 __all__ = [

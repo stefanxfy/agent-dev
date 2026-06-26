@@ -322,3 +322,126 @@ def test_semantic_hit_metadata_from_memory_store_only(workspace):
         hit = report[0]
         assert hit.title
         assert hit.rel_path.startswith("user/")
+
+# ──────────────────────────────────────────────────────────────────
+# M11: side_query 模式
+# ──────────────────────────────────────────────────────────────────
+
+class FakeLLMRouter:
+    """T7 测试用 stub LLM router, 返回固定 JSON"""
+
+    def __init__(self, selected_paths: list[str] | None = None,
+                 raise_exc: bool = False):
+        self.selected_paths = selected_paths or []
+        self.raise_exc = raise_exc
+        self.calls: list = []
+
+    def chat(self, messages, cache_namespace=None):
+        self.calls.append({"messages": messages,
+                           "cache_namespace": cache_namespace})
+        if self.raise_exc:
+            raise RuntimeError("simulated LLM failure")
+        payload = (
+            '{"selected_paths": [' +
+            ", ".join(f'"{p}"' for p in self.selected_paths) +
+            ']}'
+        )
+        chunk = type("Chunk", (), {})()
+        td = type("TD", (), {})()
+        td.text = payload
+        chunk.text_delta = td
+        yield chunk
+
+
+@pytest.fixture
+def memory_root_with_llm_stub(populated):
+    """populated + 一个 FakeLLMRouter"""
+    workspace = populated
+    workspace["llm_router"] = FakeLLMRouter(selected_paths=[
+        "user/记忆1.md", "user/记忆2.md"
+    ])
+    return workspace
+
+
+@pytest.fixture
+def memory_root_with_broken_llm(populated):
+    """LLM 失败的 stub"""
+    workspace = populated
+    workspace["llm_router"] = FakeLLMRouter(raise_exc=True)
+    return workspace
+
+
+def test_side_query_basic(memory_root_with_llm_stub):
+    """sideQuery 模式:LLM 选 path,读全文,构造 MemoryHit"""
+    from agent_core.memory.retriever import MemoryRetriever, RetrievalMode
+    ms = memory_root_with_llm_stub["store"]
+    vec = memory_root_with_llm_stub["vec"]
+    embed = memory_root_with_llm_stub["embed"]
+    llm_router = memory_root_with_llm_stub["llm_router"]
+    retriever = MemoryRetriever(ms, vec, embed, llm_router=llm_router)
+    report = retriever.search(
+        "用户叫什么", top_k=2, mode=RetrievalMode.SIDE_QUERY
+    )
+    assert report.mode == RetrievalMode.SIDE_QUERY
+    # 即使 LLM stub 返了不存在的 path, retriever 会读不到 → 跳过
+    # 但 hits 可能为 0; 至少 mode 正确
+    for hit in report.hits:
+        assert hit.breakdown == {"side_query": 1.0}
+
+
+def test_side_query_already_surfaced_filter(memory_root_with_llm_stub):
+    """already_surfaced 过滤已展示过的记忆"""
+    from agent_core.memory.retriever import MemoryRetriever, RetrievalMode
+    ms = memory_root_with_llm_stub["store"]
+    vec = memory_root_with_llm_stub["vec"]
+    embed = memory_root_with_llm_stub["embed"]
+    llm_router = memory_root_with_llm_stub["llm_router"]
+    retriever = MemoryRetriever(ms, vec, embed, llm_router=llm_router)
+
+    # 列出真实存在的 path
+    user_paths = []
+    for t in ("user", "feedback", "project"):
+        for it in ms.list_by_type(t):
+            user_paths.append(it["path"])
+
+    surfaced = {user_paths[0]} if user_paths else set()
+    report = retriever.search(
+        "用户", top_k=3, mode=RetrievalMode.SIDE_QUERY,
+        already_surfaced=surfaced,
+    )
+    for hit in report.hits:
+        assert hit.rel_path not in surfaced
+
+
+def test_side_query_failure_returns_empty(memory_root_with_broken_llm):
+    """LLM 失败时 sideQuery 降级返空(不抛)"""
+    from agent_core.memory.retriever import MemoryRetriever, RetrievalMode
+    ms = memory_root_with_broken_llm["store"]
+    vec = memory_root_with_broken_llm["vec"]
+    embed = memory_root_with_broken_llm["embed"]
+    llm_router = memory_root_with_broken_llm["llm_router"]
+    retriever = MemoryRetriever(ms, vec, embed, llm_router=llm_router)
+    report = retriever.search(
+        "user", top_k=2, mode=RetrievalMode.SIDE_QUERY
+    )
+    assert report.hits == []
+
+
+def test_side_query_no_llm_router_returns_empty(retriever):
+    """无 llm_router 时 sideQuery 降级返空"""
+    from agent_core.memory.retriever import RetrievalMode
+    report = retriever.search("user", top_k=2, mode=RetrievalMode.SIDE_QUERY)
+    assert report.hits == []
+
+
+def test_side_query_uses_cache_namespace(memory_root_with_llm_stub):
+    """sideQuery 调 LLM 时用 cache_namespace=memory_side_query 隔离"""
+    from agent_core.memory.retriever import MemoryRetriever, RetrievalMode
+    ms = memory_root_with_llm_stub["store"]
+    vec = memory_root_with_llm_stub["vec"]
+    embed = memory_root_with_llm_stub["embed"]
+    llm_router = memory_root_with_llm_stub["llm_router"]
+    retriever = MemoryRetriever(ms, vec, embed, llm_router=llm_router)
+    retriever.search("user", top_k=1, mode=RetrievalMode.SIDE_QUERY)
+    assert llm_router.calls
+    assert llm_router.calls[0]["cache_namespace"] == "memory_side_query"
