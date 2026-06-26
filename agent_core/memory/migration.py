@@ -16,7 +16,8 @@ Schema 迁移 —— v0/v1 旧记忆文件 → CURRENT_SCHEMA_VERSION (M7 / Day 
 
 Public API:
 - `MigrationRegistry.register(from_v, fn)` —— 注册转换函数
-- `MigrationRegistry.migrate(from_v, data) -> dict` —— 链式迁移
+- `MigrationRegistry.migrate(from_v, data, body="") -> (fm, body)` —— 链式迁移(M11 支持 body)
+- `MigrationRegistry.migrate_fm_only(from_v, data) -> fm` —— 仅迁移 frontmatter
 - `migrate_file(path) -> dict` —— 单文件懒迁移(返回 migrated bool)
 - `migrate_all(root) -> MigrationReport` —— 批量,返回报告(迁移/跳过/已是最新 三种计数)
 - `MigrationError` —— 迁移异常基类(继承 AgentError)
@@ -124,9 +125,12 @@ class MigrationRegistry:
         return cls._migrations.get(from_v)
 
     @classmethod
-    def migrate(cls, from_v: int, data: dict) -> dict:
+    def migrate(cls, from_v: int, data: dict, body: str = "") -> tuple[dict, str]:
         """
-        链式迁移 from_v → CURRENT_SCHEMA_VERSION
+        链式迁移 from_v → CURRENT_SCHEMA_VERSION(M11 支持 body 透传)
+
+        Returns:
+            (new_fm, new_body) 元组
 
         Raises:
             MigrationError: 缺中间版本迁移函数 / from_v > CURRENT
@@ -144,11 +148,17 @@ class MigrationRegistry:
                     f"缺 v{v} → v{v+1} 迁移函数,已注册: {sorted(cls._migrations.keys())}"
                 )
             try:
-                data = fn(data)
+                data, body = _call_migration_fn(fn, data, body)
             except Exception as e:
                 raise MigrationError(f"v{v} 迁移函数异常: {e}", cause=e) from e
             v += 1
-        return data
+        return data, body
+
+    @classmethod
+    def migrate_fm_only(cls, from_v: int, data: dict) -> dict:
+        """仅迁移 frontmatter(忽略 body),向后兼容旧 caller"""
+        new_fm, _ = cls.migrate(from_v, data, "")
+        return new_fm
 
     @classmethod
     def registered_versions(cls) -> list[int]:
@@ -219,9 +229,9 @@ def migrate_file(path: Path) -> dict:
     except OSError as e:
         raise MigrationError(f"写 .bak 失败: {e}", cause=e) from e
 
-    # 链式迁移
-    new_fm = MigrationRegistry.migrate(from_v, fm)
-    new_text = _render(new_fm, body)
+    # 链式迁移(支持 body 透传给 v2→v3)
+    new_fm, new_body = MigrationRegistry.migrate(from_v, fm, body)
+    new_text = _render(new_fm, new_body)
 
     # 写回原路径
     try:
@@ -294,7 +304,7 @@ def migrate_all(root: Path) -> MigrationReport:
 
 
 # ──────────────────────────────────────────────────────────────────
-# 内置迁移函数 (v0 → v1 → v2)
+# 内置迁移函数 (v0 → v1 → v2 → v3)
 # ──────────────────────────────────────────────────────────────────
 
 def _v0_to_v1(data: dict) -> dict:
@@ -333,6 +343,67 @@ def _v1_to_v2(data: dict) -> dict:
     return data
 
 
+def _first_meaningful_line(body: str) -> str:
+    """取 body 第一段非空非标题的行"""
+    for line in body.split("\n"):
+        s = line.strip().lstrip("# ").strip()
+        if s:
+            return s
+    return ""
+
+
+def _v2_to_v3(data: dict, body: str = "") -> tuple[dict, str]:
+    """
+    M11 v2 → v3 迁移:补 name / description,schema_version 升 3
+
+    - name:从 title mirror(若 title 也缺,取 body 第一段)
+    - description:从 body 第一段取(≤200 字符,fallback 到 title 或 '未描述')
+    - 保留 body 不变
+
+    返回 (new_fm, body) 以兼容"含 body 的链式迁移"调用方式
+    """
+    fm = dict(data)  # copy, 避免 mutate
+
+    # 1. name:从 title mirror
+    if "name" not in fm or not str(fm["name"]).strip():
+        fm["name"] = fm.get("title") or _first_meaningful_line(body)[:50] or "未命名"
+
+    # 2. description:从 body 摘要
+    if "description" not in fm or not str(fm["description"]).strip():
+        first_para = _first_meaningful_line(body)
+        fallback = fm.get("title", "未描述")
+        fm["description"] = (first_para or fallback)[:200] or "未描述"
+
+    # 3. schema_version 升 3
+    fm["schema_version"] = 3
+
+    return fm, body
+
+
 # 注册内置迁移(import 时自动生效)
 MigrationRegistry.register(0, _v0_to_v1)
 MigrationRegistry.register(1, _v1_to_v2)
+# M11: v2 → v3 注册(与 v0/v1 不同,接受 (fm, body) 元组返回)
+#      兼容两种调用:迁移函数可接受 1 或 2 参数
+MigrationRegistry.register(2, _v2_to_v3)
+
+
+def _call_migration_fn(fn: Callable, data: dict, body: str) -> tuple[dict, str]:
+    """调用迁移函数,根据签名自动适配 1-arg / 2-arg
+
+    v0/v1 迁移: fn(data) -> data
+    v2 迁移:    fn(data, body) -> (data, body)
+
+    返回 (new_fm, new_body)
+    """
+    import inspect
+    try:
+        sig = inspect.signature(fn)
+        nparams = len([p for p in sig.parameters.values()
+                       if p.kind in (p.POSITIONAL_OR_KEYWORD, p.POSITIONAL_ONLY)])
+    except (ValueError, TypeError):
+        nparams = 1  # 默认按 1-arg 调用
+
+    if nparams >= 2:
+        return fn(data, body)
+    return fn(data), body
