@@ -97,33 +97,30 @@ class Distiller:
         self,
         llm_callback: Callable[[str], str],
         candidate_root: Optional[Union[str, Path]] = None,
-        sm_dir: Optional[Union[str, Path]] = None,  # M10 C2.3
     ):
         self.llm = llm_callback
         self.candidate_root = Path(candidate_root) if candidate_root else Path(self.DEFAULT_CANDIDATE_ROOT)
-        self.sm_dir = Path(sm_dir) if sm_dir else None  # None = 不读 SM
 
     def distill(
         self,
-        session_log_files: list[Path],
-        existing_memories: Optional[list[dict]] = None,
+        existing_memories: list[dict],
     ) -> list[dict]:
         """
-        蒸馏:读 sessions + existing memories → LLM 整合 → 返回候选 dict 列表
+        M11.6 (2026-06-27): 蒸馏只依赖现有 .md 记忆库,不再扫 session 日志或 SM。
+
+        全量扫描 → LLM 整理 / 去重 / 修正 → 候选 dict 列表
 
         不写盘(纯函数),由调用方决定是否 write_candidates
+
+        Args:
+            existing_memories: 全量现有记忆列表(由 caller 从 memory_root 4 个
+                type 目录读取),每条形如 {"type": "user", "path": "...", "text": "..."}。
 
         Returns:
             [{type, title, body, source_quote, why, tags}, ...]
         """
-        sessions_text = self._read_sessions(session_log_files)
         existing_text = self._format_existing(existing_memories or [])
-
-        # M10 C2.3: SM 跨会话作为 L4 输入
-        sm_data = self._read_sm_files(self.sm_dir) if self.sm_dir else []
-        sm_text = self._format_sm_files(sm_data)
-
-        prompt = self._build_prompt(sessions_text, existing_text, sm_text)
+        prompt = self._build_prompt(existing_text)
         response = self.llm(prompt)
         candidates = self._parse_response(response)
         return candidates
@@ -178,23 +175,22 @@ class Distiller:
 
     # ── prompt 模板(§7.3) ────────────────────────────────
 
-    def _build_prompt(
-        self,
-        sessions_text: str,
-        existing_text: str,
-        sm_text: str = "(无跨会话 SM 摘要)",
-    ) -> str:
-        """v2.1 §7.3 蒸馏 prompt(per-file 输出)"""
-        return f"""从以下对话日志和现有记忆中, 蒸馏出值得保留的长期记忆.
+    def _build_prompt(self, existing_text: str) -> str:
+        """M11.6 (2026-06-27): 蒸馏 prompt 只基于现有 .md 记忆库
 
-跨会话 SM 摘要(L4 输入,直接复用,不要再提取):
-{sm_text}
+        任务:对现有记忆做整理 / 去重 / 修正,产出 candidate 候选
+        输入:全量现有 .md 记忆(已由 caller 从 memory_root 4 个 type 目录读出)
+        输出:每个候选一个 JSON dict,蒸馏引擎会写到 _candidate/{type}/ 下
+        """
+        return f"""从以下现有记忆中,蒸馏出整理 / 去重 / 修正后的候选记忆.
 
-现有记忆(不要重复提取):
+现有记忆(全量,共 {len(existing_text.splitlines())} 行):
 {existing_text}
 
-增量日志:
-{sessions_text}
+任务说明:
+- 你面对的是一个现有的 .md 记忆库,目标是让它更干净(去重 / 合并 / 修正)
+- 不要重复提取现有已有内容;只产出有"实质变化"的候选
+- "实质变化"包括:合并相似项 / 调和冲突 / 删除过时 / 修正错误
 
 输出: 每个候选记忆一个 markdown 文件, 含 YAML frontmatter.
 
@@ -202,7 +198,7 @@ frontmatter 字段:
 - type: 必须是 user | feedback | project | reference 之一
 - created_at: YYYY-MM-DD
 - confidence: 0.0-1.0
-- sources: [session_id_1, session_id_2, ...]
+- sources: [原文件名 1, 原文件名 2, ...]
 
 body 格式:
 # <标题>
@@ -215,8 +211,9 @@ body 格式:
 蒸馏规则:
 1. 合并相似记忆 (例: "先手写 ReAct" 和 "重视底层原理" → 合并)
 2. 调和冲突信息 (例: 用户改主意了 → 更新原记忆, 不新增)
-3. 删除过时记忆 (例: "Python 2 vs 3" 的 Python 2 相关 → 删)
-4. 强制: feedback / project 类必须含 **Why:** 字段
+3. 删除过时记忆 (例: 旧版本 API 用法 → 删)
+4. 修正错误信息 (例: 错别字 / 事实错误 → 重新表述)
+5. 强制: feedback / project 类必须含 **Why:** 字段
 
 输出格式(JSON 数组,严格遵循):
 ```json
@@ -227,59 +224,15 @@ body 格式:
     "why": "<重要性理由>",
     "body": "<记忆正文>",
     "confidence": 0.8,
-    "sources": ["session_id_1"],
+    "sources": ["原文件 hash 或路径片段"],
     "tags": ["偏好"]
   }}
 ]
 ```
+
+如果现有记忆已经很干净不需要整理,返回空数组 []。
 """
-
     # ── helpers ─────────────────────────────────────────
-
-    @staticmethod
-    def _read_sessions(session_log_files: list[Path]) -> str:
-        """读 session 日志文件,合并成文本"""
-        parts: list[str] = []
-        for p in session_log_files:
-            try:
-                content = Path(p).read_text(encoding="utf-8")
-                parts.append(f"=== {p.name} ===\n{content}")
-            except OSError as e:
-                logger.warning(f"读 session 文件失败 {p}: {e}")
-        return "\n\n".join(parts)
-
-    @staticmethod
-    def _read_sm_files(sm_dir: Optional[Path]) -> list[dict]:
-        """M10 C2.3: 读所有 SM .json 文件,反序列化为 list
-
-        Returns:
-            [{"session_id": "...", "summary_message_content": "...", ...}, ...]
-            文件不存在或为空 → []
-        """
-        if not sm_dir or not sm_dir.exists():
-            return []
-        out: list[dict] = []
-        for p in sm_dir.glob("*.json"):
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                data["_path"] = str(p)  # 加 path 便于 debug
-                out.append(data)
-            except (OSError, json.JSONDecodeError) as e:
-                logger.warning(f"读 SM 文件失败 {p}: {e}")
-        return out
-
-    @staticmethod
-    def _format_sm_files(sm_data_list: list[dict]) -> str:
-        """格式化 SM 数据为 prompt 片段"""
-        if not sm_data_list:
-            return "(无跨会话 SM 摘要)"
-        lines = []
-        for d in sm_data_list:
-            sid = d.get("session_id", "?")
-            content = d.get("summary_message_content", "")[:300]
-            tokens = d.get("used_tokens_estimate", "?")
-            lines.append(f"### Session {sid} (~{tokens} tokens)\n{content}")
-        return "\n\n".join(lines)
 
     @staticmethod
     def _format_existing(memories: list[dict]) -> str:
@@ -288,7 +241,9 @@ body 格式:
             return "(无现有记忆)"
         lines = []
         for m in memories:
-            lines.append(f"- [{m.get('type', '?')}] {m.get('title', '?')}: {m.get('body', '')[:200]}")
+            title = m.get("title") or m.get("body", "")[:50]
+            body = m.get("body", "")[:300]
+            lines.append(f"- [{m.get('type', '?')}] {title}: {body}")
         return "\n".join(lines)
 
     @staticmethod
@@ -422,16 +377,16 @@ class DistillationScheduler:
     def run(
         self,
         dry_run: bool = True,
-        session_log_files: Optional[list[Path]] = None,
         existing_memories: Optional[list[dict]] = None,
     ) -> DistillationResult:
         """
         端到端运行
 
+        M11.6 (2026-06-27): 不再扫 session 日志或 SM,只对全量现有 .md 记忆做整理 / 去重 / 修正。
+
         Args:
-            dry_run: True 只算候选不写盘;False 写到 _candidate/{type}/
-            session_log_files: 增量 session 日志;None = 自动扫描 logs/
-            existing_memories: 现有记忆;None = 自动从 memory_store 读
+            dry_run: True 只算候选不写盘;False 写到 _candidate/{run_id}/{type}/
+            existing_memories: 现有记忆;None = 自动从 memory_root 4 个 type 目录读
         """
         # 1. 门检查
         with tracer.start_as_current_span("memory.distill") as span:
@@ -451,8 +406,6 @@ class DistillationScheduler:
 
             # 3. 准备输入
             try:
-                if session_log_files is None:
-                    session_log_files = self._scan_session_logs(prior_mtime_ms / 1000)
                 existing = existing_memories if existing_memories is not None else self._read_existing_memories()
 
                 if self.llm is None:
@@ -462,13 +415,12 @@ class DistillationScheduler:
                         prior_mtime_ms=prior_mtime_ms,
                     )
 
-                # 4. 蒸馏(M10 C2.3 final review fix: 透传 sm_dir 让 Distiller 读 cross-session SM)
+                # 4. 蒸馏(全量 .md → LLM 整理 / 去重 / 修正 → 候选)
                 distiller = Distiller(
                     self.llm,
                     candidate_root=self._candidate_root,
-                    sm_dir=self.memory_root / "sm",
                 )
-                candidates = distiller.distill(session_log_files, existing)
+                candidates = distiller.distill(existing)
 
                 # 5. 写候选(非 dry_run)
                 written: list[Path] = []
@@ -513,7 +465,7 @@ class DistillationScheduler:
                     success=True,
                     candidates=candidates,
                     candidates_written=written,
-                    sessions_processed=len(session_log_files),
+                    sessions_processed=0,
                     prior_mtime_ms=prior_mtime_ms,
                     run_id=run_id,  # M10 C4.3
                 )
@@ -589,23 +541,11 @@ class DistillationScheduler:
             return 0
         return count
 
-    def _scan_session_logs(self, since_mtime: float) -> list[Path]:
-        """扫描 since_mtime 之后的 session 日志文件"""
-        logs_dir = self.memory_root.parent / "logs"
-        if not logs_dir.exists():
-            return []
-        result = []
-        for entry in os.scandir(logs_dir):
-            if entry.name.endswith(".jsonl"):
-                try:
-                    if entry.stat().st_mtime > since_mtime:
-                        result.append(Path(entry.path))
-                except OSError:
-                    continue
-        return sorted(result)
-
     def _read_existing_memories(self) -> list[dict]:
-        """读现有记忆(简单 glob,无 MemoryStore 依赖,降耦合)"""
+        """读现有记忆(简单 glob,无 MemoryStore 依赖,降耦合)
+
+        M11.6 (2026-06-27): 不再扫 logs/,只读 memory_root/{user,feedback,project,reference}/*.md
+        """
         memories: list[dict] = []
         for type_dir in ("user", "feedback", "project", "reference"):
             type_path = self.memory_root / type_dir
