@@ -172,16 +172,22 @@ last_compacted_at: null
         session_id: str,
         sm_path: Path | str,
         config: Optional[CompactConfig] = None,
+        llm_callback: Optional[Callable[[str], str]] = None,
     ):
         """
         Args:
             session_id: 会话 ID
             sm_path: SM 文件路径(.md)
             config: CompactConfig 实例(默认走 MemoryConfig().compact 默认值)
+            llm_callback: LLM 调用函数 (prompt) → response_text。
+                注入到 self 上,extract_incremental 时调用。
+                None 表示走测试路径(只推进 last_id,不真更新 sections)。
+                生产环境由 caller 注入真实 callback(如 make_sm_extract_callback(router=...))。
         """
         self.session_id = session_id
         self.sm_path = Path(sm_path)
         self.config = config or CompactConfig()
+        self._llm_callback = llm_callback
 
         # 内部状态
         self._extraction_in_progress = False
@@ -192,6 +198,11 @@ last_compacted_at: null
         # 从 frontmatter 恢复 last_compacted_msg_id(如果 SM 文件存在)
         if self.sm_exists():
             self._load_state_from_frontmatter()
+
+        logger.debug(
+            f"SessionMemoryLayer.__init__ session_id={self.session_id} | "
+            f"sm_path={self.sm_path} has_callback={llm_callback is not None}"
+        )
 
     # ──────────────────────────────────────────────
     # SM 文件 IO
@@ -282,6 +293,100 @@ last_compacted_at: null
                 self._last_compacted_msg_id = v if v and v != "null" else None
             elif k == "last_compacted_at":
                 self._last_compacted_at = v if v and v != "null" else None
+
+    def _apply_sm_operations(self, ops: list[dict]) -> int:
+        """把 LLM 返回的 op 列表应用到 SM 文件。
+
+        支持 3 种 op:
+        - append: 把 content 追加到 section 末尾
+        - replace: 替换整个 section 内容
+        - delete: 把 section 置空(写成 <!-- -->)
+
+        策略:
+        - ops 为空 → 不动文件,返 0
+        - 多个 op 串行应用,每条 op 之后重新 parse 文件,避免 section 位置漂移
+        - 任何一条 op 失败 → 跳过该条,继续后续 op(不让一条坏数据毁掉整个 extract)
+        - 写盘:原子写(写到 .tmp 再 rename),防止半写状态
+
+        Args:
+            ops: 形如 [{"op":"append","section":"Context","content":"..."}, ...]
+
+        Returns:
+            int: 成功应用的 op 数量
+        """
+        if not ops:
+            logger.debug("[sm._apply_sm_operations] ops 为空,不动文件")
+            return 0
+
+        logger.debug(
+            f"[sm._apply_sm_operations] 应用 {len(ops)} 条 op: "
+            + ", ".join(f"{o['op']}:{o['section']}" for o in ops)
+        )
+
+        applied = 0
+        for op in ops:
+            try:
+                content = self.read_sm() or ""
+                section_name = op["section"]
+                op_type = op["op"]
+                op_content = op.get("content", "")
+
+                # 找 section 的位置(从 ## Context 一直到下一个 ## ... 或文末)
+                section_pattern = re.compile(
+                    rf"(^## {re.escape(section_name)}\s*\n)(.*?)(?=^## |\Z)",
+                    re.MULTILINE | re.DOTALL,
+                )
+                m = section_pattern.search(content)
+                if not m:
+                    logger.warning(
+                        f"[sm._apply_sm_operations] section 不存在,跳过: {section_name!r}"
+                    )
+                    continue
+
+                header = m.group(1)
+                old_body = m.group(2)
+                new_body = self._compute_new_section_body(
+                    op_type, old_body, op_content,
+                )
+                new_content = content[: m.start()] + header + new_body + content[m.end():]
+
+                # 原子写:tmp + rename
+                tmp_path = self.sm_path.with_suffix(self.sm_path.suffix + ".tmp")
+                tmp_path.write_text(new_content, encoding="utf-8")
+                tmp_path.replace(self.sm_path)
+
+                applied += 1
+                logger.debug(
+                    f"[sm._apply_sm_operations] applied {op_type}:{section_name} "
+                    f"(old_body_chars={len(old_body)} new_body_chars={len(new_body)})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[sm._apply_sm_operations] op 失败,跳过: "
+                    f"{op.get('op')}:{op.get('section')} err={e}"
+                )
+                continue
+
+        logger.debug(f"[sm._apply_sm_operations] 完成,成功 {applied}/{len(ops)} 条")
+        return applied
+
+    @staticmethod
+    def _compute_new_section_body(op_type: str, old_body: str, new_content: str) -> str:
+        """算 section 的新 body(op 应用的纯函数,好测)。"""
+        if op_type == "delete":
+            # delete → 清空,只留占位符
+            return "<!-- -->\n"
+        if op_type == "replace":
+            # replace → 整个 body 换掉(去掉旧占位符 + 旧内容)
+            return f"{new_content.strip()}\n"
+        if op_type == "append":
+            # append → 追加到末尾;若旧 body 只有占位符,替换占位符
+            cleaned_old = re.sub(r"<!--.*?-->", "", old_body, flags=re.DOTALL).strip()
+            if cleaned_old:
+                return f"{old_body.rstrip()}\n{new_content.strip()}\n"
+            return f"{new_content.strip()}\n"
+        # 未知 op 类型 → 原样返(防御)
+        return old_body
 
     # ──────────────────────────────────────────────
     # 触发决策(5 条回退条件)
@@ -752,12 +857,28 @@ last_compacted_at: null
             # 无 callback → 仅推进 last_id,不实际调 LLM(测试路径)
             logger.debug("sm._do_extract: 无 llm_callback,仅推进 last_id(测试路径)")
         else:
+            # 有 callback → 真实调 LLM,解析响应,应用到 SM sections
+            from .sm_callback import call_sm_extract
+            from .sm_prompts import parse_sm_response
+
+            sm_full_text = self.read_sm() or ""
             import time as _t
             _t0 = _t.time()
             logger.debug(
                 f"[sm._do_extract] STEP LLM: 调 callback(prompt) (prompt_chars={len(prompt)})..."
             )
-            response = llm_callback(prompt)
+            try:
+                response = call_sm_extract(
+                    llm_callback,
+                    sm_full_text=sm_full_text,
+                    new_messages=new_messages,
+                    last_compacted_msg_id=self._last_compacted_msg_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[sm._do_extract] callback 抛异常,不更新 sections(保持 last_id 不推进): {e}"
+                )
+                return  # 不推进 last_id,保留数据下次重试
             _llm_ms = (_t.time() - _t0) * 1000
             logger.debug(
                 f"[sm._do_extract] STEP LLM done ({_llm_ms:.1f}ms) "
@@ -768,8 +889,14 @@ last_compacted_at: null
                 f"[sm._do_extract] LLM response (前 500 chars):\n"
                 f"{response[:500]}{'...[truncated]' if len(response) > 500 else ''}"
             )
-            # 生产环境:response 应该是 LLM 调用 memory_editor.edit_memory() 的结果
-            # SM 文件已被 Edit 工具改完,我们只需更新 last_compacted_msg_id
+            # 解析 ops + 写到 sm.md
+            ops = parse_sm_response(response)
+            logger.debug(
+                f"[sm._do_extract] 解析出 {len(ops)} 条 op: "
+                + (", ".join(f"{o['op']}:{o['section']}" for o in ops) or "(空)")
+            )
+            applied = self._apply_sm_operations(ops)
+            logger.debug(f"[sm._do_extract] 成功应用 {applied}/{len(ops)} 条 op 到 sm.md")
 
         # 推进 last_compacted_msg_id(不变量 #4:推进前必须成功)
         if new_messages:

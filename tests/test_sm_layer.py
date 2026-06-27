@@ -368,13 +368,20 @@ class TestExtract:
         assert sm.last_compacted_msg_id == "m2"
 
     def test_extract_with_callback_invokes_llm(self, populated_sm):
-        """extract(): 有 llm_callback → 调用 callback + 推进 last_id"""
+        """extract(): 有 llm_callback → 调用 callback + 推进 last_id
+
+        M11.5 (2026-06-27): prompt 改用 XML 包裹(sm_prompts.build_extract_prompt),
+        不再含「Session Memory Extract Task」字面量。
+        """
         messages = [
             {"id": "m1", "role": "user", "content": "测试"},
             {"id": "m2", "role": "assistant", "content": "好的"},
         ]
         called = []
 
+        # M11.5: callback 接收的是 sm_prompts.build_extract_prompt 拼出的 user prompt
+        # 返回的「LLM response」不是合法 JSON,parse_sm_response 会解析失败但
+        # 不抛异常,只是 ops=[];sm_layer 不应用 ops,但仍推进 last_id
         def mock_llm(prompt: str) -> str:
             called.append(prompt)
             return "LLM response"
@@ -383,7 +390,10 @@ class TestExtract:
         result = future.result(timeout=5)
         assert result is True
         assert len(called) == 1
-        assert "Session Memory Extract Task" in called[0]
+        # M11.5: 新的 prompt 形状
+        assert "<current_sm>" in called[0]
+        assert "[m1] user: 测试" in called[0]
+        assert "[m2] assistant: 好的" in called[0]
         assert populated_sm.last_compacted_msg_id == "m2"
 
     def test_extract_skips_when_no_new_messages(self, populated_sm, sm_path):
@@ -429,6 +439,122 @@ class TestExtract:
         # 在 future 完成前检查(可能已经完成 → 直接断言最终态)
         future.result(timeout=5)
         assert populated_sm._extraction_in_progress is False
+
+
+# ──────────────────────────────────────────────────────────────────
+# 5.5 _apply_sm_operations (M11.5 新增)
+# ──────────────────────────────────────────────────────────────────
+
+class TestApplyOps:
+    """M11.5: extract 真接到 LLM 后,_apply_sm_operations 把 ops 写到 sm.md"""
+
+    def _make_sm_with_template(self, sm_path):
+        """构造一个有 template 占位符的 SM 文件"""
+        from agent_core.memory.sm_layer import SessionMemoryLayer
+        sl = SessionMemoryLayer(
+            session_id="test", sm_path=sm_path,
+            llm_callback=lambda p: "[]",
+        )
+        sl.write_sm_template()
+        return sl
+
+    def test_apply_ops_empty_returns_zero(self, tmp_path):
+        """空 ops 列表 → 不动文件,返 0"""
+        sl = self._make_sm_with_template(tmp_path / "sm.md")
+        before = (tmp_path / "sm.md").read_text(encoding="utf-8")
+        applied = sl._apply_sm_operations([])
+        assert applied == 0
+        assert (tmp_path / "sm.md").read_text(encoding="utf-8") == before
+
+    def test_apply_ops_append_to_empty_section(self, tmp_path):
+        """append 到空 section(只有占位符)→ 替换占位符"""
+        sl = self._make_sm_with_template(tmp_path / "sm.md")
+        ops = [{"op": "append", "section": "Context", "content": "- 用户在做 X"}]
+        applied = sl._apply_sm_operations(ops)
+        assert applied == 1
+        content = (tmp_path / "sm.md").read_text(encoding="utf-8")
+        assert "- 用户在做 X" in content
+        # 占位符 <!-- --> 应被替换
+        assert "## Context\n<!-- -->" not in content
+
+    def test_apply_ops_append_to_existing_content(self, tmp_path):
+        """append 到已有内容的 section → 追加到末尾"""
+        sl = self._make_sm_with_template(tmp_path / "sm.md")
+        sl._apply_sm_operations([
+            {"op": "append", "section": "Context", "content": "- 第一条"}
+        ])
+        sl._apply_sm_operations([
+            {"op": "append", "section": "Context", "content": "- 第二条"}
+        ])
+        content = (tmp_path / "sm.md").read_text(encoding="utf-8")
+        # 第二条应在第一条之后
+        idx1 = content.find("- 第一条")
+        idx2 = content.find("- 第二条")
+        assert idx1 != -1 and idx2 != -1
+        assert idx1 < idx2
+
+    def test_apply_ops_replace_section(self, tmp_path):
+        """replace → 替换整个 section 内容"""
+        sl = self._make_sm_with_template(tmp_path / "sm.md")
+        sl._apply_sm_operations([
+            {"op": "append", "section": "Decisions", "content": "- 旧决策"}
+        ])
+        sl._apply_sm_operations([
+            {"op": "replace", "section": "Decisions", "content": "- 新决策"}
+        ])
+        content = (tmp_path / "sm.md").read_text(encoding="utf-8")
+        assert "- 新决策" in content
+        assert "- 旧决策" not in content
+
+    def test_apply_ops_delete_clears_section(self, tmp_path):
+        """delete → 清空 section 为占位符"""
+        sl = self._make_sm_with_template(tmp_path / "sm.md")
+        sl._apply_sm_operations([
+            {"op": "append", "section": "Technical", "content": "- 实现细节"}
+        ])
+        sl._apply_sm_operations([
+            {"op": "delete", "section": "Technical", "content": "<!-- -->"}
+        ])
+        content = (tmp_path / "sm.md").read_text(encoding="utf-8")
+        assert "- 实现细节" not in content
+
+    def test_apply_ops_unknown_section_skipped(self, tmp_path):
+        """未知 section → 跳过该 op,继续后续 op"""
+        sl = self._make_sm_with_template(tmp_path / "sm.md")
+        ops = [
+            {"op": "append", "section": "RandomSection", "content": "- 跳过"},
+            {"op": "append", "section": "Context", "content": "- 有效"},
+        ]
+        applied = sl._apply_sm_operations(ops)
+        assert applied == 1  # 只有 Context 那条成功
+        content = (tmp_path / "sm.md").read_text(encoding="utf-8")
+        assert "- 跳过" not in content
+        assert "- 有效" in content
+
+    def test_apply_ops_multiple_sections(self, tmp_path):
+        """多条 op 应用到不同 sections"""
+        sl = self._make_sm_with_template(tmp_path / "sm.md")
+        ops = [
+            {"op": "append", "section": "Context", "content": "- 项目背景"},
+            {"op": "append", "section": "Decisions", "content": "- 选型"},
+            {"op": "append", "section": "Technical", "content": "- 用了 X"},
+        ]
+        applied = sl._apply_sm_operations(ops)
+        assert applied == 3
+        content = (tmp_path / "sm.md").read_text(encoding="utf-8")
+        assert "- 项目背景" in content
+        assert "- 选型" in content
+        assert "- 用了 X" in content
+
+    def test_init_accepts_llm_callback(self, tmp_path):
+        """__init__ 接受 llm_callback 参数并保存到 self._llm_callback"""
+        from agent_core.memory.sm_layer import SessionMemoryLayer
+        cb = lambda p: "[]"
+        sl = SessionMemoryLayer(
+            session_id="t", sm_path=tmp_path / "sm.md",
+            llm_callback=cb,
+        )
+        assert sl._llm_callback is cb
 
 
 # ──────────────────────────────────────────────────────────────────
