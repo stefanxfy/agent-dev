@@ -37,18 +37,37 @@ from agent_core.memory import (
 
 @pytest.fixture
 def memory_root(tmp_path):
-    """测试用 memory root"""
+    """测试用 memory root(空,M11.6 改:门3 改 .md 数量门,空目录 → too_few_memories)"""
     root = tmp_path / "memory"
     root.mkdir()
     return root
 
 
 @pytest.fixture
-def logs_dir(tmp_path):
-    """测试用 logs 目录(在 memory_root.parent 下,符合 DualChannelWriter 约定)"""
-    d = tmp_path / "logs"
-    d.mkdir()
-    return d
+def populated_memory_root(tmp_path):
+    """M11.6: 构造一个有 6 条 .md 记忆的 memory_root(过门3:>=5)
+
+    写在 4 个 type 目录里各几条,模拟真实记忆库。
+    """
+    root = tmp_path / "memory"
+    (root / "user").mkdir(parents=True)
+    (root / "feedback").mkdir(parents=True)
+    (root / "project").mkdir(parents=True)
+
+    samples = [
+        ("user", "h001", "姓名", "张三"),
+        ("user", "h002", "职业", "工程师"),
+        ("feedback", "h003", "学习风格", "先原理后 API"),
+        ("feedback", "h004", "代码风格", "重视底层"),
+        ("project", "h005", "技术栈", "Vite + React"),
+        ("project", "h006", "项目背景", "agent-dev"),
+    ]
+    for type_dir, hash_id, title, body in samples:
+        (root / type_dir / f"{hash_id}.md").write_text(
+            f"---\ntype: {type_dir}\ntitle: {title}\n---\n\n{body}\n",
+            encoding="utf-8",
+        )
+    return root
 
 
 @pytest.fixture
@@ -58,9 +77,9 @@ def config():
 
 
 @pytest.fixture
-def scheduler(memory_root, logs_dir, config):
-    """默认 DistillationScheduler"""
-    return DistillationScheduler(memory_root, config, llm_callback=lambda p: "[]")
+def scheduler(populated_memory_root, config):
+    """默认 DistillationScheduler(M11.6:基于 populated root)"""
+    return DistillationScheduler(populated_memory_root, config, llm_callback=lambda p: "[]")
 
 
 @pytest.fixture
@@ -96,7 +115,7 @@ def mock_llm():
 
 class TestSchedulerGates:
 
-    def test_gate_disabled(self, memory_root, logs_dir):
+    def test_gate_disabled(self, memory_root):
         """门0: gate 关 → False / gate_disabled"""
         config = DistillationConfig(enabled=False)
         s = DistillationScheduler(memory_root, config)
@@ -104,17 +123,17 @@ class TestSchedulerGates:
         assert ok is False
         assert reason == "gate_disabled"
 
-    def test_gate_too_soon_no_lock(self, memory_root, logs_dir):
+    def test_gate_too_soon_no_lock(self, memory_root):
         """门1: 无锁文件 → busy=False,但 age_hours=inf,通过(进下一门)"""
         s = DistillationScheduler(memory_root, DistillationConfig(), llm_callback=lambda p: "[]")
         # 无锁文件时 age_hours = inf,> min_interval_hours=24h
         ok, reason = s.should_distill()
         # 期待进到门3 (session 计数)
-        # logs_dir 空 → too_few_sessions(0)
+        # 空 memory_root → too_few_memories(0)
         assert ok is False
-        assert "too_few_sessions" in reason
+        assert "too_few_memories" in reason
 
-    def test_gate_too_soon_with_fresh_lock(self, memory_root, logs_dir):
+    def test_gate_too_soon_with_fresh_lock(self, memory_root):
         """门1: .last-distill 存在但很新(< 24h) → too_soon"""
         # .last-distill 写入, mtime = now(< 24h)
         mtime = memory_root / ".last-distill"
@@ -126,7 +145,7 @@ class TestSchedulerGates:
         assert ok is False
         assert "too_soon" in reason
 
-    def test_gate_busy_wins_over_too_soon(self, memory_root, logs_dir):
+    def test_gate_busy_wins_over_too_soon(self, memory_root):
         """门4 优先级 > 门1: 锁被占时,即使 .last-distill 很新也报 locked"""
         mtime = memory_root / ".last-distill"
         mtime.touch()  # 很新
@@ -142,36 +161,34 @@ class TestSchedulerGates:
         assert ok is False
         assert "locked_by_" in reason
 
-    def test_gate_few_sessions(self, memory_root, logs_dir, config):
-        """门3: .last-distill 很久前(> 24h)但 session 数 < 阈值 → too_few_sessions"""
+    def test_gate_few_memories(self, memory_root, config):
+        """门3: .last-distill 很久前(> 24h)但 .md 数 < 阈值 → too_few_memories"""
         # .last-distill mtime = 25h 前
         mtime = memory_root / ".last-distill"
         mtime.touch()
         old_time = time.time() - 25 * 3600
         os.utime(mtime, (old_time, old_time))
 
-        # logs_dir 写 2 个 session(< 阈值 5)
+        # memory_root 写 2 个 .md(< 阈值 5)
+        (memory_root / "user").mkdir(exist_ok=True)
         for i in range(2):
-            (logs_dir / f"s{i}.jsonl").write_text("{}")
+            (memory_root / "user" / f"h{i}.md").write_text("x", encoding="utf-8")
 
         s = DistillationScheduler(memory_root, config, llm_callback=lambda p: "[]")
         ok, reason = s.should_distill()
         assert ok is False
-        assert "too_few_sessions(2<5)" in reason
+        assert "too_few_memories(2<5)" in reason
 
-    def test_gate_ok(self, memory_root, logs_dir, config):
+    def test_gate_ok(self, populated_memory_root, config):
         """所有门通过 → True / ok"""
         # .last-distill mtime = 25h 前
-        mtime = memory_root / ".last-distill"
+        mtime = populated_memory_root / ".last-distill"
         mtime.touch()
         old_time = time.time() - 25 * 3600
         os.utime(mtime, (old_time, old_time))
 
-        # logs_dir 写 6 个 session(> 阈值 5)
-        for i in range(6):
-            (logs_dir / f"s{i}.jsonl").write_text('{"user_msg":"hi","assistant_resp":"hello"}')
-
-        s = DistillationScheduler(memory_root, config, llm_callback=lambda p: "[]")
+        # populated_memory_root fixture 已有 6 个 .md(> 阈值 5)
+        s = DistillationScheduler(populated_memory_root, config, llm_callback=lambda p: "[]")
         ok, reason = s.should_distill()
         assert ok is True
         assert reason == "ok"
@@ -183,7 +200,7 @@ class TestSchedulerGates:
 
 class TestLockAtomic:
 
-    def test_concurrent_acquire_only_one_wins(self, memory_root, logs_dir):
+    def test_concurrent_acquire_only_one_wins(self, memory_root):
         """10 线程并发 acquire → 只有 1 个赢(返回 >= 0),其它 9 个 LOCK_TAKEN"""
         s = DistillationScheduler(memory_root, DistillationConfig())
         results = []
@@ -223,7 +240,7 @@ class TestLockAtomic:
 
 class TestLockStaleSteal:
 
-    def test_stale_pid_recoverable(self, memory_root, logs_dir):
+    def test_stale_pid_recoverable(self, memory_root):
         """A1: 锁 PID 已死 → should_distill 视为空闲"""
         lock = memory_root / ".consolidate-lock"
         env = memory_root / ".consolidate-lock.lock.json"
@@ -236,7 +253,7 @@ class TestLockStaleSteal:
         lock_state = s._check_lock_state()
         assert lock_state["busy"] is False, f"陈旧 PID 应视为空闲,实际 busy={lock_state['busy']}"
 
-    def test_stale_mtime_recoverable(self, memory_root, logs_dir):
+    def test_stale_mtime_recoverable(self, memory_root):
         """A2: mtime 超时 → should_distill 视为空闲"""
         lock = memory_root / ".consolidate-lock"
         env = memory_root / ".consolidate-lock.lock.json"
@@ -251,7 +268,7 @@ class TestLockStaleSteal:
         lock_state = s._check_lock_state()
         assert lock_state["busy"] is False
 
-    def test_fresh_lock_busy(self, memory_root, logs_dir):
+    def test_fresh_lock_busy(self, memory_root):
         """新鲜锁 + PID 存活 → busy=True"""
         lock = memory_root / ".consolidate-lock"
         env = memory_root / ".consolidate-lock.lock.json"
@@ -299,16 +316,16 @@ class TestEnvelopeA11:
 
 class TestFailureRollback:
 
-    def test_failure_preserves_prior_mtime(self, memory_root, logs_dir):
+    def test_failure_preserves_prior_mtime(self, populated_memory_root):
         """失败:回滚 .last-distill mtime 到 prior(失败 run 不推进 24h 门)"""
         # 创建 prior .last-distill(25h 前)
-        mtime_file = memory_root / ".last-distill"
+        mtime_file = populated_memory_root / ".last-distill"
         mtime_file.touch()
         prior_time = time.time() - 25 * 3600
         os.utime(mtime_file, (prior_time, prior_time))
         prior_mtime_ms = int(prior_time * 1000)
 
-        s = DistillationScheduler(memory_root, DistillationConfig(), llm_callback=lambda p: "[]")
+        s = DistillationScheduler(populated_memory_root, DistillationConfig(), llm_callback=lambda p: "[]")
 
         # acquire → 拿到 prior_mtime_ms
         returned_prior = s._acquire_lock()
@@ -318,21 +335,21 @@ class TestFailureRollback:
         s._release_lock(prior_mtime_ms, success=False)
 
         # 锁文件应被删除
-        assert not (memory_root / ".consolidate-lock").exists()
+        assert not (populated_memory_root / ".consolidate-lock").exists()
         # .last-distill 仍在,mtime 应等于 prior
         assert mtime_file.exists()
         actual_mtime = mtime_file.stat().st_mtime
         assert abs(actual_mtime - prior_time) < 1.0, f"mtime 未回滚: 实际 {actual_mtime}, 期望 {prior_time}"
 
-    def test_success_advances_mtime(self, memory_root, logs_dir):
+    def test_success_advances_mtime(self, populated_memory_root):
         """成功:touch .last-distill(mtime = now,推进 24h 门)"""
         # prior .last-distill(25h 前)
-        mtime_file = memory_root / ".last-distill"
+        mtime_file = populated_memory_root / ".last-distill"
         mtime_file.touch()
         prior_time = time.time() - 25 * 3600
         os.utime(mtime_file, (prior_time, prior_time))
 
-        s = DistillationScheduler(memory_root, DistillationConfig(), llm_callback=lambda p: "[]")
+        s = DistillationScheduler(populated_memory_root, DistillationConfig(), llm_callback=lambda p: "[]")
         returned_prior = s._acquire_lock()
 
         # success=True → touch .last-distill(mtime = now)
@@ -341,7 +358,7 @@ class TestFailureRollback:
         after_release = time.time()
 
         # 锁文件被删除
-        assert not (memory_root / ".consolidate-lock").exists()
+        assert not (populated_memory_root / ".consolidate-lock").exists()
         # .last-distill 仍在,mtime 应是 now(在 acquire 和 release 之间)
         assert mtime_file.exists()
         actual_mtime = mtime_file.stat().st_mtime
@@ -355,29 +372,23 @@ class TestFailureRollback:
 
 class TestDistillCore:
 
-    def test_distill_returns_candidates(self, memory_root, logs_dir, mock_llm):
-        """distill() 返回 LLM 给的候选列表"""
-        # 写 6 个 session 让 gate 通过
-        for i in range(6):
-            (logs_dir / f"s{i}.jsonl").write_text('{"user_msg":"用 Vite","assistant_resp":"好"}')
-
-        s = DistillationScheduler(memory_root, DistillationConfig(), llm_callback=mock_llm)
-        result = s.run(dry_run=True, session_log_files=[logs_dir / f"s{i}.jsonl" for i in range(6)])
+    def test_distill_returns_candidates(self, populated_memory_root, mock_llm):
+        """distill() 返回 LLM 给的候选列表(M11.6:全量 .md 扫描,不再需要 session logs)"""
+        # populated_memory_root fixture 已有 6 个 .md(过门3:>=5)
+        s = DistillationScheduler(populated_memory_root, DistillationConfig(), llm_callback=mock_llm)
+        result = s.run(dry_run=True)
         assert result.success
         assert len(result.candidates) == 2
         assert result.candidates[0]["title"] == "偏好 Vite"
 
-    def test_dry_run_skips_write(self, memory_root, logs_dir, mock_llm):
+    def test_dry_run_skips_write(self, populated_memory_root, mock_llm):
         """dry_run=True → 不写候选文件"""
-        for i in range(6):
-            (logs_dir / f"s{i}.jsonl").write_text("{}")
-
-        s = DistillationScheduler(memory_root, DistillationConfig(), llm_callback=mock_llm)
-        result = s.run(dry_run=True, session_log_files=[logs_dir / f"s{i}.jsonl" for i in range(6)])
+        s = DistillationScheduler(populated_memory_root, DistillationConfig(), llm_callback=mock_llm)
+        result = s.run(dry_run=True)
 
         assert result.success
         assert result.candidates_written == []
-        assert not (memory_root / "_candidate").exists()
+        assert not (populated_memory_root / "_candidate").exists()
 
     def test_write_candidates_to_candidate_dir(self, tmp_path, mock_llm):
         """write_candidates() 写到 candidate_root/{type}/"""
@@ -399,13 +410,11 @@ class TestDistillCore:
         assert "type: user" in text
         assert "偏好 Vite" in text
 
-    def test_run_with_no_llm_skipped(self, memory_root, logs_dir):
+    def test_run_with_no_llm_skipped(self, populated_memory_root):
         """run() 无 llm_callback → skipped / no_llm_callback"""
-        for i in range(6):
-            (logs_dir / f"s{i}.jsonl").write_text("{}")
-
-        s = DistillationScheduler(memory_root, DistillationConfig(), llm_callback=None)
-        result = s.run(dry_run=True, session_log_files=[logs_dir / f"s{i}.jsonl" for i in range(6)])
+        # populated_memory_root fixture 已有 6 个 .md(过门3:>=5),但无 LLM 仍应 skip
+        s = DistillationScheduler(populated_memory_root, DistillationConfig(), llm_callback=None)
+        result = s.run(dry_run=True)
         assert not result.success
         assert result.skipped
         assert result.skip_reason == "no_llm_callback"

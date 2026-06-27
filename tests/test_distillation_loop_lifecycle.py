@@ -107,8 +107,8 @@ def test_distillation_loop_calls_llm_when_gates_pass(tmp_path):
     """所有门通过 → 调 LLM(M2 stub)"""
     from agent_core.memory.config import DistillationConfig
 
-    # 让所有门通过:enabled=True + 时间门不存在(永远通过)+ sessions 足够
-    # 但 sessions=0 → too_few_sessions,简化测试只验 callback 调用
+    # 让所有门通过:enabled=True + 时间门不存在(永远通过)+ .md 足够
+    # 但空 root → too_few_memories,简化测试只验 callback 调用
     config = DistillationConfig(enabled=True)
     llm_called = []
 
