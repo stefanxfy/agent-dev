@@ -618,20 +618,37 @@ def get_agent(session_id=None):
     # M10 C2.2 (2026-06-26):wire SessionMemoryLayer(L3 SM 快路径)
     #   sm_path = DATA_DIR/<session_id>/sm.md,每个 session 独立
     #   注入失败 → None fallback,不阻断 agent(测试/学习阶段)
+    # M11.5 (2026-06-27):接真实 LLM callback — make_sm_extract_callback(router=...)
+    #   让 SM extract 调 LLM 真更新 sections(不再是只推进 last_id)
     session_memory = None
     if session_id:
         try:
             from agent_core.memory.sm_layer import SessionMemoryLayer
+            from agent_core.memory.sm_callback import make_sm_extract_callback
+            from agent_core.llm.router import LLMRouter
             _sm_dir = Path(DATA_DIR) / session_id
             _sm_dir.mkdir(parents=True, exist_ok=True)
+            # 独立 router 实例 — 跟 memory 系统的 extractor_router 隔离,
+            # 避免 SM 的 retry/backoff 干扰记忆提取/retrieval
+            # cache_namespace 按 session 隔离,跨 session 不串
+            _sm_router = LLMRouter(config)
+            _sm_callback = make_sm_extract_callback(
+                router=_sm_router,
+                cache_namespace=f"sm_extract_{session_id}",
+                max_retries=2,
+                backoff_base=0.5,
+                on_failure="return_empty",  # callback 失败时返空,sm_layer 走 fallback
+            )
             session_memory = SessionMemoryLayer(
                 session_id=session_id,
                 sm_path=_sm_dir / "sm.md",
                 config=memory_config.compact,
+                llm_callback=_sm_callback,
             )
             logging.info(
                 f"[L3 SM] SessionMemoryLayer 构造成功 session_id={session_id} "
-                f"sm_path={_sm_dir / 'sm.md'} enabled={memory_config.compact.enabled}"
+                f"sm_path={_sm_dir / 'sm.md'} enabled={memory_config.compact.enabled} "
+                f"callback=make_sm_extract_callback(router=LLMRouter(...))"
             )
         except Exception as e:
             logging.warning(f"[L3 SM] SessionMemoryLayer 构造失败,fallback 无 L3: {e}")
