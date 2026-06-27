@@ -114,7 +114,8 @@ class Distiller:
 
         Args:
             existing_memories: 全量现有记忆列表(由 caller 从 memory_root 4 个
-                type 目录读取),每条形如 {"type": "user", "path": "...", "text": "..."}。
+                type 目录读取),每条形如 {"type": "user", "title": "...",
+                "body": "...", "path": "..."}。
 
         Returns:
             [{type, title, body, source_quote, why, tags}, ...]
@@ -522,6 +523,11 @@ class DistillationScheduler:
         """读现有记忆(简单 glob,无 MemoryStore 依赖,降耦合)
 
         M11.6 (2026-06-27): 不再扫 logs/,只读 memory_root/{user,feedback,project,reference}/*.md
+
+        每条记忆解析 frontmatter + body,返回:
+            {"type": <type>, "title": <frontmatter.title>, "body": <正文>, "path": <path>}
+
+        frontmatter 解析失败时降级:title="<文件名>", body=<整文件>
         """
         memories: list[dict] = []
         for type_dir in ("user", "feedback", "project", "reference"):
@@ -529,12 +535,28 @@ class DistillationScheduler:
             if not type_path.exists():
                 continue
             for entry in os.scandir(type_path):
-                if entry.name.endswith(".md"):
-                    try:
-                        text = Path(entry.path).read_text(encoding="utf-8")
-                        memories.append({"type": type_dir, "path": entry.path, "text": text})
-                    except OSError:
-                        continue
+                if not entry.name.endswith(".md"):
+                    continue
+                try:
+                    text = Path(entry.path).read_text(encoding="utf-8")
+                    fm_match = re.match(r"^---\n(.*?)\n---\n?", text, re.DOTALL)
+                    if fm_match:
+                        fm_text = fm_match.group(1)
+                        # 简易 frontmatter 解析(只取 title,不依赖 yaml)
+                        title_m = re.search(r"^title:\s*(.+?)\s*$", fm_text, re.MULTILINE)
+                        title = title_m.group(1).strip().strip("'\"") if title_m else entry.name
+                        body = text[fm_match.end():].strip()
+                    else:
+                        title = entry.name
+                        body = text.strip()
+                    memories.append({
+                        "type": type_dir,
+                        "title": title,
+                        "body": body,
+                        "path": entry.path,
+                    })
+                except OSError:
+                    continue
         return memories
 
     # ── 锁 A1+A2+A11 ────────────────────────────────
