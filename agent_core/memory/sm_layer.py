@@ -853,7 +853,9 @@ last_compacted_at: null
             f"prompt_chars={len(prompt)}"
         )
 
-        if llm_callback is None:
+        # M11.5 (2026-06-27): 优先用 self._llm_callback(注入的实例),参数 callback 向后兼容
+        cb = llm_callback or self._llm_callback
+        if cb is None:
             # 无 callback → 仅推进 last_id,不实际调 LLM(测试路径)
             logger.debug("sm._do_extract: 无 llm_callback,仅推进 last_id(测试路径)")
         else:
@@ -869,7 +871,7 @@ last_compacted_at: null
             )
             try:
                 response = call_sm_extract(
-                    llm_callback,
+                    cb,
                     sm_full_text=sm_full_text,
                     new_messages=new_messages,
                     last_compacted_msg_id=self._last_compacted_msg_id,
