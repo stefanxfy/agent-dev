@@ -183,11 +183,24 @@ with st.sidebar:
                 st.metric("间隔(s)", status["interval_seconds"])
                 if status["last_tick_at"]:
                     st.caption(f"上次 tick: {status['last_tick_at']}")
-                if status["last_result_success"] is not None:
-                    succ = "✓" if status["last_result_success"] else "✗"
-                    st.caption(f"上次结果: {succ} ({status['last_candidates_count']} 候选)")
+                # 上次结果详细:succeed / skip reason / error
+                if status["last_result_success"] is True:
+                    run_id = status.get("last_run_id") or "n/a"
+                    st.caption(
+                        f"上次: ✓ {status['last_candidates_count']} 候选 "
+                        f"→ run `{run_id}`"
+                    )
+                elif status["last_result_success"] is False:
+                    skip = status.get("last_skip_reason")
+                    err = status.get("last_error")
+                    if skip:
+                        st.caption(f"上次: ⏭️ skip ({skip})")
+                    elif err:
+                        st.caption(f"上次: ✗ 失败 ({err[:80]})")
+                    else:
+                        st.caption("上次: ✗ 失败")
                 else:
-                    st.caption("上次 tick: gate 拦住")
+                    st.caption("尚未跑过")
 
     # M10 C4.1: 📥 待审候选提醒(折叠面板,默认折叠)
     # mem_root 与 get_agent() 同口径(config.agent_data_dir or ~/.agent_data)

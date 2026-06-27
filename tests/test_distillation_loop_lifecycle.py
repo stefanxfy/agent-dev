@@ -130,3 +130,53 @@ def test_distillation_loop_calls_llm_when_gates_pass(tmp_path):
     # 跑完了(可能 success=False 因 session 数据不足,但 llm 被调过)
     assert result is not None
     assert len(llm_called) >= 1
+
+
+def test_get_status_exposes_skip_reason_and_run_id(tmp_path):
+    """M11.6: DistillationLoop.get_status 应暴露 skip_reason / run_id / error,
+    让 sidebar Auto-dream 面板能区分"上次 gate 拦住 vs 真跑成功 vs 失败"。
+    """
+    from agent_core.memory.config import DistillationConfig
+    from agent_core.memory.distiller import DistillationResult
+    from agent_core.memory.scheduler import DistillationLoop
+
+    # 1. 无 result → 全 None
+    scheduler = DistillationScheduler(memory_root=tmp_path, llm_callback=lambda p: "[]")
+    loop = DistillationLoop(scheduler=scheduler)
+    status = loop.get_status()
+    assert status["last_result_success"] is None
+    assert status["last_skip_reason"] is None
+    assert status["last_run_id"] is None
+    assert status["last_error"] is None
+
+    # 2. 设一个 skip result → skip_reason 暴露
+    skip_result = DistillationResult(
+        success=False, skipped=True, skip_reason="too_soon(0.0h<24h)",
+    )
+    loop._last_result = skip_result
+    status = loop.get_status()
+    assert status["last_result_success"] is False
+    assert status["last_skip_reason"] == "too_soon(0.0h<24h)"
+    assert status["last_candidates_count"] == 0
+
+    # 3. 设一个 success result → run_id 暴露
+    success_result = DistillationResult(
+        success=True,
+        candidates=[{"type": "user", "title": "t", "body": "b"}],
+        run_id="run_12345",
+    )
+    loop._last_result = success_result
+    status = loop.get_status()
+    assert status["last_result_success"] is True
+    assert status["last_run_id"] == "run_12345"
+    assert status["last_candidates_count"] == 1
+    assert not status["last_skip_reason"]  # 空字符串 = 无 skip
+
+    # 4. 设一个 error result → error 暴露
+    error_result = DistillationResult(
+        success=False, error="LLM timeout after 2 retries",
+    )
+    loop._last_result = error_result
+    status = loop.get_status()
+    assert status["last_result_success"] is False
+    assert status["last_error"] == "LLM timeout after 2 retries"

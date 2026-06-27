@@ -177,15 +177,22 @@ class DistillationLoop:
                 "last_tick_at": ISO str or None,
                 "last_result_success": bool or None,  # None = no result yet
                 "last_candidates_count": int or None,
+                "last_skip_reason": str or None,  # "too_soon" / "gate_disabled" / None
+                "last_run_id": str or None,
+                "last_error": str or None,  # 异常 message (若有)
             }
         """
+        result = self._last_result
         return {
             "running": self.is_running,
             "tick_count": self.tick_count,
             "interval_seconds": self._interval_seconds,
             "last_tick_at": self._last_tick_at,
-            "last_result_success": self._last_result.success if self._last_result else None,
-            "last_candidates_count": len(self._last_result.candidates) if self._last_result else None,
+            "last_result_success": result.success if result else None,
+            "last_candidates_count": len(result.candidates) if result else None,
+            "last_skip_reason": result.skip_reason if result else None,
+            "last_run_id": result.run_id if result else None,
+            "last_error": result.error if result else None,
         }
 
     # ── 内部 ────────────────────────────────────────────
