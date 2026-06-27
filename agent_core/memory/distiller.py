@@ -352,7 +352,7 @@ class DistillationScheduler:
     # ── 公开 API ─────────────────────────────────────
 
     def should_distill(self) -> tuple[bool, str]:
-        """四重门检查"""
+        """四重门检查(M11.6 改:门3 改为 .md 数量门)"""
         # 门0: feature gate
         if not self.config.enabled:
             return False, "gate_disabled"
@@ -367,10 +367,11 @@ class DistillationScheduler:
         if age_hours < self.config.min_interval_hours:
             return False, f"too_soon({age_hours:.1f}h<{self.config.min_interval_hours}h)"
 
-        # 门3: session 数量门
-        sessions = self._count_recent_sessions(lock_state["prior_mtime"])
-        if sessions < self.config.min_sessions_for_distill:
-            return False, f"too_few_sessions({sessions}<{self.config.min_sessions_for_distill})"
+        # 门3: 记忆库数量门(M11.6 改:从 session 数量 → .md 数量)
+        # session 日志目录已废弃,改读 4 个 type 目录的 .md 总数
+        memory_count = len(self._read_existing_memories())
+        if memory_count < self.config.min_memories_for_distill:
+            return False, f"too_few_memories({memory_count}<{self.config.min_memories_for_distill})"
 
         return True, "ok"
 
@@ -516,30 +517,6 @@ class DistillationScheduler:
             age_hours = float("inf")  # 无上次时间 → 通过
 
         return {"busy": busy, "holder_pid": holder_pid, "age_hours": age_hours, "prior_mtime": prior_mtime}
-
-    def _count_recent_sessions(self, since_mtime: float) -> int:
-        """
-        统计 since_mtime 之后改动的 session 数
-
-        目录约定:.agent_data/logs/{session_id}.jsonl
-        注:Phase 4 之后 DualChannelWriter 不再写日志目录,该目录为空,
-        本函数总是返 0 — M5 session 数量门永久阻断,待单独重构。
-        """
-        logs_dir = self.memory_root.parent / "logs"
-        if not logs_dir.exists():
-            return 0
-        count = 0
-        try:
-            for entry in os.scandir(logs_dir):
-                if entry.name.endswith(".jsonl"):
-                    try:
-                        if entry.stat().st_mtime > since_mtime:
-                            count += 1
-                    except OSError:
-                        continue
-        except OSError:
-            return 0
-        return count
 
     def _read_existing_memories(self) -> list[dict]:
         """读现有记忆(简单 glob,无 MemoryStore 依赖,降耦合)
