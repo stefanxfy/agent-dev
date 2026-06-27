@@ -680,9 +680,26 @@ def get_agent(session_id=None):
                 _agent_data_dir = _agent_config_fb.agent_data_dir or str(Path.home() / ".agent_data")
                 mem_root = Path(_agent_data_dir) / "memory"
             mem_root.mkdir(parents=True, exist_ok=True)
+            # M11.6 (2026-06-27): 接真实 LLM callback(跟 M11.5 SM callback 同模式)
+            # 独立 distill_router 实例,与 SM router + 记忆提取 router 隔离,
+            # 避免 retry/backoff 干扰主对话 / retrieval
+            # cache_namespace 按 mem_root 隔离,跨用户不串
+            try:
+                from agent_core.memory.distill_callback import make_distill_callback
+                _distill_router = LLMRouter(config)
+                _distill_callback = make_distill_callback(
+                    router=_distill_router,
+                    cache_namespace=f"distill_{Path(_agent_config.agent_data_dir or Path.home() / '.agent_data').name}",
+                    max_retries=2,
+                    backoff_base=0.5,
+                    on_failure="return_empty",  # 蒸馏失败返空,scheduler 走 fallback 不抛
+                )
+            except Exception as e:
+                logging.warning(f"distill_callback 构造失败,fallback 无 LLM: {e}")
+                _distill_callback = None
             distill_scheduler = DistillationScheduler(
                 memory_root=mem_root,
-                llm_callback=None,  # 默认 stub;真 LLM 由 scheduler 内部注入
+                llm_callback=_distill_callback,
             )
             distill_loop = DistillationLoop(
                 scheduler=distill_scheduler,
