@@ -58,3 +58,64 @@ def _chat_sync(
 ## 2. (占位)未来其他 TODO
 
 (以后想到再追加,保持这个文件)
+
+---
+
+## 3. M10 C5.4 双通道 wiring(补 web/app.py 实现,清 3 个契约测试)
+
+**提出日期**: 2026-06-28
+**提出背景**: M3 阶段跑全量回归时发现 `tests/test_app_wiring.py` 3 个 pre-existing failure,都是 M10 C5.4 时代的"测试契约已加、web/app.py 实现未补"。
+
+**契约来源**(commit `6e07a6b` + `4e4b0e5`):
+- `test_get_agent_uses_react_memory_bridge` — `get_agent(memory_enabled=True)` 必须传非 None `ReactMemoryBridge`
+- `test_web_app_imports_strict_pipeline_components` — `web/app.py` 必须 import 4 个名字:`MetaDB` / `DualChannelWriter` / `ExtractionGate` / `ReactMemoryBridge`
+- `test_get_agent_constructs_independent_extractor_router` — 必须构造 `extractor_router`(独立 LLMRouter 实例),并 `gate = ExtractionGate(llm_router=extractor_router, ...)`
+
+**为什么 fork 独立 extractor_router**(§4.6):
+1. 共享 prompt cache → 提取任务污染主对话 context
+2. 共享 rate limit / token budget → 用户响应被 background 提取挤占
+3. 共享 model selection → 提取可能用便宜模型但 cache 命中主对话的贵模型 slot
+
+fork 后两条路径**完全隔离**,各自管 cache namespace + budget。
+
+**待补的实现**(在 `web/app.py:get_agent()` 内):
+```python
+# 1. 独立 extractor_router(防 cache 污染)
+extractor_router = LLMRouter(config)
+
+# 2. Channel B 持久化层
+meta_db = MetaDB(...)
+
+# 3. 双通道写盘
+dual_writer = DualChannelWriter(meta_db=meta_db, ...)
+
+# 4. 门控(门 3 用 extractor_router 评分)
+gate = ExtractionGate(llm_router=extractor_router, ...)
+
+# 5. 同步→异步桥
+bridge = ReactMemoryBridge(gate=gate, dual_writer=dual_writer)
+
+# 6. 注入 ReactAgent
+ReactAgent(..., react_memory_bridge=bridge)
+```
+
+**涉及文件**:
+- `web/app.py` — `get_agent()` 加 6 步 wiring(主路径)
+- `tests/test_app_wiring.py` — 现有 3 个契约测试,补实现后自然绿
+- 旁路:`web/memory_wiring.py` 可能需要微调,把 `extractor_router` 暴露出来
+
+**风险**:
+1. 改动 `web/app.py` 高频入口,影响所有用户 → 需 streamlit smoke
+2. DualChannelWriter 构造可能依赖 MetaDB schema(M11 已就绪)→ 需先确认 schema
+3. `memory_enabled=True` 路径用户主流程引入 background 提取 → 性能回归测
+
+**预估工作量**: 1-1.5 天
+- 0.5 天:在 `web/app.py:get_agent()` 加 6 步 wiring
+- 0.5 天:streamlit smoke + agent_core run 集成测
+- 0.3 天:3 个契约测试跑绿验证
+
+**优先级**: 中(契约测试在 fail,但功能未上线 → 不阻塞 M3 交付;M10/M11 后续阶段会补)
+
+**不阻塞 M3 验收**: 这 3 个 failure 与 M3(权限 UI + hook 三阶段)无关,`web/app.py` 的 memory wiring 是 M10 时代遗留任务,放后续阶段完成。
+
+---
