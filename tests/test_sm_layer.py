@@ -362,7 +362,7 @@ class TestExtract:
             {"id": "m1", "role": "user", "content": "你好"},
             {"id": "m2", "role": "assistant", "content": "hi"},
         ]
-        future = sm.extract_incremental(messages, llm_callback=None)
+        future = sm.extract_incremental(messages, llm_callback=None, current_token_count=20000)
         result = future.result(timeout=5)
         assert result is True
         assert sm.last_compacted_msg_id == "m2"
@@ -386,7 +386,9 @@ class TestExtract:
             called.append(prompt)
             return "LLM response"
 
-        future = populated_sm.extract_incremental(messages, llm_callback=mock_llm)
+        future = populated_sm.extract_incremental(
+            messages, llm_callback=mock_llm, current_token_count=20000
+        )
         result = future.result(timeout=5)
         assert result is True
         assert len(called) == 1
@@ -412,7 +414,10 @@ class TestExtract:
             {"id": "m2", "role": "assistant", "content": "last"},
         ]
         called = []
-        future = sm.extract_incremental(messages, llm_callback=lambda p: called.append(p) or "ok")
+        future = sm.extract_incremental(
+            messages, llm_callback=lambda p: called.append(p) or "ok",
+            current_token_count=20000,
+        )
         future.result(timeout=5)
         # 没有新消息 → 不调 LLM
         assert len(called) == 0
@@ -422,7 +427,9 @@ class TestExtract:
     def test_extract_initializes_sm_if_missing(self, sm, sm_path):
         """extract(): SM 文件不存在 → 自动写 template"""
         messages = [{"id": "m1", "role": "user", "content": "hi"}]
-        future = sm.extract_incremental(messages, llm_callback=None)
+        future = sm.extract_incremental(
+            messages, llm_callback=None, current_token_count=20000
+        )
         future.result(timeout=5)
         assert sm.sm_exists()
         assert sm_path.exists()
@@ -435,7 +442,9 @@ class TestExtract:
             return "ok"
 
         messages = [{"id": "m1", "role": "user", "content": "hi"}]
-        future = populated_sm.extract_incremental(messages, llm_callback=slow_llm)
+        future = populated_sm.extract_incremental(
+            messages, llm_callback=slow_llm, current_token_count=20000
+        )
         # 在 future 完成前检查(可能已经完成 → 直接断言最终态)
         future.result(timeout=5)
         assert populated_sm._extraction_in_progress is False
@@ -664,3 +673,133 @@ class TestCompactConfigEnv:
         from pydantic import ValidationError
         with pytest.raises(ValidationError):
             MemoryConfig(compact={"unknown_threshold": 1000})
+
+
+# ──────────────────────────────────────────────────────────────────
+# 9. SM 抽取节流 gate (Claude Code diff 1+3, Step 2)
+# ──────────────────────────────────────────────────────────────────
+
+class TestExtractGate:
+    """M11.7 (2026-06-28): 对齐 Claude Code SessionMemory 抽取节流
+    - 初始化门槛:会话累计 token < 10K → 不创建 SM 文件
+    - 增量门槛(dual-gate):token Δ ≥ 5K AND tool Δ ≥ 3,或 token Δ ≥ 5K AND 上一轮无 tool
+    """
+
+    def test_extract_gate_below_init_threshold_blocks(self, sm_path, config):
+        """首 turn token=5000 < 10K → gate 拦住,SM 文件不创建,_initialized=False"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        messages = [{"id": "m1", "role": "user", "content": "hi"}]
+        future = sm.extract_incremental(
+            messages, llm_callback=lambda p: "[]", current_token_count=5000,
+        )
+        result = future.result(timeout=5)
+        assert result is False
+        assert sm.sm_exists() is False
+        assert sm._initialized is False
+
+    def test_extract_gate_at_init_threshold_latches(self, sm_path, config):
+        """token=10000 → gate 放行,SM 文件创建,_initialized=True,_last_extract_token_count=10000"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        messages = [{"id": "m1", "role": "user", "content": "hi"}]
+        future = sm.extract_incremental(
+            messages, llm_callback=None, current_token_count=10000,
+        )
+        future.result(timeout=5)
+        assert sm.sm_exists() is True
+        assert sm._initialized is True
+        assert sm._last_extract_token_count == 10_000
+
+    def test_extract_gate_token_delta_below_5k_skips(self, sm_path, config):
+        """已 init=10K,第二次 13K(Δ=3K < 5K)→ 不推进,last_id 不变"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        messages = [{"id": "m1", "role": "user", "content": "hi"}]
+        # 第一次 init 10K
+        sm.extract_incremental(
+            messages, llm_callback=None, current_token_count=10000,
+        ).result(timeout=5)
+        assert sm._initialized is True
+        first_last_id = sm.last_compacted_msg_id
+
+        # 第二次 13K,token Δ=3K < 5K → 拦住
+        future2 = sm.extract_incremental(
+            messages, llm_callback=lambda p: "[]", current_token_count=13000,
+        )
+        result2 = future2.result(timeout=5)
+        assert result2 is False
+        # last_id 没推进(因为新消息还是 m1,本来就不变;但要确认没二次触发的副作用)
+        assert sm.last_compacted_msg_id == first_last_id
+
+    def test_extract_gate_dual_gate_satisfied(self, sm_path, config):
+        """已 init=10K,第二次 16K(Δ=6K ≥ 5K) + tools=4(≥ 3)→ 抽取"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        # 第一次 init
+        sm.extract_incremental(
+            [{"id": "m1", "role": "user", "content": "a"}],
+            llm_callback=None, current_token_count=10000,
+        ).result(timeout=5)
+        # 第二次 16K + 4 tools
+        future = sm.extract_incremental(
+            [{"id": "m2", "role": "user", "content": "b"}],
+            llm_callback=lambda p: "[]",
+            current_token_count=16000, tool_count_delta=4, tool_count_last_turn=2,
+        )
+        result = future.result(timeout=5)
+        assert result is True
+        # last_id 推进到 m2
+        assert sm.last_compacted_msg_id == "m2"
+        assert sm._last_extract_token_count == 16_000
+
+    def test_extract_gate_dual_gate_text_only_fallback(self, sm_path, config):
+        """已 init=10K,第二次 16K(Δ=6K) + tools=1(< 3) + last_turn=0 → 抽(OR 旁路)"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        sm.extract_incremental(
+            [{"id": "m1", "role": "user", "content": "a"}],
+            llm_callback=None, current_token_count=10000,
+        ).result(timeout=5)
+        future = sm.extract_incremental(
+            [{"id": "m2", "role": "user", "content": "b"}],
+            llm_callback=lambda p: "[]",
+            current_token_count=16000, tool_count_delta=1, tool_count_last_turn=0,
+        )
+        result = future.result(timeout=5)
+        assert result is True
+        assert sm.last_compacted_msg_id == "m2"
+
+    def test_extract_gate_dual_gate_both_fail(self, sm_path, config):
+        """已 init=10K,第二次 13K(Δ=3K < 5K)+ tools=1 + last_turn=2 → 不抽"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        sm.extract_incremental(
+            [{"id": "m1", "role": "user", "content": "a"}],
+            llm_callback=None, current_token_count=10000,
+        ).result(timeout=5)
+        future = sm.extract_incremental(
+            [{"id": "m2", "role": "user", "content": "b"}],
+            llm_callback=lambda p: "[]",
+            current_token_count=13000, tool_count_delta=1, tool_count_last_turn=2,
+        )
+        result = future.result(timeout=5)
+        assert result is False
+        # last_id 没推进
+        assert sm.last_compacted_msg_id == "m1"
+
+    def test_extract_gate_latch_resets_per_instance(self, sm_path, config):
+        """重新 load 旧 SM 文件, _initialized 重置为 False(per-instance latch,
+        file frontmatter 不持久化 — 设计如此,每个 ReactAgent 独立评估 gate)
+        """
+        # 第一次 session:init 后 _initialized=True
+        sm1 = SessionMemoryLayer("s1", sm_path, config)
+        sm1.extract_incremental(
+            [{"id": "m1", "role": "user", "content": "a"}],
+            llm_callback=None, current_token_count=15000,
+        ).result(timeout=5)
+        assert sm1._initialized is True
+        assert sm1.sm_exists() is True
+
+        # 第二次 session:重新 load 同一文件,_initialized 必须重置
+        sm2 = SessionMemoryLayer("s1", sm_path, config)
+        assert sm2._initialized is False
+        assert sm2._last_extract_token_count is None
+        # last_compacted_msg_id 在 in-memory 中没被写回 frontmatter
+        # (前向看 M11.5 的 _apply_sm_operations 才会持久化)
+        # 所以重 load 后是 None,这是当前项目行为,跟 gate 无关
+        assert sm2.last_compacted_msg_id is None

@@ -195,6 +195,12 @@ last_compacted_at: null
         self._last_compacted_msg_id: Optional[str] = None
         self._last_compacted_at: Optional[str] = None
 
+        # M11.7 (2026-06-28): 对齐 Claude Code SessionMemory 抽取节流(差异 1+3)
+        # _initialized: latch once,会话累计 < minimum_message_tokens_to_init 时不创建 SM 文件
+        # _last_extract_token_count: 记录上次抽取的累计 token,用来算 token Δ 门槛
+        self._initialized: bool = False
+        self._last_extract_token_count: Optional[int] = None
+
         # 从 frontmatter 恢复 last_compacted_msg_id(如果 SM 文件存在)
         if self.sm_exists():
             self._load_state_from_frontmatter()
@@ -760,6 +766,9 @@ last_compacted_at: null
         self,
         messages: list[dict],
         llm_callback: Optional[Callable[[str], str]] = None,
+        current_token_count: int = 0,
+        tool_count_delta: int = 0,
+        tool_count_last_turn: int = 0,
     ) -> Future:
         """
         后台增量更新 SM 文件(慢路径,LLM 调用)
@@ -773,9 +782,15 @@ last_compacted_at: null
             messages: 当前所有消息
             llm_callback: LLM 调用函数(msg) → response
                           (测试时可传 mock;实际生产用 LangGraphAgent)
+            current_token_count: 当前会话累计 token 数(M11.7 接入 Claude Code 节流 gate)
+                0 = 绕过 gate(向后兼容旧测试)
+                >0 = 走 _should_extract() dual-gate
+            tool_count_delta: 本次调用的 tool 数(M11.7 gate 的 AND 分支)
+            tool_count_last_turn: 上一轮的 tool 数(0 时放行的 OR 分支)
 
         Returns:
             Future[bool]: True 表示成功推进 last_id
+            False 表示 gate 拦住(未触发实际抽取,future 仍 resolve 为 False)
         """
         from concurrent.futures import ThreadPoolExecutor
 
@@ -786,15 +801,33 @@ last_compacted_at: null
             f"[sm.extract_incremental] ENTER session_id={self.session_id} | "
             f"input_count={len(messages)} last_id={self._last_compacted_msg_id} | "
             f"has_callback={llm_callback is not None} "
-            f"in_progress_before={self._extraction_in_progress}"
+            f"in_progress_before={self._extraction_in_progress} "
+            f"current_token_count={current_token_count} tool_delta={tool_count_delta} "
+            f"tool_last_turn={tool_count_last_turn}"
         )
+
+        # M11.7 (2026-06-28): Claude Code SessionMemory dual-gate
+        # current_token_count=0 → 绕过 gate(向后兼容旧测试,行为不变)
+        if current_token_count > 0:
+            gate_ok, gate_reason = self._should_extract(
+                current_token_count, tool_count_delta, tool_count_last_turn
+            )
+            if not gate_ok:
+                logger.debug(
+                    f"[sm.extract_incremental] GATE 拦住: reason={gate_reason} "
+                    f"(skips extract, no file write, no last_id advance)"
+                )
+                future.set_result(False)
+                return future
 
         def _runner() -> None:
             with self._extraction_lock:
                 self._extraction_in_progress = True
             logger.debug(f"[sm.extract._runner] thread start, in_progress=True")
             try:
-                self._do_extract(messages, llm_callback)
+                self._do_extract(
+                    messages, llm_callback, current_token_count=current_token_count
+                )
                 future.set_result(True)
                 logger.debug(f"[sm.extract._runner] thread done, set_result(True)")
             except Exception as e:
@@ -815,16 +848,119 @@ last_compacted_at: null
         )
         return future
 
+    def _should_extract(
+        self,
+        current_token_count: int,
+        tool_count_delta: int,
+        tool_count_last_turn: int,
+    ) -> tuple[bool, str]:
+        """M11.7 (2026-06-28): 对齐 Claude Code SessionMemory 抽取节流(差异 1+3)
+
+        双重门:
+        1. 初始化门槛:会话累计 token < minimum_message_tokens_to_init → 不创建 SM 文件
+        2. 增量门槛(token Δ + tool Δ dual-gate):
+           - token Δ < minimum_tokens_between_update → 跳过
+           - met_tokens AND met_tools → 抽
+           - met_tokens AND last_turn tool=0 → 抽(纯文本对话的 OR 旁路)
+           - 否则 → 跳过
+
+        Returns:
+            (decision: bool, reason: str)
+            reason 形如 "init" / "below_init_threshold" / "below_token_delta" /
+            "below_tool_or_last_turn" / "ok"
+        """
+        # 1. 初始化门槛(latch once)
+        if not self._initialized:
+            if current_token_count < self.config.minimum_message_tokens_to_init:
+                logger.debug(
+                    f"[sm._should_extract] 初始化门槛拦住: "
+                    f"current={current_token_count} < "
+                    f"min_init={self.config.minimum_message_tokens_to_init}"
+                )
+                return (False, "below_init_threshold")
+            self._initialized = True
+            logger.debug(
+                f"[sm._should_extract] 初始化门槛通过(写 SM 文件): "
+                f"current={current_token_count} >= min_init={self.config.minimum_message_tokens_to_init}"
+            )
+            return (True, "init")
+
+        # 2. 增量门槛 — token Δ
+        token_delta = current_token_count - (self._last_extract_token_count or 0)
+        if token_delta < self.config.minimum_tokens_between_update:
+            logger.debug(
+                f"[sm._should_extract] token Δ 门槛拦住: "
+                f"token_delta={token_delta} < min={self.config.minimum_tokens_between_update} "
+                f"(current={current_token_count} last={self._last_extract_token_count})"
+            )
+            return (False, "below_token_delta")
+
+        # 3. dual-gate: (token AND tools) OR (token AND last_turn_tool=0)
+        met_tokens = token_delta >= self.config.minimum_tokens_between_update
+        met_tools = tool_count_delta >= self.config.tool_calls_between_updates
+        last_turn_no_tools = tool_count_last_turn == 0
+
+        if (met_tokens and met_tools) or (met_tokens and last_turn_no_tools):
+            logger.debug(
+                f"[sm._should_extract] dual-gate 通过: "
+                f"token_delta={token_delta} (>= {self.config.minimum_tokens_between_update}) "
+                f"tool_delta={tool_count_delta} (>= {self.config.tool_calls_between_updates}? {met_tools}) "
+                f"last_turn_tools={tool_count_last_turn} (OR 旁路: {last_turn_no_tools})"
+            )
+            return (True, "ok")
+
+        logger.debug(
+            f"[sm._should_extract] dual-gate 拦住: token Δ OK 但 "
+            f"tool_delta={tool_count_delta} < {self.config.tool_calls_between_updates} "
+            f"且 last_turn_tools={tool_count_last_turn} > 0"
+        )
+        return (False, "below_tool_or_last_turn")
+
+    def should_extract_now(
+        self,
+        *,
+        current_token_count: int,
+        tool_count_delta: int,
+        tool_count_last_turn: int,
+    ) -> bool:
+        """M11.7 (2026-06-28): 公开 API,供 agent_core.run() 判定本轮要不要触发后台抽取
+
+        内部委托给 _should_extract()(返回 decision + reason 元组),
+        这里只返 bool + 简化日志,便于 caller 调用。
+
+        Args:
+            current_token_count: 当前会话累计 token 数(input + output)
+            tool_count_delta: 本轮 tool 调用次数
+            tool_count_last_turn: 上一轮 tool 调用次数(0 时放行 OR 旁路)
+        """
+        decision, reason = self._should_extract(
+            current_token_count, tool_count_delta, tool_count_last_turn
+        )
+        logger.debug(
+            f"[sm.should_extract_now] decision={decision} reason={reason} "
+            f"current={current_token_count} tool_delta={tool_count_delta} "
+            f"last_turn={tool_count_last_turn}"
+        )
+        return decision
+
     def _do_extract(
         self,
         messages: list[dict],
         llm_callback: Optional[Callable[[str], str]],
+        current_token_count: int = 0,
     ) -> None:
         """实际跑 extract 的内部方法
 
         注意:这里不直接调 LLM,而是构造 prompt + 调用 callback
         让 caller(M5+ 集成)提供具体的 LLM 实现 + Edit 工具
+
+        M11.7: 如果 current_token_count > 0,跑完后更新 _last_extract_token_count
         """
+        logger.debug(
+            f"[sm._do_extract] ENTER session_id={self.session_id} | "
+            f"input_count={len(messages)} sm_exists={self.sm_exists()} "
+            f"current_token_count={current_token_count}"
+        )
         logger.debug(
             f"[sm._do_extract] ENTER session_id={self.session_id} | "
             f"input_count={len(messages)} sm_exists={self.sm_exists()}"
@@ -909,6 +1045,13 @@ last_compacted_at: null
                 f"[sm._do_extract] 推进 last_compacted_msg_id: {old_id} → {self._last_compacted_msg_id} "
                 f"(last_msg.role={last_msg.get('role')!r} content_chars={len(str(last_msg.get('content','')))})"
             )
+            # M11.7: gate 跑通后,更新 token 锚点(给下次 gate 算 Δ)
+            if current_token_count > 0:
+                self._last_extract_token_count = current_token_count
+                logger.debug(
+                    f"[sm._do_extract] 更新 _last_extract_token_count={current_token_count} "
+                    f"(下次 gate 的 token Δ 基准)"
+                )
 
     def _build_extract_prompt(self, current_sm: str, new_messages: list[dict]) -> str:
         """构造 extract prompt(给 LLM 用,带 Edit 工具调用)"""
