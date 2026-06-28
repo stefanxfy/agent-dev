@@ -680,14 +680,23 @@ def get_agent(session_id=None):
         session_memory=session_memory,         # M10 C2.2: L3 SM 快路径
     )
 
-    # M12: 注入 PermissionEngine + AuditLogger(可选,settings.json 不存在时 None)
-    # 对齐 docs/tool/tool-security-architecture.md §6.3 + §4.8
+    # M12/M2: 注入 PermissionEngine + AuditLogger + Sandbox(可选,settings.json 不存在时 None)
+    # 对齐 docs/tool/tool-security-architecture.md §6.3 + §4.8 + §5.2
     try:
-        from agent_core.tools.permission_loader import load_tool_permission_context
+        from agent_core.tools.permission_loader import load_tool_permission_context, load_settings_json
         from agent_core.tools.permission_engine import PermissionEngine
         from agent_core.tools.permission_hook import default_hooks
+        from agent_core.tools.sandbox_manager import sandbox_manager
+        from agent_core.tools.audit_logger import init_audit_logger
 
-        perm_context = load_tool_permission_context()
+        # M2: 加载 sandbox 配置(settings.json 的 sandbox 段)
+        settings_json = load_settings_json()
+        sandbox_cfg = settings_json.get("sandbox") if isinstance(settings_json, dict) else None
+        sandbox_manager.load_config(sandbox_cfg)
+        sandbox_enabled = sandbox_manager.is_sandbox_enabled()
+
+        # M2: 把 sandbox_enabled 透传到 permission context
+        perm_context = load_tool_permission_context(sandbox_enabled=sandbox_enabled)
         if perm_context is not None:
             # 默认 hook registry(secret + path)
             hook_registry = default_hooks()
@@ -698,9 +707,19 @@ def get_agent(session_id=None):
             # auto_allow_ask=False → ASK 时走 UI 弹窗路径(0.1s 超时 → 默认 deny,
             # 实际由 dialog 写回 resolve_permission 解锁)
             agent.auto_allow_ask = False
+
+            # M2: 注入 audit_logger(独立 audit.jsonl 通道,对齐 §4.8)
+            # 写到 session 数据目录,与 session.jsonl 并行
+            try:
+                session_data_dir = Path("data/sessions") / session_id
+                agent.audit_logger = init_audit_logger(str(session_data_dir))
+            except Exception as audit_err:
+                logging.warning(f"AuditLogger 注入失败,降级为无审计: {audit_err}")
+
             logging.info(
-                "PermissionEngine 启用: mode=%s, hooks=[%s]",
+                "PermissionEngine 启用: mode=%s, sandbox=%s, hooks=[%s]",
                 perm_context.mode,
+                sandbox_enabled,
                 ",".join(hook_registry.list_hooks("PreToolUse")),
             )
     except Exception as e:

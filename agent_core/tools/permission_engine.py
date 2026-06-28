@@ -175,6 +175,42 @@ class PermissionEngine:
                     tool_name, e,
                 )
 
+        # ── Step 1c': BashTool 专属(对齐 spec §4.5)─────────────
+        # Bash 是最容易被 prompt injection 利用的工具,所有 Bash 调用走
+        # bash_check_permissions(subcommand 级 rule + classifier + sandbox auto-allow)
+        # ToolDef.check_permissions 保持 None — 由这里专属路径调,避免闭包循环 import
+        if tool_name == "Bash":
+            try:
+                bash_decision = self._run_bash_check_permissions(tool_input)
+            except Exception as e:
+                # defense in depth:_run_bash_check_permissions 内部已 try/except,
+                # 这里再包一层,任何意外都不破坏主 pipeline
+                logger.warning(
+                    "_run_bash_check_permissions 异常: %s — 降级继续", e,
+                )
+                bash_decision = None
+            if bash_decision is not None:
+                if bash_decision.behavior == PermissionBehavior.DENY.value:
+                    return self._log_and_return(
+                        tool_name, tool_input,
+                        bash_decision,
+                        stage="step_1c_bash_deny",
+                    )
+                if bash_decision.behavior == PermissionBehavior.ASK.value:
+                    return self._log_and_return(
+                        tool_name, tool_input,
+                        bash_decision,
+                        stage="step_1c_bash_ask",
+                    )
+                # ALLOW → 直接返(不走后续 rule match;bash sandbox auto-allow 已覆盖)
+                if bash_decision.behavior == PermissionBehavior.ALLOW.value:
+                    return self._log_and_return(
+                        tool_name, tool_input,
+                        bash_decision,
+                        stage="step_1c_bash_allow",
+                    )
+                # PASSTHROUGH → fall through 到后续 Step 1d+ 继续判断
+
         # ── Step 1d: requires_user_interaction ──────────────────
         if getattr(tool, "requires_user_interaction", False):
             return self._log_and_return(
@@ -399,6 +435,30 @@ class PermissionEngine:
         )
 
     # ── 全局 rule 查找 helper ──────────────────────────────────
+
+    def _run_bash_check_permissions(self, tool_input: dict) -> Optional[PermissionDecision]:
+        """
+        调用 bash_check_permissions(对齐 spec §4.5 + §6.3)
+
+        lazy import 避免模块加载时强制依赖(测试可独立 mock)。
+        classifier 注入 self.classifier(ANT-only stub 默认 unavailable)。
+
+        Returns:
+            PermissionDecision 或 None(调用失败时返 None,让 engine 继续 fall through)
+        """
+        try:
+            from .bash_permissions import bash_check_permissions
+            return bash_check_permissions(
+                tool_input,
+                self.context,
+                classifier=self.classifier,
+            )
+        except Exception as e:
+            logger.warning(
+                "bash_check_permissions 异常: %s — 降级继续正常 pipeline",
+                e,
+            )
+            return None
 
     def _check_global_deny_rule(self, tool_name: str) -> Optional[PermissionRule]:
         """检查 tool 是否命中全局 deny rule(按 source 优先级,第一个匹配胜出)"""
