@@ -638,7 +638,8 @@ def get_agent(session_id=None):
         try:
             from agent_core.memory.sm_layer import SessionMemoryLayer
             from agent_core.memory.sm_callback import make_sm_extract_callback
-            from agent_core.llm.router import LLMRouter
+            # LLMRouter 已在模块级 import(避免 inside-function import 把 LLMRouter
+            # 标记为 local,导致 line 579 提前 reference 报 UnboundLocalError)
             _sm_dir = Path(DATA_DIR) / session_id
             _sm_dir.mkdir(parents=True, exist_ok=True)
             # 独立 router 实例 — 跟 memory 系统的 extractor_router 隔离,
