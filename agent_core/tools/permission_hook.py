@@ -1,0 +1,425 @@
+"""
+Permission Hook — PreToolUse hook 注册 + 并行执行
+
+对齐 Claude Code:
+- src/hooks/HookRegistry.ts(runPreToolUseHooks + 并行 + cancel)
+- src/hooks/types.ts(HookResult / HookJSONOutput)
+- doc §4.4 hook 系统 + §4.4.1 并行执行 + §4.4.2 updated_input 链式 merge
+
+核心设计:
+1. **Hook 签名**:(tool_name: str, tool_input: dict, context: ToolPermissionContext) -> PreToolUseResult
+2. **并行执行**:concurrent.futures.ThreadPoolExecutor 跑所有 hook
+3. **第一个 DENY 终止**(类似 short-circuit):后续 hook 不跑
+4. **updated_input 链式 merge**:后 hook 的 updated_input 覆盖前 hook
+5. **Hook 异常不阻断 pipeline**:catch + log + 跳过该 hook
+"""
+
+from __future__ import annotations
+
+import concurrent.futures
+import logging
+import threading
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Optional
+
+from .permission_types import (
+    PermissionBehavior,
+    ToolPermissionContext,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# ────────────────────────────────────────────────────────────────────
+# PreToolUseResult — hook 返回值
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PreToolUseResult:
+    """
+    Hook 执行结果(对齐 CC PreToolUseResult + HookJSONOutput)
+
+    字段:
+    - behavior: 决策(allow / deny / ask)
+    - updated_input: 改写后的 input(后 hook 覆盖前 hook)
+    - additional_context: 额外 context 信息(拼到 system prompt)
+    - prevent_continuation: True 时立即终止后续 hook
+    - reason: 决策原因(给 UI 显示)
+    - hook_name: 来源 hook 名(audit 用)
+    - hook_source: 来源(settings.json source)
+    """
+    behavior: str = PermissionBehavior.ALLOW.value
+    updated_input: Optional[dict] = None
+    additional_context: Optional[str] = None
+    prevent_continuation: bool = False
+    reason: Optional[str] = None
+    hook_name: Optional[str] = None
+    hook_source: Optional[str] = None
+
+    @classmethod
+    def allow(cls, **kwargs) -> "PreToolUseResult":
+        """工厂:ALLOW"""
+        return cls(behavior=PermissionBehavior.ALLOW.value, **kwargs)
+
+    @classmethod
+    def deny(cls, reason: str = "", **kwargs) -> "PreToolUseResult":
+        """工厂:DENY"""
+        return cls(
+            behavior=PermissionBehavior.DENY.value,
+            reason=reason,
+            **kwargs,
+        )
+
+    @classmethod
+    def ask(cls, reason: str = "", **kwargs) -> "PreToolUseResult":
+        """工厂:ASK"""
+        return cls(
+            behavior=PermissionBehavior.ASK.value,
+            reason=reason,
+            **kwargs,
+        )
+
+
+# ────────────────────────────────────────────────────────────────────
+# Hook 签名类型
+# ────────────────────────────────────────────────────────────────────
+
+HookCallable = Callable[
+    [str, dict, ToolPermissionContext],
+    PreToolUseResult,
+]
+"""
+Hook 函数签名:
+  def my_hook(tool_name, tool_input, context) -> PreToolUseResult
+"""
+
+
+# ────────────────────────────────────────────────────────────────────
+# _HookEntry — 注册的 hook
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _HookEntry:
+    name: str
+    event: str  # "PreToolUse" | "PostToolUse" | "Stop" | etc.
+    callback: HookCallable
+    source: Optional[str] = None  # settings source name(audit 用)
+
+
+# ────────────────────────────────────────────────────────────────────
+# HookRegistry — 注册 + 调度 hook
+# ────────────────────────────────────────────────────────────────────
+
+class HookRegistry:
+    """
+    Hook 注册表(对齐 CC HookRegistry)
+
+    职责:
+      1. 注册 / 注销 hook
+      2. 按 event 触发(目前只实现 PreToolUse)
+      3. 并行执行,第一个 DENY 终止
+      4. 链式 merge updated_input
+      5. 异常隔离(单 hook 抛异常不影响其他 hook)
+    """
+
+    def __init__(self, max_workers: int = 8):
+        """
+        Args:
+            max_workers: ThreadPoolExecutor 最大并发数(M1 默认 8)
+        """
+        self._hooks: list[_HookEntry] = []
+        self._lock = threading.Lock()
+        self._max_workers = max_workers
+
+    # ── 注册 API ──────────────────────────────────────────────
+
+    def register_hook(
+        self,
+        event: str,
+        name: str,
+        callback: HookCallable,
+        source: Optional[str] = None,
+    ) -> None:
+        """
+        注册一个 hook
+
+        Args:
+            event: 事件名("PreToolUse" / "PostToolUse" / 等)
+            name: hook 名(audit + 测试用)
+            callback: HookCallable
+            source: 来源(settings.json source,audit 用)
+        """
+        with self._lock:
+            self._hooks.append(_HookEntry(
+                name=name,
+                event=event,
+                callback=callback,
+                source=source,
+            ))
+
+    def unregister_hook(self, name: str) -> bool:
+        """
+        注销 hook(按 name)
+
+        Returns:
+            True 如果删除了,False 如果未找到
+        """
+        with self._lock:
+            for i, h in enumerate(self._hooks):
+                if h.name == name:
+                    del self._hooks[i]
+                    return True
+            return False
+
+    def list_hooks(self, event: Optional[str] = None) -> list[str]:
+        """列出 hook 名(可按 event 过滤)"""
+        with self._lock:
+            if event is None:
+                return [h.name for h in self._hooks]
+            return [h.name for h in self._hooks if h.event == event]
+
+    def clear(self) -> None:
+        """清空所有 hook(测试用)"""
+        with self._lock:
+            self._hooks.clear()
+
+    # ── 触发 PreToolUse hook ──────────────────────────────────
+
+    def run_pre_tool_use(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        context: ToolPermissionContext,
+    ) -> PreToolUseResult:
+        """
+        并行跑所有 PreToolUse hook(对齐 CC runPreToolUseHooks)
+
+        行为:
+          1. 收集所有 event="PreToolUse" 的 hook
+          2. 用 ThreadPoolExecutor 并行跑
+          3. 第一个 DENY 终止后续 hook(但已 running 的仍跑完)
+          4. updated_input 链式 merge
+          5. 任一 hook 抛异常 → log + 跳过该 hook
+          6. prevent_continuation 触发 → 后续 hook 不提交
+
+        Args:
+            tool_name: 工具名
+            tool_input: 工具输入
+            context: 上下文
+
+        Returns:
+            聚合后的 PreToolUseResult
+        """
+        hooks = self._collect_hooks("PreToolUse")
+        if not hooks:
+            return PreToolUseResult.allow()
+
+        # 共享状态(线程安全)
+        first_deny: dict[str, PreToolUseResult] = {}  # 第一 DENY 优先
+        cancel_event = threading.Event()
+        merged_input: dict = dict(tool_input)  # 链式 merge
+
+        def _run_hook(entry: _HookEntry) -> PreToolUseResult:
+            """单 hook 执行 + 异常隔离"""
+            try:
+                # 同步执行(M1 简化,future 仍用 thread 包装)
+                result = entry.callback(tool_name, dict(merged_input), context)
+                result.hook_name = entry.name
+                result.hook_source = entry.source
+                return result
+            except Exception as e:
+                logger.warning(
+                    "hook %s 抛异常,跳过: %s",
+                    entry.name, e, exc_info=True,
+                )
+                return PreToolUseResult.allow(
+                    hook_name=entry.name,
+                    hook_source=entry.source,
+                    reason=f"hook exception: {e}",
+                )
+
+        # 并行执行
+        results: list[PreToolUseResult] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+            futures = {}
+            for hook in hooks:
+                if cancel_event.is_set():
+                    break  # prevent_continuation 触发,不再提交
+                future = executor.submit(_run_hook, hook)
+                futures[future] = hook
+
+            for future in concurrent.futures.as_completed(futures):
+                if cancel_event.is_set():
+                    # prevent_continuation 已触发,不再处理后续结果
+                    continue
+                try:
+                    result = future.result()
+                except Exception as e:
+                    # _run_hook 已 catch,这里兜底
+                    logger.error("hook future 异常(不应该发生): %s", e)
+                    continue
+                results.append(result)
+
+                # 链式 merge updated_input
+                if result.updated_input is not None:
+                    merged_input.update(result.updated_input)
+
+                # DENY 短路
+                if result.behavior == PermissionBehavior.DENY.value:
+                    first_deny.setdefault("result", result)
+                    cancel_event.set()
+
+                # prevent_continuation
+                if result.prevent_continuation:
+                    cancel_event.set()
+
+        # 决定最终结果
+        if first_deny:
+            deny_result = first_deny["result"]
+            if deny_result.updated_input is not None:
+                merged_input.update(deny_result.updated_input)
+            return replace(
+                deny_result,
+                updated_input=merged_input if any(r.updated_input for r in results) else None,
+            )
+
+        # 无 DENY:如果有 ASK → ASK;否则 ALLOW
+        ask_results = [r for r in results if r.behavior == PermissionBehavior.ASK.value]
+        if ask_results:
+            # 取第一个 ASK(M1 简化:用 first)
+            primary = ask_results[0]
+            return replace(
+                primary,
+                updated_input=merged_input if any(r.updated_input for r in results) else None,
+            )
+
+        # 全 ALLOW:返回 ALLOW(带 merged_input + hook metadata)
+        allow_results = [r for r in results if r.behavior == PermissionBehavior.ALLOW.value]
+        if allow_results:
+            primary = allow_results[0]
+            return PreToolUseResult(
+                behavior=PermissionBehavior.ALLOW.value,
+                updated_input=merged_input if any(r.updated_input for r in results) else None,
+                hook_name=primary.hook_name,
+                hook_source=primary.hook_source,
+                reason=primary.reason,
+            )
+        return PreToolUseResult.allow(
+            updated_input=merged_input if any(r.updated_input for r in results) else None,
+        )
+
+    # ── 内部 helper ──────────────────────────────────────────
+
+    def _collect_hooks(self, event: str) -> list[_HookEntry]:
+        """snapshot 当前注册的所有 event hook(避免并发问题)"""
+        with self._lock:
+            return [h for h in self._hooks if h.event == event]
+
+
+# ────────────────────────────────────────────────────────────────────
+# Default hooks — 预置 hook
+# ────────────────────────────────────────────────────────────────────
+
+def default_secret_hook(
+    tool_name: str,
+    tool_input: dict,
+    context: ToolPermissionContext,
+) -> PreToolUseResult:
+    """
+    预置:secret 检测 hook(命中 secret → ASK)
+
+    Args:
+        tool_name: 工具名
+        tool_input: 工具输入
+        context: 上下文
+
+    Returns:
+        ASK 如果命中 secret;否则 ALLOW
+    """
+    from .safety_check import contains_secret, _SECRET_CHECK_TOOLS
+
+    if tool_name not in _SECRET_CHECK_TOOLS:
+        return PreToolUseResult.allow(hook_name="default_secret")
+
+    for value in tool_input.values():
+        if isinstance(value, str) and contains_secret(value):
+            return PreToolUseResult.ask(
+                reason=f"secret pattern detected in {tool_name} input",
+                hook_name="default_secret",
+            )
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    for v in item.values():
+                        if isinstance(v, str) and contains_secret(v):
+                            return PreToolUseResult.ask(
+                                reason="secret pattern detected in content list",
+                                hook_name="default_secret",
+                            )
+                elif isinstance(item, str) and contains_secret(item):
+                    return PreToolUseResult.ask(
+                        reason="secret pattern detected in list item",
+                        hook_name="default_secret",
+                    )
+        elif isinstance(value, dict):
+            for v in value.values():
+                if isinstance(v, str) and contains_secret(v):
+                    return PreToolUseResult.ask(
+                        reason="secret pattern detected in nested dict",
+                        hook_name="default_secret",
+                    )
+    return PreToolUseResult.allow(hook_name="default_secret")
+
+
+def default_path_validation_hook(
+    tool_name: str,
+    tool_input: dict,
+    context: ToolPermissionContext,
+) -> PreToolUseResult:
+    """
+    预置:路径验证 hook(敏感路径 → DENY)
+
+    Args:
+        tool_name: 工具名
+        tool_input: 工具输入
+        context: 上下文
+
+    Returns:
+        DENY 如果命中敏感路径;否则 ALLOW
+    """
+    from .safety_check import is_sensitive_path, _PATH_CHECK_TOOLS
+
+    if tool_name not in _PATH_CHECK_TOOLS:
+        return PreToolUseResult.allow(hook_name="default_path")
+
+    path = tool_input.get("path") or tool_input.get("file_path") or ""
+    if path and is_sensitive_path(path):
+        return PreToolUseResult.deny(
+            reason=f"sensitive path detected: {path}",
+            hook_name="default_path",
+        )
+    return PreToolUseResult.allow(hook_name="default_path")
+
+
+def default_hooks() -> HookRegistry:
+    """
+    创建带预置 hook 的 HookRegistry
+
+    Returns:
+        HookRegistry with default_secret + default_path hooks
+    """
+    registry = HookRegistry()
+    registry.register_hook(
+        event="PreToolUse",
+        name="default_secret",
+        callback=default_secret_hook,
+        source="builtin",
+    )
+    registry.register_hook(
+        event="PreToolUse",
+        name="default_path",
+        callback=default_path_validation_hook,
+        source="builtin",
+    )
+    return registry
