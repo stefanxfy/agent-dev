@@ -3,7 +3,8 @@
 > 参考来源：QClaw 记忆系统 + Mem0 核心概念 + Claude Code 记忆设计（详见 [`claude-code-memory-system-deep-dive.md`](claude-code-memory-system-deep-dive.md)）
 > 项目：agent-dev（自研 Agent 框架）
 > 日期：2026-06-26（v2.3，frontmatter + MEMORY.md 物理索引 + sideQuery 模式）
-> 状态：v2.3 已实现并验证
+> 增量：2026-06-28（v2.3.1+M11.5 SM 解耦 LLM callback；v2.3.2+M11.6 autoDream 简化 + 接真 LLM + UI 诊断字段）
+> 状态：v2.3 已实现并验证；v2.3.1/v2.3.2 已落地
 
 ---
 
@@ -16,6 +17,8 @@
 | v2.1 | 2026-06-20 | **配置/检索升级**：Pydantic 配置校验 + 三模式共存（vector/file/hybrid）+ Hybrid 量化指标 + 锁粒度拆分 + Windows 路径兼容 | 24 项专业审查 |
 | v2.2 | 2026-06-25 | **语义去重升级**：向量召回 + 阈值/LLM 判定三层决策，替换旧提示词注入方案；bge-m3 向量编码；极性/实体差异处理 | 用户反馈去重漏报/误报 |
 | v2.3 | 2026-06-26 | **M11 frontmatter + MEMORY.md 物理索引 + sideQuery 二选一**：`name`/`description` 必填；MEMORY.md 物理索引（200 行 / 25KB 上限，写盘后 1s 异步 rebuild）；删除 keyword/hybrid 模式，只保留 `semantic` + `side_query` 二选一；L1 启动加载 + L2 sideQuery LLM 精选 + `already_surfaced` 去重；新增 TRUSTING_RECALL_SECTION 提示 LLM 验证记忆新鲜度 | 对齐 Claude Code memory 模式 |
+| v2.3.1 | 2026-06-28 | **M11.5 SM 解耦 LLM callback**: SessionMemoryLayer 不直接调 `LLMRouter.chat`,改为注入 `make_sm_extract_callback(router=, cache_namespace=, max_retries=, backoff_base=, on_failure=)` 工厂返回的同步 callback;统一 retry/指数退避/失败返空语义,与未来 M11.6 distill_callback 同模式(单一职责、可测、易替换) | SM 提取可靠性 + 与 M11.6 对齐 |
+| v2.3.2 | 2026-06-28 | **M11.6 autoDream 简化 + 接真 LLM**: (1) 蒸馏门3 从 session 数量门改为 .md 数量门 (`min_memories_for_distill`),不再扫 session 日志; (2) `_read_existing_memories()` 解析 frontmatter 让 prompt 显真实 title; (3) 删除 `_count_recent_sessions` 方法; (4) 新增 `distill_callback.py` 接真 LLM(同 M11.5 callback 模式); (5) `DistillationLoop.get_status()` 新增 `last_skip_reason`/`last_run_id`/`last_error` 3 字段; (6) sidebar UI 显示 skip reason / run_id / error,不再只看 success/failure | autoDream 单一职责(只看 .md)+ 接真 LLM + UI 可观测性 |
 
 ### 〇.1 版本时间线（演进路径）
 
@@ -40,7 +43,7 @@ v1 (2026-06-11)                    v2 (2026-06-19)                   v2.1 (2026-
 
 ## 一、核心设计理念
 
-> **🆕 标记说明**：本文用 🆕 标记 v2 相对 v1 的新增项；v2.1 的新增项用 🆕¹ 标记；v2.2 的新增项用 🆕² 标记。所有 🆕 项在 §〇.1 版本时间线里有完整列表。
+> **🆕 标记说明**：本文用 🆕 标记 v2 相对 v1 的新增项；v2.1 的新增项用 🆕¹ 标记；v2.2 的新增项用 🆕² 标记；v2.3 / M11.x 的新增项用 🆕³ 标记。所有 🆕 项在 §〇.1 版本时间线里有完整列表。
 
 | 设计原则 | 说明 |
 |---------|------|
@@ -60,6 +63,8 @@ v1 (2026-06-11)                    v2 (2026-06-19)                   v2.1 (2026-
 | **🆕² 单一职责去重** | 提取 LLM 只看本轮对话是否值得记，去重下沉到写盘前由向量召回+LLM 判定（详见 §6.9） |
 | **🆕² 三层去重决策** | ≥0.95 自动判重 / 0.85-0.95 LLM 判 / <0.85 新记忆，避免单一阈值漏报/误报 |
 | **🆕² 极性安全** | 极性相反（喜欢/不喜欢）通过 LLM 判定层显式区分，不被向量相似度误并 |
+| **🆕³ 解耦 LLM callback** | SessionMemoryLayer / DistillationScheduler 不直接调 `LLMRouter.chat`，而是注入 `make_*_callback()` 工厂返回的同步 `(prompt) -> str` 函数，统一 retry/指数退避/失败返空语义（详见 §7.3、§4.4 `_do_extract`） |
+| **🆕³ autoDream 单一职责** | M11.6 起 autoDream 只读 `.agent_data/memory/{type}/*.md`，不再扫 session 日志——去重已在 M11 下放到 `dual_channel_writer._is_semantic_duplicate`（详见 §7.1-7.3） |
 
 > **解释**：v1 → v2 的最大变化是引入了 **Claude Code 的"分层压缩"思想**——把"会话内压缩"（L3 快路径）和"跨会话整合"（L5 慢路径）分开，避免每次压缩都让 LLM 重新摘要所有历史。详细对比见 [`claude-code-memory-system-deep-dive.md` §0](claude-code-memory-system-deep-dive.md)。
 > 
@@ -1004,15 +1009,10 @@ class SessionMemoryLayer:
     def _do_extract(self, current_sm: str, new_messages: list[Message]):
         try:
             prompt = self._build_extract_prompt(current_sm, new_messages)
-            # fork agent: 独立 context, cache-safe params
-            response = self.router.chat(
-                messages=[{"role": "user", "content": prompt}],
-                provider="anthropic",
-                model="claude-haiku-4-5",  # 小模型足够
-                temperature=0.1,
-                cache_safe_params=True,  # 🆕 复用 system prompt 缓存
-                tools=[self.memory_editor.create_memory_edit_tool(self.sm_path)],
-            )
+            # 🆕³ M11.5: 解耦 LLM callback, 由 make_sm_extract_callback 工厂构造
+            # 同模式蒸馏(M11.6)的 distill_callback: retry + 指数退避 + 失败返空
+            # SessionMemoryLayer 不直接调 router,而是注入 callback 接收 LLM 响应
+            response = self._llm_callback(prompt)
             # 后台 agent 已经通过 Edit 工具改完文件了
             # 推进 last_compacted_msg_id
             self.last_compacted_msg_id = new_messages[-1].id
@@ -1157,6 +1157,8 @@ def should_trigger_compact(self, ctx: TurnContext) -> CompactDecision:
 7. **feedback / project 必须含 `**Why:**`**——避免"只有规则没有原因"的浅记忆
 8. **🆕 v2.2 提取 prompt 不含已有记忆**——去重下沉到写盘前，提取 LLM 只看本轮对话（详见 §6.9）
 9. **🆕 v2.2 语义去重绝不阻断持久化**——向量库异常/LLM 判定失败时返回 False（宁可多存不可误删）
+10. **🆕³ v2.3.1 SM/distill LLM callback 解耦**——SM 提取 / autoDream 不直接持有 `LLMRouter`,只持有 `(prompt) -> str` 同步 callback,retry/backoff/失败语义由 callback 工厂统一,易替换/易测
+11. **🆕³ v2.3.2 autoDream 不读 session 日志**——蒸馏输入只看 `.agent_data/memory/{type}/*.md`,去重已在 M11 由 `dual_channel_writer._is_semantic_duplicate` 负责(详见 §7.1 门3 + §6.9)
 
 #### 4.5.1 不变量测试矩阵：8 个并发/崩溃场景（v2.1 增，对应 A12 修复）
 
@@ -2773,10 +2775,15 @@ class AutoDreamScheduler:
     - 门0: feature gate
     - 门1: 时间门（24h）
     - 门2: 扫描节流（10 分钟）
-    - 门3: session 数量门（≥5）
+    - 门3: .md 记忆数量门（≥N，由 `min_memories_for_distill` 控制）
     - 门4: 锁（PID + mtime 双重保护）
-    
+
     v1 升级点: 锁文件合并了"上次蒸馏时间"和"当前锁状态"
+    **M11.6 升级点**: 门3 从"session 数量门"改为".md 数量门"
+    —— autoDream 不再扫 session 日志，蒸馏输入只看 .agent_data/memory/ 下的 .md
+    文件（去重场景在 M11 已下放到 `dual_channel_writer._is_semantic_duplicate`，
+    不需要再读 session log）。新门更便宜（一次 `listdir`），也更稳定（不依赖
+    session 日志的存活/格式）。
     """
     
     LOCK_FILE = ".agent_data/memory/.consolidate-lock"
@@ -2801,10 +2808,10 @@ class AutoDreamScheduler:
         if self._time_since_last_scan() < 10 * 60:
             return False, "scan_throttled"
 
-        # 门3: session 数量门
-        session_count = self._count_recent_sessions()
-        if session_count < 5:
-            return False, f"too_few_sessions({session_count})"
+        # 门3: .md 记忆数量门（M11.6: 从 session 数量门改为 .md 数量门）
+        memory_count = len(self._read_existing_memories())
+        if memory_count < self.config.min_memories_for_distill:
+            return False, f"too_few_memories({memory_count})"
 
         return True, "ok"
 
@@ -2910,27 +2917,22 @@ DistillationScheduler（每小时检查一次）
 └────────────┬────────────────────┘
              ↓
 ┌─────────────────────────────────┐
-│  2. 扫描增量 session              │
-│     列出 last_distill 之后改动的 │
-│     session 文件                  │
+│  2. 读取 .md 记忆文件            │  ← 🆕³ M11.6: 不再扫 session 日志
+│     .agent_data/memory/{type}/   │     输入只看 .md 文件,
+│     按 type 分组                 │     frontmatter 解析出 title
+│     (user/feedback/project/ref)  │     body 拼成 prompt
 └────────────┬────────────────────┘
              ↓
 ┌─────────────────────────────────┐
-│  3. 读取每条记忆文件              │
-│     按 type 分组 (user/feedback/ │
-│     project/reference)           │
-└────────────┬────────────────────┘
-             ↓
-┌─────────────────────────────────┐
-│  4. LLM 蒸馏（fork agent）       │
-│     - 合并相似记忆                │
-│     - 调和冲突信息                │
+│  3. LLM 蒸馏（decoupled callback）│  ← 🆕³ M11.6: 调真 LLM
+│     - 合并相似记忆                │     make_distill_callback(router=, ...)
+│     - 调和冲突信息                │     重试 + 指数退避 + 失败返空
 │     - 删除过时记忆                │
-│     - 生成 per-file 候选         │
+│     - 生成 per-file 候选 JSON    │
 └────────────┬────────────────────┘
              ↓
 ┌─────────────────────────────────┐
-│  5. 写入 candidate 目录          │
+│  4. 写入 candidate 目录          │
 │     .agent_data/memory/_candidate/│
 │     ├── user/                    │
 │     │   └── 2026-06-19_learning_v2.md│
@@ -2939,58 +2941,76 @@ DistillationScheduler（每小时检查一次）
 └────────────┬────────────────────┘
              ↓
 ┌─────────────────────────────────┐
-│  6. UI 展示 diff/merge review    │
-│     (🆕 P0-19: 不是 yes/no,     │
+│  5. UI 展示 diff/merge review    │
+│     (P0-19: 不是 yes/no,         │
 │      用户看 diff 后点"接受")     │
 └────────────┬────────────────────┘
              ↓ 用户接受
 ┌─────────────────────────────────┐
-│  7. 原子替换                      │
+│  6. 原子替换                      │
 │     旧文件移入 _archive/         │
 │     candidate 移到正式目录       │
 │     重建 MEMORY.md 索引           │
 └────────────┬────────────────────┘
              ↓
 ┌─────────────────────────────────┐
-│  8. 释放锁（保留 mtime）          │
+│  7. 释放锁（保留 mtime）          │
 │     mtime 自动 = now             │
 │     下次检查门1 时距今 0h         │
 └─────────────────────────────────┘
 ```
 
-### 7.3 蒸馏 Prompt（v2：per-file 输出）
+### 7.3 蒸馏 Prompt（v2.3：仅 .md 输入）
+
+> **🆕³ M11.6 变更**：v2 时期 prompt 同时含"现有记忆 + 增量 session 日志"两段输入；M11.6 起
+> autoDream 只读现有 `.md`，**不再扫 session 日志**——去重已在 M11 下放到
+> `dual_channel_writer._is_semantic_duplicate`，无需再让 LLM 蒸馏时兼顾增量日志。
+>
+> 收益：
+> - 输入更小（一般 6-30 条 .md 远少于几小时的 session 日志）
+> - 职责单一：autoDream 只负责"合并/调和/删除"已有 .md，不掺"读对话抽记忆"
+> - 失败更可预测：M11.6 失败 = LLM 不响应；不再是"找不到 session 日志路径"
 
 ```
-从以下对话日志和现有记忆中, 蒸馏出值得保留的长期记忆.
+你是记忆蒸馏 agent(autoDream),职责是合并/调和/删除已有的长期记忆文件.
 
-输出: 每个候选记忆一个 markdown 文件, 含 YAML frontmatter.
+输入: 已有 .md 列表 (frontmatter: type/title;body: 内容). 每次蒸馏前由
+      DistillationScheduler._read_existing_memories() 解析 frontmatter 后喂给你.
 
-frontmatter 字段:
-- type: 必须是 user | feedback | project | reference 之一
-- created_at: YYYY-MM-DD
-- confidence: 0.0-1.0
-- sources: [session_id_1, session_id_2, ...]
-
-body 格式:
-# <标题>
-
-**Why:** <这条记忆为什么重要, 用户/项目背景>
-
-## 内容
-<具体记忆内容>
+输出: JSON 数组,每条候选一个对象:
+[
+  {
+    "type": "user" | "feedback" | "project" | "reference",
+    "title": "<新标题或保留原标题>",
+    "why": "<这条记忆为什么值得保留 / 用户的上下文>",
+    "body": "<精炼后的内容>",
+    "confidence": 0.0-1.0,        # 你对这条记忆质量的把握
+    "sources": ["<原 .md 文件名>"],  # 用来追溯来源
+    "tags": ["<标签1>", "<标签2>"]
+  }
+  // 无需蒸馏时直接返回 []
+]
 
 蒸馏规则:
 1. 合并相似记忆 (例: "先手写 ReAct" 和 "重视底层原理" → 合并)
 2. 调和冲突信息 (例: 用户改主意了 → 更新原记忆, 不新增)
 3. 删除过时记忆 (例: "Python 2 vs 3" 的 Python 2 相关 → 删)
-4. 强制: feedback / project 类必须含 **Why:** 字段
-
-现有记忆（不要重复提取）:
-<读取 .agent_data/memory/ 下的所有 .md 文件>
-
-增量日志:
-<读取 .agent_data/logs/ 中 last_distill 之后的文件>
+4. 强制: feedback / project 类必须含 why 字段
+5. 返回 [] 表示无需整理(常见于 .md 数量少或彼此独立)
 ```
+
+**实现位置**: `agent_core/memory/distill_callback.py` 的 `DISTILL_SYSTEM_PROMPT` 常量,
+由 `make_distill_callback()` 工厂拼到 messages[0].content,再喂给 `LLMRouter.chat()`。
+
+**retry / backoff**（与 M11.5 SM callback 一致）:
+- `max_retries=2`、`backoff_base=0.5` → 失败间隔 0.5s/1.0s
+- 空响应 = 失败,触发重试
+- 耗尽后 `on_failure="return_empty"` → 返 `""` 让上层 skip 当次 run
+- 独立 `LLMRouter` 实例,不与 SM / extractor 共享,避免 retry/backoff 互相干扰
+- `cache_namespace=f"distill_{mem_root.name}"` 防跨用户 cache pollution
+
+**不变量**: autoDream LLM 失败不写任何候选文件(`DistillationResult.success=False` 时跳过写盘)——
+宁可漏一次,不可脏写。
 
 ### 7.4 dry_run → diff/merge review（P0-19）
 
@@ -3452,15 +3472,49 @@ function toggleMemory(key, value):
 
 ### 13.3 autoDream 状态行
 
+> **🆕³ M11.6 变更**: v2 时期 UI 只显示三态(`running`/`never`/`last ran X ago`),
+> 用户看不出"上次为啥没跑"。M11.6 起 sidebar 显 `DistillationLoop.get_status()`
+> 6 个字段,区分 gate 拦住 vs 真跑成功 vs LLM 失败:
+
 ```python
-# 三态: running / never / last ran X ago
-dreamStatus = (
-    "running" if isDreamRunning()
-    else "never" if lastDreamAt is None
-    else f"last ran {formatRelative(lastDreamAt)}"
-)
-# 呈现: "Auto-dream: on · last ran 3 hours ago · /dream to run"
+# M11.6: DistillationLoop.get_status() 暴露 6 个诊断字段
+status = distillation_loop.get_status()
+# {
+#     "running": bool,
+#     "tick_count": int,
+#     "interval_seconds": int,
+#     "last_tick_at": ISO str or None,
+#     "last_result_success": bool or None,  # None = 还没跑过
+#     "last_candidates_count": int or None,
+#     "last_skip_reason": str or None,      # "too_soon" / "gate_disabled" / ...
+#     "last_run_id": str or None,           # "run_<timestamp>"
+#     "last_error": str or None,            # LLM 异常 message
+# }
+
+# sidebar 渲染规则(web/app.py):
+if status["last_result_success"] is True:
+    # 真跑成功
+    render(f"✅ autoDream: {status['last_candidates_count']} 候选"
+           f" (run {status['last_run_id']})")
+elif status["last_skip_reason"]:
+    # gate 拦住 — 区分各种 reason 给用户具体反馈
+    render(f"⏸ autoDream: 跳过 ({status['last_skip_reason']})")
+elif status["last_error"]:
+    # LLM 失败
+    render(f"❌ autoDream: 失败 ({status['last_error']})")
+else:
+    # 还没跑过
+    render("💤 autoDream: 等待首次 tick")
 ```
+
+**呈现示例**:
+- `✅ autoDream: 3 候选 (run_1719480000_a1b2)` — 上次跑成功,3 条候选待 review
+- `⏸ autoDream: 跳过 (too_soon(2.1h<24h))` — 时间门拦住,告诉用户还差多久
+- `⏸ autoDream: 跳过 (too_few_memories(3))` — .md 不足
+- `❌ autoDream: 失败 (LLM timeout after 2 retries)` — 明确告诉用户是 LLM 挂了不是别的
+- `💤 autoDream: 等待首次 tick` — daemon 起动后还没 tick 过
+
+**向后兼容**: `get_status()` 旧字段(`running`/`tick_count`/`interval_seconds`/`last_tick_at`/`last_result_success`/`last_candidates_count`)保持不变,新增的 3 个字段(`last_skip_reason`/`last_run_id`/`last_error`)是可选诊断信息。
 
 ### 13.4 候选文件 review UI
 
