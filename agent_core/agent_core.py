@@ -26,9 +26,10 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import threading
 import time
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from .llm.router import (
     LLMRouter,
@@ -39,6 +40,9 @@ from .llm.router import (
     UsageStats,
 )
 from .tools.base import ToolRegistry
+
+if TYPE_CHECKING:
+    from .tools.permission_engine import PermissionEngine
 
 # Day 5: 上下文管理器
 from .context.manager import ContextManager as CM
@@ -183,6 +187,9 @@ class ReactAgent:
         react_memory_bridge: Optional["ReactMemoryBridge"] = None,  # Task 7: 双通道记忆桥接器(取代 Option C)
         session_memory: Optional["SessionMemoryLayer"] = None,  # M10 C2.1: L3 SM 快路径
         memory_config: Optional["MemoryConfig"] = None,  # M10 C6.4: 运行时切换 hook(set_runtime 用)
+        permission_engine: Optional["PermissionEngine"] = None,  # M12: 权限引擎(可选,None=不启用)
+        audit_logger: Optional[Any] = None,  # M12: 审计日志(可选,None=不写)
+        auto_allow_ask: bool = True,  # M12: ASK 时是否自动 ALLOW(测试用,UI 路径会 yield 等待)
     ):
         self.llm = llm_router
         self.tools = tool_registry
@@ -245,6 +252,14 @@ class ReactAgent:
 
         # M10 C3.1: DistillationLoop 注入位(由 web/app.py:get_agent() 挂上)
         self._distillation_loop: Optional["DistillationLoop"] = None
+
+        # M12: 权限引擎 + 审计日志(可选,None=不启用权限系统,向后兼容)
+        self.permission_engine = permission_engine
+        self.audit_logger = audit_logger
+        self.auto_allow_ask = auto_allow_ask
+        # M12: 权限决策待审批请求(给 UI 用)
+        self._pending_permission_request: Optional[dict] = None
+        self._permission_resolved: Optional[Any] = None  # threading.Event 初始为 None
 
     def _restore_usage_baseline(self):
         """
@@ -476,13 +491,121 @@ class ReactAgent:
             removed = self.messages.pop(0)
             total_tokens -= self._estimate_message_tokens(removed)
 
+    # ── 权限系统 helper(M12 增量)───────────────────────────────
+
+    def _check_tool_permission(
+        self,
+        tool_name: str,
+        tool_input: dict,
+    ) -> tuple[bool, Optional[str], dict]:
+        """
+        同步检查单工具权限(对齐 doc §6.3)
+
+        Returns:
+            (allowed, error_message, effective_input)
+            - allowed=True: 允许执行,error_message=None
+            - allowed=False: 拒绝执行,error_message 含拒绝原因,仍要让 LLM 看到
+            - effective_input: hook 可能改写后的 input(目前 M12 简化:返回原 input)
+        """
+        if self.permission_engine is None:
+            # 未注入 permission_engine → 向后兼容,允许
+            return True, None, tool_input
+
+        # 取出 tool_def(duck-typed:只要有 name 即可)
+        tool_def = self.tools.get(tool_name)
+        if tool_def is None:
+            # 工具不存在 — 让 execute() 自己返 error,这里放过
+            return True, None, tool_input
+
+        # 调 permission_engine 决策
+        decision = self.permission_engine.check_permissions(
+            tool_def, tool_input, list(self.messages),
+        )
+
+        from .tools.permission_types import PermissionBehavior
+
+        if decision.behavior == PermissionBehavior.ALLOW.value:
+            return True, None, decision.updated_input or tool_input
+        if decision.behavior == PermissionBehavior.DENY.value:
+            reason = decision.decision_reason
+            reason_str = ""
+            if reason is not None and hasattr(reason, 'reason'):
+                reason_str = reason.reason
+            elif decision.message:
+                reason_str = decision.message
+            err = f"Permission denied: {reason_str or 'no reason'}"
+            return False, err, tool_input
+        if decision.behavior == PermissionBehavior.ASK.value:
+            # M12 简化:auto_allow_ask=True → 自动 ALLOW(测试用)
+            if self.auto_allow_ask:
+                return True, None, decision.updated_input or tool_input
+            # auto_allow_ask=False → 走 UI 路径
+            return self._ask_user_permission(tool_name, tool_input, decision)
+        # passthrough 或其他 → 当作 ASK
+        return self._ask_user_permission(tool_name, tool_input, decision)
+
+    def _ask_user_permission(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        decision: Any,
+    ) -> tuple[bool, Optional[str], dict]:
+        """
+        弹权限请求(对齐 doc §6.3 异步审批)
+
+        M12 实现:挂起一个 threading.Event 等 UI 写回决策
+        - M12 简化:这里只挂起 0.1s 超时,如果没回复当 deny
+        - 完整实现由 web/app.py 接管(Step 12)
+
+        Returns:
+            (allowed, error_message, effective_input)
+        """
+        if self._permission_resolved is None:
+            self._permission_resolved = threading.Event()
+
+        # 暴露 request 给外部(UI 读)
+        self._pending_permission_request = {
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "reason": getattr(decision.decision_reason, "reason", "") if decision.decision_reason else "",
+            "message": decision.message or "",
+        }
+
+        # 简化:等 0.1s,没回复当 deny
+        got_response = self._permission_resolved.wait(timeout=0.1)
+        if got_response and self._pending_permission_request:
+            choice = self._pending_permission_request.get("choice", "deny")
+            self._pending_permission_request = None
+            self._permission_resolved = None
+            if choice == "allow":
+                return True, None, tool_input
+            if choice == "always_allow":
+                return True, None, tool_input
+            return False, "Permission denied by user", tool_input
+        # 超时:默认 deny
+        self._pending_permission_request = None
+        self._permission_resolved = None
+        return False, "Permission ask timed out (no user response)", tool_input
+
+    def resolve_permission(self, choice: str) -> None:
+        """
+        外部(UI)在用户选择后调这个,解锁 _ask_user_permission
+
+        Args:
+            choice: "allow" | "deny" | "always_allow"
+        """
+        if self._pending_permission_request is not None:
+            self._pending_permission_request["choice"] = choice
+        if self._permission_resolved is not None:
+            self._permission_resolved.set()
+
     # ── 主循环 ──────────────────────────────────────────────────────
 
     def run(self, user_message: str):
         """
         执行 ReAct 循环，返回生成器。
         流式 yield 所有中间过程（text / thinking / tool_call / tool_result / usage / system）。
-        
+
         Day 4: 如果启用了 session，run 结束后自动保存到 session。
         """
         # system prompt 不持久化到 JSONL（与 Claude Code 一致：每次 run 动态注入）
@@ -863,9 +986,25 @@ class ReactAgent:
                 tc = tool_calls[0]
                 yield ("tool_call", {"name": tc.tool_name, "input": tc.tool_input, "parallel": False})
                 self._pending_tool_logs.append({"type": "action", "name": tc.tool_name, "input": tc.tool_input})
-                
+
+                # M12: 权限检查(对齐 doc §6.3)
+                allowed, perm_err, effective_input = self._check_tool_permission(tc.tool_name, tc.tool_input)
+                if not allowed:
+                    tool_output = perm_err or "Permission denied"
+                    yield ("tool_result", {
+                        "name": tc.tool_name,
+                        "output": tool_output,
+                        "success": False,
+                        "elapsed": 0.0,
+                    })
+                    self._pending_tool_logs.append({"type": "result", "name": tc.tool_name, "output": tool_output, "success": False})
+                    self.messages.append(_make_tool_result_block(tc.tool_use_id, tool_output))
+                    self._pending_tool_results.append((tc.tool_use_id, tool_output))
+                    # 不 return,继续让 LLM 收到 tool_result 后做下一轮决策
+                    continue
+
                 start_time = time.time()
-                result = self.tools.execute(tc.tool_name, tc.tool_input, max_retries=3)
+                result = self.tools.execute(tc.tool_name, effective_input, max_retries=3)
                 elapsed = time.time() - start_time
 
                 if result["status"] == "success":
@@ -897,13 +1036,28 @@ class ReactAgent:
                 tool_names = [tc.tool_name for tc in tool_calls]
                 yield ("tool_call", {"names": tool_names, "parallel": True})
                 self._pending_tool_logs.append({"type": "parallel_start", "names": tool_names})
-                
+
                 start_time = time.time()
-                
-                # 用 ThreadPoolExecutor 并行执行
+
+                # M12: 先做权限检查,denied 的 tool 不进入 ThreadPoolExecutor
+                pre_results: list[tuple[Any, Optional[dict]]] = []  # [(tc, result_or_None)]
+                for tc in tool_calls:
+                    allowed, perm_err, effective_input = self._check_tool_permission(tc.tool_name, tc.tool_input)
+                    if not allowed:
+                        pre_results.append((tc, {
+                            "status": "error",
+                            "error": perm_err or "Permission denied",
+                        }))
+                    else:
+                        pre_results.append((tc, None))
+
+                # 用 ThreadPoolExecutor 并行执行(只对 allowed 的)
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     future_to_tc = {}
-                    for tc in tool_calls:
+                    for tc, pre_result in pre_results:
+                        if pre_result is not None:
+                            # denied → 跳过 execute
+                            continue
                         future = executor.submit(
                             self.tools.execute,
                             tc.tool_name,
@@ -918,13 +1072,18 @@ class ReactAgent:
                         tc = future_to_tc[future]
                         result = future.result()
                         results.append((tc, result))
-                    
+
+                    # 把 denied 的 pre_results 加进去
+                    for tc, pre_result in pre_results:
+                        if pre_result is not None:
+                            results.append((tc, pre_result))
+
                     # 按提交顺序 yield 结果
                     results.sort(key=lambda x: tool_calls.index(x[0]))
-                    
+
                     for tc, result in results:
                         elapsed = time.time() - start_time
-                        
+
                         if result["status"] == "success":
                             tool_output = result["output"]
                             yield ("tool_result", {
