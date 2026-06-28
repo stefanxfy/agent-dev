@@ -187,7 +187,96 @@ with st.form("add_rule_form", clear_on_submit=False):
 st.divider()
 
 
-# ── 3. 规则语法速查 ──────────────────────────────────────────────
+# ── 3. 沙箱 excluded commands 编辑区(M3 Task 4)───────────────────
+
+st.subheader("🛡️ 沙箱排除命令")
+
+from agent_core.tools.permission_loader import (
+    load_excluded_commands,
+    save_excluded_commands,
+)
+
+st.caption(
+    "这些命令命中后将**跳过 OS 沙箱**(对齐 doc §5.3 + CC excludedCommands)。"
+    "这是 **UX 而非安全** — 被排除的命令仍受应用层权限检查约束,"
+    "只是不在 OS 沙箱里跑。常用于需要绕过沙箱限制的命令(如 git 提交、网络请求等)。"
+)
+
+# 4a. 当前列表 + 命中提示预览
+try:
+    current_excluded = load_excluded_commands()
+except Exception as e:
+    st.error(f"读取 excluded commands 失败: {e}")
+    current_excluded = []
+
+st.caption(f"当前 {len(current_excluded)} 条排除规则(大小写敏感,substr match):")
+if current_excluded:
+    for p in current_excluded:
+        # 实时显示命中提示(友好消息)
+        try:
+            from agent_core.tools.sandbox_decision import get_excluded_command_message
+            msg = get_excluded_command_message(p)
+            if msg:
+                st.caption(f"  • `{p}` → {msg}")
+            else:
+                st.caption(f"  • `{p}`")
+        except Exception:
+            st.caption(f"  • `{p}`")
+else:
+    st.caption("  (暂无)")
+
+st.divider()
+
+# 4b. 编辑表单
+with st.form("excluded_commands_form", clear_on_submit=False):
+    st.caption("编辑排除命令(每行一条,substr match,大小写敏感):")
+
+    initial_text = "\n".join(current_excluded) if current_excluded else ""
+    new_text = st.text_area(
+        "excluded commands(每行一条)",
+        value=initial_text,
+        height=140,
+        placeholder="git commit\nnpm publish\ndocker push",
+        help=(
+            "每行一条 pattern,保存后写入 settings.json 的 sandbox.excludedCommands 段。"
+            "留空 = 清空列表。"
+        ),
+    )
+
+    col_dest, col_btn = st.columns([3, 1])
+    with col_dest:
+        excluded_destination = st.selectbox(
+            "写入位置",
+            options=["projectSettings", "localSettings", "userSettings"],
+            key="excluded_destination",
+            help=(
+                "projectSettings=.agent_data/settings.json;"
+                "localSettings=.agent_data/settings.local.json(不入 git);"
+                "userSettings=~/.agent_data/settings.json"
+            ),
+        )
+    with col_btn:
+        submitted_excluded = st.form_submit_button("💾 保存 excluded")
+
+if submitted_excluded:
+    try:
+        new_patterns = [
+            line.strip() for line in new_text.splitlines() if line.strip()
+        ]
+        save_excluded_commands(new_patterns, PermissionRuleSource(excluded_destination))
+        st.success(
+            f"✅ 已保存 {len(new_patterns)} 条 excluded commands 到 {excluded_destination}。"
+            "💡 新规则在下次工具调用时生效(或重启沙箱确保 reload)。"
+        )
+        st.rerun()
+    except Exception as e:
+        st.error(f"保存失败: {e}")
+
+
+st.divider()
+
+
+# ── 4. 规则语法速查(M3 Task 1)────────────────────────────────────
 
 with st.expander("📖 规则语法速查", expanded=False):
     st.markdown(
@@ -207,4 +296,4 @@ deny > ask > allow(同 source 内 deny 最强)。
 """
     )
 
-st.caption("🔐 权限规则管理 · M3 Task 1 · 对齐 Claude Code `/permissions`")
+st.caption("🔐 权限规则管理 · M3 Task 1 + Task 4 · 对齐 Claude Code `/permissions`")

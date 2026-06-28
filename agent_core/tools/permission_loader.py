@@ -491,3 +491,79 @@ def delete_permission_rule_from_settings(
             json.dump(settings, f, indent=2, ensure_ascii=False)
         return True
     return False
+
+# ────────────────────────────────────────────────────────────────────
+# sandbox.excludedCommands 写入(M3 Task 4)
+# ────────────────────────────────────────────────────────────────────
+
+def save_excluded_commands(
+    patterns: list[str],
+    destination: PermissionRuleSource,
+) -> None:
+    """
+    把 excluded commands 写回 settings.json 的 sandbox.excludedCommands 段(对齐 doc §5.3)
+
+    UI 编辑区用:用户编辑 excluded commands 列表后,写回 settings.json。
+    sandbox_manager 在下次 load_config 时读取(若已运行,需要 reload 或重启会话)。
+
+    Args:
+        patterns: 排除命令 pattern 列表(每条 = substring match,大小写敏感)
+        destination: 目标 source(PROJECT / LOCAL / USER)
+
+    注意:
+    - 写入 sandbox.excludedCommands 字段(非 permissions 段)
+    - 容忍 sandbox 段缺失(自动创建)
+    - managed-only mode 拒绝写(只读 policy)
+    """
+    if is_managed_only() and destination != PermissionRuleSource.POLICY:
+        logger.warning("managed-only mode 不允许写 excludedCommands 到 %s", destination)
+        return
+
+    path = _settings_for_destination(destination)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 读现有 settings
+    settings = load_settings_json(path)
+
+    # 确保 sandbox 段存在
+    if "sandbox" not in settings or not isinstance(settings.get("sandbox"), dict):
+        settings["sandbox"] = {}
+
+    # 过滤空串 + None
+    clean_patterns: list[str] = []
+    for p in patterns:
+        if isinstance(p, str) and p.strip():
+            clean_patterns.append(p.strip())
+
+    settings["sandbox"]["excludedCommands"] = clean_patterns
+
+    # 写回
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+
+
+def load_excluded_commands(destination: Optional[PermissionRuleSource] = None) -> list[str]:
+    """
+    从 settings.json 读 sandbox.excludedCommands 列表(对齐 doc §5.3)
+
+    UI 编辑区用:打开页面时显示当前列表。
+    注:sandbox_manager._config.excluded_commands 是 in-memory(单例),
+    这里返 settings.json 里的原始字符串(可能与 in-memory 不同步)。
+
+    Args:
+        destination: 目标 source(默认 = PROJECT)
+
+    Returns:
+        pattern 列表(空列表如果 settings.json 不存在或无该字段)
+    """
+    if destination is None:
+        destination = PermissionRuleSource.PROJECT
+    path = _settings_for_destination(destination)
+    settings = load_settings_json(path)
+    sandbox = settings.get("sandbox", {})
+    if not isinstance(sandbox, dict):
+        return []
+    excluded = sandbox.get("excludedCommands", [])
+    if not isinstance(excluded, list):
+        return []
+    return [str(p) for p in excluded if isinstance(p, str) and p.strip()]

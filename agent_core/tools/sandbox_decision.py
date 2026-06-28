@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from .sandbox_manager import sandbox_manager
 
@@ -78,7 +78,45 @@ def _is_excluded_command(tool_name: str, tool_input: dict) -> bool:
     if tool_name != "Bash":
         return False
     cmd = tool_input.get("command", "") or ""
+    return get_excluded_command_match(cmd) is not None
+
+
+def get_excluded_command_match(command: str) -> Optional[tuple[str, str]]:
+    """
+    检查 command 是否命中 excluded_commands,返 (pattern, message) 或 None
+    对齐 doc §5.3 + §8 "excludedCommands UX:正则匹配 + 自定义消息"
+
+    message 规则:
+    - 命中 pattern → 友好提示语(UX,告诉用户/模型为何跳过沙箱)
+    - excludedCommands 是 UX 而非安全(命中仍过 permission check)
+
+    Args:
+        command: bash 命令
+
+    Returns:
+        (pattern, message) 或 None(未命中 / 空命令)
+
+    Examples:
+        >>> # config.excluded_commands = ["git commit"]
+        >>> get_excluded_command_match("git commit -m x")
+        ("git commit", "命令匹配排除规则 `git commit`,将跳过 OS 沙箱...")
+    """
+    if not command:
+        return None
     for pattern in sandbox_manager._config.excluded_commands:
-        if pattern and pattern in cmd:
-            return True
-    return False
+        if pattern and pattern in command:
+            message = (
+                f"命令匹配排除规则 `{pattern}`,将跳过 OS 沙箱"
+                f"(仍受应用层权限检查约束)"
+            )
+            return (pattern, message)
+    return None
+
+
+def get_excluded_command_message(command: str) -> Optional[str]:
+    """
+    便捷封装:只返命中提示语或 None
+    对齐 doc §5.3(BashTool 命中 excluded 时给模型友好提示)
+    """
+    match = get_excluded_command_match(command)
+    return match[1] if match else None
