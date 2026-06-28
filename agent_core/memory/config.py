@@ -74,16 +74,17 @@ class DistillationConfig(BaseModel):
     时间门:距离上次成功蒸馏至少 24h 才触发
     规模门:daily log 累计 ≥ 50 行才触发
     变更门:memory 文件相对 prior_mtime 有 ≥ 10% 变更才触发
-    session 门:增量 session 数 ≥ min_sessions_for_distill 才触发(M5 增)
+    记忆库门:现有 .md 记忆总数 ≥ min_memories_for_distill 才触发(M11.6 改)
+        (2026-06-27 移除 session 日志后,原 session 数量门失去数据源,改为 .md 数量门)
     """
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
     min_interval_hours: int = Field(default=24, ge=1, le=168)
     change_threshold_pct: float = Field(default=0.10, ge=0.01, le=1.0)
-    min_sessions_for_distill: int = Field(
-        default=5, ge=1, le=100,
-        description="增量 session 数 ≥ 此值才触发(门3,2026-06-21 M5 增)",
+    min_memories_for_distill: int = Field(
+        default=5, ge=1, le=1000,
+        description="现有 .md 记忆数 ≥ 此值才触发(门3,M11.6 2026-06-27 改 .md 数量门)",
     )
 
     # 锁抢占阈值（v2.1 A1+A2+A11）
@@ -169,6 +170,37 @@ class CompactConfig(BaseModel):
     sm_insufficient_buffer_ratio: float = Field(
         default=0.95, ge=0.5, le=1.0,
         description="SM-compact 后预估 / 阈值 > 此值 → 走传统(默认 0.95,留 5% 余量)",
+    )
+
+    # ── SM 后台抽取节流(对齐 Claude Code SessionMemory,2026-06-28)──
+    # 1. 初始化门槛:会话累计 token < 此值 → 不创建 SM 文件
+    minimum_message_tokens_to_init: int = Field(
+        default=10_000, ge=1000, le=200_000,
+        description="会话累计 token 跨过此门槛才初始化 SM 文件(对齐 Claude Code minInit)",
+    )
+    # 2. token 增量门槛:相邻两次抽取 token Δ < 此值 → 跳过
+    minimum_tokens_between_update: int = Field(
+        default=5_000, ge=500, le=100_000,
+        description="相邻两次抽取的 token 增量门槛(对齐 Claude Code minUpdate)",
+    )
+    # 3. tool 增量门槛:dual-gate 之一(和 token Δ AND)
+    tool_calls_between_updates: int = Field(
+        default=3, ge=0, le=100,
+        description="相邻两次抽取的工具调用增量门槛(对齐 Claude Code toolDelta)",
+    )
+
+    # ── SM compact 窗口策略(对齐 Claude Code §4.4 keep window)──
+    window_min_tokens: int = Field(
+        default=10_000, ge=1000, le=200_000,
+        description="compact 保留窗口最小 token 数(不足则向前扩,不能跨 last_id)",
+    )
+    window_min_text_block_messages: int = Field(
+        default=5, ge=1, le=50,
+        description="compact 保留窗口最少文本消息数(不足则向前扩)",
+    )
+    window_max_tokens: int = Field(
+        default=40_000, ge=5000, le=200_000,
+        description="compact 保留窗口最大 token 数(超出则丢最旧)",
     )
 
 

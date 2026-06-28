@@ -616,3 +616,51 @@ class TestIntegration:
         # 原始消息按顺序保留
         assert new_messages[1]["id"] == "m1"
         assert new_messages[3]["id"] == "m3"
+
+
+# ──────────────────────────────────────────────────────────────────
+# 8. SM 节流配置(Claude Code diff 1-3: init/throttle/window 阈值,Step 1)
+# ──────────────────────────────────────────────────────────────────
+
+class TestCompactConfigEnv:
+    """新增 6 字段默认值 + env override + 边界校验"""
+
+    def test_compact_config_has_new_thresholds(self):
+        """默认 6 字段都在,默认值对齐 Claude Code"""
+        cfg = MemoryConfig().compact
+        assert cfg.minimum_message_tokens_to_init == 10_000
+        assert cfg.minimum_tokens_between_update == 5_000
+        assert cfg.tool_calls_between_updates == 3
+        assert cfg.window_min_tokens == 10_000
+        assert cfg.window_min_text_block_messages == 5
+        assert cfg.window_max_tokens == 40_000
+
+    def test_compact_config_env_min_init_threshold(self, monkeypatch):
+        """env: MEMORY_COMPACT__MINIMUM_MESSAGE_TOKENS_TO_INIT=20000"""
+        monkeypatch.setenv("MEMORY_COMPACT__MINIMUM_MESSAGE_TOKENS_TO_INIT", "20000")
+        cfg = MemoryConfig.from_env().compact
+        assert cfg.minimum_message_tokens_to_init == 20_000
+
+    def test_compact_config_env_tool_calls_between(self, monkeypatch):
+        """env: MEMORY_COMPACT__TOOL_CALLS_BETWEEN_UPDATES=5"""
+        monkeypatch.setenv("MEMORY_COMPACT__TOOL_CALLS_BETWEEN_UPDATES", "5")
+        cfg = MemoryConfig.from_env().compact
+        assert cfg.tool_calls_between_updates == 5
+
+    def test_compact_config_env_window_max(self, monkeypatch):
+        """env: MEMORY_COMPACT__WINDOW_MAX_TOKENS=30000"""
+        monkeypatch.setenv("MEMORY_COMPACT__WINDOW_MAX_TOKENS", "30000")
+        cfg = MemoryConfig.from_env().compact
+        assert cfg.window_max_tokens == 30_000
+
+    def test_compact_config_validation_rejects_negative(self):
+        """minimum_tokens_between_update=100(< ge=500) → ValidationError"""
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            MemoryConfig(compact={"minimum_tokens_between_update": 100})
+
+    def test_compact_config_extra_field_rejected(self):
+        """extra='forbid' 守住:多写未知字段 → ValidationError"""
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            MemoryConfig(compact={"unknown_threshold": 1000})
