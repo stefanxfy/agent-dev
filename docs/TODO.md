@@ -61,61 +61,75 @@ def _chat_sync(
 
 ---
 
-## 3. M10 C5.4 双通道 wiring(补 web/app.py 实现,清 3 个契约测试)
+## 3. M10 C5.4 双通道 wiring — **测试 fixture 错位**,不是实现缺口 ⚠️
 
 **提出日期**: 2026-06-28
-**提出背景**: M3 阶段跑全量回归时发现 `tests/test_app_wiring.py` 3 个 pre-existing failure,都是 M10 C5.4 时代的"测试契约已加、web/app.py 实现未补"。
+**更正日期**: 2026-06-28(用户质疑后核实)
+**状态**: 代码已完整实现,测试断言位置错误
 
-**契约来源**(commit `6e07a6b` + `4e4b0e5`):
-- `test_get_agent_uses_react_memory_bridge` — `get_agent(memory_enabled=True)` 必须传非 None `ReactMemoryBridge`
-- `test_web_app_imports_strict_pipeline_components` — `web/app.py` 必须 import 4 个名字:`MetaDB` / `DualChannelWriter` / `ExtractionGate` / `ReactMemoryBridge`
-- `test_get_agent_constructs_independent_extractor_router` — 必须构造 `extractor_router`(独立 LLMRouter 实例),并 `gate = ExtractionGate(llm_router=extractor_router, ...)`
+### 事实
 
-**为什么 fork 独立 extractor_router**(§4.6):
-1. 共享 prompt cache → 提取任务污染主对话 context
-2. 共享 rate limit / token budget → 用户响应被 background 提取挤占
-3. 共享 model selection → 提取可能用便宜模型但 cache 命中主对话的贵模型 slot
+M10 C5.4 wiring **已经全部实现**,只是抽到 helper 函数里([web/memory_wiring.py:build_memory_system()](web/memory_wiring.py#L60-L160)):
 
-fork 后两条路径**完全隔离**,各自管 cache namespace + budget。
+| 步骤 | 实现位置 | 行号 |
+|---|---|---|
+| `extractor_router = LLMRouter(llm_config)` | `web/memory_wiring.py` | L104 |
+| `meta_db = MetaDB(meta_db_path)` | `web/memory_wiring.py` | L122 |
+| `gate = ExtractionGate(llm_router=extractor_router, ...)` | `web/memory_wiring.py` | L130-135 |
+| `dual_channel = DualChannelWriter(...)` | `web/memory_wiring.py` | L146-155 |
+| `react_memory_bridge = ReactMemoryBridge(...)` | `web/memory_wiring.py` | L158+ |
+| `ReactAgent(react_memory_bridge=react_memory_bridge)` | `web/app.py` | L697 |
 
-**待补的实现**(在 `web/app.py:get_agent()` 内):
-```python
-# 1. 独立 extractor_router(防 cache 污染)
-extractor_router = LLMRouter(config)
+`web/app.py:get_agent()`(L617-640)委托给 `build_memory_system()`,把 bundle 解包后注入 ReactAgent。
 
-# 2. Channel B 持久化层
-meta_db = MetaDB(...)
+### 失败原因分两类
 
-# 3. 双通道写盘
-dual_writer = DualChannelWriter(meta_db=meta_db, ...)
+**类 A — 测试假设错误(2 个静态字符串测试)**:
+- `test_web_app_imports_strict_pipeline_components` — 在 `web/app.py` 源码里 grep `MetaDB` 字面
+- `test_get_agent_constructs_independent_extractor_router` — grep `extractor_router` + `gate = ExtractionGate(...)`
 
-# 4. 门控(门 3 用 extractor_router 评分)
-gate = ExtractionGate(llm_router=extractor_router, ...)
+实现把组件藏在 helper 里,源码扫描找不到。这是测试设计问题,**不是实现缺口**。
 
-# 5. 同步→异步桥
-bridge = ReactMemoryBridge(gate=gate, dual_writer=dual_writer)
+**类 B — 环境缺依赖(1 个端到端测试)**:
+- `test_get_agent_uses_react_memory_bridge` — 跑真 `get_agent()`,依赖 chromadb
 
-# 6. 注入 ReactAgent
-ReactAgent(..., react_memory_bridge=bridge)
-```
+当前 env 没装 `chromadb`(`bash scripts/setup_embeddings.sh` 未跑),`build_memory_system` 返 None → bridge=None → 测试 fail。装依赖后自然绿。
 
-**涉及文件**:
-- `web/app.py` — `get_agent()` 加 6 步 wiring(主路径)
-- `tests/test_app_wiring.py` — 现有 3 个契约测试,补实现后自然绿
-- 旁路:`web/memory_wiring.py` 可能需要微调,把 `extractor_router` 暴露出来
+### 修复路径(三选一)
 
-**风险**:
-1. 改动 `web/app.py` 高频入口,影响所有用户 → 需 streamlit smoke
-2. DualChannelWriter 构造可能依赖 MetaDB schema(M11 已就绪)→ 需先确认 schema
-3. `memory_enabled=True` 路径用户主流程引入 background 提取 → 性能回归测
+**A. 改测试 fixture**(推荐,工作最小):
+- 测试 1 改用 `unittest.mock.patch("web.memory_wiring.build_memory_system", return_value=(...mock bundle...))`,只验证 bridge flow-through
+- 测试 2/3 改扫描 `web/memory_wiring.py` 而非 `web/app.py`(或同时扫两个文件)
 
-**预估工作量**: 1-1.5 天
-- 0.5 天:在 `web/app.py:get_agent()` 加 6 步 wiring
-- 0.5 天:streamlit smoke + agent_core run 集成测
-- 0.3 天:3 个契约测试跑绿验证
+**B. 重构 web/app.py 内联 wiring**(不推荐):
+- 把 helper 拆开 inline 回 `get_agent()`(更耦合,但匹配原契约)
+- 风险:破坏 `web/memory_wiring.py` 作为单一职责模块的封装
 
-**优先级**: 中(契约测试在 fail,但功能未上线 → 不阻塞 M3 交付;M10/M11 后续阶段会补)
+**C. 装 chromadb**(`scripts/setup_embeddings.sh`):
+- 让类 B 的端到端测试有真实依赖可调
+- 类 A 仍 fail(测试 fixture 问题,与依赖无关)
 
-**不阻塞 M3 验收**: 这 3 个 failure 与 M3(权限 UI + hook 三阶段)无关,`web/app.py` 的 memory wiring 是 M10 时代遗留任务,放后续阶段完成。
+### 涉及文件
+
+- `tests/test_app_wiring.py` — 改 3 个契约测试的 fixture(L75-95 / L120-160 / L196-235)
+- `web/memory_wiring.py` — 不动(实现正确)
+- `web/app.py` — 不动(委托正确)
+
+### 风险
+
+1. 改测试时需保证仍能 catch 真实的"未接桥"回归(避免过度 mock 失去意义)
+2. chromadb 装好后端到端测试可能引入 flakiness(初始化耗时)
+
+### 预估工作量
+
+- 0.2 天:改 3 个测试 fixture + 跑绿验证
+
+### 优先级
+
+**低** — 功能已可用(streamlit UI 启动时 `memory_enabled=True` 路径走通,只是测试 fixture 与实现路径不匹配)。不阻塞 M3 验收,也不阻塞用户使用。
+
+### 不阻塞 M3 验收
+
+**澄清**:我(M3 助手)初版 TODO 误判为"代码未补",实为"测试 fixture 错位"。感谢用户质疑后核实。M3 工作 0 影响。
 
 ---
