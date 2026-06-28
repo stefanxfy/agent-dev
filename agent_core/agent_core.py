@@ -547,14 +547,11 @@ class ReactAgent:
             return True, None, tool_input
 
         # 调 permission_engine 决策
+        # 注:audit log 由 PermissionEngine._log_and_return 内部统一写(唯一审计点,
+        # 对齐 doc §4.8),agent_core 不重复写,避免 double-logging。
         decision = self.permission_engine.check_permissions(
             tool_def, tool_input, list(self.messages),
         )
-
-        # M2: 写 audit log(对齐 doc §4.8)
-        # 铁律:audit 失败绝不阻断主流程(PermissionEngine._log_and_return 内部已 try/except,
-        # 这里再包一层防御)
-        self._log_audit(tool_name, tool_input, decision)
 
         from .tools.permission_types import PermissionBehavior
 
@@ -577,35 +574,6 @@ class ReactAgent:
             return self._ask_user_permission(tool_name, tool_input, decision)
         # passthrough 或其他 → 当作 ASK
         return self._ask_user_permission(tool_name, tool_input, decision)
-
-    def _log_audit(
-        self,
-        tool_name: str,
-        tool_input: dict,
-        decision: Any,
-    ) -> None:
-        """
-        写一次 permission 决策到 audit.jsonl(对齐 doc §4.8)
-
-        铁律:audit 失败绝不阻断主流程(try/except 全包)。
-        self.audit_logger 为 None 时跳过(向后兼容)。
-        """
-        if self.audit_logger is None:
-            return
-        try:
-            self.audit_logger.log(
-                tool_name=tool_name,
-                tool_input=tool_input,
-                decision=decision,
-                context=self.permission_engine.context,
-                hook_chain=[],  # TODO M3: 实际 hook 链
-                classifier_used=self.permission_engine.classifier is not None,
-                classifier_decision=None,  # TODO M3: classifier 实际决策
-                denial_state=asdict(self.permission_engine.get_denial_state())
-                if self.permission_engine.denial_state else None,
-            )
-        except Exception as e:
-            _logger.warning("audit_logger.log 失败: %s", e)
 
     def _ask_user_permission(
         self,

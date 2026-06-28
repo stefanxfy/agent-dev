@@ -55,6 +55,7 @@ class AuditRecord:
     - rule_source: 命中 rule 的 source
     - mode: PermissionMode 值
     - sandbox_used: 是否走 sandbox
+    - stage: PermissionEngine 决策阶段(step_1a_global_deny 等,审计追溯用)
     - hook_chain: 执行的 hook 名列表
     - classifier_used: 是否调过 classifier
     - classifier_decision: classifier 返 allow/deny/None
@@ -70,6 +71,7 @@ class AuditRecord:
     rule_source: Optional[str] = None
     mode: Optional[str] = None
     sandbox_used: bool = False
+    stage: Optional[str] = None
     hook_chain: list[str] = field(default_factory=list)
     classifier_used: bool = False
     classifier_decision: Optional[str] = None
@@ -126,12 +128,13 @@ class AuditLogger:
         tool_name: str,
         tool_input: dict,
         decision: PermissionDecision,
-        context: ToolPermissionContext,
+        context: Optional[ToolPermissionContext] = None,
         hook_chain: Optional[list[str]] = None,
         classifier_used: bool = False,
         classifier_decision: Optional[Any] = None,
         denial_state: Optional[dict] = None,
         sandbox_used: Optional[bool] = None,
+        stage: Optional[str] = None,
     ) -> None:
         """
         记录一次 permission 决策(atomic append,不抛异常影响主流程)
@@ -141,12 +144,13 @@ class AuditLogger:
             tool_name: 工具名
             tool_input: 工具输入(只存 hash,不存原文)
             decision: PermissionDecision
-            context: 权限上下文
+            context: 权限上下文(可空,但传了才能记录 mode/sandbox)
             hook_chain: 执行的 hook 名列表
             classifier_used: 是否调过 classifier
             classifier_decision: classifier 返 allow/deny/None
             denial_state: denial_tracking 当前 state
             sandbox_used: 是否走 sandbox(None → 从 context.sandbox_enabled 推断)
+            stage: PermissionEngine 决策阶段(step_1a_global_deny 等)
         """
         try:
             tool_input_hash = compute_tool_input_hash(tool_input or {})
@@ -168,11 +172,11 @@ class AuditLogger:
             # sandbox_used 推断
             effective_sandbox_used = (
                 sandbox_used if sandbox_used is not None
-                else getattr(context, "sandbox_enabled", False)
+                else (getattr(context, "sandbox_enabled", False) if context else False)
             )
 
             # mode 推断
-            mode_val = getattr(context, "mode", None)
+            mode_val = getattr(context, "mode", None) if context else None
 
             # classifier_decision 转字符串
             classifier_decision_str: Optional[str] = None
@@ -195,6 +199,7 @@ class AuditLogger:
                 mode=mode_val if isinstance(mode_val, str)
                 else getattr(mode_val, "value", None),
                 sandbox_used=bool(effective_sandbox_used),
+                stage=stage,
                 hook_chain=list(hook_chain or []),
                 classifier_used=bool(classifier_used),
                 classifier_decision=classifier_decision_str,

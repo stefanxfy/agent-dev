@@ -21,6 +21,7 @@ Permission Engine — 7-step 决策引擎(对齐 doc §4.3)
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from typing import Any, Callable, Optional
 
 from .classifier import (
@@ -534,6 +535,9 @@ class PermissionEngine:
     ) -> PermissionDecision:
         """
         写 audit log(如果 audit_logger 存在)+ 更新 deny state + 返回 decision
+
+        这是唯一审计点(对齐 doc §4.8):engine 每条 decision 都经此,
+        记录 stage + context + classifier + denial_state。
         """
         # 更新 deny state
         if decision.behavior == PermissionBehavior.DENY.value:
@@ -548,7 +552,12 @@ class PermissionEngine:
                     tool_name=tool_name,
                     tool_input=tool_input,
                     decision=decision,
+                    context=self.context,
                     stage=stage,
+                    hook_chain=self.hook_registry.list_hooks("PreToolUse")
+                    if self.hook_registry else [],
+                    classifier_used=self.classifier is not None,
+                    denial_state=asdict(self.denial_state),
                 )
             except Exception as e:
                 logger.warning("audit_logger.log 失败: %s", e)
