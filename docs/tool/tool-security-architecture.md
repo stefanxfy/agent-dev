@@ -1238,7 +1238,28 @@ async def bash_check_permissions(
             decision_reason=PermissionDecisionReason(type="other", reason="empty command"),
         )
 
-    # ── 1. 拆分 subcommand ──
+    # ── Step 0: sandbox auto-allow 提前检查(对齐 CC bashPermissions.ts:checkSandboxAutoAllow)
+    # 在 subcommand 拆分 + rule check 之前先看 sandbox 是否兜底
+    # 三段条件(对齐 CC bashPermissions.ts:1829-1843):
+    #   1. is_sandbox_enabled() == True
+    #   2. config.auto_allow_bash_if_sandboxed == True
+    #   3. should_use_sandbox("Bash", tool_input) == True
+    # 满足 → 走 check_sandbox_auto_allow(input, context):
+    #   - 命中 deny rule(含 subcommand)→ deny
+    #   - 命中 ask rule(含 subcommand)→ ask
+    #   - 否则 → allow(reason: 'Auto-allowed in sandbox; deny rules already checked')
+    if (
+        sandbox_manager.is_sandbox_enabled()
+        and sandbox_manager._config.auto_allow_bash_if_sandboxed
+        and should_use_sandbox("Bash", tool_input)
+    ):
+        auto = check_sandbox_auto_allow(tool_input, context)
+        if auto.behavior in (PermissionBehavior.DENY, PermissionBehavior.ASK):
+            return auto  # deny rule 在沙箱内仍生效,不绕过
+        # 否则 fall through(沙箱兜底,不再弹窗)
+        # —— 但仍要 subcommand 拆分,看 subcommand-level deny(对齐 CC §5.3 step 2-3)
+
+    # ── Step 1: 拆分 subcommand ──
     subcommands = parse_subcommands(command)
     MAX_SUBCOMMANDS = 50  # 对齐 CC MAX_SUBCOMMANDS_FOR_SECURITY_CHECK (bashPermissions.ts:103)
     MAX_SUGGESTED_RULES = 5  # 对齐 CC MAX_SUGGESTED_RULES_FOR_COMPOUND (bashPermissions.ts:110)
@@ -1369,6 +1390,55 @@ def _parse_rule_string(rule_str: str) -> tuple[str, Optional[str]]:
         content = rest.rstrip(")")
         return name, content
     return rule_str, None
+
+
+async def check_sandbox_auto_allow(
+    tool_input: dict, context: ToolPermissionContext,
+) -> PermissionDecision:
+    """
+    对齐 CC bashPermissions.ts:1829-1843 checkSandboxAutoAllow
+
+    仅在 sandbox auto-allow 路径下调用:
+    - 用与正常 bash_check_permissions 相同的 subcommand 级 rule 检查
+    - 但不弹窗(沙箱兜底);deny/ask rule 仍生效
+    - 都通过 → allow(reason: 'Auto-allowed in sandbox; deny rules already checked')
+
+    实现:复刻 bash_check_permissions Step 1-4 但去掉 ask fallback
+    """
+    command = tool_input.get("command", "")
+    subcommands = parse_subcommands(command)
+
+    # 拆分 + cap(与 bash_check_permissions 一致)
+    if len(subcommands) > MAX_SUBCOMMANDS:
+        return PermissionDecision(
+            behavior=PermissionBehavior.ASK,
+            decision_reason=PermissionDecisionReason(
+                type="other", reason=f"subcommand 数超 {MAX_SUBCOMMANDS}"
+            ),
+        )
+
+    # 对每个 subcommand 跑 rule check(只 deny,ask 转 allow 由沙箱兜底)
+    for sc in subcommands:
+        sc_stripped = _strip_safe_wrappers(sc.command)
+        result = _check_single_command(sc_stripped, tool_input, context)
+        if result.behavior == PermissionBehavior.DENY:
+            return PermissionDecision(
+                behavior=PermissionBehavior.DENY,
+                decision_reason=PermissionDecisionReason(
+                    type="rule",
+                    rule=result.decision_reason.rule if hasattr(result.decision_reason, "rule") else None,
+                    reason=f"沙箱 auto-allow 路径下 subcommand deny: {sc.command}",
+                ),
+            )
+
+    return PermissionDecision(
+        behavior=PermissionBehavior.ALLOW,
+        decision_reason=PermissionDecisionReason(
+            type="other",
+            reason="Auto-allowed in sandbox; deny rules already checked",
+        ),
+    )
+
 ```
 
 #### 4.5.1 tree-sitter AST 详解
@@ -2066,31 +2136,64 @@ def _is_excluded_command(tool_name: str, tool_input: dict) -> bool:
 对齐 Claude Code src/tools/BashTool/prompt.ts getSimpleSandboxSection
 """
 def get_sandbox_prompt_section() -> str:
+    """
+    注入沙箱规则到 system prompt
+    对齐 Claude Code src/tools/BashTool/prompt.ts getSimpleSandboxSection (172-273)
+
+    $TMPDIR 处理:CC 把它**字面量化**(替换成实际 sandbox tmp dir 路径)注入 prompt,
+    不是保留字面量 —— 目的:让 prompt 在不同用户间**可缓存**(全局 prompt cache 命中率)
+    """
     if not sandbox_manager.is_sandbox_enabled():
         return ""
 
     cfg = sandbox_manager._config
-    return f"""
-## Command sandbox
-Your command will be run in a sandbox. The sandbox controls which directories
-and network hosts commands may access.
+    tmpdir_literal = sandbox_manager._get_sandbox_tmp_dir()  # 字面化,非 $TMPDIR
+    strict_mode = not cfg.allow_unsandboxed_commands
 
-Filesystem:
-- Write allowed: {cfg.fs_allow_write or ['. (cwd)', '/tmp/claude-<uid>']}
-- Write denied:  {cfg.fs_deny_write or []}
-- Read denied:   {cfg.fs_deny_read or []}
+    fs_read = cfg.fs_allow_read or []
+    fs_write_allowed = cfg.fs_allow_write or ['.', tmpdir_literal]
+    network_allowed = cfg.network_allowed_domains or []
 
-Network:
-- Allowed hosts: {cfg.network_allowed_domains or []}
-- Denied hosts:  {cfg.network_denied_domains or []}
+    prompt = f"""## Command sandbox
+By default, your command will be run in a sandbox. This sandbox controls
+which directories and network hosts commands may access or modify without
+an explicit override.
 
-- Always default to running commands within the sandbox.
-- For temporary files, use $TMPDIR (automatically set to sandbox tmp dir).
-- Do NOT use `/tmp` directly — use `$TMPDIR` instead.
-- If sandbox causes failures ("Operation not permitted", network denied, etc.),
-  retry with `dangerously_disable_sandbox: true` (only if allow_unsandboxed_commands).
-- Do not suggest adding sensitive paths (~/.ssh, ~/.bashrc) to the allowlist.
+The sandbox has the following restrictions:
+Filesystem: {{ "read": {{"allow": {fs_read}, "deny": {cfg.fs_deny_read or []}}}, "write": {{"allow": {fs_write_allowed}, "deny": {cfg.fs_deny_write or []}}} }}
+Network: {{ "allowedHosts": {network_allowed}, "deniedHosts": {cfg.network_denied_domains or []} }}
+
+- You should always default to running commands within the sandbox.
+  Do NOT attempt to set `dangerously_disable_sandbox: true` unless:
+  - The user *explicitly* asks you to bypass sandbox
+  - A specific command just failed and you see evidence of sandbox restrictions causing the failure.
+  Evidence of sandbox-caused failures includes:
+    - "Operation not permitted" errors for file/network operations
+    - Access denied to specific paths outside allowed directories
+    - Network connection failures to non-whitelisted hosts
+    - Unix socket connection errors
+  When you see evidence of sandbox-caused failure:
+    - Immediately retry with `dangerously_disable_sandbox: true` (don't ask, just do it)
+    - Briefly explain what sandbox restriction likely caused the failure.
+- Treat each command you execute with `dangerously_disable_sandbox: true` individually.
+- Do not suggest adding sensitive paths like ~/.bashrc, ~/.zshrc, ~/.ssh/*,
+  or credential files to the sandbox allowlist.
+
+- For temporary files, always use the `{tmpdir_literal}` directory
+  (literal path, NOT $TMPDIR). This path is sandbox-writable.
+  Do NOT use `/tmp` directly - use this path instead.
 """
+    if strict_mode:
+        # 对齐 CC 严格模式变体(prompt.ts:292)
+        prompt += """
+**STRICT MODE**: `dangerously_disable_sandbox` is **disabled** by your
+organization's policy. You cannot bypass the sandbox. If a command
+fails inside the sandbox, you must work around the restriction by:
+  - using a different command that achieves the same goal
+  - asking the user to add the path/host to the sandbox allowlist
+  - or asking the user to explicitly run the command outside this session
+"""
+    return prompt
 ```
 
 ---
@@ -2144,35 +2247,59 @@ LLM 产出 tool_use(name, input)
 | `[agent_core/tools/base.py:77](agent_core/tools/base.py#L77)` ToolRegistry.execute | **新增 schema 校验**(用 jsonschema 库) |
 | `[agent_core/tools/base.py:11](agent_core/tools/base.py#L11)` ToolDef | **新增可选字段**: `check_permissions: Optional[Callable]` |
 | `[agent_core/tools/builtin.py](agent_core/tools/builtin.py)` | calc/search 保持不变;后续加 Read/Write/Bash 时按 §4.5 模式 |
-| `[web/app.py](web/app.py)` | Streamlit sidebar 加 Permission 面板 + 弹窗 |
+| `[web/app.py](web/app.py)` | Streamlit sidebar 加 Permission 面板 + 弹窗(学习演示) |
+| ⚠️ `[web/app_langgraph.py](web/app_langgraph.py)` | 项目**实际** UI 是 LangGraph 实现;**不动此文件**(用户偏好见 MEMORY.md),PermissionDialog 集成需改 LangGraph interrupt pattern 而非 Streamlit widget |
 
 ### 6.3 BashTool + Sandbox auto-allow
 
 **对齐 CC `bashPermissions.ts:1829 checkSandboxAutoAllow`** —— 关键协同点:
 
+**调用顺序**(对齐 CC `bashToolHasPermission`):
+```
+[Step 0] check_sandbox_auto_allow(tool_input, context)        ← 沙箱 auto-allow 提前检查
+         ├─ 命中 deny rule (含 subcommand) → deny
+         ├─ 命中 ask rule (含 subcommand) → ask
+         └─ 全部 allow → fall through(沙箱兜底,不再弹窗)
+
+[Step 1] parse_subcommands(command)
+[Step 2] MAX_SUBCOMMANDS check
+[Step 3] cd + git 检测(裸 git scrub)
+[Step 4] classifier speculative check(并行)
+[Step 5] per-subcommand rule check
+         ├─ deny → 立即 cancel classifier + return deny
+         └─ ask  → 立即 cancel classifier + return ask
+[Step 6] 等 classifier 结果
+[Step 7] 全 allow → ALLOW
+```
+
+**关键不变量**:
+- 即便 sandbox auto-allow 路径下,**subcommand-level deny 仍触发整体 deny**
+  (CC `checkSandboxAutoAllow` line 1829-1843 + `bash_check_permissions` 任一 subcommand deny)
+- 即便 sandbox 整体被 `dangerouslyDisableSandbox: true` 绕过,**deny rule 仍生效**
+- 两条路都失守才可能误放 → 概率极低
+
 ```python
 def bash_check_permissions_with_sandbox(
     tool_input: dict, context: ToolPermissionContext,
 ) -> PermissionDecision:
-    # 1. 先走应用层规则(deny/ask rule 永远生效)
-    base = bash_check_permissions(tool_input, context)
-    if base.behavior in (PermissionBehavior.DENY, PermissionBehavior.ASK):
-        return base
-
-    # 2. 沙箱开启 + auto_allow_bash_if_sandboxed → 沙箱内命令自动放行
-    if (sandbox_manager.is_sandbox_enabled()
-            and sandbox_manager._config.auto_allow_bash_if_sandboxed
-            and should_use_sandbox("Bash", tool_input)):
-        return PermissionDecision(
-            behavior=PermissionBehavior.ALLOW,
-            decision_reason=PermissionDecisionReason(
-                type="other",
-                reason="Auto-allowed in sandbox; deny rules already checked",
-            ),
-        )
-
-    return base
+    """外层包装:确认 sandbox auto-allow 条件满足后才调 auto_allow 路径
+    对齐 CC bashPermissions.ts:1829-1843 的入口条件"""
+    # 注意:此函数仅用于文档解释 sandbox 入口条件判断,
+    # 真正调用逻辑在 bash_check_permissions 的 Step 0 里(见 §4.5)
+    if (
+        sandbox_manager.is_sandbox_enabled()
+        and sandbox_manager._config.auto_allow_bash_if_sandboxed
+        and should_use_sandbox("Bash", tool_input)
+    ):
+        # 走 auto-allow 路径(在 bash_check_permissions 内部 Step 0)
+        return await check_sandbox_auto_allow(tool_input, context)
+    return await bash_check_permissions(tool_input, context)
 ```
+
+**安全保证**:
+- ✅ 即便 auto-allow,**deny 规则仍生效**(防止 `Bash(rm:*)` 被绕过)
+- ✅ 即便沙箱被绕过,**deny 规则仍生效**
+- 两层都失守才可能误放 → 概率极低
 
 **安全保证**:
 - ✅ 即便 auto-allow,**deny 规则仍生效**(防止 `Bash(rm:*)` 被绕过)
