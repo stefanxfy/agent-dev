@@ -779,10 +779,15 @@ class PermissionEngine:
         return None
 
     def _should_use_classifier(self, ctx: ToolPermissionContext) -> bool:
-        """CC 注释:classifier 仅在 (sandbox 内 OR 没有 settings 匹配) AND ANT provider 时启用"""
-        if not ctx.is_anthropic_provider:
-            return False
-        return ctx.sandbox_enabled or ctx.no_settings_match
+        """对齐 CC bashClassifier.ts:isClassifierPermissionsEnabled
+
+        三段短路(provider / feature flag / 场景条件):
+        1. provider 不是 anthropic → False
+        2. TRANSCRIPT_CLASSIFIER feature flag off → False(默认 stub 化)
+        3. sandbox 内 OR 没有 settings 匹配 之一为真 → True
+        """
+        from .classifier import is_classifier_enabled
+        return is_classifier_enabled(ctx)
 
     @staticmethod
     def _parse_rule_string(rule_str: str) -> tuple[str, Optional[str]]:
@@ -1304,18 +1309,37 @@ CC 用 `TREE_SITTER_BASH` env flag 控制默认行为(默认 false,避免引入 
 
 #### 4.5.2 Classifier (`classifier.py`)
 
-**完整对齐 CC `utils/classifier.ts`** —— Haiku YOLO classifier,只在 Anthropic provider 下启用:
+**对齐 CC `utils/classifier.ts` 的接口契约,默认实现是 ANT-only stub**:
+
+> **重要**:CC `src/utils/permissions/bashClassifier.ts` 文件头明确注释
+> "Stub for external builds - classifier permissions feature is ANT-ONLY",
+> 整个文件 61 行全是 stub。真正的 classifier 实现散落在
+> `yoloClassifier.ts` (1495 行) 和 `tools/BashTool/bashSecurity.ts` (2592 行)
+> 两文件中,且 `classifyBashCommand` 在外部 build 下永远返回
+> `{matches: false, confidence: 'high', reason: 'This feature is disabled'}`。
+
+**对本项目的影响**:
+- 学习项目用 glm-4 / DeepSeek 等非 ANT provider 时,classifier **必须** 默认禁用
+- 仅在 `feature_flags.TRANSCRIPT_CLASSIFIER=true AND provider=anthropic` 时启用
+- 默认实现:返回 `None`(`PermissionEngine.check_permissions` Step 3 看到 `None` 时 fallback 到 ASK)
 
 ```python
 # agent_core/tools/classifier.py
 """
 Haiku YOLO classifier — AI-based permission decision fallback
 
-完整对齐 Claude Code src/utils/classifier.ts
+对齐 Claude Code src/utils/permissions/bashClassifier.ts(ANT-only stub by default)
++ src/utils/permissions/yoloClassifier.ts(1495 行,真 ANT 实现)
++ src/tools/BashTool/bashSecurity.ts(2592 行,BashTool 集成)
 
-启用条件:
-- provider == anthropic (ANT-only)
+启用条件(对齐 CC):
+- provider == anthropic(ANT-only,非 ANT 直接禁用)
+- TRANSCRIPT_CLASSIFIER feature flag 开启(CC 用 GrowthBook 'tengu_transcript_classifier')
 - (sandbox 内 OR 没有 settings 匹配) 之一为真
+
+默认行为(对齐 CC bashClassifier.ts:isClassifierPermissionsEnabled → false):
+- 非 ANT provider / feature flag off → classify() 立即返 None
+- engine 看到 None → fallback 到 ASK 用户(对齐 CC 'fail-closed' 默认行为)
 
 为什么叫 "YOLO":
 - 调小模型(Haiku)做快速判断,代价是可能误判
@@ -1324,11 +1348,35 @@ Haiku YOLO classifier — AI-based permission decision fallback
 """
 from __future__ import annotations
 import logging
+import os
 from typing import Optional
 
 from .permission_types import PermissionBehavior, ToolPermissionContext
 
 logger = logging.getLogger(__name__)
+
+
+# ── Feature flag & provider gate(对齐 CC) ─────────────────
+TRANSCRIPT_CLASSIFIER_ENABLED = (
+    os.environ.get("TRANSCRIPT_CLASSIFIER", "false").lower() == "true"
+)
+# 对齐 CC bashClassifier.ts:isClassifierPermissionsEnabled stub(默认 False)
+
+
+def is_classifier_enabled(context: ToolPermissionContext) -> bool:
+    """
+    对齐 CC bashClassifier.ts:isClassifierPermissionsEnabled
+
+    三段短路:
+    1. provider 不是 anthropic → False
+    2. TRANSCRIPT_CLASSIFIER feature flag off → False
+    3. sandbox 内 OR 没有 settings 匹配 之一为真 → True(否则 False)
+    """
+    if not getattr(context, "is_anthropic_provider", False):
+        return False
+    if not TRANSCRIPT_CLASSIFIER_ENABLED:
+        return False
+    return bool(context.sandbox_enabled or context.no_settings_match)
 
 
 CLASSIFY_PROMPT = """You are a security classifier for tool calls. Decide if the following tool call is safe to allow without user confirmation.
@@ -1349,7 +1397,12 @@ Output:"""
 
 
 class HaikuClassifier:
-    """小模型快速判断 safe/unsafe"""
+    """小模型快速判断 safe/unsafe。
+
+    默认行为(对齐 CC bashClassifier.ts ANT-only stub):
+    - classify() 在 is_classifier_enabled() 返 False 时直接返 None
+    - 真 ANT 启用路径调 yolo_classifier.classify_yolo_action()(对齐 CC yoloClassifier.ts)
+    """
 
     def __init__(self, llm_router):
         self.llm = llm_router
@@ -1358,21 +1411,23 @@ class HaikuClassifier:
         self, tool_name: str, tool_input: dict, context: ToolPermissionContext,
     ) -> Optional[PermissionBehavior]:
         """
-        返回 allow/deny,失败返 None
-        对齐 CC classifier.ts:classify
+        返回 allow/deny,失败/禁用返 None
+        对齐 CC classifier.ts:classify(yolo 主路径) + bashClassifier.ts:isClassifierPermissionsEnabled(gate)
         """
+        if not is_classifier_enabled(context):
+            return None  # 对齐 CC stub:feature disabled
         try:
             prompt = CLASSIFY_PROMPT.format(
                 tool_name=tool_name,
-                tool_input=repr(tool_input)[:1000],  # 截断防 prompt 过长
+                tool_input=repr(tool_input)[:1000],
                 context_summary=f"sandbox={context.sandbox_enabled}, mode={context.mode}",
             )
             response = await self.llm.chat(
                 messages=[{"role": "user", "content": prompt}],
                 provider="anthropic",
-                model="claude-haiku-4-5",  # 小模型,YOLO 决策
+                model="claude-haiku-4-5",
                 temperature=0.0,
-                max_tokens=10,  # 只输出 1 个词
+                max_tokens=10,
                 cache_safe_params=True,
                 cache_namespace="permission_classifier",
             )
@@ -1390,6 +1445,19 @@ class HaikuClassifier:
         """Bash 专用:让 prompt 更聚焦于命令内容"""
         return await self.classify("Bash", {"command": command}, context)
 ```
+
+**对齐 CC `permissions.ts:843-876` 的 fail-closed 默认**:
+- `transcriptTooLong=True` → 立即 fallback(永久性)
+- `unavailable=True`(API 错误)+ GrowthBook `tengu_iron_gate_closed` → fail-closed(默认,deny)或 fail-open(fallback)
+- 非 sandbox 下 classifier 返 allow → 仍 fallback 到 ask(更严的策略)
+
+**为什么本项目学习阶段不开真 classifier**:
+1. 项目用 zhipu / OpenAI / DeepSeek 等多 provider,ANT-only 与设计冲突
+2. yoloClassifier.ts 1495 行 + bashSecurity.ts 2592 行,学习成本高
+3. 即使开了,glm-4 等模型未必在 ANT safety training 上对齐 → 误判率高
+4. 沙箱本身是 OS 层兜底,sandbox 内误判也是安全的(CC 注释原话)
+
+M3+ 若需真 ANT-only classifier,可独立 PR 引入 `TRANSCRIPT_CLASSIFIER=true` 启用路径。
 
 #### 4.5.3 Speculative check 时序图
 
@@ -2191,7 +2259,7 @@ class TestSafetyCheck:
 | **PermissionBehavior** | allow / deny / ask / passthrough | allow / deny / ask / passthrough | ✅ **完全对齐** |
 | **PermissionDecisionReason** | rule / mode / hook / subcommandResults / classifier / workingDir / safetyCheck / other | 8 个全实现(`safetyCheck` + `classifier` + `subcommandResults` + `workingDir` 都实现) | ✅ **完全对齐** |
 | **Speculative classifier check** | `permissions.ts:387-400` 并发 | `asyncio.create_task(classifier.classify)` 在 bash_check_permissions 启动时并发 | ✅ **完全对齐** |
-| **Classifier (Haiku YOLO)** | `utils/classifier.ts` + ANT-only | `classifier.py` + `is_anthropic_provider` gate | ✅ **完全对齐** |
+| **Classifier (Haiku YOLO)** | `bashClassifier.ts`(ANT-only stub) + `yoloClassifier.ts`(1495 行,真 ANT) + `bashSecurity.ts`(2592 行) | `classifier.py` 默认 stub 化(`is_classifier_enabled` 三段短路) | ✅ **完全对齐**(默认行为与 CC bashClassifier.ts 一致) |
 | **Classifier 启用条件** | sandbox 内 OR 无 settings 匹配 + ANT | `_should_use_classifier` 完整复刻 | ✅ **完全对齐** |
 | **Hook 系统** | PreToolUse/PermissionRequest/PermissionDenied | PreToolUse(改 input + deny)+ PermissionRequest(预留) | 🔄 1 个 hook 缺(denied 钩子 M3 补) |
 | **`excludedCommands`** | UX 而非安全,正则匹配 + 自定义消息 | 同 | ✅ **完全对齐** |
@@ -2304,8 +2372,12 @@ class TestSafetyCheck:
 - Claude Code 沙箱实现:`docs/tool/sandbox-implementation.md`
 - Claude Code 源码:`/Users/fanyunxu/Desktop/myproject/ailearning/claude-code-analysis/src/`
   - `utils/permissions/permissions.ts` (1486 行)
-  - `utils/permissions/bashClassifier.ts` (61 行,external stub)
+  - `utils/permissions/bashClassifier.ts` (61 行,ANT-only external stub)
+  - `utils/permissions/yoloClassifier.ts` (1495 行,真 ANT classifier)
+  - `utils/permissions/denialTracking.ts` (45 行,DENIAL_LIMITS 阈值)
   - `tools/BashTool/bashPermissions.ts` (2621 行)
+  - `tools/BashTool/bashSecurity.ts` (2592 行,BashTool 集成 classifier)
+  - `tools/BashTool/pathValidation.ts` (1303 行)
   - `utils/sandbox/sandbox-adapter.ts` (985 行)
   - `entrypoints/sandboxTypes.ts` (156 行 Zod schema)
 - 当前项目工具现状:`agent_core/tools/base.py` + `builtin.py`
