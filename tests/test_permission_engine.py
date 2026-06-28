@@ -429,7 +429,10 @@ class TestAuditLogger:
         logged = []
 
         class MockAudit:
-            def log(self, tool_name, tool_input, decision, stage):
+            def log(self, tool_name, tool_input, decision, context=None,
+                    hook_chain=None, classifier_used=False,
+                    classifier_decision=None, denial_state=None,
+                    sandbox_used=None, stage=None, **kwargs):
                 logged.append({
                     "tool_name": tool_name,
                     "behavior": decision.behavior,

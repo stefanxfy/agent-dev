@@ -147,60 +147,49 @@ class TestSandboxAutoAllowViaEngine:
 
 
 # ────────────────────────────────────────────────────────────────────
-# audit_logger 集成(通过 _log_audit)
+# audit_logger 集成(engine 是唯一审计点)
 # ────────────────────────────────────────────────────────────────────
 
 class TestAuditLoggerIntegration:
-    def _make_agent_with_audit(self):
-        """构造一个最小 ReactAgent-like 对象测试 _log_audit"""
-        from agent_core.agent_core import ReactAgent
-        # 不真实例化(需要 LLM 等),用 __new__ 绕过 __init__
-        agent = ReactAgent.__new__(ReactAgent)
-        engine = _make_engine()
-        agent.permission_engine = engine
-        agent.audit_logger = MagicMock()
-        return agent
+    def test_engine_logs_decision_to_audit_logger(self):
+        # engine._log_and_return 是唯一审计点:每条 decision 都经此
+        audit_mock = MagicMock()
+        engine = PermissionEngine(context=_ctx(), audit_logger=audit_mock)
+        tool = _bash_tool_def()
+        engine.check_permissions(tool, {"command": "ls"})
+        audit_mock.log.assert_called_once()
+        call_kwargs = audit_mock.log.call_args.kwargs
+        assert call_kwargs["tool_name"] == "Bash"
+        assert call_kwargs["stage"] is not None
+        assert call_kwargs["context"] is engine.context
 
-    def test_log_audit_called_with_decision(self):
-        agent = self._make_agent_with_audit()
-        decision = PermissionDecision(
-            behavior=PermissionBehavior.ALLOW.value,
-            decision_reason=OtherReason(reason="test"),
-        )
-        agent._log_audit("Bash", {"command": "ls"}, decision)
-        agent.audit_logger.log.assert_called_once()
-        call_kwargs = agent.audit_logger.log.call_args
-        assert call_kwargs.kwargs["tool_name"] == "Bash"
-
-    def test_log_audit_skipped_when_logger_none(self):
-        agent = self._make_agent_with_audit()
-        agent.audit_logger = None
+    def test_engine_skips_audit_when_logger_none(self):
+        # audit_logger=None → 不写,不抛
+        engine = PermissionEngine(context=_ctx(), audit_logger=None)
+        tool = _bash_tool_def()
         # 不应抛
-        decision = PermissionDecision(
-            behavior=PermissionBehavior.ALLOW.value,
-            decision_reason=OtherReason(reason="test"),
-        )
-        agent._log_audit("Bash", {"command": "ls"}, decision)
+        engine.check_permissions(tool, {"command": "ls"})
 
-    def test_log_audit_failure_does_not_raise(self):
-        agent = self._make_agent_with_audit()
-        agent.audit_logger.log.side_effect = RuntimeError("disk full")
-        decision = PermissionDecision(
-            behavior=PermissionBehavior.ALLOW.value,
-            decision_reason=OtherReason(reason="test"),
-        )
-        # 不应抛
-        agent._log_audit("Bash", {"command": "ls"}, decision)
+    def test_engine_audit_failure_does_not_break_pipeline(self):
+        audit_mock = MagicMock()
+        audit_mock.log.side_effect = RuntimeError("disk full")
+        engine = PermissionEngine(context=_ctx(), audit_logger=audit_mock)
+        tool = _bash_tool_def()
+        # 不应抛,仍返 decision
+        decision = engine.check_permissions(tool, {"command": "ls"})
+        assert decision.behavior is not None
 
-    def test_log_audit_passes_engine_context(self):
-        agent = self._make_agent_with_audit()
-        decision = PermissionDecision(
-            behavior=PermissionBehavior.DENY.value,
-            decision_reason=OtherReason(reason="deny"),
+    def test_engine_logs_deny_with_stage(self):
+        audit_mock = MagicMock()
+        engine = PermissionEngine(
+            context=_ctx(always_deny_rules={"projectSettings": ["Bash(rm:*)"]}),
+            audit_logger=audit_mock,
         )
-        agent._log_audit("Bash", {"command": "rm"}, decision)
-        call_kwargs = agent.audit_logger.log.call_args.kwargs
-        assert call_kwargs["context"] is agent.permission_engine.context
+        tool = _bash_tool_def()
+        engine.check_permissions(tool, {"command": "rm -rf /"})
+        call_kwargs = audit_mock.log.call_args.kwargs
+        assert call_kwargs["decision"].behavior == PermissionBehavior.DENY.value
+        assert "deny" in (call_kwargs["stage"] or "")
 
 
 # ────────────────────────────────────────────────────────────────────
