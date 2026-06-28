@@ -565,6 +565,11 @@ class ReactAgent:
             elif decision.message:
                 reason_str = decision.message
             err = f"Permission denied: {reason_str or 'no reason'}"
+            # M3 Task 3: 跑 PermissionDenied hook,追加 retry_prompt 到 err
+            # 给模型"为什么被拒 + 怎么换种方式重试"上下文(对齐 CC retry: true)
+            retry_hint = self._run_permission_denied_hook(tool_name, tool_input, decision)
+            if retry_hint:
+                err = f"{err}\n💡 Retry hint: {retry_hint}"
             return False, err, tool_input
         if decision.behavior == PermissionBehavior.ASK.value:
             # M12 简化:auto_allow_ask=True → 自动 ALLOW(测试用)
@@ -601,6 +606,33 @@ class ReactAgent:
         except Exception as e:
             _logger.warning("PermissionRequest hook 异常,走默认 UI: %s", e)
         return None
+
+    def _run_permission_denied_hook(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        decision: Any,
+    ) -> Optional[str]:
+        """
+        跑 PermissionDenied hook(M3 Task 3,对齐 doc §4.4)
+
+        Returns:
+            retry_prompt 字符串(hook 给出的重试提示)或 None
+            异常时返 None(不阻断 deny,只是不加 hint)
+        """
+        if self.permission_engine is None:
+            return None
+        hook_registry = getattr(self.permission_engine, "hook_registry", None)
+        if hook_registry is None:
+            return None
+        try:
+            denied = hook_registry.run_permission_denied(
+                tool_name, tool_input, self.permission_engine.context, decision,
+            )
+            return getattr(denied, "retry_prompt", None)
+        except Exception as e:
+            _logger.warning("PermissionDenied hook 异常: %s", e)
+            return None
 
     def _ask_user_permission(
         self,

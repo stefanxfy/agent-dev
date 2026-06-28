@@ -370,6 +370,67 @@ class HookRegistry:
                 continue
         return PermissionRequestResult()
 
+    # ── PermissionDenied hook(M3 Task 3)───────────────────────
+
+    def run_permission_denied(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        context: ToolPermissionContext,
+        decision: Any,
+    ) -> "PermissionDeniedResult":
+        """
+        跑 PermissionDenied hook(对齐 CC PermissionDenied hook + doc §4.4)
+
+        场景:tool 被 deny 后,给模型一个"为什么被拒 + 怎么换种方式重试"的上下文。
+        CC 的 PermissionDenied hook 返 retry: true 时,模型收到提示后重试。
+
+        串行跑所有 hook,聚合 retry_prompt / notify_message / additional_context。
+        任何 hook 抛异常 → 跳过,不阻断。
+
+        Args:
+            tool_name: 工具名
+            tool_input: 工具输入
+            context: 权限上下文
+            decision: 导致 deny 的 PermissionDecision(含 reason)
+
+        Returns:
+            PermissionDeniedResult(聚合所有 hook 输出)
+        """
+        hooks = self._collect_hooks("PermissionDenied")
+        if not hooks:
+            return PermissionDeniedResult()
+
+        retry_parts: list[str] = []
+        notify_parts: list[str] = []
+        context_parts: list[str] = []
+        for entry in hooks:
+            try:
+                # 兼容 4 参(含 decision)和 3 参(旧签名)hook
+                try:
+                    result = entry.callback(tool_name, tool_input, context, decision)
+                except TypeError:
+                    result = entry.callback(tool_name, tool_input, context)
+                retry = getattr(result, "retry_prompt", None)
+                notify = getattr(result, "notify_message", None) or getattr(result, "reason", None)
+                addl = getattr(result, "additional_context", None)
+                if retry:
+                    retry_parts.append(retry)
+                if notify:
+                    notify_parts.append(notify)
+                if addl:
+                    context_parts.append(addl)
+            except Exception as e:
+                logger.warning(
+                    "PermissionDenied hook %s 异常,跳过: %s", entry.name, e,
+                )
+                continue
+        return PermissionDeniedResult(
+            retry_prompt="\n".join(retry_parts) if retry_parts else None,
+            notify_message="\n".join(notify_parts) if notify_parts else None,
+            additional_context="\n".join(context_parts) if context_parts else None,
+        )
+
 
 # ────────────────────────────────────────────────────────────────────
 # PermissionRequestResult — 后台 agent 外部决策(M3 Task 2)
@@ -507,6 +568,33 @@ def default_hooks() -> HookRegistry:
 
 
 # ────────────────────────────────────────────────────────────────────
+# PermissionDeniedResult — deny 后 retry 提示(M3 Task 3)
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PermissionDeniedResult:
+    """
+    PermissionDenied hook 返回值(对齐 CC PermissionDenied hook + doc §4.4)
+
+    场景:tool 被 deny 后,给模型一个"为什么被拒 + 怎么换种方式重试"的上下文。
+    CC 的 PermissionDenied hook 返 retry: true 时,模型收到提示后重试。
+
+    字段:
+    - retry_prompt: 追加到 tool_result error message 的重试提示(给模型看)
+    - notify_message: 给用户的通知(可选,UI 显示)
+    - additional_context: 额外上下文(拼到 system prompt)
+    """
+    retry_prompt: Optional[str] = None
+    notify_message: Optional[str] = None
+    additional_context: Optional[str] = None
+
+    @property
+    def has_content(self) -> bool:
+        """True 表示至少有一个字段非空"""
+        return any([self.retry_prompt, self.notify_message, self.additional_context])
+
+
+# ────────────────────────────────────────────────────────────────────
 # PermissionRequest webhook factory(M3 Task 2,示例用,不自动注册)
 # ────────────────────────────────────────────────────────────────────
 
@@ -550,4 +638,32 @@ def make_webhook_permission_request_hook(webhook_url: str) -> HookCallable:
         except Exception as e:
             logger.warning("webhook permission request 失败,走默认 UI: %s", e)
         return PermissionRequestResult()
+    return hook
+
+
+# ────────────────────────────────────────────────────────────────────
+# PermissionDenied 示例 hook factory(M3 Task 3,演示用,不自动注册)
+# ────────────────────────────────────────────────────────────────────
+
+def make_retry_hint_denied_hook() -> HookCallable:
+    """
+    示例 PermissionDenied hook:deny 后给通用 retry 提示
+
+    CC 的 PermissionDenied hook 常见用法:告诉模型"换种更安全的方式重试"。
+    本 hook 是示例,实际项目可注册自定义 webhook / 日志 hook。
+
+    签名兼容 4 参(tool_name, tool_input, context, decision)和 3 参(忽略 decision)。
+
+    Returns:
+        HookCallable
+    """
+    def hook(tool_name: str, tool_input: dict, context: ToolPermissionContext,
+             decision: Any = None) -> PermissionDeniedResult:
+        return PermissionDeniedResult(
+            retry_prompt=(
+                f"被拒绝的工具 `{tool_name}` — 尝试换种更安全的方式,"
+                f"或请用户在 /permissions 页面手动放行。"
+            ),
+            notify_message=f"工具 {tool_name} 被权限系统拒绝",
+        )
     return hook
