@@ -145,7 +145,7 @@ agent_core/tools/
 | Classifier (Haiku YOLO) | 有 + ANT-only | **完整实现** | **完全对齐** —— `classifyYoloAction` + `bashClassifier` 都做,M1 可 stub,M2+ 接真 LLM |
 | tree-sitter AST | 有(`TREE_SITTER_BASH` 默认 false) | **完整实现**(可选启用) | **完全对齐** —— §4.5 给出完整 AST 解析路径 |
 | Plan / AcceptEdits mode | 有 | **完整实现 5 个 mode** | **完全对齐** —— DEFAULT / ACCEPT_EDITS / BYPASS / DONT_ASK / PLAN 都做 |
-| denial tracking | 有 | **完整实现** | **完全对齐** —— consecutiveDenials + totalDenials + transcriptTooLong fallback |
+| denial tracking | 有(`denialTracking.ts` maxConsecutive=3 / maxTotal=20) | **完整实现** | **完全对齐** —— `denial_tracking.py` + §4.5.4:`DENIAL_LIMITS = {maxConsecutive: 3, maxTotal: 20}` + consecutiveDenials / totalDenials / transcriptTooLong fallback |
 | speculative classifier check | 有 | **完整实现** | **完全对齐** —— 与 PreToolUse hook 并行跑 |
 | PermissionDenied hook | 有 | **完整实现** | **完全对齐** —— retry: true 提示 |
 | Hook 三阶段 | PreToolUse / PermissionRequest / PermissionDenied | **完整 3 阶段** | **完全对齐** |
@@ -284,6 +284,8 @@ class PermissionMode(str, Enum):
     BYPASS = "bypassPermissions"      # 跳过所有 ask(deny/safetyCheck 仍生效)
     DONT_ASK = "dontAsk"              # ask → 自动 deny
     PLAN = "plan"                     # plan mode,只读工具放行
+    AUTO = "auto"                     # 🆕 ANT-only;用 Haiku YOLO classifier 替代用户弹窗(feature-gated)
+    BUBBLE = "bubble"                 # 🆕 内部测试模式(不对外暴露,isExternalPermissionMode 返 False)
 
 
 # ── 决策结果 ──────────────────────────────────────────
@@ -1135,7 +1137,8 @@ async def bash_check_permissions(
 
     # ── 1. 拆分 subcommand ──
     subcommands = parse_subcommands(command)
-    MAX_SUBCOMMANDS = 50  # 对齐 CC MAX_SUBCOMMANDS_FOR_SECURITY_CHECK
+    MAX_SUBCOMMANDS = 50  # 对齐 CC MAX_SUBCOMMANDS_FOR_SECURITY_CHECK (bashPermissions.ts:103)
+    MAX_SUGGESTED_RULES = 5  # 对齐 CC MAX_SUGGESTED_RULES_FOR_COMPOUND (bashPermissions.ts:110)
     if len(subcommands) > MAX_SUBCOMMANDS:
         return PermissionDecision(
             behavior=PermissionBehavior.ASK,
@@ -1405,6 +1408,116 @@ speculative 并发:
 ```
 
 CC `permissions.ts:387-400` 注释明确:> "speculative classifier check for ~20% latency reduction on bash tool"——我们完整对齐。
+
+#### 4.5.4 Denial Tracking(`denial_tracking.py`,auto-mode 必需)
+
+**完整对齐 CC `src/utils/permissions/denialTracking.ts`(45 行)**——auto-mode 下 classifier 连续 deny 触发 fallback,避免无限循环:
+
+```python
+# agent_core/tools/denial_tracking.py
+"""
+Denial tracking — auto-mode classifier 兜底机制
+完整对齐 Claude Code src/utils/permissions/denialTracking.ts
+
+触发场景:
+- auto mode 下 Haiku YOLO classifier 连续 deny 同一类型操作(可能 classifier 误判)
+- 不设阈值 → 死循环 + 烧 token + 用户体验崩溃
+
+机制(对齐 CC DENIAL_LIMITS):
+- 每次 classifier deny 累加 consecutive + total
+- 任一 allow/ask → 调 record_success() 重置 consecutive
+- 超过阈值 → handle_denial_limit_exceeded() 强制 fallback 到正常 ask
+- 事件:fired 'auto_mode_denial_limit_exceeded'(对齐 CC tengu_auto_mode_denial_limit_exceeded)
+
+为何需要:
+- transcriptTooLong → 永久 fallback(上下文超限,classifier 必挂)
+- API unavailable → GrowthBook 'tengu_iron_gate_closed' 决定 fail-closed vs fail-open
+- consecutive >= 3 → 说明 classifier 在"猜测",让用户介入更安全
+"""
+from __future__ import annotations
+import logging
+from dataclasses import dataclass, field
+from typing import Optional
+
+from .permission_types import PermissionBehavior
+
+logger = logging.getLogger(__name__)
+
+
+# CC denialTracking.ts:12 — 严格相等
+DENIAL_LIMITS = {
+    "maxConsecutive": 3,   # 连续 3 次 deny → fallback
+    "maxTotal": 20,        # 累计 20 次 deny → fallback
+}
+
+
+@dataclass
+class DenialTrackingState:
+    """每 session 一份 state(对齐 CC per-conversation state)"""
+    total_denials: int = 0
+    consecutive_denials: int = 0
+    last_deny_reason: Optional[str] = None
+    last_allow_at: Optional[float] = None  # time.time() 秒
+
+
+def record_denial(state: DenialTrackingState, reason: str) -> bool:
+    """
+    记录一次 classifier deny。返回 True = 触发 limit,需要 fallback。
+    对齐 CC denialTracking.ts:42 `state.consecutiveDenials >= maxConsecutive ||
+                                   state.totalDenials >= maxTotal`
+    """
+    state.total_denials += 1
+    state.consecutive_denials += 1
+    state.last_deny_reason = reason
+    exceeded = (
+        state.consecutive_denials >= DENIAL_LIMITS["maxConsecutive"]
+        or state.total_denials >= DENIAL_LIMITS["maxTotal"]
+    )
+    if exceeded:
+        handle_denial_limit_exceeded(state)
+    return exceeded
+
+
+def record_success(state: DenialTrackingState) -> None:
+    """任一 allow / 用户接受 → 重置 consecutive(对齐 CC recordSuccess)"""
+    state.consecutive_denials = 0
+    import time
+    state.last_allow_at = time.time()
+
+
+def handle_denial_limit_exceeded(state: DenialTrackingState) -> None:
+    """超过阈值 → 触发 fallback 事件,engine 收到后转 ask 用户
+
+    对齐 CC denialTracking.ts `handleDenialLimitExceeded`:
+    - log event 'auto_mode_denial_limit_exceeded'
+    - headless mode (should_avoid_permission_prompts=True) → 直接 AbortError
+    """
+    logger.warning(
+        f"auto-mode classifier denial limit exceeded "
+        f"(consecutive={state.consecutive_denials}, total={state.total_denials}) "
+        f"— falling back to user prompt"
+    )
+
+
+def fallback_decision(state: DenialTrackingState) -> PermissionBehavior:
+    """超过阈值时 engine 怎么决策 → ASK(让用户来定夺)"""
+    if (
+        state.consecutive_denials >= DENIAL_LIMITS["maxConsecutive"]
+        or state.total_denials >= DENIAL_LIMITS["maxTotal"]
+    ):
+        return PermissionBehavior.ASK  # 强制 ask,不再走 classifier
+    return PermissionBehavior.ALLOW  # 由调用方根据 classifier 原结果处理
+```
+
+**集成点**(对齐 CC `permissions.ts:1009-1025`):
+- `PermissionEngine.check_permissions()` Step 2(auto-mode 路径)前后:
+  - classifier 返 deny → `record_denial(state, reason)` → 若 True → fallback 到 ASK
+  - 任何 allow / 用户确认 → `record_success(state)`
+- Headless mode(`should_avoid_permission_prompts=True`)下 fallback 触发时直接 `AbortError`,而非 ask
+
+**transcriptTooLong / unavailable 单独处理**(对齐 CC `permissions.ts:822-833,843-876`):
+- `transcriptTooLong=True` → 立即 fallback(永久性,重试必挂)
+- `unavailable=True`(API 错误)+ GrowthBook `tengu_iron_gate_closed` → fail-closed(默认,deny)或 fail-open(fallback)
 
 ### 4.6 规则持久化 (`permission_loader.py`)
 
@@ -1917,6 +2030,8 @@ agent_core/tools/
 ├── permission_loader.py           (新增 ~70 行:从 settings.json 加载)
 ├── permission_hook.py             (新增 ~120 行:Hook 注册 + 预置 hook)
 ├── bash_permissions.py            (新增 ~150 行:Bash 工具专属)
+├── classifier.py                  (新增 ~60 行:Haiku YOLO + ANT-only stub 默认)
+├── denial_tracking.py             (新增 ~50 行:auto-mode classifier 兜底)
 ├── safety_check.py                (新增 ~60 行:敏感路径检测)
 ├── sandbox_manager.py             (新增 ~150 行:sandbox-runtime 适配)
 ├── sandbox_decision.py            (新增 ~50 行:should_use_sandbox)
@@ -2060,7 +2175,7 @@ class TestSafetyCheck:
 | **Compound rule 解析** | `permissionRuleParser.ts:250` | `permission_matcher._try_parse_compound` 完整实现(优先级 && > \|\| > ; > \|) | ✅ **完全对齐** |
 | **ShellPermissionRule 5 种** | Exact/Prefix/Wildcard/PathGlob/Compound | Exact/Prefix/Wildcard/PathGlob/Prompt/Compound/Unsupported | ✅ **完全对齐** |
 | **Rule 优先级 (source)** | policy > flag > cliArg > project > local > session > user > command | policy > flag > cliArg > project > local > session > user > command | ✅ **完全对齐** |
-| **Permission mode** | default / acceptEdits / bypass / dontAsk / plan / auto / bubble | 5 个核心 + auto/bubble 预留(`_resolve_behavior` 表覆盖) | ✅ **完全对齐语义** |
+| **Permission mode** | default / acceptEdits / bypass / dontAsk / plan / auto / bubble | 完整 7 mode(default/acceptEdits/bypass/dontAsk/plan + auto + bubble) | ✅ **完全对齐** |
 | **PermissionBehavior** | allow / deny / ask / passthrough | allow / deny / ask / passthrough | ✅ **完全对齐** |
 | **PermissionDecisionReason** | rule / mode / hook / subcommandResults / classifier / workingDir / safetyCheck / other | 8 个全实现(`safetyCheck` + `classifier` + `subcommandResults` + `workingDir` 都实现) | ✅ **完全对齐** |
 | **Speculative classifier check** | `permissions.ts:387-400` 并发 | `asyncio.create_task(classifier.classify)` 在 bash_check_permissions 启动时并发 | ✅ **完全对齐** |
@@ -2106,11 +2221,12 @@ class TestSafetyCheck:
 | 4. `permission_loader.py` (settings 加载 + 8 source 合并) | 新增 | 2h |
 | 5. `safety_check.py` (敏感路径 + secret) | 新增 | 1h |
 | 6. `permission_hook.py` (PreToolUse + 预置 secret/path hook) | 新增 | 2h |
-| 7. `classifier.py` (Haiku YOLO + ANT-only) | 新增 | 2h |
-| 8. `base.py` 改造 (加 check_permissions / schema 校验) | 改 | 1h |
-| 9. `agent_core.py` 整合 (PermissionEngine + 异步 check) | 改 | 2h |
-| 10. `web/app.py` Streamlit 弹窗 | 改 | 2h |
-| 11. 测试 | 新增 | 5h |
+| 7. `classifier.py` (Haiku YOLO + ANT-only stub) | 新增 | 2h |
+| 8. `denial_tracking.py` (auto-mode classifier 兜底) | 新增 | 1h |
+| 9. `base.py` 改造 (加 check_permissions / schema 校验) | 改 | 1h |
+| 10. `agent_core.py` 整合 (PermissionEngine + 异步 check) | 改 | 2h |
+| 11. `web/app.py` Streamlit 弹窗 | 改 | 2h |
+| 12. 测试 | 新增 | 5h |
 
 **里程碑**:能给 Read/Write 工具加 deny rule,跑起来看到弹窗;classifier 兜底工作(可关)。
 
