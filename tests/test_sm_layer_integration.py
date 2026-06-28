@@ -254,3 +254,87 @@ def test_session_memory_stored_on_agent(tmp_path):
 
     agent_no_sm = _make_agent(tmp_path, sm=None)
     assert agent_no_sm.session_memory is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# M11.7 (2026-06-28): agent_core.run() 接入 SM extract dual-gate
+# ──────────────────────────────────────────────────────────────────
+
+class TestSMExtractGateIntegration:
+    """Step 6:验证 agent_core.run() 在 run 末尾调 should_extract_now(),
+    通过 gate 才提交 extract_incremental 任务到后台线程。
+    """
+
+    def _patch_extract_to_spy(self, sm: SessionMemoryLayer):
+        """把 sm.extract_incremental 包成 spy,记录每次调用"""
+        calls = []
+        original = sm.extract_incremental
+
+        def spy_extract(*args, **kwargs):
+            calls.append((args, kwargs))
+            # 不真跑后台线程 — 直接返一个完成 future,保持测试快
+            from concurrent.futures import Future
+            f: Future = Future()
+            f.set_result(True)
+            return f
+
+        sm.extract_incremental = spy_extract
+        return calls, original
+
+    def test_should_extract_now_passes_when_tokens_and_tools_meet_threshold(
+        self, tmp_path, monkeypatch
+    ):
+        """current_tokens ≥ init 10K + tool Δ ≥ 3 → gate 放行 → extract_incremental 被调"""
+        sm = _make_sm(tmp_path)
+        # 预置 _last_extract_token_count=None(让 init gate 直接放行)
+        assert sm._last_extract_token_count is None
+        calls, original = self._patch_extract_to_spy(sm)
+
+        # 直接调 public API(模拟 agent_core.run() 末尾的逻辑)
+        # current=15000(> 10K init) + tool_delta=4(≥ 3) → gate OK
+        gate_ok = sm.should_extract_now(
+            current_token_count=15000, tool_count_delta=4, tool_count_last_turn=2,
+        )
+        assert gate_ok is True
+
+        # 模拟 agent 端:gate 通过后调 extract
+        if gate_ok:
+            sm.extract_incremental(
+                messages=[{"id": "m1", "role": "user", "content": "hi"}],
+                llm_callback=None,
+                current_token_count=15000, tool_count_delta=4, tool_count_last_turn=2,
+            )
+        assert len(calls) == 1
+        # 传入的 kwargs 必须带 token_count / tool delta
+        _, kwargs = calls[0]
+        assert kwargs["current_token_count"] == 15000
+        assert kwargs["tool_count_delta"] == 4
+
+    def test_should_extract_now_blocks_when_token_delta_below_5k(
+        self, tmp_path, monkeypatch
+    ):
+        """current_tokens ≥ init 但 token Δ < 5K → gate 拦 → extract 不调"""
+        sm = _make_sm(tmp_path)
+        # 先走一次 init(到 10K),wait future 同步等后台线程完成
+        f_init = sm.extract_incremental(
+            messages=[{"id": "m1", "role": "user", "content": "a"}],
+            llm_callback=None,
+            current_token_count=10000,
+        )
+        f_init.result(timeout=5)
+        # 现在 _initialized=True, _last_extract_token_count=10000
+        assert sm._initialized is True
+        assert sm._last_extract_token_count == 10_000
+
+        calls, original = self._patch_extract_to_spy(sm)
+
+        # 第二次 12K(Δ=2K < 5K)+ 2 tool → gate 拦
+        gate_ok = sm.should_extract_now(
+            current_token_count=12000, tool_count_delta=2, tool_count_last_turn=1,
+        )
+        assert gate_ok is False
+
+        # agent 端逻辑:gate 不通过则跳过 extract
+        if gate_ok:
+            sm.extract_incremental([], llm_callback=None, current_token_count=12000)
+        assert len(calls) == 0

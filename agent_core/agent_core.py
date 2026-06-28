@@ -1011,27 +1011,44 @@ class ReactAgent:
         # turn 结束后把 messages 喂给 sm_layer.extract_incremental
         # 走后台 ThreadPoolExecutor,不阻塞主对话(零延迟)
         #
-        # 本期(2026-06-26 测试学习阶段):llm_callback=None 走测试路径
-        #   → 仅推进 last_id,SM 文件写 template 但 sections 空
-        #   → 目的:打通完整 lifecycle(extract_incremental 入口 → 推进
-        #     last_id → 下次 should_trigger_compact 走 COND 2 no_sm_file
-        #     fallback,验证 wiring 正常)
-        # 下一期:实现 LLM callback + Edit 工具,真正 Edit SM 的 5 个 section
+        # M11.7 (2026-06-28): 对齐 Claude Code SessionMemory 抽取节流
+        # 在触发前调 should_extract_now() 走 dual-gate
+        # (token Δ ≥ 5K AND tool Δ ≥ 3) OR (token Δ ≥ 5K AND last_turn tool=0)
+        # 不通过则完全跳过 extract_incremental
         if self.session_memory is not None and last_turn > 0 and final_answer:
             try:
                 _msgs_with_id = self._messages_with_ids()
-                _logger.debug(
-                    f"[L3 SM extract trigger] run() 末尾触发 extract_incremental | "
-                    f"msgs={len(_msgs_with_id)} last_turn={last_turn} | "
-                    f"sm.last_id(before)={self.session_memory.last_compacted_msg_id} | "
-                    f"llm_callback=None (test path: 写 template + 推进 last_id,不调 LLM)"
+                # M11.7:dual-gate(token + tool)
+                _current_tokens = last_input_tokens + last_output_tokens
+                _tool_delta = len(last_tool_calls)
+                # last_turn tool 数 = 本轮的 tool_delta(简化:用本轮代替)
+                _gate_ok = self.session_memory.should_extract_now(
+                    current_token_count=_current_tokens,
+                    tool_count_delta=_tool_delta,
+                    tool_count_last_turn=_tool_delta,
                 )
-                future = self.session_memory.extract_incremental(
-                    _msgs_with_id, llm_callback=None,
-                )
-                # 不 .result() block(后台线程,主流程不等)
-                # 但记录 future 引用,方便测试或后续 block 等待
-                self._pending_sm_extract_future = future
+                if not _gate_ok:
+                    _logger.debug(
+                        f"[L3 SM extract trigger] gate 拦住,跳过 extract | "
+                        f"current_tokens={_current_tokens} tool_delta={_tool_delta}"
+                    )
+                else:
+                    _logger.debug(
+                        f"[L3 SM extract trigger] run() 末尾触发 extract_incremental | "
+                        f"msgs={len(_msgs_with_id)} last_turn={last_turn} | "
+                        f"sm.last_id(before)={self.session_memory.last_compacted_msg_id} | "
+                        f"current_tokens={_current_tokens} tool_delta={_tool_delta}"
+                    )
+                    future = self.session_memory.extract_incremental(
+                        _msgs_with_id,
+                        llm_callback=None,
+                        current_token_count=_current_tokens,
+                        tool_count_delta=_tool_delta,
+                        tool_count_last_turn=_tool_delta,
+                    )
+                    # 不 .result() block(后台线程,主流程不等)
+                    # 但记录 future 引用,方便测试或后续 block 等待
+                    self._pending_sm_extract_future = future
             except Exception as e:
                 _logger.warning(
                     f"[L3 SM extract trigger] 失败(不影响主流程): {e}"
