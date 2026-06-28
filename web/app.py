@@ -680,6 +680,33 @@ def get_agent(session_id=None):
         session_memory=session_memory,         # M10 C2.2: L3 SM 快路径
     )
 
+    # M12: 注入 PermissionEngine + AuditLogger(可选,settings.json 不存在时 None)
+    # 对齐 docs/tool/tool-security-architecture.md §6.3 + §4.8
+    try:
+        from agent_core.tools.permission_loader import load_tool_permission_context
+        from agent_core.tools.permission_engine import PermissionEngine
+        from agent_core.tools.permission_hook import default_hooks
+
+        perm_context = load_tool_permission_context()
+        if perm_context is not None:
+            # 默认 hook registry(secret + path)
+            hook_registry = default_hooks()
+            agent.permission_engine = PermissionEngine(
+                context=perm_context,
+                hook_registry=hook_registry,
+            )
+            # auto_allow_ask=False → ASK 时走 UI 弹窗路径(0.1s 超时 → 默认 deny,
+            # 实际由 dialog 写回 resolve_permission 解锁)
+            agent.auto_allow_ask = False
+            logging.info(
+                "PermissionEngine 启用: mode=%s, hooks=[%s]",
+                perm_context.mode,
+                ",".join(hook_registry.list_hooks("PreToolUse")),
+            )
+    except Exception as e:
+        # 权限系统初始化失败 → 不阻断 agent(向后兼容)
+        logging.warning(f"PermissionEngine 注入失败,降级为无权限检查: {e}")
+
     # M10 C3.1: 启动 DistillationLoop(后台 daemon,10 分钟检查 4 重门)
     # 用 st.session_state 单例化(避免 Streamlit rerun 每次 leak 一个 daemon 线程)
     try:
@@ -837,10 +864,53 @@ agent = st.session_state.agent
 def run_agent(user_input: str):
     """
     运行 ReAct Agent，yield 中间过程。
-    返回：(msg_type, content)
+    返回：(msg_type, content）
     """
     for msg_type, content in agent.run(user_input):
+        # M12: 权限请求弹窗(对齐 doc §6.3 + Streamlit st.dialog)
+        # 每次 yield 后检查 _pending_permission_request,有则弹窗
+        if agent.permission_engine is not None and agent._pending_permission_request is not None:
+            _handle_permission_dialog(agent)
         yield (msg_type, content)
+
+
+@st.dialog("🔐 Tool Permission Request")
+def _handle_permission_dialog(agent):
+    """
+    权限请求弹窗(对齐 doc §6.3 + §4.4)
+
+    Args:
+        agent: ReactAgent 实例(持有 _pending_permission_request + resolve_permission)
+    """
+    req = agent._pending_permission_request
+    if req is None:
+        return
+    tool_name = req.get("tool_name", "")
+    tool_input = req.get("tool_input", {})
+    reason = req.get("reason", "")
+    message = req.get("message", "")
+
+    st.write(f"**Tool**: `{tool_name}`")
+    st.write(f"**Input**:")
+    st.code(str(tool_input), language="json")
+    if reason:
+        st.write(f"**Reason**: {reason}")
+    if message and message != reason:
+        st.write(f"**Message**: {message}")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("✅ Allow once", key=f"allow_{tool_name}", use_container_width=True):
+            agent.resolve_permission("allow")
+            st.rerun()
+    with col2:
+        if st.button("🚫 Deny", key=f"deny_{tool_name}", use_container_width=True):
+            agent.resolve_permission("deny")
+            st.rerun()
+    with col3:
+        if st.button("✅✅ Always allow", key=f"always_{tool_name}", use_container_width=True):
+            agent.resolve_permission("always_allow")
+            st.rerun()
 
 
 # ── 主聊天界面 ────────────────────────────────────────────────
