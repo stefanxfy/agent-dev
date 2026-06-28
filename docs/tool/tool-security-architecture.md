@@ -376,7 +376,7 @@ class UnsupportedRule:
 @dataclass
 class CompoundRule:
     """
-    复合规则(对齐 CC shellRuleMatching.ts 的 compound 类型):
+    复合规则(对齐 CC shellRuleMatching.ts + permissionRuleParser.ts 的 compound 类型):
     "git add:* && git commit:!*" 拆成 [PrefixMatch("git add"), PrefixMatch("git commit:!")]
     全部子规则都匹配才算命中(AND 语义)
     """
@@ -392,15 +392,17 @@ ShellPermissionRule = Union[
 # ── 规则字符串解析(对齐 CC permissionRuleParser.ts) ─────
 
 COMPOUND_SEPARATORS = ["&&", "||", ";", "|"]
-# 注意:优先级 && > || > ; > |  (对齐 bash 语义)
+# 注:CC 不按"优先级"解析,而是按出现顺序拆第一个找到的 separator
+# (语义都是 AND,见 §4.2.2)
 
 def parse_rule(tool_name: str, rule_content: Optional[str]) -> ShellPermissionRule:
     """
     解析 "Bash(npm run:*)" 这种规则字符串
 
-    优先级:
+    匹配顺序(对齐 CC permissionRuleParser.ts):
     1. 无 ruleContent → 整个 tool 命中(返回 None,特殊哨兵)
-    2. 含 compound 分隔符(优先级 && / || / ; / |) → 拆成 CompoundRule
+    2. 含 compound 分隔符(&& / || / ; / |) → 拆成 CompoundRule
+       (按出现顺序找第一个 separator,语义都是 AND,见 §4.2.2)
     3. "prompt:" 前缀 → PromptMatch
     4. "*" → WildcardMatch("*")
     5. ":*" 后缀 → PrefixMatch
@@ -437,17 +439,19 @@ def parse_rule(tool_name: str, rule_content: Optional[str]) -> ShellPermissionRu
 
 def _try_parse_compound(content: str) -> Optional[CompoundRule]:
     """
-    尝试按优先级 && > || > ; > | 拆分 compound rule
+    尝试按 separator 拆分 compound rule
     对齐 CC permissionRuleParser.ts parseShellPermissionRule
 
     实现说明:
-    - 用 regex 找最早出现的位置最低优先级分隔符(从 && 开始)
-    - 简化:不处理引号内的分隔符(对齐 CC legacy path 的已知限制)
+    - CC 按出现顺序找第一个 separator 切,不按"优先级"概念
+    - 拆出两侧各自 parse_rule(允许 nested compound)
+    - 两侧任一 UnsupportedRule → 整体 UnsupportedRule(永不命中)
     - 仅在拆出 ≥2 段时才返回 CompoundRule(否则退化为单条规则)
     """
-    # 优先级:&&  >  ||  >  ;  >  |
-    # 在最低优先级分隔符处切(对齐 CC "split on lowest precedence first")
-    # 引号内不切(对齐 CC legacy path 行为 —— CC 也仅在主路径才解析引号)
+    # 按出现顺序拆第一个 separator(从前往后)
+    # 顺序:&&  ||  ;  |(对齐 CC permissionRuleParser.ts 顺序)
+    # 注:CC 不按"最低优先级"概念切,这里是按"出现最早"切;
+    # 语义上 AND(全匹配才命中),所以选哪个分隔符拆等价(见 §4.2.2)
     for sep in ["||", "&&", ";", "|"]:
         match = re.search(rf"\s*{re.escape(sep)}\s*", content)
         if match:
@@ -509,24 +513,32 @@ def match_rule(rule: Optional[ShellPermissionRule], tool_input: dict) -> bool:
 
 #### 4.2.2 拆分算法详解
 
-CC `permissionRuleParser.ts` 注释明确:
-> "split on lowest precedence separator first" — 在最低优先级分隔符处切,保证 `&&` 优先于 `||` 绑定。
+CC `permissionRuleParser.ts` 的 compound 语义是 **AND**——所有子规则都匹配才算命中。
+
+**重要澄清**:CC **不**把 `&&` / `||` / `;` / `|` 当作 rule 语言的"逻辑优先级",而是把它们都视作 **AND 语义的串联符**(子规则都要匹配)。
+
+为什么?:规则匹配的语义是"这条规则是否覆盖这次调用",不是"这次调用是否触发了这条规则的逻辑表达式"。`cmd1 && cmd2` 在 shell 里是顺序执行,任何一条出错都该 ask,所以所有子规则都检查才安全。
 
 ```text
-优先级(高 → 低):
-  &&   (AND,逻辑与)
-  ||   (OR,逻辑或)
-  ;    (序列)
-  |    (管道)
-
 例子:"git add:* && git commit:* || echo done"
-    ↓  先按 || 拆(最低优先级)
-    ["git add:* && git commit:*", "echo done"]
-    ↓  递归拆左侧(按 &&)
-    CompoundRule(parts=[
-        CompoundRule(parts=[PrefixMatch("git add"), PrefixMatch("git commit")]),
-        ExactMatch("echo done"),
-    ])
+
+CC 拆分顺序(permissionRuleParser.ts + shellRuleMatching.ts):
+  1. 扫到第一个出现的 separator → "&&"(出现在位置 N)
+  2. 在 && 处切 → ["git add:*", "git commit:* || echo done"]
+  3. 递归解析右侧,扫到 "||" → ["git commit:*", "echo done"]
+  4. 最终结构:
+     CompoundRule(parts=[
+         PrefixMatch("git add"),
+         CompoundRule(parts=[
+             PrefixMatch("git commit"),
+             ExactMatch("echo done"),
+         ]),
+     ])
+
+注:早期 doc 草稿有 "split on lowest precedence first" 的叙述,
+源码实际按"出现位置最早"切第一个 separator。语义都是 AND
+(全子规则都匹配才算命中),所以拆哪个 separator 在功能上等价,
+但实现细节与"优先级"叙述不一致(已修正)。
 ```
 
 #### 4.2.3 与规则优先级的交互
