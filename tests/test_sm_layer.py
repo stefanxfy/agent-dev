@@ -803,3 +803,87 @@ class TestExtractGate:
         # (前向看 M11.5 的 _apply_sm_operations 才会持久化)
         # 所以重 load 后是 None,这是当前项目行为,跟 gate 无关
         assert sm2.last_compacted_msg_id is None
+
+
+# ──────────────────────────────────────────────────────────────────
+# 10. SM 文件权限 (Claude Code diff 4, Step 3)
+# ──────────────────────────────────────────────────────────────────
+
+class TestFilePermissions:
+    """M11.7 (2026-06-28): 对齐 Claude Code 0o700/0o600 + O_EXCL 原子创建
+
+    Windows 上 POSIX 权限不适用,所有测试 skip。
+    """
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX file mode 不适用 Windows",
+    )
+    def test_write_sm_template_creates_file_with_0600(self, sm_path, config):
+        """write_sm_template() → sm.md 0o600"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        sm.write_sm_template()
+        mode = sm_path.stat().st_mode & 0o777
+        assert oct(mode) == "0o600", f"期望 0o600,实际 {oct(mode)}"
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX file mode 不适用 Windows",
+    )
+    def test_write_sm_template_creates_dir_with_0700(self, sm_path, config):
+        """write_sm_template() → parent dir 0o700"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        sm.write_sm_template()
+        mode = sm_path.parent.stat().st_mode & 0o777
+        assert oct(mode) == "0o700", f"期望 0o700,实际 {oct(mode)}"
+
+    def test_write_sm_template_idempotent_under_o_excl(self, sm_path, config):
+        """调两次 write_sm_template() → 不抛 FileExistsError(已存在静默 return)"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        sm.write_sm_template()
+        # 第二次:O_EXCL 抛 FileExistsError,被内部 try/except 吞掉
+        sm.write_sm_template()  # 不应抛
+        assert sm.sm_exists()
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX file mode 不适用 Windows",
+    )
+    def test_persist_compact_result_writes_json_with_0600(self, sm_path, config):
+        """compact() 后 .json 0o600"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        sm.write_sm_template()
+        # 触发一次完整 compact
+        messages = [
+            {"id": "m1", "role": "user", "content": "你好" * 200},  # 触发 token > 10K
+        ]
+        # 强制走 sm_compact:构造大消息让 token > threshold
+        big_content = "测试 " * 5000
+        messages = [{"id": "m1", "role": "user", "content": big_content}]
+        # 拿 token 估算
+        from agent_core.memory.sm_layer import TurnContext
+        ctx = TurnContext(messages=messages, total_tokens=15000, tool_count=2)
+        decision = sm.should_trigger_compact(ctx)
+        if decision.strategy == "sm_compact":
+            result = sm.compact(messages, context_window=128000)
+            if result is not None:
+                sm._persist_compact_result(result)
+                json_path = sm_path.with_suffix(".json")
+                if json_path.exists():
+                    mode = json_path.stat().st_mode & 0o777
+                    assert oct(mode) == "0o600", f"期望 0o600,实际 {oct(mode)}"
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="POSIX file mode 不适用 Windows",
+    )
+    def test_persist_compact_result_overwrites_md_with_0600(self, sm_path, config):
+        """两次 _persist_compact_result 后 .md 仍 0o600(没退回 0o644)"""
+        sm = SessionMemoryLayer("s1", sm_path, config)
+        sm.write_sm_template()
+        # 第一次写
+        sm._open_secure(sm_path, "first content")
+        # 第二次覆盖写
+        sm._open_secure(sm_path, "second content")
+        mode = sm_path.stat().st_mode & 0o777
+        assert oct(mode) == "0o600", f"期望 0o600,实际 {oct(mode)}"

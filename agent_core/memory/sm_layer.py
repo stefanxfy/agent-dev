@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 from concurrent.futures import Future
@@ -268,6 +269,11 @@ last_compacted_at: null
         """初始化 SM 文件(写 template)
 
         用于首次 extract 前,先占位 template。后续 extract 通过 Edit 增量更新。
+
+        M11.7 (2026-06-28): 对齐 Claude Code 权限 + 原子创建
+        - parent dir: 0o700
+        - file: 0o600
+        - 用 O_CREAT | O_EXCL 原子创建(已被初始化时 FileExistsError → 静默忽略)
         """
         if self.sm_exists():
             return
@@ -276,11 +282,41 @@ last_compacted_at: null
             schema_version=self.SM_SCHEMA_VERSION,
         )
         try:
-            self.sm_path.parent.mkdir(parents=True, exist_ok=True)
-            self.sm_path.write_text(content, encoding="utf-8")
-            logger.info(f"SM template 初始化: {self.sm_path}")
+            # POSIX 权限:目录 0o700(仅 owner 可访问)
+            self.sm_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            # O_EXCL 原子创建;file mode 0o600
+            try:
+                fd = os.open(
+                    self.sm_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                os.write(fd, content.encode("utf-8"))
+                os.close(fd)
+            except FileExistsError:
+                # 别的进程/线程并发初始化了,直接复用
+                pass
+            logger.info(f"SM template 初始化: {self.sm_path} (mode=0o600)")
         except Exception as e:
             raise SessionMemoryError(f"写 SM template 失败: {e}", cause=e)
+
+    @staticmethod
+    def _open_secure(path: Path, content: str, mode: int = 0o600) -> None:
+        """M11.7 (2026-06-28): 写 SM 文件的统一入口(0o600 权限)
+
+        用 O_WRONLY | O_CREAT | O_TRUNC 覆盖写,文件 mode 0o600。
+        Windows 下 mode 参数被忽略,跳过权限校验。
+        """
+        try:
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                mode,
+            )
+            os.write(fd, content.encode("utf-8"))
+            os.close(fd)
+        except Exception as e:
+            raise SessionMemoryError(f"安全写文件失败: {path}: {e}", cause=e)
 
     def _load_state_from_frontmatter(self) -> None:
         """从 SM 文件 frontmatter 恢复 last_compacted_msg_id / at"""
@@ -707,7 +743,7 @@ last_compacted_at: null
                         content,
                         count=1,
                     )
-                self.sm_path.write_text(new_content, encoding="utf-8")
+                self._open_secure(self.sm_path, new_content)
                 self._last_compacted_at = now_iso
                 logger.debug(f"SM .md frontmatter 更新: {self.sm_path}")
         except Exception as e:
@@ -716,8 +752,9 @@ last_compacted_at: null
         # 2. 写 .json snapshot
         try:
             json_path = self.sm_path.with_suffix(".json")
-            json_path.parent.mkdir(parents=True, exist_ok=True)
-            json_path.write_text(
+            json_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            self._open_secure(
+                json_path,
                 json.dumps({
                     "session_id": self.session_id,
                     "summary_message_content": result.summary_message.get("content", ""),
@@ -726,7 +763,6 @@ last_compacted_at: null
                     "strategy": result.strategy,
                     "updated_at": now_iso,
                 }, ensure_ascii=False, indent=2),
-                encoding="utf-8",
             )
             logger.debug(f"SM .json snapshot 写入: {json_path}")
         except Exception as e:
