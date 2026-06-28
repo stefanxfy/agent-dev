@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-06-18T16:00:00+08:00",
+  "model": "GLM-4.6",
+  "note": "实时 A/B 测试，每次调用 10-112s，受 GLM 服务端状态影响大",
+  "experiments": [
+    {
+      "type": "prefix_length_scan",
+      "prefix_500": {"cold_prompt": 591, "cold_cached": 384, "warm_prompt": 521, "warm_cached": 0, "warm_latency_ms": 112280, "hit_pct": 0.0},
+      "observation": "Cold call 显示 384 tokens cached（来自 system prefix），但 warm call 反而不命中"
+    },
+    {
+      "type": "stability",
+      "observation": "GLM-4.6 endpoint 延迟极不稳定（9-112s），偶发 stream 中断（已通过 P1-9 修复的 IncompleteRead 错误类型）"
+    }
+  ],
+  "conclusions": [
+    "GLM-4.6 服务端实现 prompt cache（首次 cold call 显示 384 cached tokens）",
+    "但 cache 行为不稳定：相同 payload 第二次调用可能不命中（可能是 cache TTL 短、region 不一致、或服务端策略）",
+    "延迟抖动大（9-112s），偶发 stream 截断 → P1-9 修复（_stream_with_retry）必需",
+    "A/B 自动化脚本保留在 scripts/glm_cache_abtest.py，可在不同时间段重跑"
+  ]
+}

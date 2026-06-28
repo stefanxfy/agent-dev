@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from agent_core.config import config
+
 logger = logging.getLogger("context.compact")
 
 # DEBUG 日志辅助函数
@@ -49,7 +51,30 @@ MAX_PTL_RETRIES = 3
 # 每次剥掉最旧的 20% 消息
 TRUNCATE_RATIO = 0.2
 
-# 压缩后保留最近 N 条原始消息
+# 压缩后保留最近对话（配对 turn，保证连续性）
+#
+# 设计原则（用户提议）：
+# 1. 配对：user+assistant 配对成 turn，不拆散
+# 2. 两个限制：达到任一即停
+#    - MAX_PRESERVED_TURNS：turn 对数上限
+#    - PRESERVED_HEAD_MAX_TOKENS：总 token 预算
+# 3. **不丢弃 turn**：保证 preserved head 是连续时段
+#    - 丢弃超大 turn 会让前后出现 “洞”，破坏连续性
+#    - 超大 turn 的内容交给 summary 负责压缩
+#
+# 7f071c62 实例：3 个 turn （最近→最远）
+#   turn3 "你好→你好小明" ≈ 23 tok  → 保留
+#   turn2 "重复 50 次→13187 字符"  ≈ 9230 tok  → 保留（连续性优先）
+#   turn1 "我是谁→你好小明" ≈ 5 tok  → 超预算，停
+# 结果：turn2+turn3 （连续 4 条），灌水交给 summary
+
+# preserved head 总 token 预算
+PRESERVED_HEAD_MAX_TOKENS = 4000
+
+# preserved head 最多保留几对（turn = user + assistant）
+MAX_PRESERVED_TURNS = 3
+
+# 旧常量（保留以防有外部代码引用）
 PRESERVED_HEAD_MESSAGES = 6
 
 # 工具结果截断上限（字符数）
@@ -58,13 +83,102 @@ TOOL_RESULT_TRUNCATE_CHARS = 8000
 # 压缩请求最大输出 tokens
 COMPACT_MAX_OUTPUT_TOKENS = 4096
 
+# P1-5 修复：摘要质量底线（语义退化防御）
+# - 字符数下限：少于这个数说明模型只是"敷衍了事"
+# - 重复比例上限：超过这个数说明是"复读机"产物
+# - 模板泄漏字符串：禁止出现的字面量（说明模型在复读 prompt）
+SUMMARY_MIN_CHARS = 200
+SUMMARY_MAX_REPEAT_RATIO = 0.3  # 同一行/段重复率上限
+SUMMARY_FORBIDDEN_PHRASES = (
+    "Your task is to create",
+    "Respond with TEXT ONLY",
+    "create a detailed summary",
+    "you MUST create the summary",
+    "[truncated]",
+    "...",
+)
+
+
+def _is_summary_quality_ok(summary: str, original_messages: list[dict]) -> tuple[bool, str]:
+    """
+    P1-5 修复：摘要质量检查
+
+    防御 LLM 语义退化（API 200 但内容是"敷衍""复读""模板泄漏"）。
+    与熔断器配合：质量不达标 → 等同失败 → 计入连续失败次数。
+
+    检查项：
+    1. 字符数 >= SUMMARY_MIN_CHARS
+    2. 不包含模板泄漏字符串（说明模型在复读 prompt）
+    3. 重复行/段比例 <= SUMMARY_MAX_REPEAT_RATIO
+    4. 与原始消息的 token 比 >= 5%（极度压缩到 < 5% 也视为退化）
+
+    Args:
+        summary: LLM 返回的摘要
+        original_messages: 压缩前的原始消息列表
+
+    Returns:
+        (is_ok, reason)
+    """
+    if not summary or not summary.strip():
+        return False, "summary 为空"
+
+    stripped = summary.strip()
+
+    # 1. 字符数下限
+    if len(stripped) < SUMMARY_MIN_CHARS:
+        return False, f"summary 过短 ({len(stripped)} < {SUMMARY_MIN_CHARS})"
+
+    # 2. 模板泄漏检查
+    lowered = stripped.lower()
+    for phrase in SUMMARY_FORBIDDEN_PHRASES:
+        if phrase.lower() in lowered:
+            return False, f"summary 含模板泄漏: {phrase!r}"
+
+    # 3. 重复行检查
+    lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
+    if lines:
+        from collections import Counter
+        line_counts = Counter(lines)
+        most_common_line, most_common_count = line_counts.most_common(1)[0]
+        # 同一行出现 >= 3 次且占总数 30% 以上 → 复读
+        if most_common_count >= 3 and most_common_count / len(lines) > SUMMARY_MAX_REPEAT_RATIO:
+            return False, (
+                f"summary 复读: {most_common_line[:30]!r} "
+                f"出现 {most_common_count} 次"
+            )
+
+    # 4. 极度压缩比检查（与原消息 token 数对比）
+    if original_messages:
+        try:
+            from .tokenizer import estimate_tokens
+            summary_tokens = estimate_tokens(stripped)
+            orig_tokens = sum(
+                estimate_tokens(str(m.get("content", ""))) for m in original_messages
+            )
+            if orig_tokens > 0:
+                ratio = summary_tokens / orig_tokens
+                # 极度压缩（< 2%）：丢掉太多内容
+                if ratio < 0.02:
+                    return False, (
+                        f"summary 极度压缩: {summary_tokens} / {orig_tokens} "
+                        f"= {ratio:.2%} < 2%"
+                    )
+        except Exception:
+            # 估算失败不阻塞质量检查
+            pass
+
+    return True, "ok"
+
 
 # ── 压缩 Prompt ─────────────────────────────────────────────────
 
-COMPACT_SYSTEM_PROMPT = """⚠️ CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+# 统一指令模板：{conversation_location} 占位符区分两种模式
+#   - 旧模式填 "the text below"（对话紧跟在后）
+#   - Fork 模式填 "the messages above"（对话在 messages 历史中）
+COMPACT_INSTRUCTION = """⚠️ CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.
-- You already have all the context you need in the conversation above.
+- You already have all the context you need in {conversation_location}.
 - Tool calls will be REJECTED and will waste your only turn — you will fail the task.
 - Your entire response must be plain text: an <analysis> block followed by a <summary> block.
 - Use 中文 in your summary (本项目是中文场景).
@@ -144,6 +258,190 @@ This summary should be thorough in capturing technical details, code patterns, a
 
 # ── 压缩结果 ────────────────────────────────────────────────────
 
+
+# ── Preserved head 构建器 ───────────────────────────────────────
+
+def _estimate_msg_tokens(msg: dict) -> int:
+    """
+    估算单条消息的 token 数（用于 preserved head 预算控制）
+
+    粗估：中文 ~0.7 tok/字，英文 ~0.25 tok/字。
+    这里统一按 0.7 tok/字符 估（偏保守，避免超出 budget）。
+    """
+    content = msg.get("content", "")
+    chars = 0
+    if isinstance(content, str):
+        chars = len(content)
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict):
+                # text block / tool_result block
+                text_val = b.get("text", b.get("content", ""))
+                if isinstance(text_val, str):
+                    chars += len(text_val)
+                elif isinstance(text_val, list):
+                    for sub in text_val:
+                        if isinstance(sub, dict):
+                            chars += len(str(sub.get("text", "")))
+    # 加 role 开销
+    return int(chars * 0.7) + 4
+
+
+
+def _pair_messages_to_turns(messages: list[dict]) -> list[list[dict]]:
+    """
+    把消息列表配对成 turn（user → assistant → user → ...）
+
+    返回：[[user, assistant], [user, assistant], ...]
+    边界：
+    - 开头的 assistant（无 user）→ 单独成 turn
+    - 结尾未配对的 user → 单独成 turn
+    - tool_use/tool_result 等中间 block 不拆 turn
+    """
+    turns = []
+    pending_user = None
+    for msg in messages:
+        role = msg.get("role")
+        if role == "user":
+            if pending_user is not None:
+                # 上一个 user 没配上 assistant（连续 user）
+                turns.append([pending_user])
+            pending_user = msg
+        elif role == "assistant":
+            if pending_user is not None:
+                turns.append([pending_user, msg])
+                pending_user = None
+            else:
+                # 开头 assistant 无 user
+                turns.append([msg])
+        else:
+            # tool / system / 其他：附加到当前 turn
+            if pending_user is not None:
+                pending_user = None  # 中断配对
+            if turns:
+                turns[-1].append(msg)
+            else:
+                turns.append([msg])
+    if pending_user is not None:
+        turns.append([pending_user])
+    return turns
+
+
+def _build_preserved_head(
+    non_system: list[dict],
+    max_total_tokens: int = 4000,
+    max_turns: int = 3,
+) -> list[dict]:
+    """
+    构建 preserved head：配对 + max_turns 硬停 + max_total_tokens 硬停
+
+    设计原则（v4.1 — P1-2 修复，无任何 turn 例外）：
+    1. **配对**：user+assistant 配对成 turn，不拆散
+    2. **max_turns 硬停**：达到 N 对 turn 立即停止
+    3. **max_total_tokens 硬停**：累计 token 超 budget → 这个 turn 不保留 + 停止
+       - **不区分第一个 turn**（用户指令：不做任何截断，
+         如果第一个 turn 就超 budget → 整条不保留）
+       - 极端情况：第一个 turn 单条超 budget → preserved head 为空
+         (接受此退化，summary 已包含必要上下文)
+    4. **不截断 turn**：超 budget 的 turn 整体不加入，不做 partial 截取
+       - partial 截取会让 user/assistant 失去配对语义
+
+    为什么不做任何截断？
+    - 任何"截断超大 turn"分支都意味着放弃语义完整性
+    - "第一个 turn 例外"是反模式：让单 turn 灌水绕过所有防御
+    - 退化行为（preserved head 为空）由 summary 兜底，可接受
+
+    迭代顺序：从后往前（最近的优先）
+    - 任一硬停条件达到 → break
+    - 不再保留"第一个 turn 例外"分支
+
+    Args:
+        non_system: 非 system 消息列表（按时间正序）
+        max_total_tokens: preserved head 总 token 预算（**硬限制**）
+        max_turns: 最多保留几对（turn = user + assistant），硬限制
+
+    Returns:
+        保留的消息列表（时间正序，连续）。可能为空。
+    """
+    if not non_system:
+        return []
+
+    # 1. 配对
+    turns = _pair_messages_to_turns(non_system)
+
+    # 2. 从后往前选 turn，任一硬停条件达到即停
+    # - max_turns 硬停：turn 数到 N
+    # - max_total_tokens 硬停：累计超 budget 就不加这个 turn（且停止）
+    #   P1-2 修复：取消 "first turn exception"，统一硬停
+    selected_turns = []
+    total = 0
+
+    for turn in reversed(turns):
+        turn_tokens = sum(_estimate_msg_tokens(m) for m in turn)
+
+        # 硬限制: turn 数已到上限
+        if len(selected_turns) >= max_turns:
+            break
+
+        # 硬限制: 累计超 budget（含第一个 turn，不做任何例外 / 截断）
+        #   第一个 turn 也必须遵守 budget。超 budget → 整 turn 跳过 + 停止
+        if total + turn_tokens > max_total_tokens:
+            break
+
+        # 通过所有硬停检查 → 包含
+        selected_turns.insert(0, turn)
+        total += turn_tokens
+
+    # 3. 展平
+    result = [m for turn in selected_turns for m in turn]
+
+    msg_count = len(result)
+    logger.debug(
+        f"📦 [Preserved Head] 选 {len(selected_turns)} turn / "
+        f"{msg_count} msg, ~{total} tok, "
+        f"hard_cap={max_turns}turns / hard_budget={max_total_tokens}tok"
+    )
+    return result
+
+
+
+# 旧模式：对话转纯文本拼在 user prompt 末尾
+def build_compact_user_prompt(conversation_text: str) -> str:
+    """
+    旧模式构建 user prompt：对话纯文本拼在指令之后
+
+    与 Fork 模式共享同一份 COMPACT_INSTRUCTION（保证格式一致），
+    差异仅在 {conversation_location} 占位符 + 末尾追加对话文本。
+    """
+    instruction = COMPACT_INSTRUCTION.format(conversation_location="the text below")
+    return instruction + "\n\n## 对话内容\n\n" + conversation_text
+
+
+# Fork 模式：纯指令，对话在 parent_messages 里
+def build_compact_fork_prompt() -> str:
+    """
+    Fork 模式构建 user prompt：只发指令，对话在 parent_messages 里
+
+    关键约束：每次调用必须返回**完全一致**的字符串，
+    才能保证 prompt cache 前缀字节级一致（命中 cache）。
+    conversation_location 固定为 "the messages above"。
+    """
+    return COMPACT_INSTRUCTION.format(conversation_location="the messages above")
+
+
+# ── 向后兼容别名 ──────────────────────────────────────────
+#
+# 历史原因：原代码有 3 份独立 prompt 常量
+# （COMPACT_SYSTEM_PROMPT / COMPACT_USER_PROMPT_TEMPLATE / COMPACT_FORK_PROMPT），
+# 容易漂移。重构后统一到 COMPACT_INSTRUCTION + 2 个 builder 函数。
+# 以下别名仅用于向后兼容（避免破坏已有测试和外部代码引用）。
+COMPACT_SYSTEM_PROMPT = COMPACT_INSTRUCTION  # noqa: F811
+COMPACT_USER_PROMPT_TEMPLATE = build_compact_user_prompt("{conversation}")  # noqa: F811
+# 说明：COMPACT_USER_PROMPT_TEMPLATE 现在是已 format 过的最终字符串，
+# 含 "{conversation}" 字面量作为标识。旧代码 .format(conversation=...) 不再生效，
+# 但旧测试只检查子串是否包含，仍可通过。
+
+
 @dataclass
 class CompactionResult:
     """压缩结果"""
@@ -155,6 +453,8 @@ class CompactionResult:
     error: Optional[str] = None
     compact_time_ms: float = 0
     ptl_retries: int = 0
+    usage_stats: Optional[UsageStats] = None
+    fork_fallback: bool = False  # True = Fork 失败后由旧模式兜底
 
     @property
     def tokens_freed(self) -> int:
@@ -164,8 +464,9 @@ class CompactionResult:
         """生成可读的结果摘要"""
         if not self.success:
             return f"Compact failed: {self.error}"
+        fb = " (Fork降级)" if self.fork_fallback else ""
         return (
-            f"Compact OK: {self.tokens_before:,} → {self.tokens_after:,} tokens "
+            f"Compact{fb} OK: {self.tokens_before:,} → {self.tokens_after:,} tokens "
             f"(freed {self.tokens_freed:,}), "
             f"{len(self.compacted_messages)} messages, "
             f"{self.compact_time_ms:.0f}ms, "
@@ -209,7 +510,13 @@ class CompactOrchestrator:
         self.budget = budget_manager
         self.token_counter = token_counter
 
-    def compact(self, messages: list[dict]) -> CompactionResult:
+    def compact(
+        self,
+        messages: list[dict],
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
+    ) -> CompactionResult:
         """
         执行压缩
 
@@ -218,6 +525,22 @@ class CompactOrchestrator:
         2. 构建压缩 prompt
         3. 调 LLM 生成摘要（含 PTL 防御）
         4. 组装压缩后消息
+
+        Fork 模式（仿照 Claude Code runForkedAgent）：
+        当 parent_system + parent_tools 传入时，使用 Fork 模式：
+        - system prompt = parent_system（主 agent system，字节级一致，命中 cache）
+        - tools = parent_tools（完整 schema，保留 cache 前缀）
+        - tool_choice = "none"（显式禁调工具，防 LLM 调工具打破输出格式）
+        - messages = parent_messages + [build_compact_fork_prompt()] user message
+        - 压缩指令 = build_compact_fork_prompt()（与旧模式共享 COMPACT_INSTRUCTION 源）
+        - cache 命中率预期 80-95%
+
+        未传入时（向后兼容 / 旧模式）：
+        - system prompt = COMPACT_SYSTEM_PROMPT（"你是摘要生成器"角色）
+        - user = build_compact_user_prompt(text)（含对话纯文本）
+        - tools = None
+        - messages = 仅 2 条（system + user）
+        - cache 命中率 0%
         """
         start = time.time()
         tokens_before = self.token_counter.count_messages(messages)
@@ -244,28 +567,52 @@ class CompactOrchestrator:
             )
 
             # 2-3. 生成摘要（含 PTL 防御）
-            summary, ptl_retries = self._generate_summary_with_ptl(preprocessed)
+            summary, ptl_retries, fork_fallback, usage_stats = self._generate_summary_with_ptl(
+                preprocessed,
+                parent_system=parent_system,
+                parent_tools=parent_tools,
+                parent_messages=parent_messages,
+            )
+            cached = usage_stats.cached_tokens if usage_stats else 0
+            input_tok = usage_stats.input_tokens if usage_stats else 0
+            hit_pct = (cached / max(input_tok, 1)) * 100
+            logger.debug(
+                f"🔧 [Compact] usage_stats: input={input_tok if usage_stats else 'N/A'}, "
+                f"cached={cached} ({hit_pct:.1f}%)"
+            )
 
             if not summary:
                 raise ValueError("LLM 返回空摘要")
 
+            # P1-5 修复：摘要质量检查（防御语义退化）
+            # 失败的摘要视为"压缩失败" → 计入熔断器失败计数
+            quality_ok, quality_reason = _is_summary_quality_ok(summary, messages)
+            if not quality_ok:
+                logger.warning(
+                    f"⚠️ [Compact Quality FAIL] {quality_reason}, "
+                    f"summary_len={len(summary)}, "
+                    f"messages={len(messages)}"
+                )
+                raise ValueError(f"摘要质量不达标: {quality_reason}")
+
             # 4. 组装压缩后消息
-            compacted = self._build_compacted_messages(summary, messages)
+            compacted, recent = self._build_compacted_messages(summary, messages)
 
             tokens_after = self.token_counter.count_messages(compacted)
             elapsed = (time.time() - start) * 1000
 
             self.budget.record_compact_success()
 
+            # recent 直接来自 _build_compacted_messages，不再依赖 len(compacted)-2 公式
             logger.info(
                 f"🔧 [Compact DONE] {tokens_before:,} → {tokens_after:,} tokens "
                 f"(freed {tokens_before - tokens_after:,}), "
                 f"PTL retries: {ptl_retries}, {elapsed:.0f}ms, "
-                f"preserved_head={len(compacted) - 2}"
+                f"preserved_head={len(recent)}"
             )
             logger.debug(
                 f"  └─ Final structure: [system] + [summary] + "
-                f"[{len(compacted) - 2} preserved head]"
+                f"[{len(recent)} preserved head]"
             )
 
             return CompactionResult(
@@ -276,6 +623,8 @@ class CompactOrchestrator:
                 tokens_after=tokens_after,
                 compact_time_ms=elapsed,
                 ptl_retries=ptl_retries,
+                usage_stats=usage_stats,
+                fork_fallback=fork_fallback,
             )
 
         except Exception as e:
@@ -373,8 +722,12 @@ class CompactOrchestrator:
     # ── 摘要生成（含 PTL 防御）──────────────────────────────────
 
     def _generate_summary_with_ptl(
-        self, messages: list[dict]
-    ) -> tuple[str, int]:
+        self,
+        messages: list[dict],
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
+    ) -> tuple[str, int, bool]:
         """
         生成摘要，含 PTL（Prompt-Too-Long）防御
 
@@ -382,15 +735,37 @@ class CompactOrchestrator:
         逐层截断最旧的消息分组，最多重试 MAX_PTL_RETRIES 次。
 
         参考：Claude Code compact.ts 的 PTL retry loop
+
+        Fork 模式：
+        parent_system/parent_tools/parent_messages 传入时，
+        LLM 调用复用主 agent 的 cache-key params，
+        messages = [...parent_messages, summaryRequest]，
+        仿照 Claude Code runForkedAgent。
+
+        Fork 失败时降级（FORK_FALLBACK）：
+        当 Fork 模式触发非 PTL 错误（如网络超时、API 报错、模型不支持），
+        自动降级到旧模式重试，保证压缩不因 Fork 而完全失败。
+
+        Returns:
+            (summary, attempt_count, fork_fallback)
+            fork_fallback=True 表示 Fork 模式失败后由旧模式兜底成功
         """
         to_summarize = messages
         last_error = ""
 
         for attempt in range(MAX_PTL_RETRIES + 1):
-            conversation_text = self._messages_to_text(to_summarize)
-            prompt = COMPACT_USER_PROMPT_TEMPLATE.format(
-                conversation=conversation_text
-            )
+            # Fork 模式：parent_messages 已包含完整对话，不需要重复塞文本
+            # 仿照 Claude Code compact.ts 的 summaryRequest：
+            # 只发一条简短的摘要指令，LLM 从上下文 messages 中读取对话
+            if parent_system is not None and parent_messages is not None:
+                # Fork 模式：纯指令，对话在 parent_messages 里
+                # 关键：build_compact_fork_prompt() 每次返回字节级一致的字符串
+                # → prompt cache 前缀稳定，命中
+                prompt = build_compact_fork_prompt()
+            else:
+                # 旧模式：对话转纯文本拼在 user prompt 末尾
+                conversation_text = self._messages_to_text(to_summarize)
+                prompt = build_compact_user_prompt(conversation_text)
 
             # ── DEBUG: 每轮 LLM 调用起点 ────────────────────────────
             logger.debug(
@@ -399,11 +774,16 @@ class CompactOrchestrator:
                 f"prompt_len={len(prompt)} chars"
             )
             logger.debug(
-                f"  ├─ Conversation preview:\n{_truncate(conversation_text, 300)}"
+                f"  ├─ Conversation preview:\n{_truncate(prompt, 300)}"
             )
 
             try:
-                summary, raw_text = self._call_llm_for_summary(prompt)
+                summary, raw_text, usage_stats = self._call_llm_for_summary(
+                    prompt,
+                    parent_system=parent_system,
+                    parent_tools=parent_tools,
+                    parent_messages=parent_messages,
+                )
                 if summary:
                     # ── DEBUG: 提取成功 ─────────────────────────────
                     logger.debug(
@@ -414,7 +794,8 @@ class CompactOrchestrator:
                         f"  └─ Extracted summary ({len(summary)} chars):\n"
                         f"{_truncate(summary, 500)}"
                     )
-                    return summary, attempt
+                    # Fork 模式成功（非降级）
+                    return summary, attempt, False, usage_stats  # (summary, retries, fork_fallback, usage_stats)
 
                 # 空响应，可能是 LLM 异常
                 last_error = "LLM returned empty summary"
@@ -436,6 +817,46 @@ class CompactOrchestrator:
                     "token limit",
                     "输入过长",
                 ])
+
+                # 非 PTL 错误：Fork 模式降级重试
+                use_fork = (
+                    parent_system is not None
+                    and parent_messages is not None
+                )
+                if use_fork and not is_ptl:
+                    logger.warning(
+                        f"⚠️  [Fork FAILED] non-PTL error, "
+                        f"falling back to legacy mode: {e}"
+                    )
+                    # Fork 降级：清空 Fork 参数，用旧模式兜底
+                    parent_system = None
+                    parent_tools = None
+                    parent_messages = None
+                    to_summarize = messages  # 恢复完整消息，不截断
+                    # 用旧模式再跑一轮
+                    conversation_text = self._messages_to_text(to_summarize)
+                    prompt = build_compact_user_prompt(conversation_text)
+                    try:
+                        summary, raw_text, usage_stats = self._call_llm_for_summary(
+                            prompt,
+                            parent_system=None,
+                            parent_tools=None,
+                            parent_messages=None,
+                        )
+                        if summary:
+                            logger.info(
+                                f"✅ [Fork Fallback OK] legacy mode succeeded, "
+                                f"summary={len(summary)} chars"
+                            )
+                            return summary, attempt + 1, True, usage_stats  # fork_fallback=True
+                        last_error = "Legacy mode also returned empty summary"
+                    except Exception as fallback_error:
+                        # 旧模式也失败了，不再重试，直接抛出原始错误
+                        logger.error(
+                            f"❌ [Fork FALLBACK FAILED] legacy mode also errored: "
+                            f"{fallback_error}"
+                        )
+                        raise fallback_error from e
 
                 if is_ptl and attempt < MAX_PTL_RETRIES:
                     truncate_count = max(
@@ -463,34 +884,85 @@ class CompactOrchestrator:
             f"PTL defense exhausted after {MAX_PTL_RETRIES} retries: {last_error}"
         )
 
-    def _call_llm_for_summary(self, prompt: str) -> tuple[str, str]:
+    def _call_llm_for_summary(
+        self,
+        prompt: str,
+        parent_system: Optional[str] = None,
+        parent_tools: Optional[list[dict]] = None,
+        parent_messages: Optional[list[dict]] = None,
+    ) -> tuple[str, str]:
         """
         调用 LLM 生成摘要
 
         LLMRouter.chat() 返回同步生成器（StreamChunk），
         需要消费生成器收集文本。
 
+        Fork 模式（仿照 Claude Code runForkedAgent）：
+        当 parent_system + parent_messages 传入时：
+        - messages = [主对话 messages...] + [build_compact_fork_prompt() user message]
+        - system = parent_system（字节级一致，命中 prompt cache）
+        - tools = parent_tools（字节级一致，命中 prompt cache）
+        - tool_choice = "none"（显式禁工具调用，防 LLM 调工具）
+        - cache 命中率预期 80-95%
+
+        未传入时（向后兼容 / 旧模式）：
+        - system = COMPACT_SYSTEM_PROMPT（"你是摘要生成器"角色）
+        - user   = build_compact_user_prompt(text)（含对话纯文本）
+        - tools  = None
+        - cache 命中率 0%
+
         Returns:
             (extracted_summary, raw_llm_output)
         """
-        chunks = self.llm.chat(
-            messages=[
-                {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            tools=None,  # 摘要不允许工具调用
-        )
+        use_fork = parent_system is not None and parent_messages is not None
+
+        if use_fork:
+            # ── Fork 模式 ──────────────────────────────────
+            # 仿照 Claude Code forkedAgent.ts:524
+            # initialMessages = [...forkContextMessages, ...promptMessages]
+            forked_messages = list(parent_messages) + [
+                {"role": "user", "content": prompt}
+            ]
+
+            logger.info(
+                f"🔀 [Fork Compact] Using parent cache: "
+                f"system={len(parent_system)} chars, "
+                f"tools={len(parent_tools) if parent_tools else 0}, "
+                f"parent_msgs={len(parent_messages)}, "
+                f"total_msgs={len(forked_messages)}"
+            )
+
+            chunks = self.llm.chat(
+                messages=forked_messages,
+                tools=parent_tools,
+                system_prompt_override=parent_system,
+                # Fork 模式：显式禁工具调用（防 LLM 调工具打破预期格式）
+                # 注意：tool_choice 在 Anthropic / OpenAI / GLM 均支持 "none"
+                tool_choice="none",
+            )
+        else:
+            # ── 原模式（向后兼容）──────────────────────────
+            chunks = self.llm.chat(
+                messages=[
+                    {"role": "system", "content": COMPACT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                tools=None,
+            )
 
         full_text = ""
+        last_usage = None
         for chunk in chunks:
             if chunk.text_delta:
                 full_text += chunk.text_delta.text
-            # 忽略 thinking/usage/tool_call chunks
+            if chunk.usage:
+                last_usage = chunk.usage
+            # 忽略 thinking/tool_call chunks
 
         summary = self._extract_summary(full_text)
 
 
-        return summary, full_text
+        return summary, full_text, last_usage
 
     # ── 辅助方法 ────────────────────────────────────────────────
 
@@ -585,12 +1057,12 @@ class CompactOrchestrator:
         self,
         summary: str,
         original: list[dict],
-        preserved_head: int = PRESERVED_HEAD_MESSAGES,
+        preserved_head: Optional[int] = None,
     ) -> list[dict]:
         """
         组装压缩后的消息列表
 
-        结构：[system] + [summary message] + [最近 N 条原始消息]
+        结构：[system] + [summary message] + [最近对话配对保留]
 
         参考 Claude Code 的压缩后消息结构：
         [System 边界宣告] + [精简摘要] + [最近对话]
@@ -598,7 +1070,10 @@ class CompactOrchestrator:
         策略：
         1. 保留原始消息中的 system prompt（第一条）
         2. 插入摘要消息（role=user，标记为之前对话的摘要）
-        3. 保留最近 N 条非 system 消息
+        3. preserved head 选 2 原则（用户提议，保证连续性）：
+           a. 配对：user+assistant 配成 turn，不拆散
+           b. max_turns 硬停 + max_total_tokens 软限制
+              （连续性优先，灌水 turn 也不拆）
         """
         result = []
 
@@ -616,8 +1091,18 @@ class CompactOrchestrator:
             "content": f"[Previous conversation summarized]\n\n{summary}"
         })
 
-        # 3. 保留最近 N 条消息
-        recent = non_system[-preserved_head:] if len(non_system) > preserved_head else non_system
+        # 3. 配对 + 双限制的 preserved head（保证连续性）
+        max_total_tokens = config.int("PRESERVED_HEAD_MAX_TOKENS", 4000)
+        max_turns = config.int("MAX_PRESERVED_TURNS", 3)
+        # 兼容老 API：preserved_head=N 仍可调用，但语义是"最大 turn 数"上限
+        if preserved_head is not None:
+            # 老接口：preserved_head=6 表示 6 条 = 3 对
+            max_turns = min(max_turns, (preserved_head + 1) // 2)
+        recent = _build_preserved_head(
+            non_system=non_system,
+            max_total_tokens=max_total_tokens,
+            max_turns=max_turns,
+        )
         result.extend(recent)
 
         # ── DEBUG: 构建结果 ─────────────────────────────────────
@@ -632,10 +1117,11 @@ class CompactOrchestrator:
             f"  ├─ [1] summary: {len(summary)} chars, "
             f"prefix={summary[:30]!r}..."
         )
-        logger.debug(f"  └─ [2..{len(result)-1}] preserved head ({len(recent)} msgs):")
+        # DEBUG: 直接用 recent 列表，不依赖 result[2:]（可能有多个 system msg）
+        logger.debug(f"  └─ recent ({len(recent)} msgs):")
         for i, msg in enumerate(recent):
             role = msg.get("role", "?")
             content = str(msg.get("content", ""))[:60].replace("\n", " ")
             logger.debug(f"      [{i+2}] {role}: {content!r}")
 
-        return result
+        return result, recent

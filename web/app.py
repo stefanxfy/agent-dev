@@ -12,7 +12,7 @@ import sys
 import uuid
 from pathlib import Path
 
-# ── 配置日志（在加载任何模块之前）──────────────────────────────
+# ── 解析 --log-level（在加载任何模块之前）──────────────────────
 # 用法: python3 -m streamlit run web/app.py -- --log-level=DEBUG
 #       python3 -m streamlit run web/app.py -- --log-level debug
 #       不传默认 INFO
@@ -28,24 +28,17 @@ for i, arg in enumerate(_argv):
         _log_level = getattr(logging, _val.upper(), logging.INFO)
         break
 
-logging.basicConfig(
-    level=_log_level,
-    format='[%(asctime)s] [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%H:%M:%S',
-)
-# 安静第三方库（DEBUG 模式下避免刷屏）
-if _log_level <= logging.DEBUG:
-    for _noisy in ("httpx", "httpcore", "urllib3", "openai", "anthropic",
-                   "watchdog", "git"):
-        logging.getLogger(_noisy).setLevel(logging.WARNING)
-
-# ── 加载 .env 文件（必须在最前面）────────────────────────────
-from dotenv import load_dotenv
-load_dotenv()
-
-# ── 项目根目录加入 sys.path ────────────────────────────────────
+# ── 项目根目录加入 sys.path（须在 import agent_core 之前）────────
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()  # 使用绝对路径
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ── 配置日志：控制台 + 按小时切分的本地文件 logs/app/agent.log ──
+from agent_core.logging_setup import setup_logging
+setup_logging(level=_log_level, log_dir=PROJECT_ROOT / "logs" / "app")
+
+# ── 加载 .env 文件 ────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
 
 # ── 全局常量（必须在 sidebar 之外定义）──────────────────────────
 DATA_DIR = str(PROJECT_ROOT / "data" / "sessions")
@@ -71,6 +64,8 @@ from agent_core.llm.router import (
     UsageStats,
 )
 from agent_core.agent_core import ReactAgent
+from agent_core.config import config as _agent_config  # 解析 AGENT_DATA_DIR
+from agent_core.memory.config import MemoryConfig  # M10 C7.1: 共享实例,line 648 + 719
 from agent_core.session.manager import SessionManager
 from agent_core.session.storage import SessionStorage
 from agent_core.tools.base import ToolRegistry
@@ -83,7 +78,18 @@ if "messages" not in st.session_state:
 if "agent" not in st.session_state:
     st.session_state.agent = None
 if "token_stats" not in st.session_state:
-    st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
+    st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0, "cached": 0}
+# M7 ported: 记忆系统状态
+if "memory_stats" not in st.session_state:
+    st.session_state.memory_stats = {
+        "total_searches": 0,
+        "total_hits": 0,
+        "last_zero_hit_turn": None,
+        "current_turn_hits": 0,
+        "stored_total": 0,
+    }
+if "memory_enabled" not in st.session_state:
+    st.session_state.memory_enabled = True  # 默认启用记忆检索(2026-06-24 改)
 if "current_thinking" not in st.session_state:
     st.session_state.current_thinking = ""
 if "tool_logs" not in st.session_state:
@@ -102,6 +108,16 @@ if "chat_session_id" not in st.session_state:
 
 # ── 侧边栏：LLM 配置 ─────────────────────────────────────────
 with st.sidebar:
+    # M10 C6.5: 降级 banner(任一 MemoryEventKind: BUDGET/TIMEOUT/LOCK/RATE/EXTRACT_ERROR 时显示)
+    ms = st.session_state.get("memory_stats", {})
+    last_err = ms.get("last_extract_error")
+    if last_err:
+        st.error(f"⚠️ 记忆系统降级中: {last_err}")
+        if st.button("🔄 重置", key="reset_degraded_state"):
+            ms["last_extract_error"] = None
+            st.session_state.memory_stats = ms
+            st.rerun()
+
     # ── Token 消耗面板（永久显示） ───────────────────────────────
     stats = st.session_state.token_stats
     total = stats["input"] + stats["output"] + stats["thinking"]
@@ -114,51 +130,131 @@ with st.sidebar:
         )
         if stats["thinking"]:
             st.caption(f"💭 thinking: {stats['thinking']:,}")
+        # P3 cache 命中累计
+        cached_total = stats.get("cached", 0)
+        if cached_total:
+            hit_rate = cached_total / max(stats["input"], 1) * 100
+            st.caption(f"🔥 cache: {cached_total:,} ({hit_rate:.1f}%)")
     else:
         st.caption("📝 发送消息后显示")
 
     st.divider()
+
+    # M7 ported: 🧠 Memory 状态(折叠面板,默认折叠)
+    ms = st.session_state.memory_stats
+    with st.expander("🧠 Memory 状态", expanded=False):
+        st.caption(f"{'✅ 启用' if st.session_state.memory_enabled else '⚪ 未启用'}")
+        new_mem_enabled = st.toggle(
+            "启用记忆检索",
+            value=st.session_state.memory_enabled,
+            help="开启后,每条消息会检索相关记忆注入 system prompt",
+            key="memory_enabled_toggle",
+        )
+        if new_mem_enabled != st.session_state.memory_enabled:
+            st.session_state.memory_enabled = new_mem_enabled
+            st.session_state.agent = None  # 强制重建 agent
+            st.rerun()
+        st.metric("Searches", ms["total_searches"])
+        st.metric("Total Hits", ms["total_hits"])
+        st.metric("Last Turn Hits", ms["current_turn_hits"])
+        if ms["stored_total"]:
+            st.metric("Stored (N)", f"{ms['stored_total']}")
+        if ms["last_zero_hit_turn"]:
+            gap = ms["total_searches"] - ms["last_zero_hit_turn"]
+            st.metric("Last 0-hit", f"{gap} turns ago")
+
+    st.divider()
+
+    # M10 C3.2: 🌙 Auto-dream 蒸馏状态(折叠面板,默认折叠)
+    with st.expander("🌙 Auto-dream", expanded=False):
+        # 关键:用 st.session_state.get("agent") 而不是 get_agent()
+        # sidebar rerun 频繁,不能每次重建 agent
+        agent = st.session_state.get("agent")
+        if agent is None:
+            st.caption("(agent 未初始化)")
+        else:
+            loop = getattr(agent, "_distillation_loop", None)
+            if loop is None:
+                st.caption("(未启动)")
+            else:
+                status = loop.get_status()
+                st.metric("状态", "🟢 跑" if status["running"] else "🔴 停")
+                st.metric("Tick 数", status["tick_count"])
+                st.metric("间隔(s)", status["interval_seconds"])
+                if status["last_tick_at"]:
+                    st.caption(f"上次 tick: {status['last_tick_at']}")
+                # 上次结果详细:succeed / skip reason / error
+                if status["last_result_success"] is True:
+                    run_id = status.get("last_run_id") or "n/a"
+                    st.caption(
+                        f"上次: ✓ {status['last_candidates_count']} 候选 "
+                        f"→ run `{run_id}`"
+                    )
+                elif status["last_result_success"] is False:
+                    skip = status.get("last_skip_reason")
+                    err = status.get("last_error")
+                    if skip:
+                        st.caption(f"上次: ⏭️ skip ({skip})")
+                    elif err:
+                        st.caption(f"上次: ✗ 失败 ({err[:80]})")
+                    else:
+                        st.caption("上次: ✗ 失败")
+                else:
+                    st.caption("尚未跑过")
+
+    # M10 C4.1: 📥 待审候选提醒(折叠面板,默认折叠)
+    # mem_root 与 get_agent() 同口径(config.agent_data_dir or ~/.agent_data)
+    # session_state 不存 mem_root, 这里从 config 现算(sidebar rerun 频繁, 纯读)
+    with st.expander("📥 待审记忆", expanded=False):
+        try:
+            from agent_core.config import config as _agent_config_c4
+            _cand_data_dir = _agent_config_c4.agent_data_dir or str(Path.home() / ".agent_data")
+            _mem_root_for_cand = Path(_cand_data_dir) / "memory"
+        except Exception:
+            _mem_root_for_cand = Path.home() / ".agent_data" / "memory"
+
+        if not _mem_root_for_cand.exists():
+            st.caption("(memory 目录不存在)")
+        else:
+            from agent_core.memory.candidate_actions import list_candidates as _list_cands
+            pending = _list_cands(_mem_root_for_cand)
+            st.caption(f"{len(pending)} 条待审")
+            for _p in pending[:5]:
+                st.caption(f"· {_p.name}")
+            if len(pending) > 5:
+                st.caption(f"... 共 {len(pending)} 条")
+            try:
+                st.page_link("pages/02_Candidate_Review.py", label="查看全部 →")
+            except Exception:
+                # 老 Streamlit 无 page_link → link_button 兜底
+                st.link_button("查看全部 →", "/Candidate_Review")
+
+    # 注(2026-06-26):Runtime Config 改读 .env,详见 .env 中
+    #   MEMORY_RETRIEVAL__MODE / __TOP_K / __SIDE_QUERY_MAX_SELECT
+    #   MEMORY_COST__DAILY_BUDGET_USD
+    # 改完 .env 后重启 streamlit 生效。
+
+    st.divider()
     st.header("⚙️ LLM 配置")
 
-    # 从 .env 读取默认厂商
-    default_provider = os.getenv("DEFAULT_PROVIDER", "zhipu").lower()
-    provider_index = 2  # 默认 zhipu
-    if default_provider in ["anthropic", "openai", "zhipu"]:
-        provider_index = ["anthropic", "openai", "zhipu"].index(default_provider)
+    # provider/model/env_key 列表由 LLMProvider enum 派生,加新厂商无需改 UI
+    from web.llm_options import (
+        get_default_provider_index,
+        get_env_key_for_provider,
+        get_models_for_provider,
+        get_provider_options,
+    )
 
     provider = st.selectbox(
         "厂商",
-        options=["anthropic", "openai", "zhipu"],
-        index=provider_index,
+        options=get_provider_options(),
+        index=get_default_provider_index(),
     )
 
-    model_options = {
-        "anthropic": [
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-            "claude-haiku-4-20250514",
-        ],
-        "openai": [
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "o3-mini",
-        ],
-        "zhipu": [
-            "GLM-5.1",
-            "glm-5-turbo",
-            "GLM-4.7",
-        ],
-    }
-    model = st.selectbox("模型", options=model_options[provider])
+    model = st.selectbox("模型", options=get_models_for_provider(provider))
 
     # API Key
-    env_key_map = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "zhipu": "ZHIPU_API_KEY",
-    }
-    env_key_var = env_key_map.get(provider, "OPENAI_API_KEY")
+    env_key_var = get_env_key_for_provider(provider)
     default_key = os.getenv(env_key_var, "")
     api_key = st.text_input(
         "API Key（留空则使用 .env）",
@@ -359,12 +455,15 @@ with st.sidebar:
                     except Exception as e:
                         logging.warning(f"会话消息数读取失败 (sid={sid}): {e}")
                         msg_count = 0
-                    
+
                     # 一行：加载按钮 + 操作按钮
                     cols = st.columns([4, 1, 1])
                     with cols[0]:
                         label = f"📄 {title} ({msg_count}条)"
-                        help_text = f"{sid}\n最近: {preview}" if preview else sid
+                        help_text = (
+                            f"{sid}\n最近: {preview}"
+                            if preview else f"{sid}"
+                        )
                         if st.button(label, key=f"load_{sid}", help=help_text):
                             if sid != st.session_state.get("chat_session_id"):
                                 if st.session_state.agent is not None:
@@ -428,7 +527,14 @@ with st.sidebar:
     if st.button("🗑️ 清空会话"):
         st.session_state.messages = []
         st.session_state.tool_logs = []
-        st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
+        st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0, "cached": 0}
+        st.session_state.memory_stats = {
+            "total_searches": 0,
+            "total_hits": 0,
+            "last_zero_hit_turn": None,
+            "current_turn_hits": 0,
+            "stored_total": 0,
+        }
         st.session_state.current_thinking = ""
         if st.session_state.agent:
             st.session_state.agent.reset()
@@ -452,6 +558,15 @@ def extract_text(content):
 # ── 初始化 Agent ───────────────────────────────────────────────
 def get_agent(session_id=None):
     """创建或更新 Agent 实例"""
+    # M10 C6.1: 启用 OTel tracer(读 env OTEL_EXPORTER_OTLP_ENDPOINT,
+    # 没设则 NoOp,不破坏 dev 体验)。tracing 失败不阻断 agent。
+    try:
+        from agent_core.memory.tracing import configure_tracing
+        if configure_tracing():
+            logging.info("OTel tracer 启用")
+    except Exception as e:
+        logging.warning(f"configure_tracing 失败: {e}")
+
     config = LLMConfig(
         provider=provider.lower(),
         model=model,
@@ -464,8 +579,156 @@ def get_agent(session_id=None):
     router = LLMRouter(config)
     registry = ToolRegistry()
     register_builtin_tools(registry)
+
+    # M7 ported: 记忆系统 hook(若启用,注入 retriever + store)
+    memory_retriever = None
+    memory_store = None
+    memory_embed_fn = None
+    # Task 8: 严格双通道(react_memory_bridge)在 memory_enabled=True 且
+    # 上游 memory_store/vec_store/embed_fn 全部初始化成功后才构造。
+    react_memory_bridge = None
+    # M10 C7.1: 单一 MemoryConfig 实例必须 hoist 到 memory_enabled 块之前
+    # 因为 ReactAgent(memory_config=...) 在 if 块外(line 719)使用
+    # M11 (2026-06-26):改用 from_env() 读 .env,改完 .env 需重启 streamlit 生效
+    #   MEMORY_RETRIEVAL__MODE / __TOP_K / __SIDE_QUERY_MAX_SELECT
+    #   MEMORY_COST__DAILY_BUDGET_USD
+    memory_config = MemoryConfig.from_env()
+    if st.session_state.get("memory_enabled", False):
+        try:
+            from web.memory_wiring import build_memory_system
+            agent_data_dir = _agent_config.agent_data_dir or str(Path.home() / ".agent_data")
+            mem_root = Path(agent_data_dir) / "memory"
+            chroma_path = Path(agent_data_dir) / "chroma"
+            # M11 修复(2026-06-26):build_memory_system 内部已 hoist MemoryIndex
+            # 并传给 DualChannelWriter,确保写盘后 mark_dirty 触发异步 rebuild
+            bundle = build_memory_system(
+                memory_root=mem_root,
+                chroma_path=chroma_path,
+                llm_config=config,
+                memory_config=memory_config,
+                session_id=session_id or "default",
+            )
+            if bundle is None:
+                raise RuntimeError("build_memory_system 返回 None,见上方 warning")
+            (
+                memory_store,
+                vec_store,
+                memory_embed_fn,
+                memory_retriever,
+                dual_channel,
+                react_memory_bridge,
+                _memory_index,
+            ) = bundle
+        except Exception as e:
+            logging.warning(f"Memory system init failed: {e}")
+            memory_retriever = None
+            memory_store = None
+            memory_embed_fn = None
+            react_memory_bridge = None
+
     # Day 4: 传入 session_id 实现历史持久化
-    agent = ReactAgent(router, registry, max_turns=max_turns, session_id=session_id, session_data_dir=DATA_DIR)
+    # M10 C6.4: 传入 MemoryConfig,UI expander 才能 set_runtime in-place 改字段
+    # M10 C2.2 (2026-06-26):wire SessionMemoryLayer(L3 SM 快路径)
+    #   sm_path = DATA_DIR/<session_id>/sm.md,每个 session 独立
+    #   注入失败 → None fallback,不阻断 agent(测试/学习阶段)
+    # M11.5 (2026-06-27):接真实 LLM callback — make_sm_extract_callback(router=...)
+    #   让 SM extract 调 LLM 真更新 sections(不再是只推进 last_id)
+    session_memory = None
+    if session_id:
+        try:
+            from agent_core.memory.sm_layer import SessionMemoryLayer
+            from agent_core.memory.sm_callback import make_sm_extract_callback
+            # LLMRouter 已在模块级 import(避免 inside-function import 把 LLMRouter
+            # 标记为 local,导致 line 579 提前 reference 报 UnboundLocalError)
+            _sm_dir = Path(DATA_DIR) / session_id
+            _sm_dir.mkdir(parents=True, exist_ok=True)
+            # 独立 router 实例 — 跟 memory 系统的 extractor_router 隔离,
+            # 避免 SM 的 retry/backoff 干扰记忆提取/retrieval
+            # cache_namespace 按 session 隔离,跨 session 不串
+            _sm_router = LLMRouter(config)
+            _sm_callback = make_sm_extract_callback(
+                router=_sm_router,
+                cache_namespace=f"sm_extract_{session_id}",
+                max_retries=2,
+                backoff_base=0.5,
+                on_failure="return_empty",  # callback 失败时返空,sm_layer 走 fallback
+            )
+            session_memory = SessionMemoryLayer(
+                session_id=session_id,
+                sm_path=_sm_dir / "sm.md",
+                config=memory_config.compact,
+                llm_callback=_sm_callback,
+            )
+            logging.info(
+                f"[L3 SM] SessionMemoryLayer 构造成功 session_id={session_id} "
+                f"sm_path={_sm_dir / 'sm.md'} enabled={memory_config.compact.enabled} "
+                f"callback=make_sm_extract_callback(router=LLMRouter(...))"
+            )
+        except Exception as e:
+            logging.warning(f"[L3 SM] SessionMemoryLayer 构造失败,fallback 无 L3: {e}")
+            session_memory = None
+
+    agent = ReactAgent(
+        router, registry,
+        max_turns=max_turns,
+        session_id=session_id,
+        session_data_dir=DATA_DIR,
+        memory_retriever=memory_retriever,    # M7 ported: 检索 + 注入
+        memory_store=memory_store,             # M7 ported: 库内计数
+        react_memory_bridge=react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
+        memory_config=memory_config,           # M10 C6.4 + C7.1: 共享 MemoryConfig 实例
+        session_memory=session_memory,         # M10 C2.2: L3 SM 快路径
+    )
+
+    # M10 C3.1: 启动 DistillationLoop(后台 daemon,10 分钟检查 4 重门)
+    # 用 st.session_state 单例化(避免 Streamlit rerun 每次 leak 一个 daemon 线程)
+    try:
+        from agent_core.memory.distiller import DistillationScheduler
+        from agent_core.memory.scheduler import DistillationLoop
+
+        existing_loop = st.session_state.get("distillation_loop")
+        if existing_loop is None or not getattr(existing_loop, "is_running", False):
+            # mem_root 来自 memory_enabled 分支或 fallback 构造
+            if "mem_root" not in dir():
+                from agent_core.config import config as _agent_config_fb
+                _agent_data_dir = _agent_config_fb.agent_data_dir or str(Path.home() / ".agent_data")
+                mem_root = Path(_agent_data_dir) / "memory"
+            mem_root.mkdir(parents=True, exist_ok=True)
+            # M11.6 (2026-06-27): 接真实 LLM callback(跟 M11.5 SM callback 同模式)
+            # 独立 distill_router 实例,与 SM router + 记忆提取 router 隔离,
+            # 避免 retry/backoff 干扰主对话 / retrieval
+            # cache_namespace 按 mem_root 隔离,跨用户不串
+            try:
+                from agent_core.memory.distill_callback import make_distill_callback
+                _distill_router = LLMRouter(config)
+                _distill_callback = make_distill_callback(
+                    router=_distill_router,
+                    cache_namespace=f"distill_{Path(_agent_config.agent_data_dir or Path.home() / '.agent_data').name}",
+                    max_retries=2,
+                    backoff_base=0.5,
+                    on_failure="return_empty",  # 蒸馏失败返空,scheduler 走 fallback 不抛
+                )
+            except Exception as e:
+                logging.warning(f"distill_callback 构造失败,fallback 无 LLM: {e}")
+                _distill_callback = None
+            distill_scheduler = DistillationScheduler(
+                memory_root=mem_root,
+                llm_callback=_distill_callback,
+            )
+            distill_loop = DistillationLoop(
+                scheduler=distill_scheduler,
+                on_result=lambda r: logging.debug(f"DistillationLoop tick: {r}"),
+            )
+            distill_loop.start(interval_seconds=600)  # 10 min per spec §7
+            st.session_state.distillation_loop = distill_loop
+            logging.info("DistillationLoop 启动: interval=600s")
+    except Exception as e:
+        logging.warning(f"DistillationLoop 启动失败: {e}")
+        # 不阻塞 agent 返回 — loop 失败不应影响 chat
+
+    # 把 loop 挂到 agent(每次 rerun 都重挂,但 loop 实例不变)
+    agent._distillation_loop = st.session_state.get("distillation_loop")
+
     return agent
 
 
@@ -516,7 +779,12 @@ if _loaded_sid != _current_sid and _current_sid:
     try:
         # 直接用 SessionStorage 读取，不创建 SessionManager（避免 _restore_title_state 副作用）
         _storage = SessionStorage(session_id=st.session_state.chat_session_id, data_dir=DATA_DIR)
-        history = _storage.get_messages()
+        # P5 修复：include_compact_summary=False 跳过压缩摘要 user message
+        # 原 bug：add_summary 写入的 type="user" + message.isCompactSummary=True
+        # 主聊天区 UI 加载时，etype in (..., "summary") 判断永不生效
+        # （type 是 "user"），导致 1370 字符的摘要被当成普通用户消息加载
+        # 解决：用 storage 内置 API 在加载阶段就过滤掉
+        history = _storage.get_messages(include_compact_summary=False)
 
         loaded_count = 0
         for entry in history:
@@ -546,11 +814,15 @@ if _loaded_sid != _current_sid and _current_sid:
                 st.session_state.messages.append({"role": "user", "content": text_content})
                 loaded_count += 1
             elif role == "assistant" and text_content:
+                # Day 7：从 entry 顶层取 usage（API 真实 token 统计）
+                # 加载后 sidebar 会话信息面板能直接用这个数字，不用重算
+                entry_usage = entry.get("usage")
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": text_content,
                     "thinking": thinking,
                     "tool_logs": tool_logs,
+                    "usage": entry_usage,  # 可能为 None（老 session）
                 })
                 loaded_count += 1
 
@@ -612,10 +884,14 @@ for msg in st.session_state.messages:
 
         # 显示该条消息的 Token 消耗（如果有）
         msg_usage = msg.get("usage")
-        if msg_usage and (msg_usage.get("input") or msg_usage.get("output")):
-            parts = [f"input={msg_usage['input']:,}", f"output={msg_usage['output']:,}"]
-            if msg_usage.get("thinking"):
-                parts.append(f"thinking={msg_usage['thinking']:,}")
+        if msg_usage and (msg_usage.get("input_tokens") or msg_usage.get("output_tokens")):
+            parts = [f"input={msg_usage['input_tokens']:,}", f"output={msg_usage['output_tokens']:,}"]
+            if msg_usage.get("thinking_tokens"):
+                parts.append(f"thinking={msg_usage['thinking_tokens']:,}")
+            cached = msg_usage.get("cached_tokens", 0)
+            if cached:
+                hit_rate = cached / max(msg_usage["input_tokens"], 1) * 100
+                parts.append(f"🔥cache={cached:,} ({hit_rate:.1f}%)")
             st.caption(f"📊 {' · '.join(parts)}")
 
 
@@ -636,17 +912,47 @@ if prompt := st.chat_input("输入消息..."):
 
     # 调用 Agent（流式）
     with st.chat_message("assistant"):
-        thinking_expander = st.expander("💭 思考过程", expanded=False)
+        # P4 视觉优化：思考用 st.status（自带 spinner + 自动折叠 + 绿勾）
+        # - 思考中：状态 running + 展开，用户能看到流式思考
+        # - 完成后：状态 complete + 自动折叠，不抢占主区
+        thinking_status = st.status(
+            "💭 思考中...",
+            state="running",
+            expanded=True,
+        )
+        thinking_placeholder = thinking_status.empty()
         tool_expander = st.expander("🔧 工具调用", expanded=True)
         tool_status = st.status("🔄 思考中...", expanded=True)
         text_placeholder = st.empty()
         turn_indicator = st.empty()  # P2 新增：Turn 指示器
-        
+
         full_text = ""
-        thinking_text = ""
+        # P5 优化：按 turn 分段累积思考（多轮场景下方便区分 Turn 1/2/3）
+        # turn_thinking[turn_num] = 该轮的 thinking 文本
+        turn_thinking: dict[int, str] = {}
+        current_turn: int = 1  # 默认 turn 1，收到 "Turn N" 事件时更新
         tool_logs = []
         turn_count = 0  # P2 新增：Turn 计数
         last_turn_usage = None  # 每轮 LLM 响应的 usage（用于显示单轮 token 消耗）
+
+        def render_thinking_with_turns(cursor: str = ""):
+            """渲染思考区（带 Turn 标签分隔多轮）
+
+            Args:
+                cursor: 流式光标（流式期间为 "▌"，完成后为空）
+            """
+            if not turn_thinking:
+                return
+            parts = []
+            for tnum in sorted(turn_thinking.keys()):
+                text = turn_thinking[tnum]
+                if not text:
+                    continue
+                parts.append(
+                    f"**🔄 Turn {tnum}**\n\n```text\n{text}{cursor}\n```"
+                )
+            if parts:
+                thinking_placeholder.markdown("\n\n---\n\n".join(parts))
 
         # 逐 chunk 处理
         for msg_type, content in run_agent(prompt):
@@ -654,10 +960,12 @@ if prompt := st.chat_input("输入消息..."):
                 full_text += content
                 text_placeholder.markdown(full_text + "▌")
             elif msg_type == "thinking":
-                thinking_text += content
-                # P2 改进：实时流式显示思考过程
-                with thinking_expander:
-                    thinking_expander.markdown(f"**💭 思考过程**\n\n{thinking_text}▌")
+                # P5：累积到当前 turn 的思考区
+                if current_turn not in turn_thinking:
+                    turn_thinking[current_turn] = ""
+                turn_thinking[current_turn] += content
+                # 重新渲染（带 Turn 标签）
+                render_thinking_with_turns(cursor="▌")
             elif msg_type == "tool_call":
                 # Day 3 支持并行工具调用
                 if content.get("parallel"):
@@ -688,6 +996,11 @@ if prompt := st.chat_input("输入消息..."):
                     turn_count += 1
                     turn_indicator.markdown(f"📍 **Turn {turn_count}**")
                     tool_status.update(label=f"🔄 Turn {turn_count}：思考中...")
+                    # P5：从 "🔄 Turn N/M" 中提取 turn 号，跟踪当前 turn 用于分段 thinking
+                    import re
+                    m = re.search(r"Turn (\d+)/", str(content))
+                    if m:
+                        current_turn = int(m.group(1))
                 elif "回答完成" in str(content):
                     turn_indicator.empty()  # 完成后清除 Turn 指示器
                     tool_status.update(label="✅ 回答完成", state="complete")
@@ -703,17 +1016,83 @@ if prompt := st.chat_input("输入消息..."):
                 stats["input"] += content.input_tokens
                 stats["output"] += content.output_tokens
                 stats["thinking"] += content.thinking_tokens
+                stats["cached"] = stats.get("cached", 0) + (content.cached_tokens or 0)
                 last_turn_usage = content  # 记录本轮最新 usage，用于显示单轮消耗
 
-        # 流式结束：清理 UI
-        text_placeholder.markdown(full_text)
-        thinking_expander.empty()  # 清除流式思考过程
+                # Debug 日志：缓存命中明细
+                hit_rate = (content.cached_tokens or 0) / max(content.input_tokens, 1) * 100
+                logging.debug(
+                    f"🔥 [Cache] in={content.input_tokens:,} · "
+                    f"cached={content.cached_tokens:,} · "
+                    f"hit={hit_rate:.1f}%"
+                )
+            elif msg_type == "memory_status":
+                # M7 ported: 记忆检索状态 → 累积到 session_state.memory_stats
+                ms = st.session_state.memory_stats
+                ms["total_searches"] += 1
+                ms["total_hits"] += int(content.get("hits", 0))
+                ms["current_turn_hits"] = int(content.get("hits", 0))
+                ms["stored_total"] = int(content.get("stored_total", 0))
+                if content.get("zero_hit"):
+                    ms["last_zero_hit_turn"] = ms["total_searches"]
+                logging.debug(
+                    f"🧠 [Memory] hits={content.get('hits', 0)} · "
+                    f"stored={ms['stored_total']} · "
+                    f"zero_hit={content.get('zero_hit', False)}"
+                )
+            elif msg_type == "memory_event":
+                # M9: 严格双通道记忆事件 → 累积到 session_state.memory_stats
+                event = content
+                ms = st.session_state.memory_stats
+                kind = event.kind.value
+                if kind == "extract_dispatched":
+                    ms["candidates_written"] = ms.get("candidates_written", 0) + event.candidates_count
+                elif kind == "gate_pass":
+                    ms["gate_passes"] = ms.get("gate_passes", 0) + 1
+                elif kind == "gate_skip":
+                    ms["gate_skips"] = ms.get("gate_skips", 0) + 1
+                elif kind == "extract_error":
+                    ms["last_extract_error"] = str(event.reason or "unknown")
+                # M10 C6.2 / C6.3: 预算超限 / 超时 → 同样写入 last_extract_error
+                # banner 显示已通用(消费 last_extract_error)
+                elif kind in ("budget_exceeded", "timeout"):
+                    ms["last_extract_error"] = str(event.reason or "unknown")
+                elif kind == "secret_detected":
+                    # M10 C1.2: §14.4 extract_candidates secret sanitize 事件
+                    ms["secrets_redacted"] = ms.get("secrets_redacted", 0) + 1
+                st.session_state.memory_stats = ms
 
-        # P2 改进：结构化显示思考过程
-        with thinking_expander:
-            if thinking_text:
-                st.markdown("**💭 LLM 思考过程**")
-                st.code(thinking_text)
+        # 流式结束：清理 UI
+        # 文本区去掉光标
+        text_placeholder.markdown(full_text)
+
+        # P5 优化：按 turn 分段渲染思考区（带 Turn 标签）
+        # 计算总 thinking 字数（跨所有 turn 求和）
+        total_thinking_chars = sum(len(t) for t in turn_thinking.values())
+        if turn_thinking:
+            # 去掉光标重新渲染（如果某些 turn 仍在 stream 状态）
+            render_thinking_with_turns(cursor="")
+            # 多轮提示 label
+            turn_label = (
+                f"💭 思考过程 · {len(turn_thinking)} 轮 · {total_thinking_chars} 字"
+                if len(turn_thinking) > 1
+                else f"💭 思考过程 · {total_thinking_chars} 字"
+            )
+            thinking_status.update(
+                label=turn_label,
+                state="complete",  # 自动折叠 + 绿勾
+                expanded=False,
+            )
+        else:
+            # 本轮无 thinking（Compact 路径、enable_thinking 未触发、Provider 返回空等）
+            thinking_placeholder.caption(
+                f"💭 本轮未返回思考过程（{model}）"
+            )
+            thinking_status.update(
+                label=f"💭 未返回思考过程（{model}）",
+                state="complete",
+                expanded=False,
+            )
         
         # P2 改进：结构化显示工具调用
         with tool_expander:
@@ -745,11 +1124,11 @@ if prompt := st.chat_input("输入消息..."):
         if last_turn_usage:
             turn_input = last_turn_usage.input_tokens
             turn_output = last_turn_usage.output_tokens
-            turn_thinking = last_turn_usage.thinking_tokens
-            turn_total = turn_input + turn_output + turn_thinking
+            turn_thinking_tokens = last_turn_usage.thinking_tokens
+            turn_total = turn_input + turn_output + turn_thinking_tokens
             st.caption(
                 f"📊 本轮: input={turn_input:,} · output={turn_output:,}"
-                + (f" · thinking={turn_thinking:,}" if turn_thinking else "")
+                + (f" · thinking={turn_thinking_tokens:,}" if turn_thinking_tokens else "")
                 + f" · 累计: input={stats['input']:,} · output={stats['output']:,} · thinking={stats['thinking']:,}"
             )
         else:
@@ -761,15 +1140,20 @@ if prompt := st.chat_input("输入消息..."):
 
     # 保存助手消息（兼容新旧格式）
     # 历史消息中 tool_logs 保持 dict 格式，渲染时按结构化显示
+    # P5 修复：thinking_text 拼自 turn_thinking（多轮 turn 之间用 \n\n 分隔）
+    thinking_text = "\n\n".join(turn_thinking.values()) if turn_thinking else ""
     st.session_state.messages.append({
         "role": "assistant",
         "content": full_text,
         "thinking": thinking_text,
         "tool_logs": tool_logs,
+        # Day 7：schema 跟 jsonl entry.usage 对齐（全名 input_tokens 等），
+        # 加载历史时直接 entry.get("usage") 就能用，无需转换
         "usage": {
-            "input": last_turn_usage.input_tokens if last_turn_usage else 0,
-            "output": last_turn_usage.output_tokens if last_turn_usage else 0,
-            "thinking": last_turn_usage.thinking_tokens if last_turn_usage else 0,
+            "input_tokens": last_turn_usage.input_tokens if last_turn_usage else 0,
+            "output_tokens": last_turn_usage.output_tokens if last_turn_usage else 0,
+            "thinking_tokens": last_turn_usage.thinking_tokens if last_turn_usage else 0,
+            "cached_tokens": last_turn_usage.cached_tokens if last_turn_usage else 0,
         } if last_turn_usage else None,
     })
 

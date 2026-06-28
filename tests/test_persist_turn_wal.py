@@ -1,0 +1,178 @@
+"""
+persist_turn 走 memory_tasks 表测试
+
+Phase 1 / Step 1.2.6 + Phase 4 适配 — TDD 红 → 绿
+
+- 调用 persist_turn → memory_tasks 新增一行(state=NONE)
+- 不再写 JSONL 文件
+- 不再 add_pending / remove_pending
+- 不再 set_cursor
+- 不再有 self.daily_cursor(Phase 4 删,cursors 表已 DROP)
+- 显式 turn_index < max(已写 turn_index) → 幂等跳过(不调 insert_task)
+- turn_index=None → 内部用 max(已写 turn_index) + 1
+- 同 (session, turn) 二次调用 → 幂等不抛
+"""
+import json
+import time
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+
+def _make_writer(tmp_path, **overrides):
+    from agent_core.memory.dual_channel_writer import DualChannelWriter
+    from agent_core.memory.meta_db import MetaDB
+    from agent_core.memory.memory_store import MemoryStore
+    from conftest import FakeEmbedFn
+
+    db = MetaDB(":memory:")
+    store = MemoryStore(tmp_path / "memory")
+    embed = FakeEmbedFn()
+    writer = DualChannelWriter(
+        session_id="s-wal-a",
+        meta_db=db,
+        memory_store=store,
+        vector_store=None,
+        embed_fn=embed,
+        **overrides,
+    )
+    return writer, db
+
+
+def _count_tasks(db, session_id="s-wal-a"):
+    with db.transaction() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM memory_tasks WHERE session_id=?", (session_id,)
+        ).fetchone()[0]
+
+
+def _list_tasks(db, session_id="s-wal-a"):
+    with db.transaction() as conn:
+        rows = conn.execute(
+            "SELECT turn_index, state, user_msg, assistant_resp FROM memory_tasks "
+            "WHERE session_id=? ORDER BY turn_index",
+            (session_id,),
+        ).fetchall()
+    return rows
+
+
+def _count_pending(db, session_id="s-wal-a"):
+    """Phase 4:pending_writes 表已 DROP,总是返回 0"""
+    try:
+        with db.transaction() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM pending_writes WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0  # 表不存在 → 等价 0 行
+
+
+def _count_cursors(db, session_id="s-wal-a"):
+    """Phase 4:cursors 表已 DROP,总是返回 0"""
+    try:
+        with db.transaction() as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM cursors WHERE session_id=?", (session_id,)
+            ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0  # 表不存在 → 等价 0 行
+
+
+class TestChannelAWritesToNewTable:
+    """persist_turn 直接走 memory_tasks"""
+
+    def test_writes_to_memory_tasks(self, tmp_path):
+        writer, db = _make_writer(tmp_path)
+        writer.persist_turn("hi", "hello")
+        rows = _list_tasks(db)
+        assert len(rows) == 1
+        assert rows[0][0] == 1
+        assert rows[0][1] == "NONE"  # persist_turn 刚落盘,未决
+        assert rows[0][2] == "hi"
+        assert rows[0][3] == "hello"
+
+    def test_no_jsonl_file_created(self, tmp_path):
+        """不再写 daily log JSONL 文件"""
+        writer, db = _make_writer(tmp_path)
+        writer.persist_turn("hi", "hello")
+        # 找 .jsonl 文件
+        jsonl_files = list(tmp_path.rglob("*.jsonl"))
+        assert jsonl_files == [], f"不应有 JSONL,但发现: {jsonl_files}"
+
+    def test_no_add_pending_called(self, tmp_path):
+        """不再 add_pending / remove_pending"""
+        writer, db = _make_writer(tmp_path)
+        writer.persist_turn("hi", "hello")
+        assert _count_pending(db) == 0
+
+    def test_no_cursor_table_writes(self, tmp_path):
+        """Phase 4:cursors 表已 DROP,persist_turn 不再写 cursor 行"""
+        writer, db = _make_writer(tmp_path)
+        writer.persist_turn("hi", "hello")
+        assert _count_cursors(db) == 0
+
+    def test_returns_new_turn_index(self, tmp_path):
+        writer, _ = _make_writer(tmp_path)
+        idx = writer.persist_turn("hi", "hello")
+        assert idx == 1  # 第一次写 → turn 1
+
+    def test_sequential_writes_increment_turn(self, tmp_path):
+        writer, db = _make_writer(tmp_path)
+        i1 = writer.persist_turn("a", "A")
+        i2 = writer.persist_turn("b", "B")
+        i3 = writer.persist_turn("c", "C")
+        assert (i1, i2, i3) == (1, 2, 3)
+        assert _count_tasks(db) == 3
+        rows = _list_tasks(db)
+        assert [r[0] for r in rows] == [1, 2, 3]
+
+    def test_explicit_turn_index_advances(self, tmp_path):
+        writer, _ = _make_writer(tmp_path)
+        i1 = writer.persist_turn("a", "A", turn_index=10)
+        i2 = writer.persist_turn("b", "B", turn_index=11)
+        assert (i1, i2) == (10, 11)
+
+    def test_state_field_is_none_after_persist_turn(self, tmp_path):
+        """persist_turn 落盘后,state 应是 NONE(等 extract_candidates 走完后变 PENDING)"""
+        writer, db = _make_writer(tmp_path)
+        writer.persist_turn("x", "y")
+        with db.transaction() as conn:
+            task = conn.execute(
+                "SELECT state FROM memory_tasks WHERE session_id=? AND turn_index=1",
+                ("s-wal-a",),
+            ).fetchone()
+        assert task[0] == "NONE"
+
+
+class TestChannelAIdempotency:
+    """幂等去重 / 跳过"""
+
+    def test_explicit_turn_index_below_max_noop(self, tmp_path):
+        """传 turn_index <= max(已写 turn_index) → 跳过,不入表"""
+        writer, db = _make_writer(tmp_path)
+        writer.persist_turn("first", "1st")
+        # 再用显式小 turn_index 调
+        idx = writer.persist_turn("dup", "dup", turn_index=0)
+        assert idx == 1  # 返回已存在的 max
+        assert _count_tasks(db) == 1  # 没有新行
+        # 验证表里还是 1 行(Step 1.2.7 的 UNIQUE 冲突测试是底层 insert_task 的)
+
+
+class TestChannelANoDailyCursorAttribute:
+    """Phase 4:writer 不再有 daily_cursor 属性(cursors 表已 DROP)"""
+
+    def test_no_daily_cursor_attribute(self, tmp_path):
+        writer, _ = _make_writer(tmp_path)
+        assert not hasattr(writer, "daily_cursor"), (
+            "writer.daily_cursor 应在 Phase 4 删"
+        )
+
+    def test_sequential_writes_track_max_turn_index(self, tmp_path):
+        """连续写入时,从 max(memory_tasks.turn_index) 派生下一个 turn_index"""
+        writer, _ = _make_writer(tmp_path)
+        # 不传 turn_index → 内部用 max+1
+        i1 = writer.persist_turn("a", "A")
+        i2 = writer.persist_turn("b", "B")
+        i3 = writer.persist_turn("c", "C")
+        assert (i1, i2, i3) == (1, 2, 3)

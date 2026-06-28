@@ -1,0 +1,302 @@
+"""
+三级门决策树（v2.1.1 用户调整版）
+参考 docs/memory-system-design.md §3.3.1
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import Optional, Protocol, Any
+
+from agent_core.memory.cost_tracker import BudgetExceeded, CostTracker
+from agent_core.memory.dual_channel_writer import ExtractionCandidate
+from agent_core.memory.latency import LatencyTimeout
+from agent_core.memory.prompt_templates import (
+    EXTRACT_SYSTEM_PROMPT,
+    build_extract_prompt,
+)
+from agent_core.memory.tracing import tracer
+
+logger = logging.getLogger("memory.extraction_gate")
+
+
+def _strip_code_fence(text: str) -> str:
+    """剥掉 LLM 输出的 ```json ... ``` markdown 代码块 fence。
+
+    背景:即使 prompt 明确要求"严格按 schema 输出 JSON",
+    LLM(GPT-4 / Claude / GLM) 仍倾向于把 JSON 包在 ```json ... ``` 里。
+    不剥掉的话 json.loads 在首个反引号字符处 fail。
+
+    容忍 3 种格式:
+    1. ```json\\n{...}\\n```        带语言标签
+    2. ```\\n{...}\\n```            无语言标签
+    3. 纯 JSON(无 fence)            原样返回
+
+    边界:
+    - 多余的前后空白仍 strip
+    - 嵌套的 ``` 不处理(LLM 不会输出嵌套 fence)
+    """
+    s = text.strip()
+    # 模式 1/2:以 ``` 开头且以 ``` 结尾
+    if s.startswith("```") and s.endswith("```"):
+        # 去掉首尾 3 反引号(中间可带语言标签如 "json")
+        inner = s[3:-3]
+        # 去掉首行的语言标签(例如 "json\n")
+        if "\n" in inner:
+            first_line, rest = inner.split("\n", 1)
+            # 若是语言标签(单词字符,无空格/标点),整行丢掉
+            if first_line.strip() and first_line.strip().replace("-", "").replace("+", "").isalnum():
+                inner = rest
+        return inner.strip()
+    # 模式 3:无 fence,原样返回(去掉首尾空白)
+    return s
+
+
+@dataclass
+class TurnContext:
+    session_id: str
+    cumulative_tokens: int
+    cumulative_tool_calls: int
+    last_messages: list[dict]
+
+
+@dataclass
+class Decision:
+    should_extract: bool
+    reason: str
+    confidence: float = 0.0
+    candidates: list[ExtractionCandidate] = field(default_factory=list)
+    via_gate1: bool = False
+
+
+class _LLMRouterProtocol(Protocol):
+    """LLM router 最小接口(本类只用 chat)"""
+    config: Any
+
+    def chat(self, messages: list[dict], **kw): ...
+
+
+class _MemoryStoreProtocol(Protocol):
+    """本类只用 list_by_session"""
+    def list_by_session(self, session_id: str, since_turn: int) -> list[dict]: ...
+
+
+class ExtractionGate:
+    """三级门 OR 关系决策树(§3.3.1)"""
+
+    MIN_TOKENS_TO_INIT = 10_000
+    MIN_TOOL_CALLS = 10
+    MIN_CONFIDENCE = 0.6
+    CACHE_NAMESPACE = "memory_extract_score"
+
+    KEYWORDS = [
+        "记住", "记一下", "帮我记住", "别忘了",
+        "偏好", "决策", "选择", "拒绝", "采用",
+        "教训", "经验", "原则",
+        "总是", "从不", "永远", "习惯",
+    ]
+
+    def __init__(
+        self,
+        llm_router: _LLMRouterProtocol,
+        memory_store: _MemoryStoreProtocol,
+        session_id: str,
+        cache_namespace: Optional[str] = None,
+        cost_tracker: Optional[CostTracker] = None,  # M10 C6.2
+    ):
+        self.llm_router = llm_router
+        self.memory_store = memory_store
+        self.session_id = session_id
+        self.cache_namespace = cache_namespace or self.CACHE_NAMESPACE
+        self._cost_tracker = cost_tracker  # M10 C6.2
+        self._latency_timeout = 30.0  # M10 C6.3 (秒,2026-06-24 调到 30 适配长 prompt)
+
+    def should_extract(self, ctx: TurnContext) -> Decision:
+        with tracer.start_as_current_span("memory.extract.gate") as span:
+            span.set_attribute("memory.gate.session_id", ctx.session_id)
+            span.set_attribute("memory.gate.cumulative_tokens", ctx.cumulative_tokens)
+            span.set_attribute("memory.gate.cumulative_tool_calls", ctx.cumulative_tool_calls)
+
+            gate1_pass = (
+                ctx.cumulative_tokens >= self.MIN_TOKENS_TO_INIT
+                or ctx.cumulative_tool_calls >= self.MIN_TOOL_CALLS
+            )
+            gate2_pass = self._keyword_filter(ctx.last_messages)
+            span.set_attribute("memory.gate.gate1_pass", gate1_pass)
+            span.set_attribute("memory.gate.gate2_pass", gate2_pass)
+            logger.debug(
+                f"gate: session={ctx.session_id} "
+                f"gate1(阈值)={gate1_pass} "
+                f"(tokens={ctx.cumulative_tokens}>={self.MIN_TOKENS_TO_INIT} "
+                f"or tools={ctx.cumulative_tool_calls}>={self.MIN_TOOL_CALLS}) "
+                f"| gate2(关键词)={gate2_pass}"
+            )
+
+            if not (gate1_pass or gate2_pass):
+                decision = Decision(
+                    should_extract=False,
+                    reason="no_trigger(gate1_no_threshold, gate2_no_keyword)",
+                    via_gate1=False,
+                )
+            else:
+                # 门3:LLM 评分
+                logger.debug("gate: 门1/2 触发 → 进入门3 LLM 评分")
+                decision = self._llm_score(ctx, via_gate1=gate1_pass and not gate2_pass)
+
+            span.set_attribute("memory.gate.should_extract", decision.should_extract)
+            span.set_attribute("memory.gate.reason", decision.reason)
+            logger.debug(
+                f"gate: 决策 should_extract={decision.should_extract} "
+                f"reason={decision.reason!r} confidence={decision.confidence} "
+                f"candidates={len(decision.candidates)}"
+            )
+            return decision
+
+    def _keyword_filter(self, last_messages: list[dict]) -> bool:
+        text = " ".join(
+            m.get("content", "")
+            for m in last_messages
+            if isinstance(m.get("content"), str)
+        )
+        return any(kw in text for kw in self.KEYWORDS)
+
+    def _llm_score(self, ctx: TurnContext, *, via_gate1: bool) -> Decision:
+        """门3:LLM 一次调用,既评分又提取(§3.3 L1 合并)
+
+        去重已下沉到写盘前的语义去重(向量召回 + 阈值/LLM 判定),
+        这里不再拉「已有记忆」喂 prompt —— LLM 只管从本轮对话提取。
+        """
+        turns_text = "\n".join(
+            f"[turn {i}] {m.get('content', '')[:200]}"
+            for i, m in enumerate(ctx.last_messages)
+        )
+
+        prompt = build_extract_prompt(turns_text)
+        logger.debug(f"门3: 调 LLM 评分 prompt[{len(prompt)}] chars")
+
+        # 调 LLM(用 cache_namespace 隔离)
+        try:
+            text = self._call_llm(prompt)
+        except (BudgetExceeded, LatencyTimeout):
+            # M10 C6.2/C6.3: 让上层 bridge 转为 BUDGET_EXCEEDED/TIMEOUT MemoryEvent,
+            # 不要 swallow 成 llm_call_error(...)
+            raise
+        except Exception as e:
+            logger.warning(f"LLM 评分调用失败: {e}")
+            return Decision(
+                should_extract=False,
+                reason=f"llm_call_error({type(e).__name__})",
+                via_gate1=via_gate1,
+            )
+
+        # 解析 JSON
+        # LLM 常把 JSON 包在 ```json ... ``` 代码块里(即使 prompt 要求"严格按 schema 输出 JSON")。
+        # 剥掉外层 fence 后再 parse,容忍 fence / 无 fence 两种格式。
+        try:
+            data = json.loads(_strip_code_fence(text))
+        except json.JSONDecodeError as e:
+            logger.warning(f"LLM 评分解析失败: {e}, raw={text[:200]!r}")
+            return Decision(
+                should_extract=False,
+                reason=f"parse_error({e})",
+                via_gate1=via_gate1,
+            )
+
+        confidence = float(data.get("confidence", 0.0))
+        should = bool(data.get("should_extract", False))
+        raw_candidates = data.get("candidates", [])
+        logger.debug(
+            f"门3: LLM 返回 confidence={confidence:.2f} should_extract={should} "
+            f"raw_candidates={len(raw_candidates)} "
+            f"(MIN_CONFIDENCE={self.MIN_CONFIDENCE})"
+        )
+
+        candidates = [
+            ExtractionCandidate(
+                type=c.get("type", "user"),
+                title=c.get("title", ""),
+                body=c.get("body", ""),
+                source_quote=c.get("source_quote", ""),
+                tags=[],
+                score=confidence,
+            )
+            for c in raw_candidates
+        ]
+
+        if confidence < self.MIN_CONFIDENCE:
+            return Decision(
+                should_extract=False,
+                reason=f"low_confidence({confidence:.2f})",
+                confidence=confidence,
+                via_gate1=via_gate1,
+            )
+
+        if not should or not candidates:
+            return Decision(
+                should_extract=False,
+                reason=f"llm_says_no({data.get('reason', 'no_reason')})",
+                confidence=confidence,
+                via_gate1=via_gate1,
+            )
+
+        return Decision(
+            should_extract=True,
+            reason="extract",
+            confidence=confidence,
+            candidates=candidates,
+            via_gate1=via_gate1,
+        )
+
+    def _call_llm(self, prompt: str) -> str:
+        """调 LLM,收集 text_delta(M10 C6.2 + C6.3 加守卫)
+
+        顺序: budget check → timeout wrap → cost accumulate
+        """
+        # M10 C6.2: 预算检查
+        if self._cost_tracker:
+            budget_err = self._cost_tracker.check_budget()
+            if budget_err is not None:
+                raise budget_err
+
+        # M10 C6.3: timeout wrap(走 ThreadPoolExecutor)
+        text = ""
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(self._do_llm_call, prompt)
+                text = future.result(timeout=self._latency_timeout)
+        except concurrent.futures.TimeoutError:
+            raise LatencyTimeout(self._latency_timeout)
+
+        # M10 C6.2: 累计 cost(chars/4 粗略估算)
+        if self._cost_tracker:
+            input_tokens = len(prompt) // 4
+            output_tokens = len(text) // 4
+            self._cost_tracker.add(input_tokens, output_tokens)
+
+        return text
+
+    def _do_llm_call(self, prompt: str) -> str:
+        """_call_llm 的非 timeout 版本(给 ThreadPoolExecutor 调)
+
+        必须独立成方法:lambda/局部函数不能被 pickle
+        """
+        text = ""
+        for chunk in self.llm_router.chat(
+            messages=[
+                {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            cache_namespace=self.cache_namespace,
+        ):
+            if chunk.text_delta:
+                text += chunk.text_delta.text
+        return text
+
+    def set_cost_tracker(self, new_tracker: "CostTracker") -> None:
+        """M10 C6.4: 运行时替换 cost_tracker(避免 UI 戳穿 _cost_tracker 私有属性)。
+
+        不做迁移旧 total / reset 等 — YAGNI。要重置总额时由 UI 显式 new 一个。
+        """
+        self._cost_tracker = new_tracker

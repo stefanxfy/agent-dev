@@ -66,11 +66,14 @@ with st.sidebar:
     
     st.divider()
     
-    # LLM 配置
+    # LLM 配置(provider 列表由 LLMProvider enum 派生)
+    from web.llm_options import get_provider_options
+
     st.subheader("LLM 配置")
-    provider = st.selectbox("Provider", ["anthropic", "openai", "zhipu"], index=0)
-    model = st.text_input("Model", value="claude-3-7-sonnet-20250219" if provider == "anthropic" else "")
-    api_key = st.text_input("API Key", type="password")
+    # 显式 key= 让 session_state 可预测 (避免 value= 切换时 widget 状态被清)
+    provider = st.selectbox("Provider", get_provider_options(), index=0, key="chat_provider")
+    model = st.text_input("Model", value="claude-3-7-sonnet-20250219" if provider == "anthropic" else "", key="chat_model")
+    api_key = st.text_input("API Key", type="password", key="chat_api_key")
     temperature = st.slider("Temperature", 0.0, 1.0, 0.7)
     max_tokens = st.number_input("Max Tokens", value=4096)
     
@@ -244,7 +247,11 @@ if user_input:
 
 with st.expander("🔧 调试信息"):
     st.write("**Session ID:**", st.session_state.chat_session_id)
+    st.write("**Sidebar Model (session_state):**", model)
+    st.write("**Sidebar Provider (session_state):**", provider)
     if agent:
         st.write("**Agent Session ID:**", agent.session_id)
         st.write("**History Length:**", len(agent.messages))
-        st.write("**LLM Provider:**", agent.llm.config.provider)
+        st.write("**LLM Provider (agent):**", agent.llm.config.provider)
+        st.write("**LLM Model (agent):**", agent.llm.config.model)
+        st.write("**LLM Base URL (agent):**", agent.llm.config.base_url)

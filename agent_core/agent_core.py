@@ -27,6 +27,7 @@ import concurrent.futures
 import json
 import logging
 import time
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from .llm.router import (
@@ -42,14 +43,41 @@ from .tools.base import ToolRegistry
 # Day 5: 上下文管理器
 from .context.manager import ContextManager as CM
 
+# M10 C2.1: L3 SessionMemoryLayer 快路径(字符串前向引用避免循环 import)
+from .memory.sm_layer import TurnContext as _TurnContext  # noqa: E402,F401
+try:
+    from .memory.sm_layer import SessionMemoryLayer as _SessionMemoryLayer  # type: ignore # noqa: F401,E402
+except ImportError:  # pragma: no cover
+    _SessionMemoryLayer = None  # type: ignore[assignment]
+
 # ── Debug 日志配置 ───────────────────────────────────────────────
 
 # 创建 logger（使用单例模式防止重复配置）
 _logger = logging.getLogger("react_agent")
 
+# Bug 1e:表示「回答被截断、未完整收尾」的终止原因(跨 provider)。
+# Anthropic 用 max_tokens,OpenAI 兼容用 length。命中这些 → 本轮回答不完整,
+# 不提取记忆(避免把半句话存成记忆)。未知/None 的 stop_reason 不拦(向后兼容)。
+_TRUNCATED_STOP_REASONS = {"max_tokens", "length"}
+
 # 日志统一走 root handler（由 web/app.py basicConfig 配置）
 # agent_core 不再自建 handler，避免 propagate 导致重复输出
 _logger.setLevel(logging.DEBUG)  # 自己放开 DEBUG，由 root handler 的 level 控制是否输出
+
+
+# M11: TRUSTING_RECALL_SECTION 独立 H2 段
+# 借鉴 Claude Code: 提醒 LLM 在依据记忆做推荐前,先验证文件/函数/flag 是否仍存在。
+# 记忆是过去的快照,不能假定当下仍为真。
+TRUSTING_RECALL_SECTION = """
+## Before recommending from memory
+
+A memory that names a specific function, file, or flag is a claim that it existed *when the memory was written*. It may have been renamed, removed, or never merged. Before recommending it:
+- If the memory names a file path: check the file exists.
+- If the memory names a function or flag: grep for it.
+- If the user is about to act on your recommendation (not just asking about history), verify first.
+
+"The memory says X exists" is not the same as "X exists now."
+"""
 
 
 def _format_messages_for_log(messages: list) -> str:
@@ -150,22 +178,47 @@ class ReactAgent:
         max_context_tokens: int = 100_000,  # Day 3: Token 预算（已被 ContextManager 替代，保留向后兼容）
         session_id: Optional[str] = None,   # Day 4: 会话 ID（可选）
         session_data_dir: Optional[str] = None,  # Day 4: session 数据目录
+        memory_retriever: Optional["MemoryRetriever"] = None,  # M7 ported: 记忆检索
+        memory_store: Optional["MemoryStore"] = None,           # M7 ported: 库内计数
+        react_memory_bridge: Optional["ReactMemoryBridge"] = None,  # Task 7: 双通道记忆桥接器(取代 Option C)
+        session_memory: Optional["SessionMemoryLayer"] = None,  # M10 C2.1: L3 SM 快路径
+        memory_config: Optional["MemoryConfig"] = None,  # M10 C6.4: 运行时切换 hook(set_runtime 用)
     ):
         self.llm = llm_router
         self.tools = tool_registry
         self.max_turns = max_turns
         self.max_context_tokens = max_context_tokens  # 保留向后兼容
         self.messages: list[dict] = []  # 当前对话消息列表（对齐 Claude Code messages: Message[]）
-        
+
         # Day 5: ContextManager（替代 _trim_messages）
         self.context_manager = CM(
             llm_router=llm_router,
             model=getattr(llm_router.config, 'model', 'glm-4'),
         )
-        
+
         # P2 新增：从 LLMConfig 读取 system_prompt
         self.system_prompt = self.llm.config.system_prompt
-        
+
+        # M7 ported: 记忆系统 hooks(若注入,则每次 LLM 调用前检索 + 推送 memory_status)
+        self.memory_retriever = memory_retriever
+        self.memory_store = memory_store
+        # Task 7: 双通道记忆桥接器(取代 Option C,run() 末尾调 bridge.on_turn_end)
+        self.react_memory_bridge = react_memory_bridge
+        # M10 C2.1: L3 SM 快路径(可选注入,None 时走 ContextManager 传统路径)
+        self.session_memory = session_memory
+        # M10 C6.4: 运行时配置切换 hook — UI expander 用 set_runtime 改字段不重建 agent
+        self.memory_config = memory_config  # type: ignore[assignment]
+        # M11: MEMORY.md 物理索引(L1 启动加载 + 写盘后异步 rebuild)
+        self.memory_index = None
+        if memory_store is not None:
+            try:
+                from agent_core.memory.memory_index import MemoryIndex
+                self.memory_index = MemoryIndex(memory_store.root)
+                self.memory_index.rebuild()  # lazy rebuild 兜底
+            except Exception as e:
+                _logger.warning(f"MEMORY.md lazy rebuild 失败: {e}")
+        # M11: 已展示过的记忆 rel_path 集合(用于 sideQuery 去重)
+        self._surfaced_memories: set[str] = set()
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
         if session_id:
@@ -182,6 +235,168 @@ class ReactAgent:
         self._pending_thinking: str = ""
         self._pending_tool_logs: list = []
         self._pending_tool_results: list = []  # [(tool_use_id, output), ...]
+        # Day 7 改进：记录本轮 LLM 返回的 usage 统计，用于持久化到 jsonl
+        # 解决 F5 刷新后 baseline 从 API 真实值（33,345）跳变到字面估算（58,406）的 bug
+        self._last_turn_usage: Optional[UsageStats] = None
+
+        # Day 7 改进：从 session 历史最后一条带 usage 的 entry 恢复 baseline
+        # 优先级：API 真实数字 > 字面估算。F5 刷新后仍能保持 33,345 而不是 58,406。
+        self._restore_usage_baseline()
+
+        # M10 C3.1: DistillationLoop 注入位(由 web/app.py:get_agent() 挂上)
+        self._distillation_loop: Optional["DistillationLoop"] = None
+
+    def _restore_usage_baseline(self):
+        """
+        从 jsonl 历史最后一条带 usage 的 entry 恢复 context_manager baseline。
+
+        为什么需要：
+        - F5 刷新后，agent 重建会重新走 _estimate_used_tokens 字面估算路径
+        - 字面估算不准（灌水内容 SimpleTokenCounter 高估 ~43%）
+        - 如果 jsonl 最后一条 entry 里有 usage 字段（API 返回的 input_tokens），
+          用真实数字作 baseline，0 跳变。
+
+        复杂度：O(1) read_tail(64KB) 快路径 + O(n) read_entries() 兑底。
+        - 99% 场景：read_tail 一次搞定（O(1)）
+        - 1% 场景（灌水 entry > 64KB 在结尾）：fallback 到全量扫（O(n)）
+
+        兼容性：
+        - 老 jsonl（没 usage 字段）：entry.get("usage") 返回 None，fallback 到原路径
+        - 新 jsonl（有 usage 字段）：用 API 真实数字
+        - 天然平滑升级，无需迁移脚本
+        """
+        if not self.context_manager or not self._session_manager:
+            return
+
+        try:
+            from .session.storage import SessionStorage
+            storage = self._session_manager.storage
+
+            # 快路径：O(1) tail 64KB 窗口
+            try:
+                tail_entries = storage.read_tail(kb=64)
+            except Exception:
+                tail_entries = []
+
+            for entry in reversed(tail_entries):
+                usage = entry.get("usage")
+                if usage and usage.get("input_tokens"):
+                    # entry 是最后一条 assistant，它的 input_tokens 不含自己
+                    # 刷新后 self.messages 包含这条，所以 baseline_msg_count = len - 1
+                    msg_count = len(self.messages) - 1
+                    self.context_manager.set_baseline(
+                        usage["input_tokens"],
+                        msg_count,
+                    )
+                    _logger.debug(
+                        f"🔄 [Restore O(1)] baseline={usage['input_tokens']:,} "
+                        f"msg_count={msg_count} "
+                        f"from tail (uuid={entry.get('uuid', '?')[:8]})"
+                    )
+                    return
+
+            # Fallback：tail 没找到（灌水 entry > 64KB 或老 jsonl 无 usage）
+            # 降级到全量扫，极少触发
+            all_entries = storage.read_entries(include_compact_boundary=True)
+            for entry in reversed(all_entries):
+                usage = entry.get("usage")
+                if usage and usage.get("input_tokens"):
+                    msg_count = len(self.messages) - 1
+                    self.context_manager.set_baseline(
+                        usage["input_tokens"],
+                        msg_count,
+                    )
+                    _logger.debug(
+                        f"🔄 [Restore fallback] baseline={usage['input_tokens']:,} "
+                        f"msg_count={msg_count} "
+                        f"from full scan (uuid={entry.get('uuid', '?')[:8]})"
+                    )
+                    return
+
+            _logger.debug("🔄 [Restore] no usage in history, baseline stays 0")
+        except Exception as e:
+            _logger.debug(f"🔄 [Restore] failed (silent fallback): {e}")
+
+    # ── M11 L1: MEMORY.md 启动加载 ────────────────────────────────
+
+    def _build_system_prompt_with_memory(self) -> str:
+        """M11 L1:启动加载 MEMORY.md + 拼到 system prompt(独立 H1 段)
+
+        借鉴 Claude Code appendSystemPrompt:
+        - base system prompt 在前
+        - MEMORY.md 内容作为独立 H1 段追加(若有)
+        - 末尾追加 TRUSTING_RECALL_SECTION H2 段(无论是否有 index 都加)
+        - 加载失败 → base + TRUSTING_RECALL_SECTION,不抛
+        """
+        base = self.system_prompt or ""
+        if self.memory_index is None:
+            return base + "\n" + TRUSTING_RECALL_SECTION
+        try:
+            index_content = self.memory_index.load_index()
+        except Exception as e:
+            _logger.warning(f"MEMORY.md 加载失败,跳过: {e}")
+            return base + "\n" + TRUSTING_RECALL_SECTION
+        if not index_content:
+            return base + "\n" + TRUSTING_RECALL_SECTION
+        return f"{base}\n\n{index_content}\n\n{TRUSTING_RECALL_SECTION}"
+
+    # ── M11: 检索 wiring(从 .env → memory_config → retriever.search) ──
+
+    def _call_memory_retriever(self, query: str):
+        """调 memory_retriever.search(),mode/top_k 从 self.memory_config 读。
+
+        为什么独立成方法(2026-06-26 修复):
+        - 之前直接 inline 在 run() 里 hardcode top_k=5、不传 mode,
+          导致 .env 里 MEMORY_RETRIEVAL__MODE / __TOP_K 改了不生效
+        - 抽成方法后单测可验证 wiring,且未来加 side_query 二次精选 hook 也有落点
+
+        Args:
+            query: 用户消息文本
+
+        Returns:
+            retriever.search() 返回值(通常是 RetrievalReport)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        if self.memory_config is not None:
+            mode = self.memory_config.retrieval.mode
+            top_k = self.memory_config.retrieval.top_k
+            cfg_min_score = self.memory_config.retrieval.min_score
+        else:
+            # 向后兼容:老 caller 不传 memory_config
+            mode = "semantic"
+            top_k = 5
+            cfg_min_score = 0.3
+        logger.debug(
+            f"[_call_memory_retriever] query={query!r} (len={len(query)}) | "
+            f"resolved mode={mode!r} top_k={top_k} min_score={cfg_min_score} | "
+            f"already_surfaced_count={len(self._surfaced_memories)} "
+            f"already_surfaced_paths={list(self._surfaced_memories)[:5]}"
+            f"{'...' if len(self._surfaced_memories) > 5 else ''}"
+        )
+        return self.memory_retriever.search(
+            query,
+            top_k=top_k,
+            mode=mode,
+            already_surfaced=self._surfaced_memories,
+        )
+
+    def _messages_with_ids(self) -> list[dict]:
+        """M11 (2026-06-26):给 self.messages 注入 stable id(仅当 m 无 id)。
+
+        背景:sm_layer._slice_kept_messages 通过 m.get("id") 找 last_id,
+        但 self.messages 只有 {role, content} 没有 id,导致 _slice_kept
+        永远走 last_id is None 全返路径,SM 实际上丢不掉任何消息。
+
+        实现:enumerate 索引当 id ("m0", "m1", ...)。纯运行时,不写盘不持久化。
+        caller 拿到结果后用完即弃,id 字段不要回写到 self.messages。
+        """
+        out = []
+        for i, m in enumerate(self.messages):
+            if "id" not in m:
+                m = {**m, "id": f"m{i}"}
+            out.append(m)
+        return out
 
     # ── Token 估算（粗略）──────────────────────────────────────────────
 
@@ -289,42 +504,192 @@ class ReactAgent:
 
         # Day 5：用 ContextManager 替代 _trim_messages
         # 检查 token 预算，必要时自动压缩
-        compacted, compact_result = self.context_manager.check_and_compact(self.messages)
-        if compact_result:
-            if compact_result.success:
-                self.messages = compacted
-                _logger.info(f"Context compacted: {compact_result.summary_str()}")
+        # Fork 模式：传入主 agent 的 system_prompt + tools，复用 cache prefix
+        tool_schemas = self.tools.list_schemas(provider=self._detect_provider())
 
-                # 对齐 Claude Code buildPostCompactMessages 单一构造点
-                # 顺序: boundary → summary → preserved head
-                # 之前 P0 bug: 只写了 boundary + summary 两方法，preserved head 6 条不写盘
-                # 现场: data/sessions/7f071c62.jsonl
-                if self._session_manager:
-                    try:
-                        self._persist_compacted_messages(self.messages, compact_result)
-                    except Exception as e:
-                        _logger.warning(f"Failed to persist compaction to session: {e}")
+        # M10 C2.1: L3 SM 快路径决策(§4.3/§4.4)
+        # 在 ContextManager 之前先问 SM:命中 sm_compact 走零 LLM 快路径
+        # 否则 fallback 到 ContextManager(原有逻辑)
+        sm_compact_used = False
+        if self.session_memory is not None:
+            try:
+                # M11 (2026-06-26):_slice_kept_messages 通过 m.get("id") 找 last_id
+                # 但 self.messages 里只有 {role, content} 没有 id,导致 _slice_kept
+                # 永远走 last_id is None 全返路径,SM 实际上无法丢消息
+                # 修复:在传给 SM 之前用 enumerate 注入 stable id(仅当 m 无 id)
+                msgs_with_id = self._messages_with_ids()
 
-                yield ("system", f"📦 上下文已压缩: {compact_result.tokens_freed:,} tokens 释放")
-            else:
-                _logger.warning(f"Context compact failed: {compact_result.error}")
-                # 压缩失败时回退到旧的截断策略
-                self._trim_messages()
+                total_tokens = sum(
+                    self._estimate_message_tokens(m) for m in self.messages
+                )
+                tool_count = getattr(self, "cumulative_tool_calls", 0)
+                ctx = _TurnContext(
+                    messages=msgs_with_id,
+                    total_tokens=total_tokens,
+                    tool_count=tool_count,
+                )
+                _logger.debug(
+                    f"[L3 SM] 决策入口: msgs={len(msgs_with_id)} total_tokens={total_tokens} "
+                    f"tool_count={tool_count} | "
+                    f"sm_path={self.session_memory.sm_path} | "
+                    f"sm.last_compacted_msg_id={self.session_memory.last_compacted_msg_id}"
+                )
+                decision = self.session_memory.should_trigger_compact(ctx)
+                _logger.debug(
+                    f"[L3 SM] 决策结果: strategy={decision.strategy} reason={decision.reason!r} "
+                    f"timeout_ms={decision.timeout_ms}"
+                )
+                if decision.strategy == "sm_compact":
+                    sm_result = self.session_memory.compact(
+                        msgs_with_id,
+                        context_window=self.max_context_tokens,
+                    )
+                    if sm_result is not None:
+                        # SM 压缩成功:替换 messages
+                        # kept_messages 是 msgs_with_id 的子集,剥离注入的 id(避免污染
+                        # 后续 self.messages 持久化逻辑;id 是 SM 内部用)
+                        kept = [
+                            {k: v for k, v in m.items() if k != "id"}
+                            for m in sm_result.kept_messages
+                        ]
+                        self.messages = [sm_result.summary_message] + kept
+                        sm_compact_used = True
+                        _logger.info(
+                            f"SM-compact OK: ~{sm_result.used_tokens_estimate} tokens estimated"
+                        )
+                        _logger.debug(
+                            f"[L3 SM] 应用 compact 结果: "
+                            f"summary_message.role={sm_result.summary_message['role']!r} "
+                            f"summary_chars={len(sm_result.summary_message['content'])} | "
+                            f"kept_count={len(sm_result.kept_messages)} "
+                            f"self.messages 新长度={len(self.messages)}"
+                        )
+                        yield (
+                            "system",
+                            f"📦 [L3 fast path] 上下文已压缩(SM 文件): ~{sm_result.used_tokens_estimate} tokens",
+                        )
+                    else:
+                        _logger.debug(
+                            f"[L3 SM] compact() 返 None(SM 文件不可用),fallback ContextManager"
+                        )
+                    # else: SM 返回 None → fallback 走 ContextManager
+                elif decision.strategy == "wait":
+                    # 等 extraction 完成(本期简化:记 log,fallback ContextManager)
+                    _logger.info(
+                        f"[L3 SM] wait: {decision.reason} timeout_ms={decision.timeout_ms}, "
+                        f"fallback ContextManager"
+                    )
+                elif decision.strategy == "traditional":
+                    _logger.debug(
+                        f"[L3 SM] strategy=traditional fallback ContextManager "
+                        f"(reason={decision.reason!r})"
+                    )
+            except Exception as e:
+                # SM 决策/压缩异常 → 安全回退到 ContextManager
+                _logger.warning(f"SM fast path 异常,fallback ContextManager: {e}")
+
+        if not sm_compact_used:
+            compacted, compact_result = self.context_manager.check_and_compact(
+                self.messages,
+                parent_system=self.system_prompt,
+                parent_tools=tool_schemas or None,
+                parent_messages=self.messages,
+            )
+            if compact_result:
+                if compact_result.success:
+                    self.messages = compacted
+                    _logger.info(f"Context compacted: {compact_result.summary_str()}")
+
+                    # 对齐 Claude Code buildPostCompactMessages 单一构造点
+                    # 顺序: boundary → summary → preserved head
+                    # 之前 P0 bug: 只写了 boundary + summary 两方法，preserved head 6 条不写盘
+                    # 现场: data/sessions/7f071c62.jsonl
+                    if self._session_manager:
+                        try:
+                            self._persist_compacted_messages(self.messages, compact_result)
+                        except Exception as e:
+                            _logger.warning(f"Failed to persist compaction to session: {e}")
+
+                    yield ("system", f"📦 上下文已压缩: {compact_result.tokens_freed:,} tokens 释放")
+                else:
+                    _logger.warning(f"Context compact failed: {compact_result.error}")
+                    # 压缩失败时回退到旧的截断策略
+                    self._trim_messages()
         # Day 3 旧逻辑（保留作为 fallback）
         # self._trim_messages()
+
+        # Task 7 (Path A): 跟踪最后一轮的 usage/tool_calls,供 run 末尾调 bridge.on_turn_end 使用
+        last_turn: int = 0
+        last_input_tokens: int = 0
+        last_output_tokens: int = 0
+        last_tool_calls: list = []
+        # Bug 1e 修复(2026-06-24):只有本轮真正走到"最终文本回答"分支(无 tool_call、
+        # 正常收尾)才记下这条文本。None 表示本轮没有完整回答(还在工具循环里被
+        # max_turns 截断 / 中断),此时末尾不调 on_turn_end,避免拿 reversed 扫描误配
+        # 到上一轮的回答。
+        final_answer: Optional[str] = None
+        # 收尾那一轮的终止原因(end_turn/stop=正常,max_tokens/length=被截断)。
+        # 用于在「无 tool_call 但被 max_tokens 截断」时也跳过提取。
+        final_stop_reason: Optional[str] = None
 
         for turn in range(1, self.max_turns + 1):
             yield ("system", f"🔄 Turn {turn}/{self.max_turns}")
 
             # ── 准备发送给 LLM 的 messages ──────────────────────────
             messages_for_llm = list(self.messages)
-            
+
             # P2 新增：如果有 system_prompt，添加到消息开头
             if self.system_prompt:
                 # 检查是否已经有 system message
                 has_system = any(m.get("role") == "system" for m in messages_for_llm)
                 if not has_system:
                     messages_for_llm.insert(0, {"role": "system", "content": self.system_prompt})
+
+            # M7 ported: 记忆检索(若启用)→ 拼成 system 片段 + 推送 memory_status
+            if self.memory_retriever:
+                # 用最后一条 user message 做 query
+                last_user_msg = next(
+                    (m for m in reversed(messages_for_llm) if m.get("role") == "user"),
+                    None,
+                )
+                if last_user_msg and isinstance(last_user_msg.get("content"), str):
+                    try:
+                        # M11 (2026-06-26 修复):mode/top_k 从 memory_config 读
+                        # (.env → MemoryConfig.from_env()),不再硬编码
+                        # M11: 传 already_surfaced 让 retriever 过滤已展示过的
+                        report = self._call_memory_retriever(
+                            last_user_msg["content"],
+                        )
+                        hits = report.hits if hasattr(report, "hits") else []
+                        # 记录已展示的 hit(用于下一轮去重)
+                        for h in hits:
+                            if hasattr(h, "rel_path") and h.rel_path:
+                                self._surfaced_memories.add(h.rel_path)
+                        if hits:
+                            mem_block = "\n\n[记忆库 / {} hits]\n".format(len(hits))
+                            for h in hits:
+                                mem_block += f"- [{getattr(h, 'type', '?')}] {getattr(h, 'title', '')}: {(getattr(h, 'body', '') or '')[:200]}\n"
+                            # 追加到 system prompt(不覆盖,只是叠加)
+                            messages_for_llm = [{"role": "system", "content": (self.system_prompt or "") + mem_block}] + [
+                                m for m in messages_for_llm if m.get("role") != "system"
+                            ]
+                        # 推送 memory_status 给 UI(stream chunk)
+                        stored_total = 0
+                        if self.memory_store:
+                            try:
+                                counts = self.memory_store.count_by_type()
+                                stored_total = sum(counts.values()) if isinstance(counts, dict) else 0
+                            except Exception:
+                                pass
+                        injected_tokens = sum(len((getattr(h, "body", "") or "")) // 4 for h in hits)
+                        yield ("memory_status", {
+                            "hits": len(hits),
+                            "stored_total": stored_total,
+                            "injected_tokens": injected_tokens,
+                            "zero_hit": len(hits) == 0,
+                        })
+                    except Exception as e:
+                        _logger.warning(f"Memory retrieval failed: {e}")
 
             # ── 调用 LLM（流式）─────────────────────────────────────
             tool_schemas = self.tools.list_schemas(provider=self._detect_provider())
@@ -333,6 +698,7 @@ class ReactAgent:
             tool_calls = []  # list of ToolCallDelta
             full_text = ""
             thinking_text = ""
+            stop_reason_this_turn: Optional[str] = None  # 本轮 LLM 终止原因
 
             # === 日志：发送给 LLM 的原始消息 ===
             _logger.debug("\n" + "=" * 60)
@@ -346,6 +712,7 @@ class ReactAgent:
                 llm_chunks = self.llm.chat(
                     messages=messages_for_llm,
                     tools=tool_schemas or None,
+                    cache_namespace=f"react:{self._session_manager.session_id if self._session_manager else 'default'}",  # M7 ported: prompt cache namespace
                 )
             except Exception as e:
                 # LLM 调用异常，优雅降级
@@ -358,7 +725,10 @@ class ReactAgent:
                 # Day 4: 保存到 session
                 if self._session_manager:
                     try:
-                        self._session_manager.add_assistant_message(f"抱歉，遇到了技术问题：{e}")
+                        self._session_manager.add_assistant_message(
+                            f"抱歉，遇到了技术问题：{e}",
+                            usage=asdict(self._last_turn_usage) if self._last_turn_usage else None,
+                        )
                     except Exception:
                         pass
                 return
@@ -382,8 +752,17 @@ class ReactAgent:
                     if chunk.tool_call:
                         tool_calls.append(chunk.tool_call)
 
+                    # 终止原因(流末尾 yield 一次)→ 记下本轮的
+                    if getattr(chunk, "stop_reason", None):
+                        stop_reason_this_turn = chunk.stop_reason
+
                     # Token 消耗 → 转发给 UI + 回传给 context manager
                     if chunk.usage:
+                        # Day 7 改进：保存到 self，供持久化时写入 jsonl
+                        self._last_turn_usage = chunk.usage
+                        # Task 7 (Path A): 捕获最后一轮 token,供 bridge.on_turn_end 用
+                        last_input_tokens = chunk.usage.input_tokens
+                        last_output_tokens = chunk.usage.output_tokens
                         yield ("usage", chunk.usage)
                         # 对齐 Claude Code tokenCountWithEstimation：
                         # 用 API 权威数字作增量基准，减少全量估算开销
@@ -405,7 +784,10 @@ class ReactAgent:
                 self.messages.append({"role": "assistant", "content": partial})
                 if self._session_manager:
                     try:
-                        self._session_manager.add_assistant_message(partial)
+                        self._session_manager.add_assistant_message(
+                            partial,
+                            usage=asdict(self._last_turn_usage) if self._last_turn_usage else None,
+                        )
                     except Exception:
                         pass
                 return
@@ -422,6 +804,10 @@ class ReactAgent:
                 _logger.debug(f"\n🔧 工具调用 ({len(tool_calls)} 个):")
                 _logger.debug(_format_tool_calls_for_log(tool_calls))
 
+            # Task 7 (Path A): 记录最后一轮 turn 索引 + tool_calls,供 bridge.on_turn_end 用
+            last_turn = turn
+            last_tool_calls = list(tool_calls)
+
             # ── 如果没有 tool_call → 最终回答 ───────────────────────
             if not tool_calls:
                 # 最终回答已通过 text_delta 流式输出
@@ -430,6 +816,10 @@ class ReactAgent:
                     "role": "assistant",
                     "content": full_text,
                 })
+                # Bug 1e:本轮正常收尾,记下这条文本作为 on_turn_end 的 assistant_resp
+                # (直接用 full_text,不靠末尾 reversed 扫描,避免误配上一轮)
+                final_answer = full_text
+                final_stop_reason = stop_reason_this_turn
                 # Day 4: 保存最终回答到 session（含本轮累积的全部 thinking/tool_logs）
                 if self._session_manager:
                     try:
@@ -437,10 +827,14 @@ class ReactAgent:
                             full_text,
                             thinking=self._pending_thinking,
                             tool_logs=self._pending_tool_logs,
+                            # Day 7：把本轮 API 返回的 usage 持久化到 jsonl
+                            # 下次 F5 刷新后能从这里恢复 baseline，0 跳变
+                            usage=asdict(self._last_turn_usage) if self._last_turn_usage else None,
                         )
                         # 保存后重置，避免跨 run 累积
                         self._pending_thinking = ""
                         self._pending_tool_logs = []
+                        self._last_turn_usage = None  # Day 7：用完清零
                     except Exception:
                         pass
                 yield ("system", "✅ 回答完成")
@@ -582,6 +976,84 @@ class ReactAgent:
             # 循环正常结束（没 break）→ 达到 max_turns
             yield ("system", f"⚠️ 达到最大轮次（{self.max_turns}），强制结束")
 
+        # Task 7: run 末尾调 bridge.on_turn_end(取代 Option C 同步提取)
+        # 失败不阻断:try/except 兜底,只 log + yield 错误事件
+        #
+        # Bug 1e 修复(2026-06-24):只在本轮「正常产出完整文本回答」时才提取。
+        # - final_answer 为空 → 本轮在工具循环里被 max_turns 截断、或流式中断
+        #   (中断路径已提前 return),此时没有本轮的完整回答,跳过提取,
+        #   绝不退回去拿 reversed 扫描误配上一轮的回答。
+        # - final_stop_reason 命中 max_tokens/length → 回答被 token 上限切断、不完整,
+        #   跳过提取(避免把半句话存成记忆)。end_turn/stop/未知 → 视为正常收尾。
+        # - user_msg 直接用本 run 的入参 user_message,assistant_resp 用 final_answer,
+        #   两者都来自「本轮」,不再做全局 reversed 扫描。
+        if (
+            self.react_memory_bridge
+            and last_turn > 0
+            and final_answer
+            and user_message
+            and final_stop_reason not in _TRUNCATED_STOP_REASONS
+        ):
+            try:
+                for event in self.react_memory_bridge.on_turn_end(
+                    user_msg=user_message,
+                    assistant_resp=final_answer,
+                    turn_index=last_turn,
+                    input_tokens=last_input_tokens,
+                    output_tokens=last_output_tokens,
+                    tool_calls_in_turn=len(last_tool_calls),
+                ):
+                    yield ("memory_event", event)
+            except Exception as e:
+                _logger.warning(f"Memory bridge failed: {e}")
+
+        # M10 C2.2 (2026-06-26):L3 SessionMemory extract 触发点
+        # turn 结束后把 messages 喂给 sm_layer.extract_incremental
+        # 走后台 ThreadPoolExecutor,不阻塞主对话(零延迟)
+        #
+        # M11.7 (2026-06-28): 对齐 Claude Code SessionMemory 抽取节流
+        # 在触发前调 should_extract_now() 走 dual-gate
+        # (token Δ ≥ 5K AND tool Δ ≥ 3) OR (token Δ ≥ 5K AND last_turn tool=0)
+        # 不通过则完全跳过 extract_incremental
+        if self.session_memory is not None and last_turn > 0 and final_answer:
+            try:
+                _msgs_with_id = self._messages_with_ids()
+                # M11.7:dual-gate(token + tool)
+                _current_tokens = last_input_tokens + last_output_tokens
+                _tool_delta = len(last_tool_calls)
+                # last_turn tool 数 = 本轮的 tool_delta(简化:用本轮代替)
+                _gate_ok = self.session_memory.should_extract_now(
+                    current_token_count=_current_tokens,
+                    tool_count_delta=_tool_delta,
+                    tool_count_last_turn=_tool_delta,
+                )
+                if not _gate_ok:
+                    _logger.debug(
+                        f"[L3 SM extract trigger] gate 拦住,跳过 extract | "
+                        f"current_tokens={_current_tokens} tool_delta={_tool_delta}"
+                    )
+                else:
+                    _logger.debug(
+                        f"[L3 SM extract trigger] run() 末尾触发 extract_incremental | "
+                        f"msgs={len(_msgs_with_id)} last_turn={last_turn} | "
+                        f"sm.last_id(before)={self.session_memory.last_compacted_msg_id} | "
+                        f"current_tokens={_current_tokens} tool_delta={_tool_delta}"
+                    )
+                    future = self.session_memory.extract_incremental(
+                        _msgs_with_id,
+                        llm_callback=None,
+                        current_token_count=_current_tokens,
+                        tool_count_delta=_tool_delta,
+                        tool_count_last_turn=_tool_delta,
+                    )
+                    # 不 .result() block(后台线程,主流程不等)
+                    # 但记录 future 引用,方便测试或后续 block 等待
+                    self._pending_sm_extract_future = future
+            except Exception as e:
+                _logger.warning(
+                    f"[L3 SM extract trigger] 失败(不影响主流程): {e}"
+                )
+
         # Day 4: run 结束后 flush session
         if self._session_manager:
             try:
@@ -607,6 +1079,14 @@ class ReactAgent:
 
         在切换会话或销毁 Agent 前显式调用。
         """
+        # M10 C3.1: 停蒸馏 loop(若有)
+        if getattr(self, "_distillation_loop", None) is not None:
+            try:
+                self._distillation_loop.stop(timeout=5.0)
+            except Exception as e:
+                _logger.warning(f"DistillationLoop.stop 失败: {e}")
+            self._distillation_loop = None
+
         if self._session_manager:
             try:
                 self._session_manager.close()
@@ -669,11 +1149,13 @@ class ReactAgent:
         现场: data/sessions/7f071c62.jsonl
 
         Args:
-            compacted: CompactOrchestrator._build_compacted_messages 输出
-                结构: [system, summary, ...preserved_head]  共 8 条
+            compacted: CompactOrchestrator._build_compacted_messages 输出，tuple[list[dict], list[dict]]
+                - compacted[0]: [system, summary, ...preserved_head]
+                - compacted[1] (recent): 最近 N 条非 system 消息
+                结构:
                 - [0] system: 动态注入不持久化（每次 run 重新构造）
                 - [1] summary: user role + content 以 "[Previous conversation summarized]" 开头
-                - [2..] preserved: 最近 6 条原始 user/assistant 消息
+                - [2..] preserved: 最近 N 条原始 user/assistant 消息
             compact_result: CompactionResult 实例
         """
         if not self._session_manager:
@@ -685,19 +1167,22 @@ class ReactAgent:
         storage = self._session_manager.storage
 
         # 1. boundary（parent 链到最后一条旧消息，由 add_compact_boundary 内部 _get_last_uuid 决定）
-        storage.add_compact_boundary(
+        boundary_uuid = storage.add_compact_boundary(
             trigger="auto",
             pre_tokens=compact_result.tokens_before,
             messages_summarized=len(compacted) - 1,  # 含 summary 的 compacted 长度减 1
         )
+        _logger.debug(f"💾 [Persist] boundary written: uuid={boundary_uuid}, parent→旧链末尾")
 
         # 2. summary（parent 链到 boundary）
-        storage.add_summary(
+        summary_uuid = storage.add_summary(
             summary=compact_result.summary,
             tokens_saved=compact_result.tokens_freed,
         )
+        _logger.debug(f"💾 [Persist] summary written: uuid={summary_uuid}, len={len(compact_result.summary)} chars")
 
         # 3. preserved head（跳过 system[0] 和 summary）
+        preserved_count = 0
         # compacted 结构: [system, summary, ...preserved]
         # - 跳过 system（[0]，动态注入不持久化）
         # - 跳过 summary（已由 add_summary 写）
@@ -719,9 +1204,15 @@ class ReactAgent:
                 entry_type=role,
                 message=msg,  # 原样存整个 message dict
             )
+            preserved_count += 1
+
+        _logger.debug(f"💾 [Persist] preserved head: {preserved_count} messages")
 
         # 4. flush 确保落盘
         storage.flush()
+        _logger.debug(f"💾 [Persist] flush done, storage.last_uuid={storage.last_uuid}")
+
+        _logger.debug(f"💾 [Sync] manager._last_uuid: {self._session_manager._last_uuid} → {storage.last_uuid}")
 
         # 5. P1 修复：同步 manager 的 _last_uuid 到 preserved head 最后一条
         # 为什么需要：storage.add_* 只更新 storage 内部状态，不调 manager.add_user_message 等

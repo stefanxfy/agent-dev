@@ -48,7 +48,15 @@ if "messages" not in st.session_state:
 if "agent" not in st.session_state:
     st.session_state.agent = None
 if "token_stats" not in st.session_state:
-    st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0}
+    st.session_state.token_stats = {"input": 0, "output": 0, "thinking": 0, "cached": 0}
+if "memory_stats" not in st.session_state:
+    st.session_state.memory_stats = {
+        "total_searches": 0,
+        "total_hits": 0,
+        "last_zero_hit_turn": None,
+        "current_turn_hits": 0,
+        "stored_total": 0,
+    }
 if "system_prompt" not in st.session_state:
     st.session_state.system_prompt = ""
 if "active_thread_id" not in st.session_state:
@@ -72,34 +80,23 @@ with st.sidebar:
     # ━━━ LLM 配置 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     st.header("⚙️ LLM 配置")
 
-    default_provider = os.getenv("DEFAULT_PROVIDER", "zhipu").lower()
-    provider_index = 2  # 默认 zhipu
-    if default_provider in ["anthropic", "openai", "zhipu"]:
-        provider_index = ["anthropic", "openai", "zhipu"].index(default_provider)
+    # provider/model/env_key 列表由 LLMProvider enum 派生,加新厂商无需改 UI
+    from web.llm_options import (
+        get_default_provider_index,
+        get_env_key_for_provider,
+        get_models_for_provider,
+        get_provider_options,
+    )
 
     provider = st.selectbox(
         "厂商",
-        options=["anthropic", "openai", "zhipu"],
-        index=provider_index,
+        options=get_provider_options(),
+        index=get_default_provider_index(),
     )
 
-    model_options = {
-        "anthropic": [
-            "claude-sonnet-4-20250514",
-            "claude-opus-4-20250514",
-            "claude-haiku-4-20250514",
-        ],
-        "openai": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3-mini"],
-        "zhipu": ["GLM-5.1", "glm-5-turbo", "GLM-4.7"],
-    }
-    model = st.selectbox("模型", options=model_options[provider])
+    model = st.selectbox("模型", options=get_models_for_provider(provider))
 
-    env_key_map = {
-        "anthropic": "ANTHROPIC_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "zhipu": "ZHIPU_API_KEY",
-    }
-    env_key_var = env_key_map.get(provider, "OPENAI_API_KEY")
+    env_key_var = get_env_key_for_provider(provider)
     default_key = os.getenv(env_key_var, "")
     api_key = st.text_input(
         "API Key（留空则使用 .env）",
@@ -126,7 +123,26 @@ with st.sidebar:
     st.divider()
     st.subheader("📊 Token 消耗（本次会话）")
     stats = st.session_state.token_stats
+    cache_hit_rate = (
+        stats["cached"] / stats["input"] if stats["input"] > 0 else 0.0
+    )
     st.metric("Total", f"{stats['input'] + stats['output'] + stats['thinking']:,}")
+    st.metric("Cached", f"{stats['cached']:,} ({cache_hit_rate:.0%})")
+    st.caption(f"in={stats['input']:,} · out={stats['output']:,} · think={stats['thinking']:,}")
+
+    # M7: 记忆状态条
+    ms = st.session_state.memory_stats
+    with st.expander("🧠 Memory 状态", expanded=False):
+        st.metric("Searches", ms["total_searches"])
+        st.metric("Total Hits", ms["total_hits"])
+        st.metric("Last Turn Hits", ms["current_turn_hits"])
+        if ms["stored_total"]:
+            st.metric("Stored (N)", f"{ms['stored_total']}")
+        if ms["last_zero_hit_turn"]:
+            gap = ms["total_searches"] - ms["last_zero_hit_turn"]
+            st.metric("Last 0-hit", f"{gap} turns ago")
+        else:
+            st.metric("Last 0-hit", "—")
 
 
 # ── 初始化 LangGraph Agent ───────────────────────────────────────
@@ -337,6 +353,17 @@ if prompt := st.chat_input("输入消息..."):
                 stats["input"] += getattr(content, "input_tokens", 0)
                 stats["output"] += getattr(content, "output_tokens", 0)
                 stats["thinking"] += getattr(content, "thinking_tokens", 0)
+                # M7: 补 cached_tokens(此前被静默丢弃)
+                stats["cached"] += getattr(content, "cached_tokens", 0)
+            elif msg_type == "memory_status":
+                # M7: 记忆检索状态 → 累积到 session_state.memory_stats
+                ms = st.session_state.memory_stats
+                ms["total_searches"] += 1
+                ms["total_hits"] += int(content.get("hits", 0))
+                ms["current_turn_hits"] = int(content.get("hits", 0))
+                ms["stored_total"] = int(content.get("stored_total", 0))
+                if content.get("zero_hit"):
+                    ms["last_zero_hit_turn"] = ms["total_searches"]
         
         text_placeholder.markdown(full_text)
         if thinking_content:

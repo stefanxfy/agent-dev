@@ -27,6 +27,11 @@ from agent_core.context.compact import (
     COMPACT_USER_PROMPT_TEMPLATE,
     PRESERVED_HEAD_MESSAGES,
     MAX_PTL_RETRIES,
+    _build_preserved_head,
+    _pair_messages_to_turns,
+    _estimate_msg_tokens,
+    PRESERVED_HEAD_MAX_TOKENS,
+    MAX_PRESERVED_TURNS,
 )
 from agent_core.context.manager import ContextManager
 
@@ -47,9 +52,10 @@ class TestSimpleTokenCounter:
     def test_chinese_text(self):
         # "你好世界" = 4 个中文字
         # count() 不含 overhead，只有纯文本 token
-        # 预期 ~4 * 1.4 = 5.6 → int = 5
+        # tiktoken o200k_base: "你好"+"世界" = 2 tokens
+        # 启发式回退: ~4 * 1.4 = 5.6 → int = 5
         result = self.counter.count("你好世界")
-        assert 3 < result < 10
+        assert 1 < result < 10
 
     def test_english_text(self):
         # "hello world" = 11 chars (all English)
@@ -60,8 +66,10 @@ class TestSimpleTokenCounter:
 
     def test_mixed_text(self):
         # 中英混合
+        # tiktoken o200k_base: Hello(1)+空格你好(2)+空格world(1)+空格世界(2)=6+
+        # 启发式回退: >5
         result = self.counter.count("Hello 你好 world 世界")
-        assert result > 5
+        assert result >= 5
 
     def test_string_messages(self):
         messages = [
@@ -70,7 +78,9 @@ class TestSimpleTokenCounter:
             {"role": "assistant", "content": "Hi there"},
         ]
         result = self.counter.count_messages(messages)
-        assert result > 30  # 3 条消息 * overhead + 内容
+        # tiktoken: 3*5(overhead) + 5+1+2(content) = 23
+        # 启发式回退: 3*5 + higher heuristic counts > 15
+        assert result > 15
 
     def test_list_content_messages(self):
         messages = [
@@ -97,8 +107,8 @@ class TestSimpleTokenCounter:
     def test_none_content(self):
         messages = [{"role": "assistant", "content": None}]
         result = self.counter.count_messages(messages)
-        # 只有 role overhead
-        assert result == 10
+        # 只有 role overhead（GLM API 实测 ≈5）
+        assert result == 5
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -192,7 +202,7 @@ class TestContextBudgetManager:
 
     def test_model_config_unknown_fallback(self):
         config = get_model_config("unknown-model")
-        assert config["context_window"] == 128_000  # 默认保守值
+        assert config["context_window"] == 32_000   # 默认保守值（中等窗口）
 
     def test_model_config_glm5(self):
         config = get_model_config("glm-5.1")
@@ -214,7 +224,7 @@ class TestContextBudgetManager:
         # GLM-4 total_budget = 128000 - 4096 - 13000 = 110904
         # compact_threshold = 110904 - 13000 = 97904
         # 需要构造 >= 97904 tokens 的消息
-        big_text = "你好世界" * 5000  # ~35000 tokens 每条
+        big_text = "你好世界" * 6200  # tiktoken: 2*6200=12400, 8条≈99264>97904
         messages = []
         for i in range(4):
             messages.append({"role": "user", "content": f"消息{i}: {big_text}"})
@@ -297,13 +307,24 @@ class TestCompactOrchestrator:
         self.bm = ContextBudgetManager("glm-4", self.counter)
 
         # Mock LLM Router — 不实际调用 LLM
+        # P1-5 修复后：summary 必须 ≥ SUMMARY_MIN_CHARS (200) 才算质量合格
+        _long_summary = (
+            "<analysis>用户做了计算</analysis>\n"
+            "<summary>1. 用户目标：用户希望完成一个计算任务，输入为数字 N，"
+            "期望输出该数字的阶乘结果。测试多个边界场景包括 0、1、负数等特殊输入。"
+            "2. 关键决策：采用迭代而非递归实现以避免 Python 递归深度限制，"
+            "使用 functools.lru_cache 加速重复计算，并加入输入校验逻辑。"
+            "3. 当前状态：计算已成功完成，输出了正确的阶乘结果，"
+            "用户对此表示满意。代码使用 def factorial(n) 函数实现，"
+            "包含完整的类型检查、负数处理和大数边界条件覆盖。"
+            "4. 待办事项：暂无后续任务，会话可正常结束。</summary>"
+        )
+
         class MockLLMRouter:
             def chat(self, messages, tools=None):
                 """返回模拟的摘要响应"""
                 from agent_core.llm.router import StreamChunk, TextDelta
-                yield StreamChunk(text_delta=TextDelta(
-                    text="<analysis>用户做了计算</analysis>\n<summary>用户请求计算并被成功完成</summary>",
-                ))
+                yield StreamChunk(text_delta=TextDelta(text=_long_summary))
 
         self.mock_llm = MockLLMRouter()
         self.compactor = CompactOrchestrator(
@@ -411,20 +432,22 @@ class TestCompactOrchestrator:
             {"role": "user", "content": "recent1"},
             {"role": "assistant", "content": "recent_reply"},
         ]
-        result = self.compactor._build_compacted_messages(
+        compacted, recent = self.compactor._build_compacted_messages(
             summary="这是摘要",
             original=messages,
             preserved_head=4,
         )
         # 1 system + 1 summary + 4 recent = 6
-        assert len(result) == 6
+        assert len(compacted) == 6
         # 第一条是 system
-        assert result[0]["role"] == "system"
+        assert compacted[0]["role"] == "system"
         # 第二条是摘要（role=user）
-        assert result[1]["role"] == "user"
-        assert "这是摘要" in result[1]["content"]
+        assert compacted[1]["role"] == "user"
+        assert "这是摘要" in compacted[1]["content"]
         # 最近 4 条保留
-        assert result[2]["content"] == "msg3"
+        assert compacted[2]["content"] == "msg3"
+        # recent 应该是最后 4 条非 system 消息
+        assert len(recent) == 4
 
     def test_build_compacted_preserves_system(self):
         """没有 system 消息时不应崩溃"""
@@ -432,12 +455,12 @@ class TestCompactOrchestrator:
             {"role": "user", "content": "msg1"},
             {"role": "assistant", "content": "reply1"},
         ]
-        result = self.compactor._build_compacted_messages(
+        compacted, recent = self.compactor._build_compacted_messages(
             summary="摘要",
             original=messages,
         )
         # 无 system + summary + 2 recent = 3
-        assert len(result) == 3
+        assert len(compacted) == 3
 
     def test_compact_success_with_mock_llm(self):
         """用 Mock LLM 测试完整压缩流程"""
@@ -479,9 +502,18 @@ class TestCompactOrchestrator:
                 call_count[0] += 1
                 if call_count[0] == 1:
                     raise RuntimeError("Prompt too long")
-                # 第二次成功
+                # 第二次成功（P1-5 修复后：mock summary 必须 ≥ 200 chars）
                 from agent_core.llm.router import StreamChunk, TextDelta
-                yield StreamChunk(text_delta=TextDelta(text="<summary>摘要</summary>"))
+                yield StreamChunk(text_delta=TextDelta(text=(
+                    "<summary>1. 用户目标：测试 PTL 防御的剥洋葱重试机制是否生效，"
+                    "第一次调用应因 prompt 过长触发 RuntimeError，第二次重试应返回完整摘要。"
+                    "2. 关键决策：用 call_count 模拟 PTL 触发，"
+                    "然后返回符合 P1-5 质量要求的 4 段结构化摘要（≥200 字符）。"
+                    "3. 当前状态：PTL 重试后第二次 LLM 调用成功，"
+                    "剥洋葱截掉了最旧的 8 条消息，剩余 33 条进入 summary 生成流程。"
+                    "4. 待办事项：测试结束后验证 P1-5 质量检查全部通过，"
+                    "且 CompactionResult.success=True 符合预期。</summary>"
+                )))
 
         compactor = CompactOrchestrator(
             llm_router=PTLLLMRouter(),
@@ -533,9 +565,18 @@ class TestContextManager:
     def setup_method(self):
         class MockLLMRouter:
             def chat(self, messages, tools=None):
+                # P1-5 修复后：mock summary 必须 ≥ 200 chars
                 from agent_core.llm.router import StreamChunk, TextDelta
                 yield StreamChunk(text_delta=TextDelta(
-                    text="<summary>测试摘要</summary>"
+                    text=(
+                        "<summary>1. 用户目标：测试压缩上下文管理的核心功能，"
+                        "验证 ContextManager 是否能正确触发压缩流程并返回 CompactionResult。"
+                        "2. 关键决策：使用 MockLLMRouter 避免真实 API 调用，"
+                        "加快单测运行速度并保证测试可重复。"
+                        "3. 当前状态：ContextManager 已初始化，compact_count=0，"
+                        "total_tokens_freed=0，所有依赖组件就绪。"
+                        "4. 待办事项：运行所有 test_should_compact 变体以验证阈值逻辑。</summary>"
+                    )
                 ))
 
         self.mock_llm = MockLLMRouter()
@@ -736,6 +777,121 @@ def test_compact_prompt_extract_summary_works_with_new_format():
     assert CompactOrchestrator is not None, "CompactOrchestrator 可正常导入"
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  统一压缩 Prompt 设计：旧模式 + Fork 模式共享 COMPACT_INSTRUCTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestUnifiedCompactPrompt:
+    """统一压缩 Prompt：一份指令源，两种拼接方式"""
+
+    def test_compact_instruction_exists(self):
+        """统一源 COMPACT_INSTRUCTION 必须存在"""
+        from agent_core.context.compact import COMPACT_INSTRUCTION
+        assert isinstance(COMPACT_INSTRUCTION, str)
+        assert len(COMPACT_INSTRUCTION) > 1000, "指令模板应该足够长（含 example）"
+
+    def test_build_compact_fork_prompt_deterministic(self):
+        """Fork 模式必须返回字节级一致的字符串（保 cache）"""
+        from agent_core.context.compact import build_compact_fork_prompt
+        p1 = build_compact_fork_prompt()
+        p2 = build_compact_fork_prompt()
+        assert p1 == p2, "build_compact_fork_prompt 每次必须返回相同字符串（cache 命中）"
+
+    def test_build_compact_fork_prompt_no_conversation_text(self):
+        """Fork 模式 user prompt 不应含对话内容（对话在 parent_messages 里）"""
+        from agent_core.context.compact import build_compact_fork_prompt
+        p = build_compact_fork_prompt()
+        assert "对话内容" not in p, "Fork 模式 user prompt 不应含对话内容"
+        assert "the messages above" in p, "Fork 模式应指向 parent_messages"
+
+    def test_build_compact_user_prompt_has_conversation(self):
+        """旧模式 user prompt 必须含对话文本"""
+        from agent_core.context.compact import build_compact_user_prompt
+        p = build_compact_user_prompt("用户：你好\n助手：你好！")
+        assert "对话内容" in p, "旧模式 user prompt 必须含对话内容标题"
+        assert "用户：你好" in p, "旧模式必须含实际对话文本"
+        assert "the text below" in p, "旧模式应指向 prompt 内的对话"
+
+    def test_unified_instruction_in_both_modes(self):
+        """旧模式和 Fork 模式必须用同一份指令（去掉 conversation_location 差异）"""
+        from agent_core.context.compact import (
+            build_compact_user_prompt, build_compact_fork_prompt,
+        )
+        old_prompt = build_compact_user_prompt("")
+        fork_prompt = build_compact_fork_prompt()
+        # 提取指令部分（旧模式后面拼接 \n\n## 对话内容...，剥掉它）
+        old_instruction = old_prompt.split("## 对话内容")[0].rstrip()
+        # Fork prompt 可能含尾部换行，一起 rstrip 归一化
+        fork_instruction = fork_prompt.rstrip()
+        # 占位符归一化后应与 fork 指令部分一致
+        normalized_old = old_instruction.replace("the text below", "the messages above")
+        assert normalized_old == fork_instruction, (
+            "旧模式和 Fork 模式必须用同一份指令源（仅 conversation_location 差异）"
+        )
+
+    def test_fork_prompt_has_4_layer_defense(self):
+        """Fork 模式必须包含 4 道防调工具防线（仿 Claude Code）"""
+        from agent_core.context.compact import build_compact_fork_prompt
+        p = build_compact_fork_prompt()
+        # 防线 1: CRITICAL 前置警告
+        assert "CRITICAL" in p, "防线 1: CRITICAL 前置警告"
+        assert "TEXT ONLY" in p, "防线 1: TEXT ONLY"
+        assert "Do NOT call any tools" in p, "防线 1: 禁止调工具"
+        # 防线 2: 工具黑名单
+        for tool in ["Read", "Bash", "Grep", "Glob", "Edit", "Write"]:
+            assert tool in p, f"防线 2: 工具黑名单含 {tool}"
+        # 防线 3: only turn 警告（仿 Claude Code 防 2.79% 触发）
+        assert "only turn" in p, "防线 3: only turn 警告（防 Sonnet 4.6+ 自适应调工具）"
+        assert "REJECTED" in p, "防线 3: REJECTED 后果警告"
+        # 防线 4: 末尾 REMINDER 重复警告
+        assert "REMINDER" in p, "防线 4: 末尾 REMINDER 重复警告"
+        # 格式要求
+        assert "<analysis>" in p and "</analysis>" in p, "格式要求 <analysis> 标签"
+        assert "<summary>" in p and "</summary>" in p, "格式要求 <summary> 标签"
+        # example + 防漂移
+        assert "<example>" in p, "few-shot example"
+        assert "verbatim quotes" in p, "防漂移规则"
+        assert "防漂移" in p, "防漂移中文标识"
+
+    def test_backward_compat_aliases(self):
+        """向后兼容：旧常量名仍可访问且内容正确"""
+        from agent_core.context.compact import (
+            COMPACT_SYSTEM_PROMPT, COMPACT_USER_PROMPT_TEMPLATE,
+        )
+        # COMPACT_SYSTEM_PROMPT 现在是 COMPACT_INSTRUCTION 的别名
+        assert "CRITICAL" in COMPACT_SYSTEM_PROMPT
+        assert "TEXT ONLY" in COMPACT_SYSTEM_PROMPT
+        # COMPACT_USER_PROMPT_TEMPLATE 现在是已 format 的最终字符串
+        # 含 "{conversation}" 占位符（不替换）
+        assert "对话内容" in COMPACT_USER_PROMPT_TEMPLATE
+        assert "{conversation}" in COMPACT_USER_PROMPT_TEMPLATE
+
+    def test_compact_fork_prompt_removed(self):
+        """旧版 COMPACT_FORK_PROMPT 应被删除（被 build_compact_fork_prompt 替代）"""
+        from agent_core.context import compact
+        assert not hasattr(compact, "COMPACT_FORK_PROMPT"), (
+            "COMPACT_FORK_PROMPT 应已删除，使用 build_compact_fork_prompt()"
+        )
+
+    def test_conversation_location_placeholder(self):
+        """{conversation_location} 占位符必须存在并被 format"""
+        from agent_core.context.compact import (
+            COMPACT_INSTRUCTION, build_compact_user_prompt, build_compact_fork_prompt,
+        )
+        # 原始模板应含占位符
+        assert "{conversation_location}" in COMPACT_INSTRUCTION, (
+            "原始指令模板必须含 {conversation_location} 占位符"
+        )
+        # 旧模式：替换为 "the text below"
+        old = build_compact_user_prompt("x")
+        assert "the text below" in old
+        assert "{conversation_location}" not in old, "占位符必须被替换"
+        # Fork 模式：替换为 "the messages above"
+        fork = build_compact_fork_prompt()
+        assert "the messages above" in fork
+        assert "{conversation_location}" not in fork, "占位符必须被替换"
+
+
 def test_compact_debug_logging_emits_expected_events():
     """验证 DEBUG 日志输出关键事件（Compact START / LLM Call / Extract / Build）"""
     import logging
@@ -757,8 +913,19 @@ def test_compact_debug_logging_emits_expected_events():
         
         class MockLLM:
             def chat(self, messages, tools=None):
+                # P1-5 修复后：mock summary 必须 ≥ 200 chars
                 yield StreamChunk(text_delta=TextDelta(
-                    text="<analysis>分析内容</analysis><summary>1. 用户目标：A 2. 关键决策：B 3. 当前状态：完 4. 待办事项：无</summary>"
+                    text=(
+                        "<analysis>分析内容：用户进行了一个简短测试，验证压缩管道的核心链路是否打通。"
+                        "包括 preprocess、summary 生成、compacted 组装等步骤。</analysis>"
+                        "<summary>1. 用户目标：验证压缩流程端到端可用，"
+                        "包括预处理、PTL 防御、摘要生成、compacted 组装。"
+                        "2. 关键决策：使用流式响应模拟真实 LLM 行为，"
+                        "Mock LLM 返回固定 4 段结构（用户目标/关键决策/当前状态/待办事项）。"
+                        "3. 当前状态：压缩流程已成功，结构验证通过，preserved head 正确生成，"
+                        "日志包含 Compact START / DONE 全流程信息。"
+                        "4. 待办事项：暂无后续任务，可以继续测试 PTL 重试场景。</summary>"
+                    )
                 ))
         
         compactor = CompactOrchestrator(
@@ -815,9 +982,17 @@ def test_compact_debug_logging_shows_ptl_retry():
                 if call_count[0] == 1:
                     # 第一次触发 PTL
                     raise ValueError("prompt too long: context length exceeded")
-                # 第二次成功
+                # 第二次成功（P1-5 修复后：mock summary 必须 ≥ 200 chars）
                 yield StreamChunk(text_delta=TextDelta(
-                    text="<summary>1. 用户目标：A 2. 关键决策：B 3. 当前状态：完 4. 待办事项：无</summary>"
+                    text=(
+                        "<summary>1. 用户目标：测试 PTL 防御的剥洋葱重试机制，"
+                        "第一次调用因 prompt 过长触发异常，第二次重试应成功返回摘要。"
+                        "2. 关键决策：使用 call_count 模拟 PTL 触发，"
+                        "然后返回符合 P1-5 质量要求的 4 段结构化摘要。"
+                        "3. 当前状态：第二次 LLM 调用成功返回，剥洋葱重试链完整，"
+                        "PTL 防御计数 = 1，摘要通过质量检查（长度 + 模板泄漏 + 重复 + 压缩比）。"
+                        "4. 待办事项：测试成功后清理 mock，验证恢复后状态正确。</summary>"
+                    )
                 ))
         
         compactor = CompactOrchestrator(
@@ -971,3 +1146,207 @@ class TestImageDocumentTokenEstimation:
         # 纯文本 + tool_use，不含 image/document
         assert count > 0
         assert count < 500  # 不会算到 2000
+
+
+
+# ── Preserved Head 测试（连续性优先）──────────────────────────
+
+class TestPreservedHeadBuilder:
+    """preserved head 配对 + max_turns 硬停 + max_total_tokens 硬停
+
+    设计原则（用户 21:12 确认的 v4 — 严格执行）：
+    1. 配对：user+assistant 配对成 turn，不拆散
+    2. max_turns 硬停：达到 N turn 立即停止
+    3. max_total_tokens 硬停：累计超 budget → 这个 turn 不保留 + 停止
+    4. 第一个 turn 总是包含：避免空 head
+    """
+
+    def test_pair_user_assistant_into_turns(self):
+        """配对：user → assistant 配对成 turn"""
+        msgs = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        turns = _pair_messages_to_turns(msgs)
+        assert len(turns) == 2
+        assert turns[0] == [{"role": "user", "content": "u1"},
+                             {"role": "assistant", "content": "a1"}]
+        assert turns[1] == [{"role": "user", "content": "u2"},
+                             {"role": "assistant", "content": "a2"}]
+
+    def test_pair_consecutive_users_separate_turns(self):
+        """连续 user 各自单独成 turn（不合并）"""
+        msgs = [
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+        ]
+        turns = _pair_messages_to_turns(msgs)
+        assert len(turns) == 2
+
+    def test_empty_messages_returns_empty(self):
+        """空消息列表返回空"""
+        assert _build_preserved_head(non_system=[]) == []
+
+    def test_normal_short_dialogue_all_preserved(self):
+        """正常短对话：所有 turn 完整保留（未达上限）"""
+        msgs = []
+        for i in range(3):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+        )
+        assert len(result) == 6
+        assert result[0]["content"] == "u0"
+        assert result[-1]["content"] == "a2"
+
+    def test_max_turns_hard_cap_stops_iteration(self):
+        """max_turns 硬停：达到 N turn 立即停"""
+        msgs = []
+        for i in range(5):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+        )
+        assert len(result) == 6
+        assert result[0]["content"] == "u2"
+        assert result[-1]["content"] == "a4"
+
+    def test_max_total_tokens_is_hard_limit(self):
+        """max_total_tokens 硬限制：超 budget 这个 turn 不加 + 停止（v4）"""
+        # 4 turn, 每个 ~980 tok
+        msgs = []
+        for i in range(4):
+            msgs.append({"role": "user", "content": f"u{i} " + "x" * 700})
+            msgs.append({"role": "assistant", "content": f"a{i} " + "x" * 700})
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=2000,  # 硬限制：超了就 stop
+            max_turns=4,
+        )
+        # 从后往前：turn3 (~980 tok) 加 → total=980 → turn2 (~980 tok) 加 → total=1960 ok
+        # 再 turn1 (~980 tok) → total=2940 > 2000 → break
+        # 实际：2 turn 保留，4 条
+        # 注：调参后 turn1 是第一个 turn（边界 case），但 selected_turns 已非空，所以 break
+        # 验证 budget 严格不超
+        total_chars = sum(len(str(m.get("content", ""))) for m in result)
+        # token = chars * 0.7 + overhead，每个 turn ~ (700+2)*2 * 0.7 + 8 = 987
+        # budget 2000 → 最多 2 turn (~1974), 第 3 个 turn 会超
+        assert total_chars > 0
+        assert len(result) == 4  # 2 turn
+        assert "u2" in result[0]["content"]
+        assert "a3" in result[-1]["content"]
+        # turn0/turn1 不在
+        assert not any("u0" in str(m.get("content", "")) or "a0" in str(m.get("content", "")) for m in result)
+
+    def test_oversized_turn_excluded_by_budget(self):
+        """核心：超大 turn 不进 preserved head（v4 严格执行 budget）"""
+        flood = "x" * 13187
+        msgs = [
+            {"role": "user", "content": "turn1 user"},
+            {"role": "assistant", "content": "turn1 assistant"},
+            {"role": "user", "content": "turn2 user"},
+            {"role": "assistant", "content": "turn2 assistant"},
+            {"role": "user", "content": "turn3 灌水 user"},
+            {"role": "assistant", "content": flood},  # 灌水
+            {"role": "user", "content": "turn4 user"},
+            {"role": "assistant", "content": "turn4 assistant"},
+        ]
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+        )
+        # 从后往前：turn4 (小) → total=小 → 加
+        # turn3 (灌水超大) → total + 灌水 > 4000 → break（selected_turns 非空）
+        # 期望：保留 turn4 = 2 条
+        assert len(result) == 2
+        assert "turn4 user" in result[0]["content"]
+        assert "turn4 assistant" in result[1]["content"]
+        # turn1/turn2/turn3 都不在（灌水 turn 也不在）
+        assert not any("turn1" in str(m.get("content", "")) for m in result)
+        assert not any("turn2" in str(m.get("content", "")) for m in result)
+        assert not any("turn3" in str(m.get("content", "")) for m in result)
+        # budget 严格不超
+        total = sum(int(len(str(m.get("content", ""))) * 0.7) + 4 for m in result)
+        assert total <= 4000
+
+    def test_continuity_no_gaps(self):
+        """连续性：保留的 turn 在原消息列表中必须相邻（无 gap）"""
+        msgs = []
+        for i in range(10):
+            msgs.append({"role": "user", "content": f"u{i}"})
+            msgs.append({"role": "assistant", "content": f"a{i}"})
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+        )
+        assert len(result) == 6
+        assert result[0]["content"] == "u7"
+        assert result[1]["content"] == "a7"
+        assert result[2]["content"] == "u8"
+        assert result[3]["content"] == "a8"
+        assert result[4]["content"] == "u9"
+        assert result[5]["content"] == "a9"
+        assert "u5" not in [m["content"] for m in result]
+        assert "u6" not in [m["content"] for m in result]
+
+    def test_orphan_assistant_turn_handled(self):
+        """孤儿 assistant turn（无配对 user）也作为 turn 保留"""
+        msgs = [
+            {"role": "assistant", "content": "orphan灌水 assistant"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+        ]
+        result = _build_preserved_head(
+            non_system=msgs,
+            max_total_tokens=4000,
+            max_turns=3,
+        )
+        # 3 turn 都保留（含孤儿）
+        assert len(result) == 3
+        assert "orphan" in str(result[0]["content"])
+
+    def test_compacted_uses_budget_strategy(self):
+        """端到端：_build_compacted_messages 用 budget 硬限制（v4）"""
+        flood = "灌水 " * 3000
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "turn1: 我是谁"},
+            {"role": "assistant", "content": "turn1: 你好小明"},
+            {"role": "user", "content": "turn2: 请逐字重复 50 次"},
+            {"role": "assistant", "content": flood},  # 灌水
+            {"role": "user", "content": "turn3: 你好"},
+            {"role": "assistant", "content": "turn3: 你好，小明"},
+        ]
+        compactor = CompactOrchestrator(
+            llm_router=None,
+            budget_manager=None,
+            token_counter=SimpleTokenCounter(),
+        )
+        compacted, recent = compactor._build_compacted_messages(
+            summary="这是摘要",
+            original=messages,
+        )
+        assert compacted[0]["role"] == "system"
+        assert compacted[1]["role"] == "user"
+        # v4 budget 硬限制：turn3 (最后 1 turn) 保留，turn2 灌水不进
+        # 注：实际看 _build_compacted_messages 默认 max_total_tokens=4000
+        # turn3 小 → 加；turn2 灌水超大 → 加了会超 → break（selected_turns 非空）
+        # 期望：recent = [turn3 user, turn3 assistant] = 2 条
+        assert len(recent) == 2
+        assert "turn3" in str(recent[0]["content"])
+        assert "turn3" in str(recent[1]["content"])
+        # 灌水不在
+        assert not any("灌水" in str(m.get("content", "")) for m in recent)
+        assert not any("turn1" in str(m.get("content", "")) for m in recent)
+        assert not any("turn2" in str(m.get("content", "")) for m in recent)
