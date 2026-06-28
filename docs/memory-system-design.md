@@ -19,6 +19,7 @@
 | v2.3 | 2026-06-26 | **M11 frontmatter + MEMORY.md 物理索引 + sideQuery 二选一**：`name`/`description` 必填；MEMORY.md 物理索引（200 行 / 25KB 上限，写盘后 1s 异步 rebuild）；删除 keyword/hybrid 模式，只保留 `semantic` + `side_query` 二选一；L1 启动加载 + L2 sideQuery LLM 精选 + `already_surfaced` 去重；新增 TRUSTING_RECALL_SECTION 提示 LLM 验证记忆新鲜度 | 对齐 Claude Code memory 模式 |
 | v2.3.1 | 2026-06-28 | **M11.5 SM 解耦 LLM callback**: SessionMemoryLayer 不直接调 `LLMRouter.chat`,改为注入 `make_sm_extract_callback(router=, cache_namespace=, max_retries=, backoff_base=, on_failure=)` 工厂返回的同步 callback;统一 retry/指数退避/失败返空语义,与未来 M11.6 distill_callback 同模式(单一职责、可测、易替换) | SM 提取可靠性 + 与 M11.6 对齐 |
 | v2.3.2 | 2026-06-28 | **M11.6 autoDream 简化 + 接真 LLM**: (1) 蒸馏门3 从 session 数量门改为 .md 数量门 (`min_memories_for_distill`),不再扫 session 日志; (2) `_read_existing_memories()` 解析 frontmatter 让 prompt 显真实 title; (3) 删除 `_count_recent_sessions` 方法; (4) 新增 `distill_callback.py` 接真 LLM(同 M11.5 callback 模式); (5) `DistillationLoop.get_status()` 新增 `last_skip_reason`/`last_run_id`/`last_error` 3 字段; (6) sidebar UI 显示 skip reason / run_id / error,不再只看 success/failure | autoDream 单一职责(只看 .md)+ 接真 LLM + UI 可观测性 |
+| v2.3.3 | 2026-06-28 | **M11.7 SM 对齐 Claude Code SessionMemory (differences 1+3+4+7+8)**: (1) **extract 节流 dual-gate** — `should_extract_now()` 公开 API + `_should_extract()` 私有:会话累计 < 10K token 不创建 SM 文件;已 init 后 token Δ ≥ 5K AND tool Δ ≥ 3(纯文本旁路:last_turn tool=0 时放行);(2) **文件权限对齐** — `write_sm_template()` 用 `0o700` 目录 + `0o600` 文件 + `O_CREAT|O_EXCL` 原子创建,新 helper `_open_secure()` 统一覆盖写;(3) **compact window 3 约束** — `calculate_messages_to_keep_index()` 顺序执行 cap(40K) + min-tokens(10K) + min-text-blocks(5);(4) **API 不变量保护** — `adjust_index_to_preserve_api_invariants()` 保证 tool_use/tool_result 配对 + 同 message.id 整体不被切断;(5) **6 新阈值全 env 可配** — `MEMORY_COMPACT__MINIMUM_MESSAGE_TOKENS_TO_INIT` / `MINIMUM_TOKENS_BETWEEN_UPDATE` / `TOOL_CALLS_BETWEEN_UPDATES` / `WINDOW_MIN_TOKENS` / `WINDOW_MIN_TEXT_BLOCK_MESSAGES` / `WINDOW_MAX_TOKENS`,`CompactConfig.from_env()` 已支持;**6 个新不变量(#12-17)** 加入 §4.5;**5 项架构偏离保留**(JSON-ops/5 sections/wait fallback/zero-LLM/postCompactTokenCount) | Claude Code SessionMemory 行为对齐,提升 compact 正确性 + 安全性 |
 
 ### 〇.1 版本时间线（演进路径）
 
@@ -985,14 +986,34 @@ class SessionMemoryLayer:
         self.last_compacted_msg_id: Optional[str] = None
 
     # ---------- 慢路径: extraction (调 LLM) ----------
-    def extract_incremental(self, messages: list[Message]):
+    def extract_incremental(
+        self,
+        messages: list[Message],
+        llm_callback: Optional[Callable[[str], str]] = None,
+        # 🆕³ M11.7: dual-gate 入参(0 = 跳过闸门, 兼容老调用方)
+        current_token_count: int = 0,
+        tool_count_delta: int = 0,
+        tool_count_last_turn: int = 0,
+    ):
         """
         增量更新 SM 文件
+        - 🆕³ M11.7: 先过 should_extract_now() 闸门(详见 §4.4.5)
+          - current_token_count == 0 → 跳过闸门(向后兼容)
+          - 否则走 3 条件 dual-gate(init 门槛 / token Δ / tool Δ + OR 旁路)
         - 读 SM 文件当前内容
         - 取 last_compacted_msg_id 之后的新消息
         - LLM 用 Edit 工具更新 SM 文件 (schema 不变)
         - 后台跑, 不阻塞
         """
+        # 🆕³ M11.7 dual-gate(详见 §4.4.5)
+        if current_token_count > 0 and not self.should_extract_now(
+            current_token_count=current_token_count,
+            tool_count_delta=tool_count_delta,
+            tool_count_last_turn=tool_count_last_turn,
+        ):
+            log.debug(f"[sm.extract_incremental] gate 拦住, 跳过 (current={current_token_count})")
+            return
+
         current_sm = self.read_sm() if self.sm_exists() else self._template()
         new_messages = messages[self._index_after(self.last_compacted_msg_id):]
 
@@ -1002,11 +1023,16 @@ class SessionMemoryLayer:
         # fork agent + cache-safe params (P0-6)
         threading.Thread(
             target=self._do_extract,
-            args=(current_sm, new_messages),
+            args=(current_sm, new_messages, current_token_count),
             daemon=True,
         ).start()
 
-    def _do_extract(self, current_sm: str, new_messages: list[Message]):
+    def _do_extract(
+        self,
+        current_sm: str,
+        new_messages: list[Message],
+        current_token_count: int = 0,
+    ):
         try:
             prompt = self._build_extract_prompt(current_sm, new_messages)
             # 🆕³ M11.5: 解耦 LLM callback, 由 make_sm_extract_callback 工厂构造
@@ -1014,8 +1040,10 @@ class SessionMemoryLayer:
             # SessionMemoryLayer 不直接调 router,而是注入 callback 接收 LLM 响应
             response = self._llm_callback(prompt)
             # 后台 agent 已经通过 Edit 工具改完文件了
-            # 推进 last_compacted_msg_id
+            # 推进 last_compacted_msg_id + 记录本次抽取 token(供下次 dual-gate 计算 Δ)
             self.last_compacted_msg_id = new_messages[-1].id
+            if current_token_count > 0:
+                self._last_extract_token_count = current_token_count
         except Exception as e:
             log.warning(f"sm extract failed: {e}")
 
@@ -1023,8 +1051,16 @@ class SessionMemoryLayer:
     def compact(self, messages: list[Message], context_window: int) -> CompactResult:
         """
         触发压缩时 (token 超阈值), 直接用 SM 文件拼 summary
-        
+
         零 LLM 调用, 毫秒级完成
+
+        🆕³ M11.7: kept_messages 用 calculate_messages_to_keep_index()
+        算窗口(3 约束 + API 不变量保护,详见不变量 #14/#15):
+        1. cap: token > window_max_tokens (40K) → 丢最旧
+        2. min-tokens: token < window_min_tokens (10K) → 反向扩
+        3. min-text-block: 文本消息 < window_min_text_block_messages (5) → 反向扩
+        4. adjust_index_to_preserve_api_invariants: tool_use/tool_result pair +
+           同 message.id 整体性保护
         """
         sm_content = self.read_sm() if self.sm_exists() else None
         if not sm_content:
@@ -1045,9 +1081,11 @@ class SessionMemoryLayer:
             ),
         }
 
-        # 丢弃 last_compacted_msg_id 之前的消息
-        # 它们的"信息"在 SM 文件里, 不丢
-        kept_messages = messages[self._index_after(self.last_compacted_msg_id):]
+        # 🆕³ M11.7: 用 window 3 约束 + API 不变量算 kept 窗口
+        # (详见 calculate_messages_to_keep_index + 不变量 #14/#15)
+        last_compacted_idx = self._index_after(self.last_compacted_msg_id) - 1
+        keep_start = self.calculate_messages_to_keep_index(messages, last_compacted_idx)
+        kept_messages = messages[keep_start:]
 
         return CompactResult(
             summary=summary_message,
@@ -1144,6 +1182,102 @@ def should_trigger_compact(self, ctx: TurnContext) -> CompactDecision:
 | extraction 正在跑 | 避免读写冲突 | 等 ≤15s |
 | SM-compact 后仍超阈值 | SM 文件不够精简 | 走传统 |
 
+#### 4.4.5 抽取时机 dual-gate (🆕 M11.7)
+
+> §4.4 是 **compact 时**决策（要不要走 SM 压缩）。本节是 **extract 时**决策（要不要起后台抽取任务）——两条路径的 throttle 是独立的。
+
+**核心问题**：`extract_incremental()` 每 run 末尾被调用会无差别触发后台 LLM 任务，造成：(a) 短会话(<10K token) 也建 SM 文件，浪费 token；(b) 相邻 run 间 token Δ 很小时也起 LLM，浪费算力；(c) 反复 `extract → write` 抖动，cache 命中率低。
+
+**对策**：三层闸门 — **init 门槛** + **token Δ 阈值** + **tool Δ 阈值**,对齐 Claude Code SessionMemory 的 throttle 设计。
+
+```python
+def _should_extract(
+    current_token_count: int,
+    tool_count_delta: int,
+    tool_count_last_turn: int,
+) -> tuple[bool, str]:
+    """
+    M11.7 抽取时机闸门 — 返回 (decision, reason)
+
+    闸门逻辑(顺序短路):
+    1. 未 init 且 current < minimum_message_tokens_to_init(默认 10K)→ False
+       "below_init_threshold": 不建 SM 文件
+    2. 未 init 且 current ≥ 10K → True (init latch 置位, 写 SM template)
+    3. 已 init 且 token Δ < minimum_tokens_between_update(默认 5K)→ False
+       "below_token_delta": 增量不够, 浪费 LLM 算力
+    4. 已 init 且 token Δ ≥ 5K + tool Δ ≥ tool_calls_between_updates(默认 3) → True
+    5. 已 init 且 token Δ ≥ 5K + last_turn tool = 0 → True (纯文本旁路 OR)
+    6. 否则 → False "below_tool_or_last_turn"
+    """
+```
+
+**公开 API**(`should_extract_now`):
+
+```python
+def should_extract_now(
+    self, *, current_token_count: int,
+    tool_count_delta: int, tool_count_last_turn: int,
+) -> bool:
+    """agent_core.run() 末尾调用 — 决定是否提交后台抽取任务"""
+    decision, reason = self._should_extract(
+        current_token_count, tool_count_delta, tool_count_last_turn,
+    )
+    logger.debug(
+        f"[sm.should_extract_now] decision={decision} reason={reason} "
+        f"current={current_token_count} delta={tool_count_delta} "
+        f"last_turn={tool_count_last_turn}"
+    )
+    return decision
+```
+
+**决策表**:
+
+| current_token | 已 init? | token Δ | tool Δ | last_turn tools | 决策 | reason |
+| --- | --- | --- | --- | --- | --- | --- |
+| < 10K | 否 | — | — | — | **False** | `below_init_threshold` |
+| ≥ 10K | 否 (首次) | — | — | — | **True** | `init` (latch) |
+| ≥ 10K | 是 | < 5K | * | * | **False** | `below_token_delta` |
+| ≥ 10K | 是 | ≥ 5K | ≥ 3 | * | **True** | `ok` (双门满足) |
+| ≥ 10K | 是 | ≥ 5K | < 3 | 0 | **True** | `ok` (纯文本旁路) |
+| ≥ 10K | 是 | ≥ 5K | < 3 | > 0 | **False** | `below_tool_or_last_turn` |
+
+**调用方集成** (`agent_core.py:1020+`):
+
+```python
+# M11.7: extract 前先过 should_extract_now 闸门
+_gate_ok = self.session_memory.should_extract_now(
+    current_token_count=last_input_tokens + last_output_tokens,
+    tool_count_delta=len(last_tool_calls),
+    tool_count_last_turn=len(last_tool_calls),
+)
+if not _gate_ok:
+    _logger.debug("[L3 SM extract trigger] gate 拦住, 跳过 extract")
+else:
+    self.session_memory.extract_incremental(
+        messages=_msgs_with_id,
+        llm_callback=llm_cb,
+        current_token_count=_current_tokens,
+        tool_count_delta=_tool_delta,
+        tool_count_last_turn=_tool_delta,
+    )
+```
+
+**6 个新阈值字段**(`CompactConfig`,全 env 可配):
+
+| 字段 | 默认 | Env | 范围 |
+| --- | --- | --- | --- |
+| `minimum_message_tokens_to_init` | 10_000 | `MEMORY_COMPACT__MINIMUM_MESSAGE_TOKENS_TO_INIT` | 1K-200K |
+| `minimum_tokens_between_update` | 5_000 | `MEMORY_COMPACT__MINIMUM_TOKENS_BETWEEN_UPDATE` | 500-100K |
+| `tool_calls_between_updates` | 3 | `MEMORY_COMPACT__TOOL_CALLS_BETWEEN_UPDATES` | 0-100 |
+| `window_min_tokens` | 10_000 | `MEMORY_COMPACT__WINDOW_MIN_TOKENS` | 1K-200K |
+| `window_min_text_block_messages` | 5 | `MEMORY_COMPACT__WINDOW_MIN_TEXT_BLOCK_MESSAGES` | 1-50 |
+| `window_max_tokens` | 40_000 | `MEMORY_COMPACT__WINDOW_MAX_TOKENS` | 5K-200K |
+
+**`_initialized` latch 行为**:
+- 是 **per-instance latch**(内存变量),不持久化到 SM 文件 frontmatter
+- 重新 load SM 文件后 `_initialized = False` — 下次 `extract_incremental` 会按当前 token 重新决策(不会因为旧文件存在就跳过 init 门)
+- 这是有意为之:**避免跨进程重启后错误推断 latch 状态**
+
 ### 4.5 v2 关键不变量
 
 **这些不变量是 v2 设计的"安全网"，违反任意一条都会破坏系统**：
@@ -1159,6 +1293,10 @@ def should_trigger_compact(self, ctx: TurnContext) -> CompactDecision:
 9. **🆕 v2.2 语义去重绝不阻断持久化**——向量库异常/LLM 判定失败时返回 False（宁可多存不可误删）
 10. **🆕³ v2.3.1 SM/distill LLM callback 解耦**——SM 提取 / autoDream 不直接持有 `LLMRouter`,只持有 `(prompt) -> str` 同步 callback,retry/backoff/失败语义由 callback 工厂统一,易替换/易测
 11. **🆕³ v2.3.2 autoDream 不读 session 日志**——蒸馏输入只看 `.agent_data/memory/{type}/*.md`,去重已在 M11 由 `dual_channel_writer._is_semantic_duplicate` 负责(详见 §7.1 门3 + §6.9)
+12. **🆕³ v2.3.3 抽取时机 dual-gate**——`extract_incremental()` 前必须过 `should_extract_now()` 闸门:会话累计 token < `minimum_message_tokens_to_init` (10K) 不创建 SM 文件;已 init 后 token Δ < `minimum_tokens_between_update` (5K) 不抽取;同时满足 token Δ ≥ 5K AND (tool Δ ≥ 3 OR last_turn tool = 0) 才抽取,避免短会话浪费 LLM 算力 + 降低 cache 抖动(详见 §4.4.5)
+13. **🆕³ v2.3.3 SM 文件权限 0o700 + 0o600 + O_EXCL**——`write_sm_template()` 必须用 `0o700` 目录 + `0o600` 文件 + `O_WRONLY|O_CREAT|O_EXCL` 原子创建(吞 `FileExistsError` 实现幂等);`_persist_compact_result()` 走 `_open_secure()` helper 用 `O_WRONLY|O_CREAT|O_TRUNC,0o600` 覆盖写,SM 文件含对话级敏感信息,必须禁止其他用户读
+14. **🆕³ v2.3.3 compact 窗口保留 API 不变量**——`calculate_messages_to_keep_index()` 末尾必须调 `adjust_index_to_preserve_api_invariants()`,保证 (a) `tool_use`/`tool_result` 配对不被切断(`tool_use` 在 kept 外但 `tool_result` 在 kept 内 → 必须把 `tool_use` 拉回 kept);(b) 同 `message.id` 整体性不被破坏(同 id 在 kept 内但另一个相同 id 在 kept 外 → 必须拉回 kept);floor 硬夹防越界
+15. **🆕³ v2.3.3 compact 窗口 3 约束**——`calculate_messages_to_keep_index()` 必须顺序执行 3 约束:(1) **cap** — token 总和 > `window_max_tokens` (40K) → 丢最旧;(2) **min-tokens** — 总和 < `window_min_tokens` (10K) → 反向扩(但不破 `floor = last_compacted_idx + 1`);(3) **min-text-block** — 文本消息数 < `window_min_text_block_messages` (5) → 反向扩;然后过不变量 #14 调整。3 约束顺序固定,与 Claude Code SessionMemory `getMessagesToKeepIndex` 一致
 
 #### 4.5.1 不变量测试矩阵：8 个并发/崩溃场景（v2.1 增，对应 A12 修复）
 
