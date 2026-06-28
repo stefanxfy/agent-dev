@@ -2038,6 +2038,186 @@ def query_audit(  # M3
 
 ---
 
+### 4.9 Classifier 三阶段 fast-path (`classifier_fast_path.py`)
+
+**完整对齐 CC `src/utils/permissions/permissions.ts:600-686`** —— `auto` mode 下不必每次都调 Haiku classifier,先用快速路径判断要不要跳过 classifier。
+
+**为什么需要 fast-path**:
+- CC `auto` mode 完全 YOLO,classifier 每次都要调 Haiku API(昂贵 + 延迟)
+- 多数场景可静态判断(acceptEdits 行为 / 安全工具白名单),没必要花钱调模型
+- Agent / REPL 工具内嵌 VM,**必须**走 fast-path 跳过 classifier(`permissions.ts:600-603` 注释明确解释——"REPL 内嵌 VM 逃逸会绕过 classifier")
+
+```python
+# agent_core/tools/classifier_fast_path.py
+"""
+auto mode 的三阶段 fast-path
+对齐 Claude Code src/utils/permissions/permissions.ts:600-686
+
+顺序:
+  0. requires_user_interaction  → 必须 ask,不走 classifier
+  1. acceptEdits  fast-path     → 用 mode='acceptEdits' 重跑 tool.checkPermissions
+                                   (Agent / REPL 工具禁用——REPL 内嵌 VM 逃逸会绕过 classifier)
+  2. safe-tool   allowlist     → 命中常量白名单直接放行
+  3. classifier  main path     → fallback 调 Haiku classifyYoloAction
+
+返回值:
+  ('allow', reason, fast_path_stage)
+  ('ask', reason, None)             # 不可绕过
+  (None, None, None)                # 三阶段都没命中,需调 classifier
+"""
+from __future__ import annotations
+import logging
+from typing import Optional, Tuple
+
+from .permission_types import (
+    PermissionBehavior, PermissionDecision, PermissionMode,
+    ToolPermissionContext, ToolDef,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ── safe-tool allowlist(对齐 CC classifierDecision.ts:isAutoModeAllowlistedTool) ──
+# 这些工具在 auto mode 下默认安全,可跳过 classifier 直接 allow
+_AUTO_MODE_ALLOWLIST: frozenset[str] = frozenset({
+    "Read",         # 读文件,静态分析已审过敏感路径
+    "Glob",         # 文件搜索,只读
+    "Grep",         # 文本搜索,只读
+    "ListFiles",    # 列目录
+    "ReadImage",    # 读图片,无副作用
+    # Agent / REPL / Bash / Write / Edit / NotebookEdit **故意不在白名单**——
+    # 前两者内嵌 VM 逃逸,后三者有副作用或可执行任意代码
+})
+
+
+def is_auto_mode_allowlisted_tool(tool_name: str) -> bool:
+    """CC `classifierDecision.ts:isAutoModeAllowlistedTool` 的 Python 版本"""
+    return tool_name in _AUTO_MODE_ALLOWLIST
+
+
+# ── Agent / REPL 工具 fast-path 禁用名单 ──
+# 对齐 CC permissions.ts:600-603 注释:
+#   "REPL 内嵌 VM 逃逸会绕过 classifier,必须强制 ask"
+_FAST_PATH_DISABLED_TOOLS: frozenset[str] = frozenset({
+    "Agent",
+    "REPL",
+})
+
+
+def check_classifier_fast_path(
+    tool: ToolDef,
+    tool_input: dict,
+    context: ToolPermissionContext,
+) -> Tuple[Optional[PermissionBehavior], Optional[str], Optional[str]]:
+    """
+    返回 (behavior, reason, fast_path_stage) / (None, None, None) 表示需调 classifier。
+
+    stage 取值:
+      - "interaction"  — requires_user_interaction 拦下,必须 ask
+      - "acceptEdits"  — acceptEdits fast-path 命中
+      - "allowlist"    — safe-tool allowlist 命中
+      - None           — 三阶段都没命中,fall through 到 classifier
+
+    对齐 CC `permissions.ts:600-686`
+    """
+    # ── Stage 0: requires_user_interaction(对齐 CC 600-603) ──
+    # tool 自己声明必须交互的(AskUserQuestion 等),即使 auto mode 也必须 ask
+    if getattr(tool, "requires_user_interaction", False):
+        return (
+            PermissionBehavior.ASK,
+            "tool requires user interaction",
+            "interaction",
+        )
+
+    # ── Stage 1: acceptEdits fast-path(对齐 CC 600-620) ──
+    # **例外**:Agent / REPL 工具**禁用**这条 fast-path,REPL 内嵌 VM 逃逸会绕过 classifier
+    if (
+        tool.name not in _FAST_PATH_DISABLED_TOOLS
+        and context.mode != PermissionMode.ACCEPT_EDITS  # 已经是 ACCEPT_EDITS 不需要重跑
+        and tool.check_permissions is not None
+    ):
+        try:
+            # 用 mode='acceptEdits' 重跑 tool.checkPermissions
+            accept_edits_context = _swap_mode(context, PermissionMode.ACCEPT_EDITS)
+            decision = tool.check_permissions(tool_input, accept_edits_context)
+            if decision.behavior == PermissionBehavior.ALLOW:
+                # CC `permissions.ts:617-620`:`fastPath: 'acceptEdits'`,reason: mode=auto
+                logger.debug(
+                    f"[classifier.fast_path] acceptEdits 命中: tool={tool.name}"
+                )
+                return (
+                    PermissionBehavior.ALLOW,
+                    "fastPath: acceptEdits",
+                    "acceptEdits",
+                )
+        except Exception as e:
+            # tool.checkPermissions 抛错不破坏 fast-path(对齐 CC 'fail-open to classifier')
+            logger.debug(f"[classifier.fast_path] acceptEdits 重跑失败: {e}")
+
+    # ── Stage 2: safe-tool allowlist(对齐 CC classifierDecision.ts) ──
+    if is_auto_mode_allowlisted_tool(tool.name):
+        logger.debug(
+            f"[classifier.fast_path] allowlist 命中: tool={tool.name}"
+        )
+        return (
+            PermissionBehavior.ALLOW,
+            f"safe-tool allowlist: {tool.name}",
+            "allowlist",
+        )
+
+    # ── 三阶段都没命中 → fall through 到 classifier ──
+    return (None, None, None)
+
+
+def _swap_mode(
+    context: ToolPermissionContext,
+    new_mode: PermissionMode,
+) -> ToolPermissionContext:
+    """构造一个新 context,mode 替换为 new_mode(其它字段保持不变)
+
+    Pydantic model_copy 实现(避免 mutation 污染原 context)
+    """
+    return context.model_copy(update={"mode": new_mode})
+```
+
+**与 §4.5.2 classifier 的关系**:
+- §4.5.2 是**主路径**(`HaikuClassifier.classify()` 调 Haiku API)
+- §4.9 是**前置 fast-path**,在主路径之前跑
+- 整体流程:`check_permissions()` → 进入 auto mode → `check_classifier_fast_path()` → 命中返 allow / 不命中调 §4.5.2 classifier
+
+**与 `requires_user_interaction` 的关系**(对齐 CC `permissions.ts:1232-1236`):
+- `ToolDef.requires_user_interaction = True` 的工具(§7.2 定义)在任何 mode(包括 bypass)都强制 ask
+- §4.9 stage 0 把这条规则也复用于 classifier fast-path(避免 fast-path 误把 AskUserQuestion 工具直接 allow 了)
+
+**与 `denial_tracking` 的关系**:
+- fast-path 返回 allow → 不计入 denial
+- fast-path 返回 ask → 不计入 denial(本来就是 ask,模型无法"撞墙")
+- fall through 到 classifier → classifier 返 deny 时计入 §4.5.4 denial_tracking
+
+**集成点**(M1 实施时):
+- `PermissionEngine.check_permissions()` 进入 auto mode 后,先调 `check_classifier_fast_path()`
+- fast-path 返 (allow, reason, stage) → 直接返回 `PermissionDecision(behavior=ALLOW, decision_reason={type:'mode', mode:'auto', fast_path:stage})`
+- fast-path 返 (ask, reason, stage) → 直接返 `PermissionDecision(behavior=ASK, decision_reason={type:'mode', mode:'auto', fast_path:stage})`
+- fast-path 返 (None, None, None) → 调 §4.5.2 `HaikuClassifier.classify()`
+
+**为什么这里**不**让 fast-path 覆盖 `deny`**:
+- CC `permissions.ts:600-686` 三阶段最多返 allow / fall through,从不主动 deny
+- deny 必须由 classifier / Hook / safety_check 决定(避免 fast-path 误拦导致模型反复重试)
+
+**测试要点**(M1 阶段):
+- `test_fast_path_stage0_blocks_agent_tool` — Agent.requires_user_interaction=True → (ASK, 'interaction')
+- `test_fast_path_stage1_accept_edits_returns_allow` — Read + mode='auto' + acceptEdits allow → (ALLOW, 'acceptEdits')
+- `test_fast_path_stage1_disabled_for_repl_tool` — REPL 工具即使 mode=acceptEdits allow 也不走 fast-path
+- `test_fast_path_stage2_allowlist_returns_allow` — Read/Glob/Grep → (ALLOW, 'allowlist')
+- `test_fast_path_stage3_falls_through` — Bash → (None, None, None),classifier 接管
+
+**与 CC `permissions.ts:600-686` 的关键差异**:
+- 本实现把"requires_user_interaction 阶段"提前到 fast-path(CC 是和 `checkPermissionMode` 一起判)
+- 本实现把 "Agent / REPL 禁用 acceptEdits fast-path" 抽成常量 `_FAST_PATH_DISABLED_TOOLS`(CC 是 inline 注释)
+- 本实现允许 fast-path 返回 `ask`(CC 的 interaction 阶段是直接在 permissions.ts 主体返 ask,没经过 fast-path)
+
+---
+
 ## 5. OS 层 — 安全沙箱 (Security Sandbox)
 
 ### 5.1 架构决策
@@ -2491,6 +2671,7 @@ agent_core/tools/
 ├── sandbox_decision.py            (新增 ~50 行:should_use_sandbox)
 ├── sandbox_prompt.py              (新增 ~60 行:prompt 注入)
 └── audit_logger.py                (新增 ~80 行:独立审计通道,见 §4.8)
+└── classifier_fast_path.py        (新增 ~70 行:auto mode 三阶段 fast-path,见 §4.9)
 
 docs/tool/
 ├── tool-security-architecture.md  (本文档,新增)
@@ -2636,6 +2817,7 @@ class TestSafetyCheck:
 | **PermissionBehavior** | allow / deny / ask / passthrough | allow / deny / ask / passthrough | ✅ **完全对齐** |
 | **PermissionDecisionReason** | rule / mode / hook / subcommandResults / classifier / workingDir / safetyCheck / other | 8 个全实现(`safetyCheck` + `classifier` + `subcommandResults` + `workingDir` 都实现) | ✅ **完全对齐** |
 | **Speculative classifier check** | `permissions.ts:387-400` 并发 | `asyncio.create_task(classifier.classify)` 在 bash_check_permissions 启动时并发 | ✅ **完全对齐** |
+| **Classifier 三阶段 fast-path** | `permissions.ts:600-686`:requiresUserInteraction + acceptEdits fast-path + safe-tool allowlist | `classifier_fast_path.py` 三阶段(Stage0 interaction / Stage1 acceptEdits / Stage2 allowlist / Stage3 fall through,见 §4.9)| ✅ **完全对齐**(Agent/REPL 工具禁用 fast-path,与 CC 600-603 注释一致) |
 | **Classifier (Haiku YOLO)** | `bashClassifier.ts`(ANT-only stub) + `yoloClassifier.ts`(1495 行,真 ANT) + `bashSecurity.ts`(2592 行) | `classifier.py` 默认 stub 化(`is_classifier_enabled` 三段短路) | ✅ **完全对齐**(默认行为与 CC bashClassifier.ts 一致) |
 | **Classifier 启用条件** | sandbox 内 OR 无 settings 匹配 + ANT | `_should_use_classifier` 完整复刻 | ✅ **完全对齐** |
 | **Hook 系统** | PreToolUse(并行)/PermissionRequest(headless)/PermissionDenied(retry) | PreToolUse(并行 + updated_input + deny + prevent_continuation)+ PermissionRequest(预留)+ PermissionDenied(M3) | 🔄 1 个 hook 缺(denied 钩子 M3 补) |
@@ -2680,10 +2862,11 @@ class TestSafetyCheck:
 | 6. `permission_hook.py` (PreToolUse + 预置 secret/path hook) | 新增 | 2h |
 | 7. `classifier.py` (Haiku YOLO + ANT-only stub) | 新增 | 2h |
 | 8. `denial_tracking.py` (auto-mode classifier 兜底) | 新增 | 1h |
-| 9. `base.py` 改造 (加 check_permissions / schema 校验) | 改 | 1h |
-| 10. `agent_core.py` 整合 (PermissionEngine + 异步 check) | 改 | 2h |
-| 11. `web/app.py` Streamlit 弹窗 | 改 | 2h |
-| 12. 测试 | 新增 | 5h |
+| 9. `classifier_fast_path.py` (auto mode 三阶段 fast-path,见 §4.9) | 新增 | 1h |
+| 10. `base.py` 改造 (加 check_permissions / schema 校验) | 改 | 1h |
+| 11. `agent_core.py` 整合 (PermissionEngine + 异步 check) | 改 | 2h |
+| 12. `web/app.py` Streamlit 弹窗 | 改 | 2h |
+| 13. 测试 | 新增 | 5h |
 
 **里程碑**:能给 Read/Write 工具加 deny rule,跑起来看到弹窗;classifier 兜底工作(可关)。
 
@@ -2748,14 +2931,16 @@ class TestSafetyCheck:
 - Claude Code 工具权限设计:`docs/tool/permission-design.md`
 - Claude Code 沙箱实现:`docs/tool/sandbox-implementation.md`
 - Claude Code 源码:`/Users/fanyunxu/Desktop/myproject/ailearning/claude-code-analysis/src/`
-  - `utils/permissions/permissions.ts` (1486 行)
+  - `utils/permissions/permissions.ts` (1486 行,含 `permissions.ts:600-686` 三阶段 fast-path)
   - `utils/permissions/bashClassifier.ts` (61 行,ANT-only external stub)
   - `utils/permissions/yoloClassifier.ts` (1495 行,真 ANT classifier)
   - `utils/permissions/denialTracking.ts` (45 行,DENIAL_LIMITS 阈值)
+  - `utils/permissions/classifierDecision.ts` (~200 行,safe-tool allowlist + isAutoModeAllowlistedTool)
   - `tools/BashTool/bashPermissions.ts` (2621 行)
   - `tools/BashTool/bashSecurity.ts` (2592 行,BashTool 集成 classifier)
   - `tools/BashTool/pathValidation.ts` (1303 行)
   - `utils/sandbox/sandbox-adapter.ts` (985 行)
+  - `services/analytics/analyticsHooks.ts` (CC telemetry 设计参考,本项目改为纯本地 audit_logger,见 §4.8)
   - `entrypoints/sandboxTypes.ts` (156 行 Zod schema)
 - 当前项目工具现状:`agent_core/tools/base.py` + `builtin.py`
 
