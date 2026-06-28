@@ -559,18 +559,216 @@ last_compacted_at: null
         return sm_tokens + kept_tokens + 50
 
     def _slice_kept_messages(self, messages: list[dict]) -> list[dict]:
-        """根据 last_compacted_msg_id 切出保留的消息"""
+        """根据 last_compacted_msg_id 切出保留的消息
+
+        M11.7 (2026-06-28): 委托给 calculate_messages_to_keep_index(),加
+        minTokens / minTextBlockMessages / maxTokens 3 约束(对齐 Claude Code diff 7)。
+        """
+        if not messages:
+            return []
         if self._last_compacted_msg_id is None:
-            return messages
-        try:
-            idx = next(
-                i for i, m in enumerate(messages)
-                if m.get("id") == self._last_compacted_msg_id
+            last_idx = -1
+        else:
+            try:
+                last_idx = next(
+                    i for i, m in enumerate(messages)
+                    if m.get("id") == self._last_compacted_msg_id
+                )
+            except StopIteration:
+                last_idx = -1
+        start = self.calculate_messages_to_keep_index(messages, last_idx)
+        return messages[start:]
+
+    def calculate_messages_to_keep_index(
+        self, messages: list[dict], last_compacted_idx: int,
+    ) -> int:
+        """M11.7 (2026-06-28): 对齐 Claude Code keep window 3 约束(diff 7)
+
+        输入:完整 messages + last_compacted_idx(-1 表示无 prior compaction)
+        输出:kept window 的起始 index(slice 用)
+
+        3 约束(顺序):
+        1. cap pass(window_max_tokens):从头开始丢最旧,直到 kept < maxTokens
+        2. min tokens pass(window_min_tokens):若 kept < minTokens,向前扩(不能过 floor)
+        3. min text-block pass(window_min_text_block_messages):若 kept 文本消息数 < N,向前扩
+        4. 最后调 adjust_index_to_preserve_api_invariants()(Step 5)
+
+        Args:
+            messages: 完整消息列表
+            last_compacted_idx: last_compacted_msg_id 在 messages 中的 index,-1 表示无
+
+        Returns:
+            int: 起始 index ∈ [0, len(messages)-1]
+        """
+        if not messages:
+            return 0
+        floor = max(last_compacted_idx + 1, 0)
+        start_index = floor
+
+        def _tokens_upto(end_idx: int) -> int:
+            """messages[start_index..end_idx] 的 token 数(启发式)"""
+            if end_idx < start_index:
+                return 0
+            return self._estimate_messages_tokens(messages[start_index:end_idx + 1])
+
+        # 1. cap pass: 超过 maxTokens 就丢最旧
+        while (
+            start_index < len(messages) - 1
+            and _tokens_upto(len(messages) - 1) > self.config.window_max_tokens
+        ):
+            start_index += 1
+            logger.debug(
+                f"[sm.window] cap pass: start_index++ → {start_index} "
+                f"(tokens={_tokens_upto(len(messages) - 1)} > "
+                f"max={self.config.window_max_tokens})"
             )
-            return messages[idx + 1:]
-        except StopIteration:
-            # last_id 不在 messages 里 → 全保留
-            return messages
+
+        # 2. min tokens pass: 不足 minTokens 就向前扩(不能过 floor)
+        while (
+            start_index > floor
+            and _tokens_upto(len(messages) - 1) < self.config.window_min_tokens
+        ):
+            start_index -= 1
+            logger.debug(
+                f"[sm.window] min-tokens pass: start_index-- → {start_index} "
+                f"(tokens={_tokens_upto(len(messages) - 1)} < "
+                f"min={self.config.window_min_tokens})"
+            )
+
+        # 3. min text-block pass: 文本消息数 < window_min_text_block_messages 就向前扩
+        min_text = self.config.window_min_text_block_messages
+        while start_index > floor:
+            text_count = self._count_text_block_messages(messages[start_index:])
+            if text_count >= min_text:
+                break
+            start_index -= 1
+            logger.debug(
+                f"[sm.window] min-text-block pass: start_index-- → {start_index} "
+                f"(text_count={text_count} < min={min_text})"
+            )
+
+        result = max(0, min(start_index, len(messages) - 1))
+        # M11.7 Step 5: API 不变量保护(tool pair + same message.id)
+        result = self.adjust_index_to_preserve_api_invariants(messages, result, floor)
+        logger.debug(
+            f"[sm.window] final start_index={result} (floor={floor}, "
+            f"total={len(messages)})"
+        )
+        return result
+
+    def _count_text_block_messages(self, msgs: list[dict]) -> int:
+        """数文本消息数(role=user/assistant 且 content 非空)
+
+        文本判定:
+        - content 是 str 且非空
+        - content 是 list 且含 type=='text' 的 block
+        """
+        count = 0
+        for m in msgs:
+            role = m.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                if content.strip():
+                    count += 1
+            elif isinstance(content, list):
+                has_text = any(
+                    isinstance(b, dict) and b.get("type") == "text"
+                    and b.get("text", "").strip()
+                    for b in content
+                )
+                if has_text:
+                    count += 1
+        return count
+
+    def adjust_index_to_preserve_api_invariants(
+        self,
+        messages: list[dict],
+        start_index: int,
+        floor: int,
+    ) -> int:
+        """M11.7 (2026-06-28): 对齐 Claude Code API 不变量保护(diff 8)
+
+        Anthropic API 强约束,kept window 不能破坏:
+        1. tool_use (idx i) + tool_result (idx j, j > i) → start_index 必须 ≤ i
+        2. 同 message.id 的 thinking + tool_use 必须一起保留
+
+        策略:仅向后扩 start_index(不能跨 floor),扫描 [start_index, ...) 找问题。
+        floor 永远不被跨越 — 不变量不可解时由 caller 决定(通常认为 token 太少,
+        反正不会再 compact,数据一致性比精简度优先)。
+
+        Args:
+            messages: 完整消息列表
+            start_index: 当前候选起始 index
+            floor: 硬下界(= last_compacted_idx + 1)
+
+        Returns:
+            int: 调整后的 start_index
+        """
+        if not messages:
+            return 0
+        adjusted = max(start_index, floor)
+
+        # 工具块内容提取 helper
+        def _tool_use_ids(msg: dict) -> set[str]:
+            c = msg.get("content", [])
+            if not isinstance(c, list):
+                return set()
+            return {
+                b.get("id", "")
+                for b in c
+                if isinstance(b, dict) and b.get("type") == "tool_use"
+            }
+
+        def _tool_result_ids(msg: dict) -> set[str]:
+            c = msg.get("content", [])
+            if not isinstance(c, list):
+                return set()
+            return {
+                b.get("tool_use_id", "")
+                for b in c
+                if isinstance(b, dict) and b.get("type") == "tool_result"
+            }
+
+        # Invariant 1: tool_use 在 [floor, adjusted) 但 tool_result 在 [adjusted, ...)
+        # → 把 start_index 拉回到 tool_use 之前
+        for i in range(adjusted - 1, floor - 1, -1):
+            if i < 0:
+                break
+            use_ids = _tool_use_ids(messages[i])
+            if not use_ids:
+                continue
+            # 在 i 之后找配对的 tool_result
+            for j in range(i + 1, len(messages)):
+                result_ids = _tool_result_ids(messages[j])
+                if use_ids & result_ids and j >= adjusted:
+                    # pair broken:tool_use 在 kept 之外,tool_result 在 kept 内
+                    logger.debug(
+                        f"[sm.invariant] tool pair broken at i={i} j={j}, "
+                        f"pull adjusted {adjusted} → {i}"
+                    )
+                    adjusted = i
+                    break
+
+        # Invariant 2: 同 message.id 必须一起保留
+        # [adjusted, ...) 找每个 id,检查 [floor, adjusted) 是否有同 id
+        kept_ids = set()
+        for i in range(adjusted, len(messages)):
+            mid = messages[i].get("id")
+            if mid:
+                kept_ids.add(mid)
+        for kid in kept_ids:
+            for j in range(floor, adjusted):
+                if messages[j].get("id") == kid:
+                    logger.debug(
+                        f"[sm.invariant] same message.id={kid!r} at j={j}, "
+                        f"pull adjusted {adjusted} → {j}"
+                    )
+                    adjusted = j
+                    break
+
+        return max(floor, adjusted)
 
     def _estimate_messages_tokens(self, messages: list[dict]) -> int:
         """估算消息列表的 token 数(启发式,无 LLM)

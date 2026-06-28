@@ -887,3 +887,203 @@ class TestFilePermissions:
         sm._open_secure(sm_path, "second content")
         mode = sm_path.stat().st_mode & 0o777
         assert oct(mode) == "0o600", f"期望 0o600,实际 {oct(mode)}"
+
+
+# ──────────────────────────────────────────────────────────────────
+# 11. SM compact window 3 约束 (Claude Code diff 7, Step 4)
+# ──────────────────────────────────────────────────────────────────
+
+def _make_text_msg(i: int, content: str = "测试文本") -> dict:
+    """构造一条文本消息(用于 window 测试)"""
+    return {"id": f"m{i}", "role": "user", "content": content}
+
+
+def _make_tool_msg(i: int, tool_id: str = "tool_x") -> dict:
+    """构造一条 assistant tool_use 消息"""
+    return {
+        "id": f"m{i}",
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": tool_id, "name": "search", "input": {}}],
+    }
+
+
+def _make_tool_result_msg(i: int, tool_id: str = "tool_x") -> dict:
+    """构造一条 user tool_result 消息"""
+    return {
+        "id": f"m{i}",
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}],
+    }
+
+
+class TestWindowStrategy:
+    """M11.7 (2026-06-28): 对齐 Claude Code keep window 3 约束(Step 4)"""
+
+    def test_window_keep_typical_case_under_max(self, sm, config):
+        """100 msg / ~10K token, last_id=m50 → 留 ~50 条(在 max 之内)"""
+        # 100 条 ~100 chars 用户消息,每条约 50 token
+        messages = [_make_text_msg(i, "x" * 100) for i in range(100)]
+        sm._last_compacted_msg_id = "m50"
+        kept = sm._slice_kept_messages(messages)
+        # kept 应该在 m51..m99(约 50 条,token < 40K)
+        assert kept[0]["id"] == "m51"
+        assert kept[-1]["id"] == "m99"
+        assert len(kept) == 49
+
+    def test_window_cap_drops_oldest_when_over_40k(self, sm, config):
+        """400 msg / ~88K token, last_id=m10 → cap 把前面丢到 < 40K"""
+        # 400 条 1000 chars 文本,每条约 220 token,总 ~88K → 必触发 cap
+        messages = [_make_text_msg(i, "x" * 1000) for i in range(400)]
+        sm._last_compacted_msg_id = "m10"
+        kept = sm._slice_kept_messages(messages)
+        # 起始 index > 11(必须 cap,不能全保留 400 条 ~88K)
+        assert kept[0]["id"] != "m11"
+        # cap 后 kept 必须 < 200(40K cap 下大致 180 条)
+        assert len(kept) < 200
+        # 必须比原始少很多
+        assert len(kept) < len(messages) // 2
+        # 末条是最后一条
+        assert kept[-1]["id"] == "m399"
+
+    def test_window_min_tokens_expands_backward_but_respects_floor(self, sm, config):
+        """5 msg / 8K token, last_id=m1 → min_tokens 触发反向扩,但夹在 floor"""
+        # 5 条 2000 chars 文本,每条约 1000 token,总 ~5K
+        # last_id=m1 → floor=2,start=2,token ~3K < 10K
+        # 反向扩:start=1,token ~4K < 10K,继续到 start=0(不,是 floor=2 夹住)
+        messages = [_make_text_msg(i, "x" * 2000) for i in range(5)]
+        sm._last_compacted_msg_id = "m1"
+        kept = sm._slice_kept_messages(messages)
+        # floor=2,start 不会 < 2
+        assert kept[0]["id"] == "m2"
+        # 但 min_tokens 10K > total 5K,无法满足,只能到 floor
+        assert kept[-1]["id"] == "m4"
+
+    def test_window_min_text_block_messages_floor(self, sm, config):
+        """10 tool_msg + 4 text_msg, last_id=m0 → text<5,反向扩到 floor"""
+        # m0 是 last_id; m1-m5 全 tool 消息(text count = 0);
+        # m6-m9 是 text 消息(text count = 4 < 5)
+        # 反向扩但 floor=1
+        messages = (
+            [_make_text_msg(0, "first")]
+            + [_make_tool_msg(i) for i in range(1, 6)]  # 5 tool
+            + [_make_text_msg(i) for i in range(6, 10)]  # 4 text
+        )
+        sm._last_compacted_msg_id = "m0"
+        kept = sm._slice_kept_messages(messages)
+        # floor=1,start 不会 < 1
+        assert kept[0]["id"] == "m1"
+        # 末条是 m9
+        assert kept[-1]["id"] == "m9"
+
+    def test_window_with_no_last_id_uses_index_minus_one(self, sm, config):
+        """last_id=None → floor=0,total < max → 全保留"""
+        messages = [_make_text_msg(i, "x" * 100) for i in range(20)]
+        # _last_compacted_msg_id 保持 None
+        kept = sm._slice_kept_messages(messages)
+        assert len(kept) == 20
+
+    def test_window_empty_messages_returns_zero(self, sm, config):
+        """messages=[] → 返 [] 不抛"""
+        kept = sm._slice_kept_messages([])
+        assert kept == []
+
+    def test_window_messages_to_keep_index_no_floor_no_constraint_violation(self, sm, config):
+        """3 条小消息,last_id=-1 → 全保留"""
+        messages = [_make_text_msg(i, "hi") for i in range(3)]
+        result = sm.calculate_messages_to_keep_index(messages, -1)
+        assert result == 0
+
+
+# ──────────────────────────────────────────────────────────────────
+# 12. SM API 不变量保护 (Claude Code diff 8, Step 5)
+# ──────────────────────────────────────────────────────────────────
+
+class TestAPIInvariants:
+    """M11.7 (2026-06-28): 对齐 Claude Code API 不变量保护(Step 5)"""
+
+    def test_invariant_tool_use_pair_pulls_backward(self, sm, config):
+        """4 msg: orphan tool_use (idx 1) + valid tool_use (idx 2) + tool_result×2 (idx 3)
+        start=2 → adjusted=1(orphan pair 必须拉回)
+        """
+        messages = [
+            {"id": "m0", "role": "user", "content": "ask"},
+            {"id": "m1", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "ORPHAN", "name": "search", "input": {}}
+            ]},
+            {"id": "m2", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "VALID", "name": "search", "input": {}}
+            ]},
+            {"id": "m3", "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "ORPHAN", "content": "ok1"},
+                {"type": "tool_result", "tool_use_id": "VALID", "content": "ok2"},
+            ]},
+        ]
+        # last_compacted_idx=0,floor=1,start=1 应该 OK
+        # 但初始 start=2(跳过 m1),orphan tool_use 留在外 → 必须拉回 1
+        adjusted = sm.adjust_index_to_preserve_api_invariants(messages, 2, 1)
+        assert adjusted == 1
+
+    def test_invariant_no_pair_no_change(self, sm, config):
+        """全 text 消息 → start=1 不变"""
+        messages = [
+            {"id": "m0", "role": "user", "content": "ask"},
+            {"id": "m1", "role": "assistant", "content": "answer"},
+            {"id": "m2", "role": "user", "content": "follow"},
+        ]
+        adjusted = sm.adjust_index_to_preserve_api_invariants(messages, 1, 1)
+        assert adjusted == 1
+
+    def test_invariant_tool_pair_already_complete(self, sm, config):
+        """tool_use idx 2 + tool_result idx 3 → start=2 不变"""
+        messages = [
+            {"id": "m0", "role": "user", "content": "ask"},
+            {"id": "m1", "role": "user", "content": "noise"},
+            {"id": "m2", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "T1", "name": "search", "input": {}}
+            ]},
+            {"id": "m3", "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "T1", "content": "ok"}
+            ]},
+        ]
+        adjusted = sm.adjust_index_to_preserve_api_invariants(messages, 2, 1)
+        assert adjusted == 2
+
+    def test_invariant_thinking_block_same_message_id(self, sm, config):
+        """m1[id=X,thinking], m2[id=X,tool_use] → start=1 拉回 0"""
+        messages = [
+            {"id": "X", "role": "assistant", "content": [
+                {"type": "thinking", "thinking": "reasoning"}
+            ]},
+            {"id": "X", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "T1", "name": "search", "input": {}}
+            ]},
+            {"id": "Y", "role": "user", "content": "ok"},
+        ]
+        adjusted = sm.adjust_index_to_preserve_api_invariants(messages, 1, 0)
+        assert adjusted == 0  # 拉到 thinking 之前
+
+    def test_invariant_does_not_cross_floor(self, sm, config):
+        """start=2,floor=2,但需要 idx=0 → 夹在 floor=2"""
+        # m0=tool_use, m1=tool_result(同一对,完整),m2=text
+        # 想 start=2 但 m2 在 floor 之上,floor=2
+        messages = [
+            {"id": "m0", "role": "assistant", "content": [
+                {"type": "tool_use", "id": "T1", "name": "search", "input": {}}
+            ]},
+            {"id": "m1", "role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "T1", "content": "ok"}
+            ]},
+            {"id": "m2", "role": "user", "content": "follow"},
+        ]
+        # floor=2,start=2 → 没动
+        adjusted = sm.adjust_index_to_preserve_api_invariants(messages, 2, 2)
+        assert adjusted == 2
+
+    def test_invariant_string_content_messages_ignored(self, sm, config):
+        """content 是 str 的消息 → tool_use_ids 返空,start 不变"""
+        messages = [
+            {"id": "m0", "role": "user", "content": "ask"},
+            {"id": "m1", "role": "assistant", "content": "answer"},  # str,不是 list
+        ]
+        adjusted = sm.adjust_index_to_preserve_api_invariants(messages, 1, 0)
+        assert adjusted == 1
