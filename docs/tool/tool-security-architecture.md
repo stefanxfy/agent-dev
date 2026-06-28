@@ -307,13 +307,32 @@ class PermissionDecision(BaseModel):
 
 
 # ── 工具权限上下文(对齐 CC ToolPermissionContext) ──────
+
+class AdditionalWorkingDirectory(BaseModel):
+    """单条 additionalWorkingDirectory 的 metadata(对齐 CC 实际是 Map 值)"""
+    path: str                                              # 解析后的绝对路径
+    source: PermissionRuleSource = PermissionRuleSource.CLI_ARG  # 来自哪个 source
+    added_at: Optional[float] = None                       # time.time() 时间戳
+    reason: Optional[str] = None                           # 用户 add 时的备注
+
+
 class ToolPermissionContext(BaseModel):
     mode: PermissionMode = PermissionMode.DEFAULT
     always_allow_rules: dict[PermissionRuleSource, list[str]] = Field(default_factory=dict)
     always_deny_rules: dict[PermissionRuleSource, list[str]] = Field(default_factory=dict)
     always_ask_rules: dict[PermissionRuleSource, list[str]] = Field(default_factory=dict)
-    additional_working_directories: list[str] = Field(default_factory=list)
-    should_avoid_permission_prompts: bool = False  # 后台 agent 用
+    # 🆕 对齐 CC:Map<path, AdditionalWorkingDirectory>,不是简单 list
+    # CC src/types/permissions.ts 用 ReadonlyMap<string, AdditionalWorkingDirectory>
+    additional_working_directories: dict[str, AdditionalWorkingDirectory] = Field(default_factory=dict)
+    should_avoid_permission_prompts: bool = False            # 后台 agent 用
+    await_automated_checks_before_dialog: bool = False       # 等 hook 跑完再弹窗
+    is_bypass_permissions_mode_available: bool = True        # plan mode 是否能切 bypass
+    pre_plan_mode: Optional[PermissionMode] = None           # plan 切换前的 mode
+    stripped_dangerous_rules: Optional[dict[PermissionRuleSource, list[str]]] = None  # permissionSetup 处理后的安全版
+    # Classifier gate 用的上下文标志(对齐 CC classifierShared.ts)
+    sandbox_enabled: bool = False
+    no_settings_match: bool = False
+    is_anthropic_provider: bool = False
 ```
 
 ### 4.2 规则匹配 (`permission_matcher.py`)
@@ -620,9 +639,9 @@ class PermissionEngine:
         ctx = self.context
         tool_name = tool.name
 
-        # ── Step 0: Pre-tool-use hooks(对齐 CC utils/hooks.ts) ──
+        # ── Step 0: Pre-tool-use hooks(对齐 CC toolExecution.ts:800-862 并行) ──
         # hook 可改 input 或直接 deny;用户用 hook 接入自定义逻辑
-        hook_result = self.hooks.run_pre_tool_use(tool_name, tool_input)
+        hook_result = await self.hooks.run_pre_tool_use(tool_name, tool_input)
         if hook_result.decision == PermissionBehavior.DENY:
             return PermissionDecision(
                 behavior=PermissionBehavior.DENY,
@@ -657,6 +676,13 @@ class PermissionEngine:
                     type="rule", rule=ask_rule, reason=f"命中 ask rule: {ask_rule['rule_str']}"
                 ),
             )
+
+        # Bash + ask rule + sandbox auto-allow path:
+        # 透传给 BashTool 自己处理 subcommand-level rule 检查
+        # 对齐 CC permissions.ts:1094-1109
+        # (沙箱已开 + auto_allow_bash_if_sandboxed 时,tool-level ask rule 不立即返回,
+        #  让 BashTool 用 check_sandbox_auto_allow 检查 deny rule 后再处理 ask)
+        # —— 此处不立即返,继续往下走 Step 1c,tool.check_permissions 会处理。
 
         # ── Step 1c: tool 自定义权限检查(BashTool 调 bash_permissions) ──
         if hasattr(tool, "check_permissions"):
@@ -849,7 +875,7 @@ CC 注释:classifier 仅在 **Anthropic provider** + **(sandbox 内 OR 没有 se
 
 ### 4.4 Hook 机制 (`permission_hook.py`)
 
-对齐 CC `utils/hooks.ts` 的 PreToolUse / PermissionRequest:
+对齐 CC `utils/hooks.ts` 的 PreToolUse / PermissionRequest / PermissionDenied + `toolExecution.ts:800-862` 的并行执行模型:
 
 ```python
 # agent_core/tools/permission_hook.py
@@ -860,15 +886,18 @@ Hook 机制 — 在 tool 执行前/后插入用户自定义逻辑
 - PreToolUse Hook: tool 执行前(可改写 input 或 deny)
 - PostToolUse Hook: tool 执行后(可改写 output)
 - PermissionRequest Hook: 后台 agent 弹窗时给外部决策机会
+- PermissionDenied Hook: classifier 拒绝后给模型"重试"机会
 
-实现:同步顺序执行链,任一 hook 返 deny 立即短路(对齐 CC utils/hooks.ts 的链式语义)
-  - 顺序执行保证后一 hook 看到前一 hook 的 updated_input
-  - 短路保证 hook 返 deny 后不再执行
-  - 单 hook 失败 try/except 隔离,不影响后续 hook(对齐 CC 错误处理)
+实现(对齐 CC toolExecution.ts:800-862 并行执行 + 短路语义):
+- PreToolUse hooks 用 asyncio.gather 并行启动
+- 任一 hook 返 deny → 短路(其他 hook task 取消或结果丢弃)
+- merged_input 用顺序 merge(updated_input)→ 后注册的 hook 看到先注册的结果
+- 单 hook 失败 try/except 隔离,不影响其他 hook(对齐 CC 错误处理)
+- prevent_continuation=True → 立即停止后续 hook(对齐 CC preventContinuation)
 """
 import asyncio
 from typing import Callable, Optional, Awaitable, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -876,37 +905,94 @@ class PreToolUseResult:
     decision: Optional[PermissionBehavior] = None  # None = 让上层决定
     updated_input: Optional[dict] = None
     additional_context: Optional[str] = None
+    prevent_continuation: bool = False  # 🆕 对齐 CC preventContinuation(审计 hook 用)
 
 
-PreToolUseHook = Callable[[str, dict], PreToolUseResult]
+# Hook 可以是 sync 或 async(对齐 CC mixed sync/async)
+PreToolUseHook = Callable[[str, dict], Union[PreToolUseResult, Awaitable[PreToolUseResult]]]
 
 
 class HookRegistry:
-    """注册 + 串行执行 hook"""
+    """注册 + 并行执行 hook(对齐 CC toolExecution.ts:800-862)"""
 
     def __init__(self):
         self._pre_tool_use_hooks: list[tuple[str, PreToolUseHook]] = []
-        # name → hook, 名字用于 debug 和 unregister
 
     def register_pre_tool_use(self, name: str, hook: PreToolUseHook):
         self._pre_tool_use_hooks.append((name, hook))
 
-    def run_pre_tool_use(self, tool_name: str, tool_input: dict) -> PreToolUseResult:
-        """串行跑所有 hook,任一 deny 立即返回"""
+    async def run_pre_tool_use(self, tool_name: str, tool_input: dict) -> PreToolUseResult:
+        """
+        并行执行所有 PreToolUse hook(对齐 CC toolExecution.ts:800-862)
+
+        短路语义:
+        - 任一 hook 返 deny → 取消其他 hook,立即返回
+        - 任一 hook 返 prevent_continuation=True → 不再启动后续 hook
+          (但已在跑的不取消,等结果)
+
+        合并语义:
+        - updated_input 按注册顺序 merge(后注册 hook 看到先注册的结果)
+        - additional_context 累积(用于 classifier / safety_check 上下文)
+        """
+        if not self._pre_tool_use_hooks:
+            return PreToolUseResult(updated_input=tool_input)
+
         merged_input = tool_input
+        accumulated_context: list[str] = []
+        deny_result: Optional[PreToolUseResult] = None
+
+        # 按注册顺序遍历,但每个 hook 异步启动
+        # 取消策略:任一 deny → 立即 cancel 其他尚未完成的 task
+        tasks: list[tuple[str, asyncio.Task]] = []
         for hook_name, hook in self._pre_tool_use_hooks:
+            coro = _safe_call_hook(hook, tool_name, merged_input)
+            tasks.append((hook_name, asyncio.create_task(coro)))
+
+        for hook_name, task in tasks:
             try:
-                result = hook(tool_name, merged_input)
+                result = await task
+            except asyncio.CancelledError:
+                continue
             except Exception as e:
                 logger.exception(f"PreToolUse hook {hook_name} raised: {e}")
                 continue
-            # hook 可改 input(后一个 hook 看到前一个的结果)
+
             if result.updated_input is not None:
                 merged_input = result.updated_input
-            # hook 可直接 deny
+            if result.additional_context:
+                accumulated_context.append(result.additional_context)
             if result.decision == PermissionBehavior.DENY:
-                return result
-        return PreToolUseResult(updated_input=merged_input)
+                deny_result = result
+                # 取消其他尚未完成的 task
+                for other_name, other_task in tasks:
+                    if not other_task.done():
+                        other_task.cancel()
+                break
+            if result.prevent_continuation:
+                # 取消其他尚未启动/未完成的 task
+                for other_name, other_task in tasks:
+                    if not other_task.done():
+                        other_task.cancel()
+                break
+
+        if deny_result is not None:
+            return PreToolUseResult(
+                decision=deny_result.decision,
+                updated_input=merged_input,
+                additional_context="\n".join(accumulated_context) or deny_result.additional_context,
+            )
+        return PreToolUseResult(
+            updated_input=merged_input,
+            additional_context="\n".join(accumulated_context) or None,
+        )
+
+
+async def _safe_call_hook(hook, tool_name, tool_input):
+    """兼容 sync / async hook(对齐 CC mixed sync/async)"""
+    result = hook(tool_name, tool_input)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
 
 
 # ── 预置 hook(开箱即用) ────────────────────────────────
@@ -2144,6 +2230,9 @@ class ToolDef:
     version: str = "1.0"
     deprecated_since: Optional[str] = None
     check_permissions: Optional[Callable] = None  # (input, context) -> PermissionDecision
+    requires_user_interaction: bool = False      # 🆕 对齐 CC Tool.requiresUserInteraction
+                                                # REPL/Agent/NotebookEdit 等 VM/escape 风险工具必须 True
+                                                # (permissions.ts:549 auto-mode skip classifier)
 
 
 class ToolRegistry:
@@ -2261,7 +2350,7 @@ class TestSafetyCheck:
 | **Speculative classifier check** | `permissions.ts:387-400` 并发 | `asyncio.create_task(classifier.classify)` 在 bash_check_permissions 启动时并发 | ✅ **完全对齐** |
 | **Classifier (Haiku YOLO)** | `bashClassifier.ts`(ANT-only stub) + `yoloClassifier.ts`(1495 行,真 ANT) + `bashSecurity.ts`(2592 行) | `classifier.py` 默认 stub 化(`is_classifier_enabled` 三段短路) | ✅ **完全对齐**(默认行为与 CC bashClassifier.ts 一致) |
 | **Classifier 启用条件** | sandbox 内 OR 无 settings 匹配 + ANT | `_should_use_classifier` 完整复刻 | ✅ **完全对齐** |
-| **Hook 系统** | PreToolUse/PermissionRequest/PermissionDenied | PreToolUse(改 input + deny)+ PermissionRequest(预留) | 🔄 1 个 hook 缺(denied 钩子 M3 补) |
+| **Hook 系统** | PreToolUse(并行)/PermissionRequest(headless)/PermissionDenied(retry) | PreToolUse(并行 + updated_input + deny + prevent_continuation)+ PermissionRequest(预留)+ PermissionDenied(M3) | 🔄 1 个 hook 缺(denied 钩子 M3 补) |
 | **`excludedCommands`** | UX 而非安全,正则匹配 + 自定义消息 | 同 | ✅ **完全对齐** |
 | **`dangerouslyDisableSandbox`** | 仅 bypass sandbox,不 bypass permission | 同(Step 2 注释明确) | ✅ **完全对齐** |
 | **auto-allow + 显式 deny** | bashPermissions.ts:1829 同时 sandbox + permission 检查 | `bash_check_permissions` 先 rule match 再 sandbox wrap | ✅ **完全对齐** |
