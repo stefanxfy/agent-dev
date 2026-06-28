@@ -1877,6 +1877,167 @@ def safety_check(tool_name: str, tool_input: dict) -> bool:
 
 ---
 
+### 4.8 审计日志(`audit_logger.py`)
+
+**完整对齐 CC `src/services/analytics/analyticsHooks.ts` 的 telemetry 设计 + `session.jsonl` 持久化**——但**拆出独立通道**(§8 表中标 ✅ **加强**),原因:
+- CC 的 telemetry 走 PostHog + 内部 telemetry,学习项目不应耦合
+- 独立 audit logger 写到独立文件,便于事后审计 + 合规检查
+- 与 session.jsonl 隔离:session.jsonl 是对话历史(可被用户裁剪),audit logger 是安全事件流(只追加,不能改)
+
+```python
+# agent_core/tools/audit_logger.py
+"""
+独立审计通道 — 所有 permission / sandbox / hook 决策的可追溯记录
+
+对齐 Claude Code:
+- telemetry: src/services/analytics/analyticsHooks.ts(本项目不引入,改成纯本地文件)
+- session.jsonl: data/sessions/<id>/session.jsonl(对话 + tool_use/tool_result)
+
+为什么不混到 session.jsonl:
+- session.jsonl 可被 `claude --continue` 裁剪(用户操作)
+- audit logger 只追加,不可变;事后审计 + 合规检查的 source of truth
+- 安全事件需要 atomic write(避免 partial record 导致审计丢失)
+
+写入策略:
+- 每个 tool_use 触发一次 audit record(decision 后立即写,不延迟)
+- 文件名:data/sessions/<id>/audit.jsonl
+- 字段:timestamp / tool_name / tool_input_hash / decision / reason /
+       rule_source / sandbox_used / hook_chain / classifier_used
+- tool_input 不存原文(可能含密钥);只存 sha256(tool_input)[:16]
+"""
+from __future__ import annotations
+import hashlib
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Optional
+
+from .permission_types import (
+    PermissionBehavior, PermissionDecision, PermissionMode,
+    ToolPermissionContext, PermissionRuleSource,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AuditRecord:
+    """单次 tool_use 的安全决策记录(对齐 CC telemetry 字段集)"""
+    timestamp: float                              # time.time() 决策时刻
+    session_id: str                               # 当前 session
+    tool_name: str                                # "Bash" / "Read" / ...
+    tool_input_hash: str                          # sha256(tool_input)[:16],不存原文
+    decision: str                                 # PermissionBehavior 值
+    reason_type: str                              # PermissionDecisionReason.type
+    reason_detail: Optional[str] = None           # reason.rule.rule_str 等
+    rule_source: Optional[str] = None             # PermissionRuleSource 值
+    mode: Optional[str] = None                    # PermissionMode 值
+    sandbox_used: bool = False                    # 是否走 sandbox
+    hook_chain: list[str] = field(default_factory=list)   # 执行的 hook 名
+    classifier_used: bool = False                 # 是否调过 classifier
+    classifier_decision: Optional[str] = None     # classifier 返 allow/deny/None
+    denial_state: Optional[dict] = None           # denial_tracking 当前 state
+
+
+class AuditLogger:
+    """单例 + per-session append-only JSONL 文件"""
+
+    def __init__(self, session_data_dir: str):
+        self.session_id = Path(session_data_dir).name
+        self.path = Path(session_data_dir) / "audit.jsonl"
+        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # atomic append:open with 'a' + flush each write(避免 crash 丢记录)
+
+    def log(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        decision: PermissionDecision,
+        context: ToolPermissionContext,
+        hook_chain: Optional[list[str]] = None,
+        classifier_used: bool = False,
+        classifier_decision: Optional[PermissionBehavior] = None,
+        denial_state: Optional[dict] = None,
+    ) -> None:
+        """
+        记录一次 permission 决策(atomic append,不抛异常影响主流程)
+
+        对齐 CC analyticsHooks.ts:firePermissionDecision
+        """
+        try:
+            tool_input_hash = hashlib.sha256(
+                json.dumps(tool_input, sort_keys=True).encode()
+            ).hexdigest()[:16]
+
+            reason = decision.decision_reason
+            record = AuditRecord(
+                timestamp=time.time(),
+                session_id=self.session_id,
+                tool_name=tool_name,
+                tool_input_hash=tool_input_hash,
+                decision=decision.behavior.value,
+                reason_type=reason.type,
+                reason_detail=getattr(reason, "reason", None),
+                rule_source=getattr(getattr(reason, "rule", None), "source", None)
+                    and reason.rule.source.value,
+                mode=context.mode.value,
+                sandbox_used=context.sandbox_enabled,
+                hook_chain=hook_chain or [],
+                classifier_used=classifier_used,
+                classifier_decision=classifier_decision.value
+                    if classifier_decision else None,
+                denial_state=denial_state,
+            )
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())  # atomic durability
+        except Exception as e:
+            # 审计失败绝不能影响主流程(对齐 CC 'audit must never block decision')
+            logger.warning(f"audit log failed: {e}")
+
+
+# ── 全局单例(由 ReactAgent 注入 session_data_dir 后初始化) ──
+_audit_logger: Optional[AuditLogger] = None
+
+
+def init_audit_logger(session_data_dir: str) -> AuditLogger:
+    global _audit_logger
+    _audit_logger = AuditLogger(session_data_dir)
+    return _audit_logger
+
+
+def get_audit_logger() -> Optional[AuditLogger]:
+    return _audit_logger
+```
+
+**与现有 `_pending_tool_logs` 的关系**:
+- `_pending_tool_logs` 写到 `session.jsonl`(对话历史)
+- `audit_logger` 写到 `audit.jsonl`(安全事件流)
+- 两者并行存在,不替换(避免破坏现有 `session.jsonl` 消费者)
+
+**集成点**(M1 实施时):
+- `PermissionEngine.check_permissions()` 决策后调 `audit_logger.log(...)`
+- `SandboxManager.wrap_with_sandbox()` 实际执行前调一次(记录 sandbox_used=True)
+- `cleanup_after_command()` 触发后调一次(记录 bare-git scrub 结果)
+- `denial_tracking.record_denial()` 触发后调一次(记录 denial_state)
+
+**查询接口(M3 可选)**:
+```python
+def query_audit(  # M3
+    session_id: str,
+    tool_name: Optional[str] = None,
+    decision: Optional[PermissionBehavior] = None,
+    since_ts: Optional[float] = None,
+) -> list[AuditRecord]:
+    """事后审计:拉指定 session / tool / decision 的所有记录"""
+```
+
+---
+
 ## 5. OS 层 — 安全沙箱 (Security Sandbox)
 
 ### 5.1 架构决策
@@ -2329,7 +2490,7 @@ agent_core/tools/
 ├── sandbox_manager.py             (新增 ~150 行:sandbox-runtime 适配)
 ├── sandbox_decision.py            (新增 ~50 行:should_use_sandbox)
 ├── sandbox_prompt.py              (新增 ~60 行:prompt 注入)
-└── audit_logger.py                (新增 ~80 行:独立审计通道)
+└── audit_logger.py                (新增 ~80 行:独立审计通道,见 §4.8)
 
 docs/tool/
 ├── tool-security-architecture.md  (本文档,新增)
@@ -2484,7 +2645,7 @@ class TestSafetyCheck:
 | **bare-git scrub attack** | `bashPermissions.ts:1663` (#29316) | `cd + git` 检测 → ask,sandbox 兜底 | ✅ **完全对齐** |
 | **sensitivity check** | `.claude/` `.git/` 等 | `.agent_data/` `.git/` `.ssh/` 等(替换项目路径) | ✅ **路径替换(语义对齐)** |
 | **fail_if_unavailable** | 有 | 有 | ✅ **完全对齐** |
-| **audit log** | session.jsonl + telemetry + PostHog | session.jsonl + `audit_logger.py` 独立通道 + 简化 telemetry | ✅ **加强**(拆出独立通道,语义对齐) |
+| **audit log** | session.jsonl + telemetry + PostHog | session.jsonl + `audit_logger.py` 独立通道 + 简化 telemetry(见 §4.8) | ✅ **加强**(拆出独立通道,语义对齐) |
 | **Sandbox 适配层** | `sandbox-adapter.ts:985` | `sandbox_manager.py`(Python subprocess 调 npm 包) | 🔄 Python 化(不可避免) |
 | **Sandbox 底层** | `@anthropic-ai/sandbox-runtime` (npm) | **复用同款**(subprocess 调) | ✅ **0% 偏离** |
 | **Settings 文件位置** | `~/.claude/settings.json` + `.claude/settings.json` | `~/.agent_data/settings.json` + `.agent_data/settings.json` | ✅ **路径替换(语义对齐)** |
@@ -2536,7 +2697,7 @@ class TestSafetyCheck:
 | 2. `sandbox_decision.py` (auto-allow 决策) | 新增 | 1h |
 | 3. `sandbox_prompt.py` (sandbox 启动 prompt) | 新增 | 1h |
 | 4. `bash_permissions.py` (含 tree-sitter AST + classifier 集成) | 新增 | 5h |
-| 5. `audit_logger.py` (独立 audit 通道) | 新增 | 2h |
+| 5. `audit_logger.py` (独立 audit 通道,见 §4.8) | 新增 | 2h |
 | 6. BashTool 内置实现 (含 `dangerouslyDisableSandbox` 透传) | 新增 | 2h |
 | 7. `agent_core.py` 整合 (sandbox wrap + 异步) | 改 | 2h |
 | 8. 测试 + 集成测试(含 bare-git scrub attack 回归) | 新增 | 4h |
