@@ -575,6 +575,33 @@ class ReactAgent:
         # passthrough 或其他 → 当作 ASK
         return self._ask_user_permission(tool_name, tool_input, decision)
 
+    def _run_permission_request_hook(
+        self,
+        tool_name: str,
+        tool_input: dict,
+    ) -> Optional[str]:
+        """
+        跑 PermissionRequest hook(M3 Task 2,对齐 doc §4.4)
+
+        Returns:
+            hook 决策("allow"/"deny")或 None(未决策 → 走 UI)
+            异常时返 None(走默认 UI,不阻断)
+        """
+        if self.permission_engine is None:
+            return None
+        hook_registry = getattr(self.permission_engine, "hook_registry", None)
+        if hook_registry is None:
+            return None
+        try:
+            req_result = hook_registry.run_permission_request(
+                tool_name, tool_input, self.permission_engine.context,
+            )
+            if getattr(req_result, "has_decision", False):
+                return req_result.decision
+        except Exception as e:
+            _logger.warning("PermissionRequest hook 异常,走默认 UI: %s", e)
+        return None
+
     def _ask_user_permission(
         self,
         tool_name: str,
@@ -591,6 +618,15 @@ class ReactAgent:
         Returns:
             (allowed, error_message, effective_input)
         """
+        # M3 Task 2: 先跑 PermissionRequest hook(后台 agent / webhook 外部决策)
+        # hook 返决策 → 直接用,不等 UI(对齐 doc §4.4 PermissionRequest hook)
+        hook_decision = self._run_permission_request_hook(tool_name, tool_input)
+        if hook_decision == "allow":
+            return True, None, tool_input
+        if hook_decision == "deny":
+            return False, "Permission denied by PermissionRequest hook", tool_input
+        # hook 未决策(ask 或 None)→ 走原 UI 路径(threading.Event.wait)
+
         if self._permission_resolved is None:
             self._permission_resolved = threading.Event()
 

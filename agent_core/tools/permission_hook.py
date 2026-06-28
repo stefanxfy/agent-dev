@@ -316,6 +316,87 @@ class HookRegistry:
         with self._lock:
             return [h for h in self._hooks if h.event == event]
 
+    # ── PermissionRequest hook(M3 Task 2)─────────────────────
+
+    def run_permission_request(
+        self,
+        tool_name: str,
+        tool_input: dict,
+        context: ToolPermissionContext,
+    ) -> "PermissionRequestResult":
+        """
+        跑 PermissionRequest hook(对齐 CC PermissionRequest hook + doc §4.4)
+
+        场景:ASK 决策时,给外部决策来源(webhook / Slack / 钉钉)一个决策机会。
+        后台 agent(should_avoid_permission_prompts=True)无法弹 UI 时尤其有用。
+
+        与 PreToolUse 不同:
+        - 串行跑(不并行 — 外部决策来源通常只有一个 webhook)
+        - 第一个返 has_decision 的 hook 胜出(短路)
+        - 都没决策 → 返 PermissionRequestResult()(decision=None,走默认 UI)
+
+        Args:
+            tool_name: 工具名
+            tool_input: 工具输入
+            context: 权限上下文
+
+        Returns:
+            PermissionRequestResult(decision=None 表示走默认 UI)
+        """
+        hooks = self._collect_hooks("PermissionRequest")
+        if not hooks:
+            return PermissionRequestResult()
+
+        merged_input = dict(tool_input)
+        for entry in hooks:
+            try:
+                result = entry.callback(tool_name, dict(merged_input), context)
+                # 兼容 PermissionRequestResult 和 PreToolUseResult(旧签名)
+                decision = getattr(result, "decision", None) or getattr(result, "behavior", None)
+                if decision is not None:
+                    reason = getattr(result, "reason", None)
+                    updated = getattr(result, "updated_input", None)
+                    if updated:
+                        merged_input.update(updated)
+                    return PermissionRequestResult(
+                        decision=decision,
+                        reason=reason,
+                        updated_input=merged_input if updated else None,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "PermissionRequest hook %s 异常,跳过: %s", entry.name, e,
+                )
+                continue
+        return PermissionRequestResult()
+
+
+# ────────────────────────────────────────────────────────────────────
+# PermissionRequestResult — 后台 agent 外部决策(M3 Task 2)
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PermissionRequestResult:
+    """
+    PermissionRequest hook 返回值(对齐 CC PermissionRequest hook + doc §4.4)
+
+    场景:后台 agent(should_avoid_permission_prompts=True)无法弹 UI 时,
+    给外部决策来源(webhook / Slack / 钉钉)一个决策机会。
+
+    字段:
+    - decision: "allow" / "deny" / "ask"(None = 未决策,走默认 UI 路径)
+    - reason: 决策原因(audit + UI 显示)
+    - updated_input: hook 改写后的 input(可选)
+    """
+    decision: Optional[str] = None
+    reason: Optional[str] = None
+    updated_input: Optional[dict] = None
+
+    @property
+    def has_decision(self) -> bool:
+        """True 表示 hook 给出了决策(调用方应直接用,不走 UI)"""
+        return self.decision is not None
+
 
 # ────────────────────────────────────────────────────────────────────
 # Default hooks — 预置 hook
@@ -423,3 +504,50 @@ def default_hooks() -> HookRegistry:
         source="builtin",
     )
     return registry
+
+
+# ────────────────────────────────────────────────────────────────────
+# PermissionRequest webhook factory(M3 Task 2,示例用,不自动注册)
+# ────────────────────────────────────────────────────────────────────
+
+def make_webhook_permission_request_hook(webhook_url: str) -> HookCallable:
+    """
+    创建 webhook PermissionRequest hook(对齐 CC 外部决策来源 + doc §4.4)
+
+    POST tool_use 信息到 webhook_url,期望返:
+        {"decision": "allow"/"deny"/"ask", "reason": "..."}
+    webhook 超时/失败 → 返 decision=None(走默认 UI,不阻断,对齐 CC fail-open)
+
+    用户在 settings.json 配置 webhook URL 后,由 web/app.py 注册本 hook。
+    默认不预置(YAGNI + 安全:不强制外发)。
+
+    Args:
+        webhook_url: 外部决策 webhook URL
+
+    Returns:
+        HookCallable(签名与 PreToolUse 一致,返 PermissionRequestResult)
+    """
+    def hook(
+        tool_name: str,
+        tool_input: dict,
+        context: ToolPermissionContext,
+    ) -> PermissionRequestResult:
+        import requests
+        try:
+            resp = requests.post(
+                webhook_url,
+                json={"tool_name": tool_name, "tool_input": tool_input},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            decision = data.get("decision")
+            if decision in ("allow", "deny", "ask"):
+                return PermissionRequestResult(
+                    decision=decision,
+                    reason=data.get("reason", "webhook decision"),
+                )
+        except Exception as e:
+            logger.warning("webhook permission request 失败,走默认 UI: %s", e)
+        return PermissionRequestResult()
+    return hook
