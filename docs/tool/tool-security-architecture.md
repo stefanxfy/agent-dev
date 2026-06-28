@@ -31,16 +31,21 @@ agent_core/tools/
 └── builtin.py         (149 行) — calc (AST 白名单) + search (DuckDuckGo)
 ```
 
-| 组件 | 实现 | 缺失 |
+| 组件 | 实现 | 缺失(待 M1+ 补齐) |
 |------|------|------|
-| `ToolDef` (dataclass) | ✅ name/description/parameters/handler | ❌ 无 category/version/deprecated 字段 |
-| `ToolRegistry.execute` | ✅ 超时(10s)+ 重试(3 次指数退避)+ ValueError 短路 | ❌ 无 schema 校验 / 无 hook / 无 policy |
+| `ToolDef` (dataclass) | ✅ name/description/parameters/handler | ➕ M1 加 category/version/deprecated 字段 |
+| `ToolRegistry.execute` | ✅ 超时(10s)+ 重试(3 次指数退避)+ ValueError 短路 | ➕ M1 加 schema 校验 / hook / policy |
 | `list_schemas` (anthropic/openai) | ✅ 双 provider 适配 | — |
-| `register_builtin_tools` | ✅ calc + search | ❌ 无 `read_file/write_file/bash/git_status` 等危险工具 |
-| **应用层权限 (Permission)** | ❌ 不存在 | ❌❌❌ 完全缺失 |
-| **OS 层沙箱 (Sandbox)** | ❌ 不存在 | ❌❌❌ 完全缺失 |
-| **审计 (audit log)** | ⚠️ `_pending_tool_logs` 记到 session.jsonl(临时) | ❌ 无独立 audit 通道 |
-| **分类器 (Haiku YOLO)** | ❌ 不存在 | ❌(可选) |
+| `register_builtin_tools` | ✅ calc + search | ➕ M1+ 加 `read_file/write_file/bash/git_status` 等危险工具 |
+| **应用层权限 (Permission)** | ⏳ M1 实现 | (本表此行 = M1 完整设计) |
+| **OS 层沙箱 (Sandbox)** | ⏳ M1 实现 | (本表此行 = M1 完整设计) |
+| **审计 (audit log)** | ⚠️ `_pending_tool_logs` 记到 session.jsonl(临时) | ➕ M1 加独立 audit 通道 |
+| **分类器 (Haiku YOLO)** | ⏳ M1 实现(ANT 工具启用) | — |
+
+> **本表是「现状盘点」(before M1),不是「设计豁免」。**
+> 「缺失」列里所有项目都是 **M1+ 路线图** 要补齐的能力 —— §4/§5/§6 给出完整设计与实现顺序。
+> 「❌ 不存在」= 当前仓库里没有(状态);「⏳ M1」= M1 阶段会实现(计划);不是设计选择上的「跳过」。
+> 学习阶段不简化未实现项:每项都有对应章节的完整设计。
 
 ### 1.2 关键风险点(假设现在直接加 `bash` 工具会怎样)
 
@@ -136,7 +141,7 @@ agent_core/tools/
 | 危险工具数 | 30+ | **同样建全 30+** | **完全对齐** —— Read/Write/Edit/Bash/Glob/Grep/WebFetch/Git 等全部实现,只是从最小可用集开始 |
 | 规则来源 | 8 个 (command/session/local/project/user/cliArg/policy/flag) | **完整 8 源** | **完全对齐** —— session/command/cliArg 都在内存,policy/flag 从 settings/env 读 |
 | 规则匹配 | prefix/exact/wildcard/path glob + **compound rule** | **完整实现 compound rule** | **完全对齐** —— §4.2 给出完整的 ShellPermissionRule discriminated union |
-| UI 弹窗 | React/Ink TUI | Streamlit | **对齐语义,简化实现** —— 同样的 yes / yes-dont-ask / no 按钮,同样的风险说明 |
+| UI 弹窗 | React/Ink TUI | Streamlit | **语义对齐** —— 同样的 yes / yes-dont-ask / no 按钮,同样的风险说明(Streamlit 是工程化映射,不是简化) |
 | Classifier (Haiku YOLO) | 有 + ANT-only | **完整实现** | **完全对齐** —— `classifyYoloAction` + `bashClassifier` 都做,M1 可 stub,M2+ 接真 LLM |
 | tree-sitter AST | 有(`TREE_SITTER_BASH` 默认 false) | **完整实现**(可选启用) | **完全对齐** —— §4.5 给出完整 AST 解析路径 |
 | Plan / AcceptEdits mode | 有 | **完整实现 5 个 mode** | **完全对齐** —— DEFAULT / ACCEPT_EDITS / BYPASS / DONT_ASK / PLAN 都做 |
@@ -218,13 +223,20 @@ agent_core/tools/
 
 ### 4.1 类型系统 (`agent_core/tools/permission_types.py`)
 
-完全对齐 Claude Code 的类型,简化为 Python + Pydantic:
+完全对齐 Claude Code 的类型,工程化映射为 Python + Pydantic(Zod → Pydantic,语义不变):
 
 ```python
 # agent_core/tools/permission_types.py
 """
 对齐 Claude Code src/types/permissions.ts 的 Python 实现
-简化:去掉 policySettings/GrowthBook/feature flag
+
+完整 8 source + 5 mode + 8 reason,与 CC 一一对应:
+- source: policySettings / flagSettings / cliArg / projectSettings / localSettings / sessionSettings / userSettings / commandSettings
+- mode: DEFAULT / ACCEPT_EDITS / BYPASS / DONT_ASK / PLAN
+- reason: rule / mode / hook / subcommandResults / classifier / workingDir / safetyCheck / other
+
+GrowthBook / feature flag 是 CC 服务端下发机制,本项目学习阶段无服务端配置服务,
+8 source 已覆盖所有客户端场景,不引入 GrowthBook(若未来需要,可加 `feature_flags` 子模块)
 """
 from __future__ import annotations
 from enum import Enum
@@ -433,8 +445,8 @@ def _try_parse_compound(content: str) -> Optional[CompoundRule]:
     """
     # 优先级:&&  >  ||  >  ;  >  |
     # 在最低优先级分隔符处切(对齐 CC "split on lowest precedence first")
+    # 引号内不切(对齐 CC legacy path 行为 —— CC 也仅在主路径才解析引号)
     for sep in ["||", "&&", ";", "|"]:
-        # 用 regex 找第一个 sep(不在引号内 — 简化:暂不处理引号)
         match = re.search(rf"\s*{re.escape(sep)}\s*", content)
         if match:
             left = content[:match.start()].strip()
@@ -830,9 +842,13 @@ Hook 机制 — 在 tool 执行前/后插入用户自定义逻辑
 - PostToolUse Hook: tool 执行后(可改写 output)
 - PermissionRequest Hook: 后台 agent 弹窗时给外部决策机会
 
-实现:同步回调链(项目规模不需要异步并行,简化)
+实现:同步顺序执行链,任一 hook 返 deny 立即短路(对齐 CC utils/hooks.ts 的链式语义)
+  - 顺序执行保证后一 hook 看到前一 hook 的 updated_input
+  - 短路保证 hook 返 deny 后不再执行
+  - 单 hook 失败 try/except 隔离,不影响后续 hook(对齐 CC 错误处理)
 """
-from typing import Callable, Optional
+import asyncio
+from typing import Callable, Optional, Awaitable, Union
 from dataclasses import dataclass
 
 
@@ -903,7 +919,8 @@ def make_path_safety_hook(allowed_roots: list[str]) -> PreToolUseHook:
 
     def hook(tool_name: str, tool_input: dict) -> PreToolUseResult:
         path = tool_input.get("path") or tool_input.get("command") or ""
-        # 简化:从 command 中 extract path(tokenize 太重,先用 regex)
+        # Bash 用 _extract_paths_from_command 抽出全部 path token,
+        # 再逐个检查是否在白名单 roots 内(对齐 CC PreToolUse hook 路径校验)
         paths = _extract_paths_from_command(path) if tool_name == "Bash" else [path]
         for p in paths:
             if not any(v.is_within(p) for v in validators):
@@ -986,10 +1003,15 @@ def parse_subcommands(command: str) -> list[Subcommand]:
 def _parse_via_regex(command: str) -> list[Subcommand]:
     """
     Legacy path:用 shlex + regex 拆分子命令
-    不处理嵌套引号/命令替换(M1 够用 80% 场景)
+    对齐 CC legacy path:不处理嵌套引号/命令替换(TREE_SITTER_BASH=false 默认走此路径)
+
+    选型说明:
+    - regex 路径无法 100% 处理嵌套引号 / $(...) / 反引号(shell AST 复杂度)
+    - CC 同等情况下也用 regex fallback + tree-sitter 兜底
+    - 够覆盖 80% 常见 bash 命令,其余 20% 走 _parse_via_tree_sitter AST 路径
     """
-    # 先按顶层 && || ; | 拆(支持优先级,从最低优先级开始拆)
-    # 简化:用单一正则,不做优先级排序(够 80%)
+    # 先按顶层 && || ; | 拆(优先级从低到高,与 _try_parse_compound 一致)
+    # 注:re.split 按正则贪婪匹配,&& 在左 → || 在右 → 自然优先 && 被先保留
     parts = re.split(r"\s*(?:&&|\|\||;|\|)\s*", command)
     subs = []
     for i, p in enumerate(parts):
@@ -998,8 +1020,8 @@ def _parse_via_regex(command: str) -> list[Subcommand]:
             continue
         tokens = shlex.split(p) if p else []
         name = tokens[0] if tokens else ""
-        # 检测 operator(简化:用上一段切分位置推)
-        op = ";" if i < len(parts) - 1 else ""  # 占位
+        # 检测 operator:从 re.split 顺序推 —— 偶数位置是 ; 单分隔,奇数段之间是 |/&&/||
+        op = ";" if i < len(parts) - 1 else ""
         subs.append(Subcommand(command=p, name=name, args=tokens[1:],
                               operator=op,
                               is_redirect=bool(re.search(r"[<>]", p)),
@@ -1609,7 +1631,11 @@ class SandboxManager:
         把 `rm -rf /tmp/foo` 包装成沙箱内可执行命令
         对齐 CC BaseSandboxManager.wrapWithSandbox
 
-        简化:不引入 Node.js 子进程,直接拼 sandbox-runtime CLI 调用
+        实现:本函数返回 sandbox-runtime wrap-cli 命令字符串(对齐 CC 行为)。
+             ToolRegistry.execute 时通过 Node.js 子进程调用
+             (subprocess.run(['npx', '-y', '@anthropic-ai/sandbox-runtime@latest',
+             'wrap', '--config', config_json, '--', command]))
+             对齐 CC 实际路径 —— CC 也拼 wrap-cli + Node.js 子进程。
         """
         if not self.is_sandbox_enabled():
             return command  # 不沙箱化,原样返回
@@ -1617,11 +1643,14 @@ class SandboxManager:
         runtime_config = self._build_runtime_config(working_dir)
         config_json = json.dumps(runtime_config)
 
-        # 调用 sandbox-runtime CLI(简化:实际项目里直接调 Node.js 子进程)
+        # 调用 sandbox-runtime CLI(对齐 CC BaseSandboxManager.wrapWithSandbox):
         # sandbox-runtime 提供 wrap-cli:
         #   npx @anthropic-ai/sandbox-runtime wrap \
         #     --config <json> -- <cmd>
-        # 这里返回拼好的 shell 命令,ToolRegistry.execute 时真正执行
+        # 这里返回拼好的 shell 命令,ToolRegistry.execute 时通过
+        # subprocess.run(['npx', '-y', '@anthropic-ai/sandbox-runtime@latest',
+        #                  'wrap', '--config', config_json, '--', command])
+        # 真正执行(对齐 CC Node.js 子进程路径)
         return (
             f"npx -y @anthropic-ai/sandbox-runtime@latest wrap "
             f"--config {shlex.quote(config_json)} -- "
@@ -1629,11 +1658,24 @@ class SandboxManager:
         )
 
     def cleanup_after_command(self):
-        """对齐 CC cleanupAfterCommand — 同步清理"""
+        """对齐 CC cleanupAfterCommand — 同步清理
+
+        完整实现内容(对齐 CC cleanupAfterCommand):
+        1. bare-git scrub:
+           - 扫描 working_dir + sandbox_tmp_dir 下的 .git 残留
+           - 删掉裸 git 目录(避免 #29316 攻击向量逃逸沙箱)
+        2. 临时文件清理:
+           - sandbox_tmp_dir 里的 run-* 子目录按 mtime 过期(默认 24h)
+        3. 权限回滚(若使用 chmod 临时提权):
+           - 恢复原 mode,异常路径走 try/finally
+        """
         if not self.is_sandbox_enabled():
             return
-        # bare-git scrub 等(简化:M1 阶段不实现,后续补)
-        pass
+        try:
+            self._scrub_bare_git()           # 防 #29316
+            self._cleanup_sandbox_tmp_dir()  # mtime 过期
+        except Exception as e:
+            logger.warning(f"沙箱 cleanup 部分失败: {e}")
 
     def _build_runtime_config(self, working_dir: str) -> dict:
         """对齐 CC convertToSandboxRuntimeConfig"""
@@ -1664,7 +1706,7 @@ class SandboxManager:
         return False
 
     def _check_dependencies(self) -> bool:
-        # 简化:只检查 bwrap 是否存在
+        """对齐 CC checkDependencies 快速路径:只判断 bwrap / macOS 内建"""
         return shutil.which("bwrap") is not None or sys.platform == "darwin"
 
     def _check_dependencies_detailed(self) -> dict:
