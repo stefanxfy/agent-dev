@@ -229,6 +229,25 @@ with st.sidebar:
                 # 老 Streamlit 无 page_link → link_button 兜底
                 st.link_button("查看全部 →", "/Candidate_Review")
 
+    # M3 Task 1: 🔐 权限规则入口(对齐 CC /permissions)
+    with st.expander("🔐 权限规则", expanded=False):
+        st.caption("管理 allow/deny/ask 规则")
+        try:
+            st.page_link("pages/03_Permissions.py", label="编辑规则 →")
+        except Exception:
+            st.link_button("编辑规则 →", "/Permissions")
+        # 简要计数
+        try:
+            from agent_core.tools.permission_loader import load_rules_by_source
+            from agent_core.tools.permission_ui_helpers import format_rules_by_source
+            _rules = format_rules_by_source(load_rules_by_source())
+            _deny = sum(1 for r in _rules if r["behavior"] == "deny")
+            _allow = sum(1 for r in _rules if r["behavior"] == "allow")
+            _ask = sum(1 for r in _rules if r["behavior"] == "ask")
+            st.caption(f"deny {_deny} · ask {_ask} · allow {_allow}")
+        except Exception:
+            st.caption("(读取失败)")
+
     # 注(2026-06-26):Runtime Config 改读 .env,详见 .env 中
     #   MEMORY_RETRIEVAL__MODE / __TOP_K / __SIDE_QUERY_MAX_SELECT
     #   MEMORY_COST__DAILY_BUDGET_USD
