@@ -42,3 +42,8 @@ tests/e2e/.pytest_cache/
 
 # 运行日志（web/app.py 按小时切分写入）
 logs/
+.codebuddy/
+.trash/
+.workbuddy/
+data/
+.serena/
