@@ -2,10 +2,22 @@
 LLMRouter 测试
 覆盖：UsageStats 字段提取（input/output/thinking/cached_tokens） +
 Fork 模式下 system_prompt_override 在 zhipu/openai 路径的行为
+
+Stage 4 后的差异:
+- `_ThinkTagSplitter` 改为 `MiniMaxProvider._ThinkTagSplitter()`(已 nest 进 provider)
+- `_get_openai_provider` 改为 `ProviderRegistry.create`(稳定 classmethod 锚点)
 """
 import pytest
 from dataclasses import dataclass
-from agent_core.llm.router import UsageStats, LLMConfig, LLMRouter, LLMProvider, LLMModel, _ThinkTagSplitter, StreamChunk
+from unittest.mock import patch, MagicMock
+from agent_core.llm.router import (
+    UsageStats, LLMConfig, LLMRouter, LLMProvider, LLMModel, StreamChunk,
+    EmptyResponseError, InvokeTimeoutError, TextDelta,
+)
+from agent_core.llm.providers.openai import MiniMaxProvider
+
+# _ThinkTagSplitter 改用 provider 嵌套版本
+_ThinkTagSplitter = MiniMaxProvider._ThinkTagSplitter
 
 
 # 模拟不同 provider 的 usage 对象
@@ -160,26 +172,31 @@ class TestForkSystemPromptOverride:
         return LLMRouter(cfg)
 
     def _capture_provider_messages(self, router, messages, system_prompt_override):
-        """Monkey-patch _get_openai_provider 捕获实际发给 OpenAI 兼容 provider 的 messages。
-        M10 重构后,3 个 OpenAI 兼容 provider 共用同一个 dispatch 路径 + _get_openai_provider()
-        工厂,所以只需 patch 这一个分发点。
-        """
-        captured = {}
-        from agent_core.llm import router as router_module
-        RouterClass = router_module.LLMRouter
-        original = RouterClass._get_openai_provider
+        """Monkey-patch ProviderRegistry.create 捕获实际创建的 provider。
 
-        def mock_get_openai_provider(self):
-            class _FakeProvider:
+        Stage 4 后 LLMRouter 走 ProviderRegistry.create 拿到 BaseProvider 实例。
+        3 个 OpenAI 兼容 provider 共用同一分发点,所以只需 patch 这一个 classmethod。
+        """
+        from agent_core.llm.registry import ProviderRegistry
+        from agent_core.llm.providers.base import BaseProvider
+        captured = {}
+        original = ProviderRegistry.create
+
+        def mock_create(config):
+            class _FakeProvider(BaseProvider):
                 provider_name = "fake"
-                def chat(self_, msgs, tools, tool_choice=None):
-                    captured["messages"] = msgs
+                def _do_chat(self_, messages, tools=None, tool_choice=None,
+                             system_prompt=None, cache_namespace=None):
+                    # 模拟 OpenAI 兼容 provider 的 system 注入行为(保持与生产一致)
+                    if system_prompt:
+                        messages = [{"role": "system", "content": system_prompt}, *messages]
+                    captured["messages"] = messages
                     captured["tools"] = tools
                     captured["tool_choice"] = tool_choice
                     return iter([])  # 空生成器
-            return _FakeProvider()
+            return _FakeProvider(config)
 
-        RouterClass._get_openai_provider = mock_get_openai_provider
+        ProviderRegistry.create = classmethod(lambda cls, config: mock_create(config))
         try:
             list(router.chat(
                 messages=messages,
@@ -187,7 +204,7 @@ class TestForkSystemPromptOverride:
                 system_prompt_override=system_prompt_override,
             ))
         finally:
-            RouterClass._get_openai_provider = original
+            ProviderRegistry.create = original
         return captured
 
     def _capture_zhipu_messages(self, router, messages, system_prompt_override):
@@ -275,7 +292,7 @@ class TestMinimaxProvider:
 
     def test_minimax_routes_to_chat_minimax(self):
         """chat() 收到 provider='minimax' 必须路由到 MiniMaxProvider(而不是 zhipu/openai)
-        M10 重构后:走 _get_openai_provider() → create_openai_compatible_provider(LLMProvider.MINIMAX)
+        Stage 4 后:走 ProviderRegistry.create() → MiniMaxProvider
         """
         cfg = LLMConfig(
             provider="minimax",
@@ -284,26 +301,27 @@ class TestMinimaxProvider:
         )
         router = LLMRouter(cfg)
 
-        # Monkey-patch _get_openai_provider,验证 chat() 实际调用了工厂
-        from agent_core.llm import router as router_module
-        RouterClass = router_module.LLMRouter
+        # Monkey-patch ProviderRegistry.create,验证 chat() 实际调用了工厂
+        from agent_core.llm.registry import ProviderRegistry
+        from agent_core.llm.providers.base import BaseProvider
         called = {"flag": False, "provider": None}
-        original = RouterClass._get_openai_provider
+        original = ProviderRegistry.create
 
-        def mock_get_openai_provider(self):
+        def mock_create(config):
             called["flag"] = True
-            class _FakeProvider:
+            class _FakeProvider(BaseProvider):
                 provider_name = "fake"
-                def chat(self_, msgs, tools, tool_choice=None):
+                def _do_chat(self_, messages, tools=None, tool_choice=None,
+                             system_prompt=None, cache_namespace=None):
                     return iter([])
-            return _FakeProvider()
+            return _FakeProvider(config)
 
-        RouterClass._get_openai_provider = mock_get_openai_provider
+        ProviderRegistry.create = classmethod(lambda cls, config: mock_create(config))
         try:
             list(router.chat(messages=[{"role": "user", "content": "hi"}]))
         finally:
-            RouterClass._get_openai_provider = original
-        assert called["flag"] is True, "chat() 没把 provider='minimax' 路由到 _get_openai_provider()"
+            ProviderRegistry.create = original
+        assert called["flag"] is True, "chat() 没把 provider='minimax' 路由到 ProviderRegistry.create()"
 
     def test_minimax_empty_override_does_not_inject_system(self):
         """minimax: 空 system_prompt_override 不应注入空 system(与 zhipu 行为一致,保持 cache prefix 对齐)"""
@@ -314,27 +332,31 @@ class TestMinimaxProvider:
             system_prompt="",
         )
         router = LLMRouter(cfg)
-        from agent_core.llm import router as router_module
-        RouterClass = router_module.LLMRouter
+        from agent_core.llm.registry import ProviderRegistry
+        from agent_core.llm.providers.base import BaseProvider
         captured = {}
-        original = RouterClass._get_openai_provider
+        original = ProviderRegistry.create
 
-        def mock_get_openai_provider(self):
-            class _FakeProvider:
+        def mock_create(config):
+            class _FakeProvider(BaseProvider):
                 provider_name = "fake"
-                def chat(self_, msgs, tools, tool_choice=None):
-                    captured["messages"] = msgs
+                def _do_chat(self_, messages, tools=None, tool_choice=None,
+                             system_prompt=None, cache_namespace=None):
+                    # 模拟 OpenAI 兼容 provider 的 system 注入行为
+                    if system_prompt:
+                        messages = [{"role": "system", "content": system_prompt}, *messages]
+                    captured["messages"] = messages
                     return iter([])
-            return _FakeProvider()
+            return _FakeProvider(config)
 
-        RouterClass._get_openai_provider = mock_get_openai_provider
+        ProviderRegistry.create = classmethod(lambda cls, config: mock_create(config))
         try:
             list(router.chat(
                 messages=[{"role": "user", "content": "hi"}],
                 system_prompt_override="",
             ))
         finally:
-            RouterClass._get_openai_provider = original
+            ProviderRegistry.create = original
         # 第一个 message 仍是 user(空 override 不注入)
         assert captured["messages"][0] == {"role": "user", "content": "hi"}, \
             f"minimax 空 override 不应注入 system,实际收到: {captured['messages']}"
@@ -347,27 +369,31 @@ class TestMinimaxProvider:
             api_key="test-key",
         )
         router = LLMRouter(cfg)
-        from agent_core.llm import router as router_module
-        RouterClass = router_module.LLMRouter
+        from agent_core.llm.registry import ProviderRegistry
+        from agent_core.llm.providers.base import BaseProvider
         captured = {}
-        original = RouterClass._get_openai_provider
+        original = ProviderRegistry.create
 
-        def mock_get_openai_provider(self):
-            class _FakeProvider:
+        def mock_create(config):
+            class _FakeProvider(BaseProvider):
                 provider_name = "fake"
-                def chat(self_, msgs, tools, tool_choice=None):
-                    captured["messages"] = msgs
+                def _do_chat(self_, messages, tools=None, tool_choice=None,
+                             system_prompt=None, cache_namespace=None):
+                    # 模拟 OpenAI 兼容 provider 的 system 注入行为
+                    if system_prompt:
+                        messages = [{"role": "system", "content": system_prompt}, *messages]
+                    captured["messages"] = messages
                     return iter([])
-            return _FakeProvider()
+            return _FakeProvider(config)
 
-        RouterClass._get_openai_provider = mock_get_openai_provider
+        ProviderRegistry.create = classmethod(lambda cls, config: mock_create(config))
         try:
             list(router.chat(
                 messages=[{"role": "user", "content": "hi"}],
                 system_prompt_override="You are helpful",
             ))
         finally:
-            RouterClass._get_openai_provider = original
+            ProviderRegistry.create = original
         assert captured["messages"][0] == {"role": "system", "content": "You are helpful"}
         assert captured["messages"][1] == {"role": "user", "content": "hi"}
 
@@ -376,7 +402,7 @@ class TestMinimaxProvider:
         源码级校验(.venv 没装 openai,不能 import openai)
         """
         import inspect
-        from agent_core.llm.openai_compatible import MiniMaxProvider, OpenAICompatibleProvider
+        from agent_core.llm.providers.openai import MiniMaxProvider, OpenAICompatibleProvider
         src = inspect.getsource(MiniMaxProvider)
         assert "https://api.minimaxi.com/v1" in src, (
             "MiniMaxProvider.default_base_url 应该是 https://api.minimaxi.com/v1,"
@@ -631,7 +657,7 @@ class TestStopReasonPlumbing:
 
     def _make_provider(self):
         from unittest.mock import MagicMock
-        from agent_core.llm.openai_compatible import OpenAIProvider
+        from agent_core.llm.providers.openai import OpenAIProvider
         cfg = LLMConfig(provider="openai", model="gpt-4o", api_key="x")
         prov = OpenAIProvider(cfg)
         prov._client = MagicMock()  # 注入 mock,绕过 lazy import openai
@@ -666,3 +692,159 @@ class TestStopReasonPlumbing:
         chunks = list(prov.chat([{"role": "user", "content": "hi"}], tools=None))
         stops = [c.stop_reason for c in chunks if c.stop_reason]
         assert stops == ["stop"]
+
+
+# ═══════════════════════════════════════════════════════════════
+# Stage 0 基线测试:MiniMax splitter 不泄漏 <think> 文本
+# (LLM Router 重构 Stage 0 — 必须在 Stage 3 之前通过)
+# ═══════════════════════════════════════════════════════════════
+
+class TestMinimaxSplitterNoLeakBaseline:
+    """基线:<think>hello</think> world → text 流只含 ' world',不能含 '<think>'。
+
+    重构后 `MiniMaxProvider._extract_thinking` 走钩子 + `_consumed_text` 哨兵,
+    本测试确保重构没破坏这个 invariant。
+    """
+
+    def _make_minimax(self):
+        from agent_core.llm.providers.openai import MiniMaxProvider
+        from unittest.mock import MagicMock
+        cfg = LLMConfig(
+            provider="minimax", model="MiniMax-Text-01", api_key="test",
+        )
+        p = MiniMaxProvider(cfg)
+        p._client = MagicMock()
+        return p
+
+    def _chunk(self, content):
+        from unittest.mock import MagicMock
+        ch = MagicMock()
+        # 用 spec 限定 delta 的属性,避免 MagicMock 默认 truthy 导致 reasoning_content
+        # 误命中(MagicMock 的 hasattr 永远 True,任何属性都是 MagicMock 实例 → truthy)
+        delta = MagicMock(spec=["content", "tool_calls", "reasoning_content"])
+        delta.content = content
+        delta.tool_calls = None
+        delta.reasoning_content = None
+        ch.choices = [MagicMock(delta=delta, finish_reason="stop")]
+        ch.usage = None
+        return ch
+
+    def test_splitter_does_not_leak_think_text(self):
+        """<think>hello</think> world → text 只剩 ' world',thinking 拿到 'hello'"""
+        p = self._make_minimax()
+        p._client.chat.completions.create.return_value = iter([
+            self._chunk("<think>hello</think> world"),
+        ])
+        chunks = list(p.chat([{"role": "user", "content": "hi"}]))
+        text = "".join(c.text_delta.text for c in chunks if c.text_delta)
+        thinking = "".join(c.thinking_delta.thinking for c in chunks if c.thinking_delta)
+        assert "<think>" not in text, f"text 流泄漏 <think> 标签: {text!r}"
+        assert "world" in text, f"text 流应含 'world',实际 {text!r}"
+        assert "hello" in thinking, f"thinking 流应含 'hello',实际 {thinking!r}"
+
+    def test_splitter_preserves_text_outside_think_tags(self):
+        """<think>foo</think>bar → text 仅为 'bar'(无空字符/无 tag)"""
+        p = self._make_minimax()
+        p._client.chat.completions.create.return_value = iter([
+            self._chunk("<think>foo</think>bar"),
+        ])
+        chunks = list(p.chat([{"role": "user", "content": "hi"}]))
+        text = "".join(c.text_delta.text for c in chunks if c.text_delta)
+        assert text == "bar", f"text 应为 'bar',实际 {text!r}"
+
+
+class TestLLMRouterInvoke:
+    """router.invoke() — 同步聚合调用,内置重试+超时+空响应检测。
+    参考:docs/llm-invoke-retry-design.md
+    """
+
+    @staticmethod
+    def _make_chunks(*texts: str):
+        """构造一个 generator 返回带 text_delta 的 StreamChunk"""
+        for t in texts:
+            yield StreamChunk(text_delta=TextDelta(text=t))
+
+    @staticmethod
+    def _make_router_with_chat(chunks_or_side_effect):
+        """构造 LLMRouter,mock provider.chat() 返回指定 chunks。
+
+        chunks_or_side_effect:
+          - list/tuple: 每次 chat() 都返回这些 chunks 的新 generator
+          - callable:   chat() 调用它(可能 raise 或返回 generator)
+        """
+        router = LLMRouter(LLMConfig(
+            provider=LLMProvider.MINIMAX,
+            model="test-model",
+            api_key="sk-test",
+            base_url="http://x",
+        ))
+        if callable(chunks_or_side_effect):
+            chat_side_effect = chunks_or_side_effect
+        else:
+            def chat_side_effect(messages, **kwargs):
+                return iter([StreamChunk(text_delta=TextDelta(text=t)) for t in chunks_or_side_effect])
+        # 替换 provider.chat (不走网络)
+        router._provider = MagicMock()
+        router._provider.chat = MagicMock(side_effect=chat_side_effect)
+        return router
+
+    def test_invoke_basic_returns_aggregated_text(self):
+        """正常场景:chunks 聚合为单个字符串返回"""
+        router = self._make_router_with_chat(["hello", " ", "world"])
+        text = router.invoke(
+            messages=[{"role": "user", "content": "hi"}],
+            cache_namespace="test",
+        )
+        assert text == "hello world"
+        # kwargs 透传
+        router._provider.chat.assert_called_once()
+        call_kwargs = router._provider.chat.call_args.kwargs
+        assert call_kwargs["cache_namespace"] == "test"
+
+    def test_invoke_empty_response_triggers_retry_then_raises(self):
+        """空响应触发重试,所有重试都空时抛 EmptyResponseError"""
+        call_count = 0
+        def always_empty(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return iter([])  # 永远空
+
+        router = self._make_router_with_chat(always_empty)
+        with pytest.raises(EmptyResponseError, match="空响应"):
+            router.invoke(
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=1,  # 总尝试 2 次
+                timeout=None,   # 关闭超时避免测试慢
+            )
+        assert call_count == 2, f"应调 2 次(1 retry),实际 {call_count}"
+
+    def test_invoke_on_failure_callback_used_when_all_retries_fail(self):
+        """所有重试失败后调 on_failure,返回降级文本"""
+        def always_fails(messages, **kwargs):
+            raise RuntimeError("network down")
+
+        router = self._make_router_with_chat(always_fails)
+        result = router.invoke(
+            messages=[{"role": "user", "content": "hi"}],
+            max_retries=1,
+            timeout=None,
+            on_failure=lambda e: f"degraded:{type(e).__name__}",
+        )
+        assert result == "degraded:RuntimeError"
+
+    def test_invoke_on_failure_can_raise_through(self):
+        """on_failure 回调内部 raise,异常穿透 invoke()"""
+        def always_fails(messages, **kwargs):
+            raise RuntimeError("api down")
+
+        def raise_specific(e):
+            raise ValueError(f"wrapped:{e}") from e
+
+        router = self._make_router_with_chat(always_fails)
+        with pytest.raises(ValueError, match="wrapped"):
+            router.invoke(
+                messages=[{"role": "user", "content": "hi"}],
+                max_retries=0,
+                timeout=None,
+                on_failure=raise_specific,
+            )

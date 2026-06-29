@@ -11,6 +11,10 @@
 - .venv 已装 openai>=1.30.0
 
 跑法:.venv/bin/python scripts/test_minimax_smoke.py
+
+Stage 4 后的差异:
+- `LLMRouter._get_openai_provider` 改为 `ProviderRegistry.create`(稳定 classmethod 锚点)
+- `MiniMaxProvider` 走 OpenAI 兼容协议,system_prompt 注入 messages 由 provider 自己处理
 """
 from __future__ import annotations
 
@@ -26,9 +30,11 @@ sys.path.insert(0, str(project_root))  # 让 agent_core 可被 import
 from dotenv import load_dotenv  # noqa: E402
 load_dotenv(project_root / ".env")
 
-from agent_core.llm.router import (  # noqa: E402
-    LLMRouter, LLMConfig, LLMProvider, LLMModel, StreamChunk,
+from agent_core.llm import (  # noqa: E402
+    LLMRouter, LLMConfig, LLMProvider, LLMModel, StreamChunk, TextDelta,
 )
+from agent_core.llm.registry import ProviderRegistry  # noqa: E402
+from agent_core.llm.providers.base import BaseProvider  # noqa: E402
 
 
 def main() -> int:
@@ -48,9 +54,8 @@ def main() -> int:
         temperature=0.0,  # 关掉随机性,易复现
     )
     router = LLMRouter(cfg)
-    # 用新 API:走 OpenAICompatibleProvider.base_url 路径
-    # (旧 _get_minimax_client 已在 M10 抽到 openai_compatible.py 删除)
-    client = router._get_openai_provider().client
+    # Stage 4 后走 provider lazy property → ProviderRegistry.create
+    client = router.provider.client
     print(f"   base_url = {client.base_url}")
     assert "api.minimaxi.com" in str(client.base_url), \
         f"base_url 异常: {client.base_url}"
@@ -104,26 +109,29 @@ def main() -> int:
     # ── Test 4: system_prompt_override 注入 ──
     print("\n[4/4] system_prompt_override 注入...")
     captured_msgs = None
-    # M10 重构:3 个 OpenAI 兼容 provider 共用 _get_openai_provider 工厂
-    # 所以 monkey-patch 改在 _get_openai_provider 上,而不是 _chat_minimax
-    original = LLMRouter._get_openai_provider
-    def _capture_get_provider(self):
-        class _FakeProvider:
+    # Stage 4:monkey-patch ProviderRegistry.create(稳定 classmethod 锚点,不受懒加载影响)
+    original = ProviderRegistry.create
+    def _mock_create(config):
+        class _FakeProvider(BaseProvider):
             provider_name = "fake-minimax"
-            def chat(self_, msgs, tools, tool_choice=None):
+            def _do_chat(self_, messages, tools=None, tool_choice=None,
+                         system_prompt=None, cache_namespace=None):
                 nonlocal captured_msgs
-                captured_msgs = msgs
+                # 模拟 OpenAI 兼容 provider 的 system 注入行为
+                if system_prompt:
+                    messages = [{"role": "system", "content": system_prompt}, *messages]
+                captured_msgs = messages
                 # 返回最小可用 chunk,避免真发请求
-                return iter([StreamChunk(text_delta=__import__("agent_core.llm.router", fromlist=["TextDelta"]).TextDelta(text="ok"))])
-        return _FakeProvider()
-    LLMRouter._get_openai_provider = _capture_get_provider
+                return iter([StreamChunk(text_delta=TextDelta(text="ok"))])
+        return _FakeProvider(config)
+    ProviderRegistry.create = classmethod(lambda cls, config: _mock_create(config))
     try:
         list(router.chat(
             messages=[{"role": "user", "content": "hi"}],
             system_prompt_override="你是一只猫,叫 Mia,只回答喵喵相关的问题。",
         ))
     finally:
-        LLMRouter._get_openai_provider = original
+        ProviderRegistry.create = original
     assert captured_msgs is not None, "override 路径没被调用"
     assert captured_msgs[0]["role"] == "system", \
         f"override 必须注入到首位,实际: {captured_msgs[0]}"
