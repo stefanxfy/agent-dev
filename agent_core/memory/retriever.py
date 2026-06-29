@@ -548,22 +548,30 @@ class MemoryRetriever:
         logger.debug(
             f"[_call_side_query] user prompt (full {len(prompt)} chars):\n{prompt}"
         )
-        text = ""
         t0 = time.time()
+
+        def _on_failure(err: Exception) -> str:
+            """所有 invoke 重试失败 → 降级返空数组的 JSON 文本"""
+            llm_ms = (time.time() - t0) * 1000
+            logger.warning(
+                f"sideQuery 失败 ({llm_ms:.1f}ms),降级返空: {err}"
+            )
+            return "[]"
+
         try:
-            # llm_router.chat 是 stream 协议
-            for chunk in self.llm_router.chat(
+            # invoke() 收归:chunk 聚合 + 重试(默认 2 次)+ 30s 超时 + 空响应检测
+            # on_failure 返回 "[]" 让外部 json.loads 拿到空 list(降级路径)
+            text = self.llm_router.invoke(
                 messages=[
                     {"role": "system", "content": SIDE_QUERY_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 cache_namespace="memory_side_query",
-            ):
-                if getattr(chunk, "text_delta", None):
-                    text += chunk.text_delta.text
+                on_failure=_on_failure,
+            )
             llm_ms = (time.time() - t0) * 1000
             logger.debug(
-                f"[_call_side_query] LLM 流式返回完成 ({llm_ms:.1f}ms) "
+                f"[_call_side_query] LLM 调用完成 ({llm_ms:.1f}ms) "
                 f"raw_text_chars={len(text)}"
             )
             logger.debug(
@@ -580,10 +588,11 @@ class MemoryRetriever:
             )
             return selected
         except Exception as e:
+            # 兜底:on_failure 内部 raise 穿透(例如 InvokeTimeoutError → 业务层抛 LatencyTimeout)
+            # 或者 JSON 解析失败
             llm_ms = (time.time() - t0) * 1000
             logger.warning(
-                f"sideQuery 失败 ({llm_ms:.1f}ms),降级返空: {e}\n"
-                f"  raw_text={text!r}"
+                f"sideQuery 失败 ({llm_ms:.1f}ms),降级返空: {type(e).__name__}: {e}"
             )
             return []
 

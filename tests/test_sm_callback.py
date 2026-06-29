@@ -53,12 +53,26 @@ def _non_text_chunk() -> MagicMock:
 
 
 def _make_router(chunks_or_side_effect):
-    """构造 fake router: chat(messages=..., cache_namespace=...) -> generator"""
+    """构造 fake router: chat(messages=..., cache_namespace=...) -> generator;
+    invoke() 走与 chat() 相同路径(sm_callback 改用 invoke())。"""
     router = MagicMock()
-    if isinstance(chunks_or_side_effect, list):
-        router.chat.return_value = iter(chunks_or_side_effect)
-    else:
-        router.chat.side_effect = chunks_or_side_effect
+
+    def fake_chat(messages, **kw):
+        if isinstance(chunks_or_side_effect, list):
+            return iter(chunks_or_side_effect)
+        return chunks_or_side_effect(messages=messages, **kw)
+
+    def fake_invoke(messages, *, cache_namespace=None, **kwargs):
+        """sm_callback._callback 改走 invoke() — 聚合 fake_chat 的 chunks。"""
+        chunks = list(fake_chat(messages, cache_namespace=cache_namespace, **kwargs))
+        return "".join(
+            getattr(c.text_delta, "text", None) or ""
+            for c in chunks
+            if c.text_delta is not None
+        )
+
+    router.chat.side_effect = fake_chat
+    router.invoke.side_effect = fake_invoke
     return router
 
 
@@ -106,8 +120,8 @@ def test_callback_messages_assembly():
     )
     cb("USER PROMPT HERE")
 
-    router.chat.assert_called_once()
-    call_kwargs = router.chat.call_args.kwargs
+    router.invoke.assert_called_once()
+    call_kwargs = router.invoke.call_args.kwargs
     msgs = call_kwargs["messages"]
     assert msgs[0]["role"] == "system"
     assert msgs[0]["content"] == SM_EDIT_SYSTEM_PROMPT
@@ -121,41 +135,44 @@ def test_callback_uses_default_cache_namespace():
     router = _make_router([_chunk("ok")])
     cb = make_sm_extract_callback(router=router)
     cb("p")
-    assert router.chat.call_args.kwargs["cache_namespace"] == "sm_extract"
+    assert router.invoke.call_args.kwargs["cache_namespace"] == "sm_extract"
 
 
-def test_callback_retries_on_failure():
-    """LLM 失败 → 退避 → 重试 → 成功"""
+def test_callback_passes_max_retries_to_invoke():
+    """callback 把 max_retries 透传给 router.invoke()(重试由 invoke() 收归)"""
+    router = _make_router([_chunk("ok")])
+    cb = make_sm_extract_callback(router=router, max_retries=5)
+    cb("p")
+    assert router.invoke.call_args.kwargs["max_retries"] == 5
+
+
+def test_callback_returns_invoke_result():
+    """callback 把 invoke() 的返回值原样返给 sm_layer"""
     router = MagicMock()
-    router.chat.side_effect = [
-        RuntimeError("network error"),
-        RuntimeError("rate limit"),
-        iter([_chunk("success on 3rd")]),
-    ]
-    cb = make_sm_extract_callback(
-        router=router, max_retries=3, backoff_base=0.001  # 加速测试
-    )
-    result = cb("p")
-    assert result == "success on 3rd"
-    assert router.chat.call_count == 3
+    router.invoke.return_value = "synthesized sm.md content"
+    cb = make_sm_extract_callback(router=router, max_retries=0)
+    assert cb("p") == "synthesized sm.md content"
 
 
-def test_callback_raises_after_max_retries():
-    """on_failure='raise': 所有重试失败后抛 RuntimeError"""
+def test_callback_raises_after_all_retries():
+    """on_failure='raise': invoke() 抛错时 callback 透传(包装由 router.invoke() on_failure 负责)"""
     router = MagicMock()
-    router.chat.side_effect = RuntimeError("always fails")
+    router.invoke.side_effect = RuntimeError("always fails")
     cb = make_sm_extract_callback(
         router=router, max_retries=2, backoff_base=0.001
     )
-    with pytest.raises(RuntimeError, match="重试2次仍无法获取响应"):
+    with pytest.raises(RuntimeError, match="always fails"):
         cb("p")
-    assert router.chat.call_count == 2
 
 
 def test_callback_return_empty_on_failure():
-    """on_failure='return_empty': 重试失败后返空字符串(走 fallback)"""
+    """on_failure='return_empty': invoke() on_failure 返空后 callback 原样返空(走 fallback)
+
+    注:真实 router.invoke() 在 on_failure='return_empty' 时自己返空字符串。
+    测试模拟"invoke 内部 on_failure 已处理" — mock.invoke.return_value = ''。
+    """
     router = MagicMock()
-    router.chat.side_effect = RuntimeError("always fails")
+    router.invoke.return_value = ""  # 模拟 invoke() on_failure 返空
     cb = make_sm_extract_callback(
         router=router,
         max_retries=2,
@@ -164,36 +181,7 @@ def test_callback_return_empty_on_failure():
     )
     result = cb("p")
     assert result == ""
-    assert router.chat.call_count == 2
-
-
-def test_callback_rejects_empty_response():
-    """LLM 返回空响应 → 视为失败,触发重试"""
-    router = MagicMock()
-    router.chat.side_effect = [
-        iter([]),  # 第 1 次:0 chunks
-        iter([_chunk("recovered")]),  # 第 2 次:有内容
-    ]
-    cb = make_sm_extract_callback(
-        router=router, max_retries=2, backoff_base=0.001
-    )
-    result = cb("p")
-    assert result == "recovered"
-    assert router.chat.call_count == 2
-
-
-def test_callback_rejects_whitespace_only_response():
-    """LLM 返回纯空白 → 视为空,触发重试"""
-    router = MagicMock()
-    router.chat.side_effect = [
-        iter([_chunk("   \n\t  ")]),  # 全空白
-        iter([_chunk("real content")]),
-    ]
-    cb = make_sm_extract_callback(
-        router=router, max_retries=2, backoff_base=0.001
-    )
-    result = cb("p")
-    assert result == "real content"
+    assert router.invoke.call_args.kwargs["on_failure"] is not None
 
 
 # ──────────────────────────────────────────────────────────────────

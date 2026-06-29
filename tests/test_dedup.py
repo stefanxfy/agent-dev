@@ -60,13 +60,17 @@ def test_decide_action_three_bands():
 # ── LLM 判定器 ─────────────────────────────────────────────────────
 
 def _router_yielding(text):
-    """构造一个 chat() 产出指定文本的假 router"""
+    """构造一个 invoke() 返指定文本的假 router(dedup 改走 invoke() 路径)"""
     router = MagicMock()
     def chat(messages, **kw):
         chunk = MagicMock()
         chunk.text_delta.text = text
         yield chunk
+    def invoke(messages, *, cache_namespace=None, **kwargs):
+        chunks = list(chat(messages, cache_namespace=cache_namespace, **kwargs))
+        return "".join(c.text_delta.text for c in chunks if c.text_delta is not None)
     router.chat = chat
+    router.invoke = invoke
     return router
 
 

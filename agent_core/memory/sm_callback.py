@@ -33,7 +33,6 @@ sm_layer 不需要知道：
 from __future__ import annotations
 
 import logging
-import time
 from typing import Callable, Optional
 
 from .sm_prompts import (
@@ -78,56 +77,37 @@ def make_sm_extract_callback(
 
         sm_layer 在 worker 线程调 extract_incremental，所以这里即使是 sync
         也不会卡主线程。
+
+        重试 / chunk 聚合 / 空响应检测 全部由 router.invoke() 收归
+        (参 docs/llm-invoke-retry-design.md),callback 只负责拼 messages。
         """
         messages = [
             {"role": "system", "content": SM_EDIT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
 
-        last_err: Optional[Exception] = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                chunks: list[str] = []
-                # router.chat 是同步 generator,逐 chunk yield
-                for chunk in router.chat(  # type: ignore[attr-defined]
-                    messages=messages,
-                    cache_namespace=cache_namespace,
-                ):
-                    # 流式 chunk 聚合：只取 text_delta
-                    text_delta = getattr(chunk, "text_delta", None)
-                    if text_delta is not None:
-                        text = getattr(text_delta, "text", None)
-                        if text:
-                            chunks.append(text)
-                response = "".join(chunks)
-                if not response.strip():
-                    raise RuntimeError("LLM 返回空响应")
-                logger.debug(
-                    f"[L3 SM callback] LLM 响应成功 "
-                    f"attempt={attempt} chars={len(response)}"
-                )
-                return response
-            except Exception as e:
-                last_err = e
+        def _on_failure(err: Exception) -> str:
+            """on_failure="return_empty" 时返空走 fallback,否则穿透抛 RuntimeError。"""
+            if on_failure == "return_empty":
                 logger.warning(
-                    f"[L3 SM callback] LLM 调用失败 "
-                    f"attempt={attempt}/{max_retries} err={type(e).__name__}: {e}"
+                    f"[L3 SM callback] 重试{max_retries}次仍失败,返空字符串(走 fallback)"
                 )
-                if attempt < max_retries:
-                    backoff = backoff_base * (2 ** (attempt - 1))
-                    time.sleep(backoff)
-                    continue
+                return ""
+            raise RuntimeError(
+                f"SM extract LLM callback 失败 "
+                f"重试{max_retries}次仍无法获取响应: {err}"
+            ) from err
 
-        # 所有重试都失败
-        if on_failure == "return_empty":
-            logger.warning(
-                f"[L3 SM callback] 重试{max_retries}次仍失败,返空字符串(走 fallback)"
-            )
-            return ""
-        raise RuntimeError(
-            f"SM extract LLM callback 失败 "
-            f"重试{max_retries}次仍无法获取响应: {last_err}"
-        ) from last_err
+        response = router.invoke(  # type: ignore[attr-defined]
+            messages=messages,
+            cache_namespace=cache_namespace,
+            max_retries=max_retries,
+            on_failure=_on_failure,
+        )
+        logger.debug(
+            f"[L3 SM callback] LLM 响应成功 chars={len(response)}"
+        )
+        return response
 
     return _callback
 

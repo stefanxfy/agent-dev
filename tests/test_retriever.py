@@ -353,6 +353,14 @@ class FakeLLMRouter:
         chunk.text_delta = td
         yield chunk
 
+    def invoke(self, messages, *, cache_namespace=None, **kwargs):
+        """invoke() 收归 chat() + chunk 聚合 — 测试用 stub 走与 chat() 相同路径。"""
+        chunks = list(self.chat(messages, cache_namespace=cache_namespace))
+        return "".join(
+            c.text_delta.text for c in chunks
+            if getattr(c, "text_delta", None) is not None
+        )
+
 
 @pytest.fixture
 def memory_root_with_llm_stub(populated):

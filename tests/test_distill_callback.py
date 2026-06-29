@@ -39,6 +39,19 @@ def _make_chunk(text: str):
     return chunk
 
 
+def _make_router(invoke_value):
+    """构造 fake router: invoke() 返固定 str(distill_callback 改用 invoke() 收归)。
+
+    invoke_value 可以是 str(返 str)或 MagicMock(走 side_effect)。
+    """
+    router = MagicMock()
+    if isinstance(invoke_value, MagicMock):
+        router.invoke = invoke_value
+    else:
+        router.invoke.return_value = invoke_value
+    return router
+
+
 # ──────────────────────────────────────────────────────────────────
 # 1. 基础同步 callback
 # ──────────────────────────────────────────────────────────────────
@@ -47,25 +60,21 @@ class TestBasicCallback:
 
     def test_callback_returns_string(self):
         """callback 是同步 (prompt) -> str"""
-        router = MagicMock()
-        router.chat.return_value = iter([_make_chunk('[{"type":"user","title":"t","body":"b"}]')])
-
+        router = _make_router('[{"type":"user","title":"t","body":"b"}]')
         cb = make_distill_callback(router=router)
         result = cb("test prompt")
         assert isinstance(result, str)
         assert "type" in result and "user" in result
 
-    def test_router_chat_called_with_messages_and_cache_namespace(self):
-        """callback 把 system+user messages + cache_namespace 透传给 router.chat"""
-        router = MagicMock()
-        router.chat.return_value = iter([_make_chunk("[]")])
-
+    def test_router_invoke_called_with_messages_and_cache_namespace(self):
+        """callback 把 system+user messages + cache_namespace 透传给 router.invoke"""
+        router = _make_router("[]")
         cb = make_distill_callback(router=router, cache_namespace="distill_xyz")
         cb("user prompt body")
 
-        # router.chat 只被调一次
-        assert router.chat.call_count == 1
-        call_kwargs = router.chat.call_args.kwargs
+        # router.invoke 只被调一次
+        assert router.invoke.call_count == 1
+        call_kwargs = router.invoke.call_args.kwargs
         assert call_kwargs["cache_namespace"] == "distill_xyz"
         messages = call_kwargs["messages"]
         assert len(messages) == 2
@@ -74,118 +83,54 @@ class TestBasicCallback:
         assert messages[1]["role"] == "user"
         assert messages[1]["content"] == "user prompt body"
 
-    def test_chunks_aggregated_in_order(self):
-        """流式 chunks 按顺序拼接"""
-        router = MagicMock()
-        router.chat.return_value = iter([
-            _make_chunk("[{"),
-            _make_chunk('"type":"user"'),
-            _make_chunk(',"title":"t"'),
-            _make_chunk(',"body":"b"'),
-            _make_chunk("}]"),
-        ])
-
+    def test_invoke_returns_aggregated_response(self):
+        """invoke() 已聚合 chunks — callback 原样返 invoke() 的结果"""
+        router = _make_router('[{"type":"user","title":"t","body":"b"}]')
         cb = make_distill_callback(router=router)
         result = cb("p")
         assert result == '[{"type":"user","title":"t","body":"b"}]'
 
-    def test_thinking_and_tool_call_chunks_ignored(self):
-        """thinking_delta / tool_call chunks 应被忽略,只取 text_delta.text"""
-        router = MagicMock()
-
-        chunk_with_thinking = MagicMock()
-        chunk_with_thinking.text_delta = None
-        chunk_with_thinking.thinking_delta = MagicMock(text="思考中")
-        chunk_with_thinking.tool_call = None
-
-        router.chat.return_value = iter([
-            chunk_with_thinking,
-            _make_chunk("real response"),
-            chunk_with_thinking,
-        ])
-
-        cb = make_distill_callback(router=router)
-        result = cb("p")
-        assert result == "real response"
-
 
 # ──────────────────────────────────────────────────────────────────
-# 2. retry / backoff
+# 2. retry / backoff(已由 router.invoke() 收归,这里只测 callback 的 max_retries 透传)
 # ──────────────────────────────────────────────────────────────────
 
 class TestRetryBackoff:
 
+    def test_passes_max_retries_to_invoke(self):
+        """callback 把 max_retries 透传给 invoke()"""
+        router = _make_router("ok")
+        cb = make_distill_callback(router=router, max_retries=5)
+        cb("p")
+        assert router.invoke.call_args.kwargs["max_retries"] == 5
+
     def test_success_first_attempt(self):
         """第 1 次成功 → 不重试"""
-        router = MagicMock()
-        router.chat.return_value = iter([_make_chunk("[]")])
-
+        router = _make_router("[]")
         cb = make_distill_callback(router=router, max_retries=2)
         cb("p")
-        assert router.chat.call_count == 1
+        assert router.invoke.call_count == 1
 
-    def test_retry_then_success(self, monkeypatch):
-        """第 1 次 fail → 第 2 次 succeed,mock time.sleep 加速"""
-        # mock sleep 避免真的等
-        monkeypatch.setattr("time.sleep", lambda s: None)
-
+    def test_retry_exhausted_raises(self):
+        """invoke() 抛错 + on_failure='raise' → callback 透传"""
         router = MagicMock()
-        router.chat.side_effect = [
-            RuntimeError("transient err"),
-            iter([_make_chunk("ok_response")]),
-        ]
-
-        cb = make_distill_callback(router=router, max_retries=2)
-        result = cb("p")
-        assert result == "ok_response"
-        assert router.chat.call_count == 2
-
-    def test_retry_exhausted_raises(self, monkeypatch):
-        """max_retries 全部失败 + on_failure='raise' → RuntimeError"""
-        monkeypatch.setattr("time.sleep", lambda s: None)
-
-        router = MagicMock()
-        router.chat.side_effect = RuntimeError("always fail")
-
+        router.invoke.side_effect = RuntimeError("always fail")
         cb = make_distill_callback(
             router=router, max_retries=2, on_failure="raise",
         )
-        with pytest.raises(RuntimeError, match="Distill LLM callback 失败"):
+        with pytest.raises(RuntimeError, match="always fail"):
             cb("p")
-        assert router.chat.call_count == 2
 
-    def test_retry_exhausted_returns_empty(self, monkeypatch):
-        """max_retries 全部失败 + on_failure='return_empty' → 返 ''"""
-        monkeypatch.setattr("time.sleep", lambda s: None)
-
-        router = MagicMock()
-        router.chat.side_effect = RuntimeError("always fail")
-
+    def test_retry_exhausted_returns_empty(self):
+        """invoke() 返空 + on_failure='return_empty' → callback 返 ''"""
+        router = _make_router("")  # 模拟 invoke() on_failure 返空
         cb = make_distill_callback(
             router=router, max_retries=2, on_failure="return_empty",
         )
         result = cb("p")
         assert result == ""
-
-    def test_empty_response_triggers_retry(self, monkeypatch):
-        """LLM 返空字符串 → 视为失败,触发重试"""
-        monkeypatch.setattr("time.sleep", lambda s: None)
-
-        router = MagicMock()
-        # 第一次返空 chunk → 失败
-        empty_chunk = MagicMock()
-        empty_chunk.text_delta = MagicMock(text="")
-        empty_chunk.thinking_delta = None
-        empty_chunk.tool_call = None
-        router.chat.side_effect = [
-            iter([empty_chunk]),
-            iter([_make_chunk("valid")]),
-        ]
-
-        cb = make_distill_callback(router=router, max_retries=2)
-        result = cb("p")
-        assert result == "valid"
-        assert router.chat.call_count == 2
+        # 验证 callback 确实把 on_failure 闭包传给了 invoke()
+        assert router.invoke.call_args.kwargs["on_failure"] is not None
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -213,25 +158,29 @@ class TestLogging:
 
     def test_logs_success(self, caplog):
         """成功 → DEBUG 日志"""
-        router = MagicMock()
-        router.chat.return_value = iter([_make_chunk("ok")])
-
+        router = _make_router("ok")
         cb = make_distill_callback(router=router)
         with caplog.at_level(logging.DEBUG, logger="agent_core.memory.distill_callback"):
             cb("p")
 
         assert any("LLM 响应成功" in r.message for r in caplog.records)
 
-    def test_logs_retry_warning(self, caplog, monkeypatch):
-        """retry 失败 → WARNING 日志"""
-        monkeypatch.setattr("time.sleep", lambda s: None)
+    def test_logs_retry_warning(self, caplog):
+        """on_failure='return_empty' 触发 → WARNING 日志
 
+        模拟 router.invoke() 内部重试耗尽 → 调 on_failure(err) 返空字符串
+        (即真实 invoke() 在 on_failure='return_empty' 时的行为)。
+        """
         router = MagicMock()
-        router.chat.side_effect = RuntimeError("transient")
-
-        cb = make_distill_callback(router=router, max_retries=2, on_failure="return_empty")
+        def fake_invoke(messages, *, on_failure=None, **kwargs):
+            # 真实 invoke() 内部:重试耗尽 → on_failure(last_err) → 返结果
+            if on_failure is not None:
+                return on_failure(RuntimeError("simulated invoke failure"))
+            raise RuntimeError("simulated invoke failure, no on_failure")
+        router.invoke.side_effect = fake_invoke
+        cb = make_distill_callback(router=router, max_retries=0, on_failure="return_empty")
         with caplog.at_level(logging.WARNING, logger="agent_core.memory.distill_callback"):
             cb("p")
 
-        assert any("LLM 调用失败" in r.message for r in caplog.records)
-        assert any("重试" in r.message and "返空字符串" in r.message for r in caplog.records)
+        # 确认 on_failure 路径触发了 WARNING 日志
+        assert any("返空" in r.message or "重试" in r.message for r in caplog.records)

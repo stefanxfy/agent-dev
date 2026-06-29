@@ -59,7 +59,7 @@ def test_keyword_list_has_16_items():
 
 
 def _make_mock_router(json_text: str) -> MagicMock:
-    """构造返回固定 JSON 的 mock LLM router"""
+    """构造返回固定 JSON 的 mock LLM router(invoke() 走与 chat() 相同路径)"""
     mock = MagicMock()
 
     def fake_chat(messages, **kw):
@@ -67,7 +67,13 @@ def _make_mock_router(json_text: str) -> MagicMock:
         chunk.text_delta.text = json_text
         yield chunk
 
+    def fake_invoke(messages, *, cache_namespace=None, **kwargs):
+        """gate._call_llm 改走 invoke() — 聚合 fake_chat 的 chunks。"""
+        chunks = list(fake_chat(messages, cache_namespace=cache_namespace, **kwargs))
+        return "".join(c.text_delta.text for c in chunks if c.text_delta is not None)
+
     mock.chat = fake_chat
+    mock.invoke = fake_invoke
     mock.config.provider = "mock"
     return mock
 

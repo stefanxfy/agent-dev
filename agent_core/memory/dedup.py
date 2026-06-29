@@ -122,17 +122,26 @@ def make_llm_dedup_judge(
         )
 
         prompt = build_dedup_prompt(cand_text, similar)
-        text = ""
+
+        def _on_failure(err: Exception) -> str:
+            """invoke() 重试耗尽:返非法 JSON 字符串,触发下游 JSON 解析异常,
+            最终落到 except 分支 → 返 False(不当重复,宁可多存不可误删)。"""
+            _log.warning(
+                f"LLM 去重判定 invoke 失败(放行,不当重复): "
+                f"{type(err).__name__}: {err}"
+            )
+            return "[]"  # 非法 JSON 走 JSONDecodeError → 返 False
+
         try:
-            for chunk in llm_router.chat(
+            # invoke() 收归:chunk 聚合 + 重试 + 超时 + 空响应检测
+            text = llm_router.invoke(
                 messages=[
                     {"role": "system", "content": DEDUP_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 cache_namespace=cache_namespace,
-            ):
-                if chunk.text_delta:
-                    text += chunk.text_delta.text
+                on_failure=_on_failure,
+            )
             data = json.loads(_strip_code_fence(text))
             is_dup = bool(data.get("is_duplicate", False))
             reason = data.get("reason", "")[:100]  # 截断避免日志过长

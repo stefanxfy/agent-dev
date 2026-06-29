@@ -250,24 +250,37 @@ class ExtractionGate:
         )
 
     def _call_llm(self, prompt: str) -> str:
-        """调 LLM,收集 text_delta(M10 C6.2 + C6.3 加守卫)
+        """调 LLM(M10 C6.2 + C6.3 守卫保留在 invoke() 外部)
 
-        顺序: budget check → timeout wrap → cost accumulate
+        顺序: budget check(pre-invoke)→ invoke(timeout + chunk 聚合)→ cost accumulate(post-invoke)
         """
-        # M10 C6.2: 预算检查
+        from agent_core.llm.router import InvokeTimeoutError
+
+        # M10 C6.2: 预算检查(pre-invoke,不是执行期错误处理)
         if self._cost_tracker:
             budget_err = self._cost_tracker.check_budget()
             if budget_err is not None:
                 raise budget_err
 
-        # M10 C6.3: timeout wrap(走 ThreadPoolExecutor)
-        text = ""
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                future = ex.submit(self._do_llm_call, prompt)
-                text = future.result(timeout=self._latency_timeout)
-        except concurrent.futures.TimeoutError:
-            raise LatencyTimeout(self._latency_timeout)
+        def _on_failure(err: Exception) -> str:
+            """invoke() 重试耗尽:Timeout 穿透抛 LatencyTimeout,其他降级 JSON。"""
+            if isinstance(err, InvokeTimeoutError):
+                raise LatencyTimeout(self._latency_timeout) from err
+            logger.warning(f"LLM gate 降级: {type(err).__name__}: {err}")
+            return json.dumps({"should_extract": False, "reason": "llm_call_error"})
+
+        # invoke() 收归:chunk 聚合 + 30s 超时守卫 + 空响应检测
+        # max_retries=0 — gate 要保延迟,不重试 LLM 调用
+        text = self.llm_router.invoke(
+            messages=[
+                {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            cache_namespace=self.cache_namespace,
+            max_retries=0,
+            timeout=self._latency_timeout,
+            on_failure=_on_failure,
+        )
 
         # M10 C6.2: 累计 cost(chars/4 粗略估算)
         if self._cost_tracker:
@@ -275,23 +288,6 @@ class ExtractionGate:
             output_tokens = len(text) // 4
             self._cost_tracker.add(input_tokens, output_tokens)
 
-        return text
-
-    def _do_llm_call(self, prompt: str) -> str:
-        """_call_llm 的非 timeout 版本(给 ThreadPoolExecutor 调)
-
-        必须独立成方法:lambda/局部函数不能被 pickle
-        """
-        text = ""
-        for chunk in self.llm_router.chat(
-            messages=[
-                {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            cache_namespace=self.cache_namespace,
-        ):
-            if chunk.text_delta:
-                text += chunk.text_delta.text
         return text
 
     def set_cost_tracker(self, new_tracker: "CostTracker") -> None:
