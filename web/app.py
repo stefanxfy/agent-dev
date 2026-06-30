@@ -64,6 +64,7 @@ from agent_core.llm.router import (
     UsageStats,
 )
 from agent_core.agent_core import ReactAgent
+from agent_core.builder import AgentBuilder  # D9:统一 agent 组装入口
 from agent_core.config import config as _agent_config  # 解析 AGENT_DATA_DIR
 from agent_core.memory.config import MemoryConfig  # M10 C7.1: 共享实例,line 648 + 719
 from agent_core.session.manager import SessionManager
@@ -104,6 +105,24 @@ if "chat_session_id" not in st.session_state:
         st.session_state.chat_session_id = url_sid
     else:
         st.session_state.chat_session_id = None
+
+# ── v2 状态机集成(C8 + D14-D20)───────────────────────────────
+# _run_phase:run() 推进状态机(为 v2 step() 重构铺路 + Stop 按钮工作)
+# - "idle"           : 无 active run
+# - "running"        : run() 正在生成(events 流式 yield 中)
+# - "awaiting_perm"  : run() 等用户对工具权限决定(legacy Event 路径)
+# - "interrupted"    : 用户按 Stop → cancel_event set,DONE
+if "_run_phase" not in st.session_state:
+    st.session_state._run_phase = "idle"
+if "_interrupt_requested" not in st.session_state:
+    st.session_state._interrupt_requested = False
+
+# R4 (review 修复): 顶部永远清 _interrupt_requested — 否则上次 Stop
+# 后没新 prompt,_interrupt_requested 滞留,下次随便哪次 rerun 都有可能
+# 触发幽灵 cancel。把清理放在 init 段(每次 rerun 都跑)
+# 已覆盖 new-session + 在 rerun 之间 cleanup。
+if st.session_state.get("_run_phase") == "idle":
+    st.session_state._interrupt_requested = False
 
 
 # ── 侧边栏：LLM 配置 ─────────────────────────────────────────
@@ -687,16 +706,25 @@ def get_agent(session_id=None):
             logging.warning(f"[L3 SM] SessionMemoryLayer 构造失败,fallback 无 L3: {e}")
             session_memory = None
 
-    agent = ReactAgent(
-        router, registry,
-        max_turns=max_turns,
-        session_id=session_id,
-        session_data_dir=DATA_DIR,
-        memory_retriever=memory_retriever,    # M7 ported: 检索 + 注入
-        memory_store=memory_store,             # M7 ported: 库内计数
-        react_memory_bridge=react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
-        memory_config=memory_config,           # M10 C6.4 + C7.1: 共享 MemoryConfig 实例
-        session_memory=session_memory,         # M10 C2.2: L3 SM 快路径
+    # D9 (2026-06-30): 走 AgentBuilder 统一组装入口 — 跟 ReactAgent 直接构造等价,
+    # 但有了 hook point 接入(后续 M11/M12 想插 handler 不用再改这里)。
+    # Post-construction injection(permission_engine / auto_allow_ask / audit_logger
+    # / _distillation_loop)保留 — 它们是 agent 属性而非 chain handler,builder 不管。
+    agent = (
+        AgentBuilder()
+        .use_real_session_persist(True)  # 走 SessionPersistHandler 真实现(D6-3,production 默认)
+        .build({
+            "llm_router": router,
+            "tool_registry": registry,
+            "max_turns": max_turns,
+            "session_id": session_id,
+            "session_data_dir": DATA_DIR,
+            "memory_retriever": memory_retriever,        # M7 ported: 检索 + 注入
+            "memory_store": memory_store,                # M7 ported: 库内计数
+            "react_memory_bridge": react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
+            "memory_config": memory_config,              # M10 C6.4 + C7.1: 共享 MemoryConfig 实例
+            "session_memory": session_memory,            # M10 C2.2: L3 SM 快路径
+        })
     )
 
     # M12/M2: 注入 PermissionEngine + AuditLogger + Sandbox(可选,settings.json 不存在时 None)
@@ -903,13 +931,65 @@ def run_agent(user_input: str):
     """
     运行 ReAct Agent，yield 中间过程。
     返回：(msg_type, content）
+
+    Plan A (v2 state machine 集成,2026-06-30):
+    - 不再调 agent.run() — 改为 start_run + step 循环
+    - 每次 step() 推进 state machine 直到暂停点(完成 / awaiting_permission / interrupted)
+    - awaiting_permission 触发 → yield event + return → streamlit rerun → dialog 渲染
+    - 三个按钮调 agent.resume_after_permission() 解锁 + 重 trigger state machine
+    - 兼容:agent.run() 仍工作(v1 路径,向后兼容测试 / 老调用方)
     """
-    for msg_type, content in agent.run(user_input):
-        # M12: 权限请求弹窗(对齐 doc §6.3 + Streamlit st.dialog)
-        # 每次 yield 后检查 _pending_permission_request,有则弹窗
-        if agent.permission_engine is not None and agent._pending_permission_request is not None:
-            _handle_permission_dialog(agent)
-        yield (msg_type, content)
+    # 标记 session_state phase
+    st.session_state._run_phase = "running"
+    st.session_state._interrupt_requested = False
+
+    # Plan A: 启动 run(start_run 初始化 SM + per-run state)
+    agent.start_run(user_input)
+
+    try:
+        # step() 循环:每次 step() 推进直到暂停 / 完成
+        # state machine 内部会跑完本 turn 的 SETUP → LLM → TOOLS → ...
+        # 直到 awaiting_permission 或 DONE / INTERRUPTED
+        for msg_type, content in agent.step():
+            # ── Stop 按钮 interrupt signal ─────────────────────────
+            if st.session_state.get("_interrupt_requested", False):
+                agent.interrupt()
+                st.session_state._interrupt_requested = False
+                st.session_state._run_phase = "interrupted"
+                yield ("system", "⏹️ 对话已被用户中断")
+                yield ("system", "✅ 对话结束")
+                break
+
+            # ── cancel_event 已 set ────────────────────────────────
+            if (agent._run_state is not None
+                    and agent._run_state.cancel_event.is_set()):
+                st.session_state._run_phase = "interrupted"
+                yield ("system", "✅ 对话结束")
+                break
+
+            # ── P1 关键:awaiting_permission 触发 → 暂停 + 弹 dialog ──
+            # v2 marker 已写入 _run_state.awaiting_permission,step() 自动
+            # 转 AWAITING_PERMISSION phase 暂停。这里 yield event 让 UI 知道
+            # 进入暂停,然后 return 让 streamlit rerun → @st.dialog 渲染。
+            if msg_type == "awaiting_permission":
+                st.session_state._run_phase = "awaiting_permission"
+                yield (msg_type, content)
+                return  # 早退 → streamlit rerun → @st.dialog 渲染
+
+            yield (msg_type, content)
+
+        # step() 自然结束 → phase=idle
+        if st.session_state._run_phase == "running":
+            if agent._sm.is_interrupted:
+                st.session_state._run_phase = "interrupted"
+            elif agent._sm.is_done:
+                st.session_state._run_phase = "idle"
+            else:
+                st.session_state._run_phase = "idle"
+    except Exception:
+        # 异常 → 回 idle,避免 phase 卡死
+        st.session_state._run_phase = "idle"
+        raise
 
 
 @st.dialog("🔐 Tool Permission Request")
@@ -919,6 +999,11 @@ def _handle_permission_dialog(agent):
 
     Args:
         agent: ReactAgent 实例(持有 _pending_permission_request + resolve_permission)
+
+    Plan A: 三个按钮调 agent.resume_after_permission() 而非 agent.resolve_permission()
+    - resolve_permission: 只设 Event + 写 choice(v1 legacy 路径)
+    - resume_after_permission: 走 resolve_permission + trigger state machine 从
+      AWAITING_PERMISSION 转 EXECUTING_TOOLS,真正续 run
     """
     req = agent._pending_permission_request
     if req is None:
@@ -939,15 +1024,33 @@ def _handle_permission_dialog(agent):
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("✅ Allow once", key=f"allow_{tool_name}", use_container_width=True):
-            agent.resolve_permission("allow")
+            agent.resume_after_permission("allow")
+            # 清 _pending: resolve_permission 不清它(避免弹窗条件残留)
+            agent._pending_permission_request = None
+            st.session_state._run_phase = "running"  # 重启 step() 循环
             st.rerun()
     with col2:
         if st.button("🚫 Deny", key=f"deny_{tool_name}", use_container_width=True):
-            agent.resolve_permission("deny")
+            # Deny = 结束本次对话(用户明确语义:不再继续、不调 LLM、不显示 Stop)。
+            # - resume_after_permission: 写 denial tool_result + 持久化(给 LLM 上下文一致)
+            # - 清 _pending: resolve_permission 不清它(已知问题),清掉避免弹窗条件残留
+            # - phase=idle: 续 run 段不跑(不调 LLM),Stop 段 else 分支(不显示按钮)
+            # - 弹窗段条件 phase==awaiting,idle 不满足 → 弹窗消失
+            # - append 反馈消息: 让用户在主区看到"已拒绝",reload 后这条仍在(tool
+            #   role 不渲染,但 tool_result 已在 self.messages,下次 reload 仍可见)
+            agent.resume_after_permission("deny")
+            agent._pending_permission_request = None
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": f"🚫 已拒绝工具 `{tool_name}` 的执行权限,本次对话结束。",
+            })
+            st.session_state._run_phase = "idle"
             st.rerun()
     with col3:
-        if st.button("✅✅ Always allow", key=f"always_{tool_name}", use_container_width=True):
-            agent.resolve_permission("always_allow")
+        if st.button("✅ Always allow", key=f"always_{tool_name}", use_container_width=True):
+            agent.resume_after_permission("always_allow")
+            agent._pending_permission_request = None  # 清 pending(见 allow 注释)
+            st.session_state._run_phase = "running"
             st.rerun()
 
 
@@ -1001,6 +1104,145 @@ for msg in st.session_state.messages:
                 hit_rate = cached / max(msg_usage["input_tokens"], 1) * 100
                 parts.append(f"🔥cache={cached:,} ({hit_rate:.1f}%)")
             st.caption(f"📊 {' · '.join(parts)}")
+
+
+# ── v2: Stop 按钮(C8 + D18)───────────────────────────────────────
+# 当 _run_phase == "running" 时显示,点击 → 设 _interrupt_requested → 下一 yield 触发 interrupt()
+if st.session_state.get("_run_phase") == "running":
+    col_stop, _ = st.columns([1, 5])
+    with col_stop:
+        if st.button("⏹️ Stop", key="stop_run_button", type="secondary", use_container_width=True):
+            st.session_state._interrupt_requested = True
+            logging.info("🛑 [Stop 按钮] 用户点击,设 _interrupt_requested=True")
+            st.rerun()
+else:
+    # Reset interrupt flag (上次 run 已结束)
+    st.session_state._interrupt_requested = False
+
+# ── Plan A: 续 run 处理器(permission allow 后) ──────────────────────
+# Phase = "running" + 无新 prompt → drive step() 续 run。
+# 用一个简单的事件消费循环(不重用 chat_input 内的完整 UI 更新逻辑)。
+# 视觉:开新 chat_message 气泡续接(可接受 artifact)。
+if (st.session_state.get("_run_phase") == "running"
+        and agent._run_state is not None
+        and not agent._sm.is_done
+        and not agent._sm.is_interrupted):
+    with st.chat_message("assistant"):
+        # af73c8d1 fix (2026-06-30): 累积 events 用于最后 append 到
+        # session_state.messages。续 run handler 渲染的内容必须 persist,
+        # 否则下面 finally 触发 st.rerun() 后,下次 rerun 历史区只渲染
+        # session_state.messages(没追加 assistant msg 就空白)。
+        _res_full_text = ""
+        _res_thinking = ""
+        _res_tool_logs = []
+        _res_usage = None
+        try:
+            for msg_type, content in agent.step():
+                if msg_type == "text":
+                    _res_full_text += content
+                    st.markdown(content)
+                elif msg_type == "thinking":
+                    _res_thinking += content
+                    st.caption(f"💭 {content}")
+                elif msg_type == "tool_call":
+                    if content.get("parallel"):
+                        names = content.get("names", [])
+                        st.info(f"⚡ 并行执行 {len(names)} 个工具")
+                        _res_tool_logs.append({"type": "parallel_start", "names": names})
+                    else:
+                        tool_name = content.get("name", "")
+                        tool_input = content.get("input", {})
+                        st.info(f"🔧 执行工具: `{tool_name}`")
+                        _res_tool_logs.append({"type": "action", "name": tool_name, "input": tool_input})
+                elif msg_type == "tool_result":
+                    tool_name = content.get("name", "")
+                    tool_output = content.get("output", "")
+                    success = content.get("success", False)
+                    elapsed = content.get("elapsed", 0)
+                    icon = "✅" if success else "❌"
+                    elapsed_str = f" ({elapsed:.2f}s)" if elapsed else ""
+                    st.markdown(f"{icon} **{tool_name}**{elapsed_str}")
+                    if len(tool_output) > 200:
+                        with st.expander("查看完整结果"):
+                            st.code(tool_output)
+                    else:
+                        st.code(tool_output)
+                    _res_tool_logs.append({
+                        "type": "result", "name": tool_name,
+                        "output": tool_output, "success": success,
+                        "elapsed": elapsed,
+                    })
+                elif msg_type == "system":
+                    if "回答完成" in str(content):
+                        st.info("✅ 回答完成")
+                    elif "强制结束" in str(content) or "工具执行失败" in str(content):
+                        st.warning(content)
+                    else:
+                        st.info(content)
+                elif msg_type == "awaiting_permission":
+                    st.session_state._run_phase = "awaiting_permission"
+                    break
+                elif msg_type == "memory_event":
+                    pass  # skip memory stats update on resume
+                elif msg_type == "memory_status":
+                    pass
+                elif msg_type == "usage":
+                    # 累积 usage(对齐 chat_input 路径的 schema)
+                    _res_usage = {
+                        "input_tokens": content.input_tokens,
+                        "output_tokens": content.output_tokens,
+                        "thinking_tokens": content.thinking_tokens,
+                        "cached_tokens": getattr(content, "cached_tokens", 0) or 0,
+                    }
+                # 其他 type(text/thinking) 跳过
+        except Exception as e:
+            st.error(f"续 run 异常: {e}")
+            st.session_state._run_phase = "idle"
+        finally:
+            # af73c8d1 fix (2026-06-30): 把累积的 assistant 内容 append 到
+            # session_state.messages。chat_input 路径(line 1447)也做这件事,
+            # 但续 run handler 是独立路径 — 之前漏了,导致 st.rerun 后历史区空白。
+            if _res_full_text or _res_thinking or _res_tool_logs:
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": _res_full_text,
+                    "thinking": _res_thinking,
+                    "tool_logs": _res_tool_logs,
+                    "usage": _res_usage,
+                })
+            # M10 Stop-button-fix (2026-06-30): SM 完成 / 中断后必须 rerun,
+            # 否则 line 1101 已渲染的 Stop 按钮留在原页面,用户看到
+            # "回答完成 + Stop 按钮同时存在" 的 artifact(sessions 59858029 暴露)。
+            # Streamlit 不会自动 rerun(只在用户交互时触发),所以这里主动触发。
+            # 安全:下次 rerun 时 _run_phase == "idle" → Stop 按钮不再渲染;
+            # 续 run handler 入口检查 _run_phase == "running" 不通过,不会重入。
+            if st.session_state.get("_run_phase") == "running":
+                if agent._sm.is_done or agent._sm.is_interrupted:
+                    st.session_state._run_phase = "idle" if agent._sm.is_done else "interrupted"
+                    st.rerun()
+
+
+# ── Plan A: 权限弹窗触发点 ────────────────────────────────────────
+# 当 _run_phase == "awaiting_permission" 时,在主区域前触发 @st.dialog 渲染
+# (Streamlit 的 @st.dialog 必须在 rerun 顶层调用,不能延迟到事件处理中)
+if st.session_state.get("_run_phase") == "awaiting_permission":
+    if agent.permission_engine is not None and agent._pending_permission_request is not None:
+        # 把弹窗下移到视口下半部(更靠近输入框)。
+        # Streamlit 1.58 真实 DOM: stDialog > div(flex container, inline paddingTop:32px) > stModal(实际弹窗)。
+        # 弹窗垂直位置由外层 flex container 的 paddingTop 决定(默认 threeXL=32px,贴近顶部)。
+        # 直接覆盖这个 paddingTop 才能下移;旧 selector `div[role="dialog"]` 根本不存在于 DOM,故不生效。
+        # (Fix A2, 2026-06-30: 经 grep streamlit 1.58 静态 JS/CSS 确认 DOM 结构后修正 selector)
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stDialog"] > div:first-child {
+                padding-top: 30vh !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        _handle_permission_dialog(agent)
 
 
 # 用户输入
@@ -1063,7 +1305,15 @@ if prompt := st.chat_input("输入消息..."):
                 thinking_placeholder.markdown("\n\n---\n\n".join(parts))
 
         # 逐 chunk 处理
+        # Plan A: 监听 awaiting_permission 事件 — 中断 for 循环,避免
+        # 后续渲染 + session_state.messages.append() 误提交 partial assistant msg。
+        # run_agent() 自身会在 awaiting_permission 时 return。
+        _awaiting_permission_seen = False
         for msg_type, content in run_agent(prompt):
+            if msg_type == "awaiting_permission":
+                # P1 关键:中止 for 循环,不让后续渲染逻辑误提交 partial msg
+                _awaiting_permission_seen = True
+                break
             if msg_type == "text":
                 full_text += content
                 text_placeholder.markdown(full_text + "▌")
@@ -1169,6 +1419,14 @@ if prompt := st.chat_input("输入消息..."):
                     # M10 C1.2: §14.4 extract_candidates secret sanitize 事件
                     ms["secrets_redacted"] = ms.get("secrets_redacted", 0) + 1
                 st.session_state.memory_stats = ms
+
+        # Plan A: 如果 awaiting_permission 已触发,跳过 final 渲染 + 提交,
+        # 触发 st.rerun() 让 @st.dialog 渲染。
+        if _awaiting_permission_seen:
+            # 不提交 partial assistant msg 到 messages(等续 run 完后才提交)
+            # st.rerun() 会终止当前 rerun,后续代码不会执行
+            st.rerun()
+            st.stop()  # 显式停(streamlit 推荐方式,不用裸 return)
 
         # 流式结束：清理 UI
         # 文本区去掉光标
