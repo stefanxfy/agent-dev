@@ -31,6 +31,9 @@ from .permission_types import (
 
 logger = logging.getLogger(__name__)
 
+# 🛡️ denial tracking 仍属 permission 子系统
+permission_logger = logging.getLogger("agent_core.permission")
+
 
 # ────────────────────────────────────────────────────────────────────
 # DENIAL_LIMITS — 阈值常量
@@ -78,11 +81,17 @@ def record_denial(state: DenialTrackingState) -> DenialTrackingState:
     Returns:
         新的 state(dataclass frozen 设计选择 → 用 replace 返新对象)
     """
-    return replace(
+    new_state = replace(
         state,
         consecutive_denials=state.consecutive_denials + 1,
         total_denials=state.total_denials + 1,
     )
+    permission_logger.debug(
+        "🛡️ [denial_record] consecutive=%d→%d total=%d→%d",
+        state.consecutive_denials, new_state.consecutive_denials,
+        state.total_denials, new_state.total_denials,
+    )
+    return new_state
 
 
 def record_success(state: DenialTrackingState) -> DenialTrackingState:
@@ -95,7 +104,12 @@ def record_success(state: DenialTrackingState) -> DenialTrackingState:
     Returns:
         新的 state(consecutive=0)
     """
-    return replace(state, consecutive_denials=0)
+    new_state = replace(state, consecutive_denials=0)
+    permission_logger.debug(
+        "🛡️ [denial_record_success] consecutive=%d→0 total=%d",
+        state.consecutive_denials, state.total_denials,
+    )
+    return new_state
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -216,6 +230,12 @@ def check_denial_limit(state: DenialTrackingState) -> Optional[PermissionDecisio
     Returns:
         PermissionDecision(behavior=ask) 如果超阈值,否则 None
     """
+    permission_logger.debug(
+        "🛡️ [denial_limit_check] consecutive=%d total=%d "
+        "max_consec=%d max_total=%d",
+        state.consecutive_denials, state.total_denials,
+        DENIAL_LIMITS["max_consecutive"], DENIAL_LIMITS["max_total"],
+    )
     if state.consecutive_denials >= DENIAL_LIMITS["max_consecutive"]:
         return handle_denial_limit_exceeded(state)
     if state.total_denials >= DENIAL_LIMITS["max_total"]:

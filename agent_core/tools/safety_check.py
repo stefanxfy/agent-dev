@@ -9,10 +9,19 @@ Safety check — 敏感路径 + secret 正则检测
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
 from typing import Optional
+
+
+# ────────────────────────────────────────────────────────────────────
+# 🧪 safety 子系统 logger — 可被 AGENT_LOG_SAFETY 单独调级别
+# 这是本文件从 0 引入的 logger;safety_check 在主 permission 流程中地位关键
+# (Step 1e),但之前完全静默,无任何可观测性
+# ────────────────────────────────────────────────────────────────────
+safety_logger = logging.getLogger("agent_core.safety")
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -117,12 +126,25 @@ def is_sensitive_path(path: str) -> bool:
         normalized = normalized[2:]
     normalized = normalized.lstrip("/")
 
+    safety_logger.debug(
+        "🧪 [sensitive_path_check] path=%s normalized=%s prefixes=%d",
+        path, normalized, len(_SENSITIVE_NORMALIZED),
+    )
+
     for prefix in _SENSITIVE_NORMALIZED:
         # 1. 完全等于(防止 "./id_rsa" 撞到 "id_rsa" 单独匹配)
         if normalized == prefix.rstrip("/"):
+            safety_logger.info(
+                "🧪 [sensitive_path_match] path=%s matched_prefix=%s mode=exact",
+                path[:120], prefix,
+            )
             return True
         # 2. 前缀匹配(目录或文件)
         if normalized.startswith(prefix):
+            safety_logger.info(
+                "🧪 [sensitive_path_match] path=%s matched_prefix=%s mode=prefix",
+                path[:120], prefix,
+            )
             return True
 
     return False
@@ -144,8 +166,17 @@ def contains_secret(text: str) -> bool:
     """
     if not text:
         return False
-    for pattern in SECRET_PATTERNS:
-        if pattern.search(text):
+    safety_logger.debug(
+        "🧪 [secret_check] text_len=%d patterns=%d",
+        len(text), len(SECRET_PATTERNS),
+    )
+    for i, pattern in enumerate(SECRET_PATTERNS):
+        match = pattern.search(text)
+        if match:
+            safety_logger.info(
+                "🧪 [secret_match] pattern_idx=%d matched=%r text_preview=%s",
+                i, match.group(0)[:20], text[:80],
+            )
             return True
     return False
 
@@ -188,18 +219,34 @@ def safety_check(tool_name: str, tool_input: dict) -> bool:
         True
     """
     if not tool_input:
+        safety_logger.debug("🧪 [safety_check_skip] tool=%s empty input", tool_name)
         return False
+
+    safety_logger.debug(
+        "🧪 [safety_check_entry] tool=%s input_keys=%s path_check=%s secret_check=%s",
+        tool_name, list(tool_input.keys()),
+        tool_name in _PATH_CHECK_TOOLS,
+        tool_name in _SECRET_CHECK_TOOLS,
+    )
 
     # 1. Path 检查(仅 Read/Write/Edit/MultiEdit/NotebookEdit)
     if tool_name in _PATH_CHECK_TOOLS:
         path = tool_input.get("path") or tool_input.get("file_path") or ""
         if path and is_sensitive_path(path):
+            safety_logger.info(
+                "🧪 [safety_path_block] tool=%s path=%s",
+                tool_name, path[:120],
+            )
             return True
 
     # 2. Secret 检查(在所有 string 字段上跑 regex)
     if tool_name in _SECRET_CHECK_TOOLS:
-        for value in tool_input.values():
+        for key, value in tool_input.items():
             if isinstance(value, str) and contains_secret(value):
+                safety_logger.info(
+                    "🧪 [safety_secret_block] tool=%s key=%s value_preview=%s",
+                    tool_name, key, value[:80],
+                )
                 return True
             elif isinstance(value, list):
                 # 处理 content list(Anthropic format) — 检查每项
@@ -208,13 +255,25 @@ def safety_check(tool_name: str, tool_input: dict) -> bool:
                         # content block dict
                         for v in item.values():
                             if isinstance(v, str) and contains_secret(v):
+                                safety_logger.info(
+                                    "🧪 [safety_secret_block] tool=%s list_dict value_preview=%s",
+                                    tool_name, str(v)[:80],
+                                )
                                 return True
                     elif isinstance(item, str) and contains_secret(item):
+                        safety_logger.info(
+                            "🧪 [safety_secret_block] tool=%s list_str value_preview=%s",
+                            tool_name, item[:80],
+                        )
                         return True
             elif isinstance(value, dict):
                 # 嵌套 dict,递归检查 string value
                 for v in value.values():
                     if isinstance(v, str) and contains_secret(v):
+                        safety_logger.info(
+                            "🧪 [safety_secret_block] tool=%s dict value_preview=%s",
+                            tool_name, str(v)[:80],
+                        )
                         return True
 
     return False

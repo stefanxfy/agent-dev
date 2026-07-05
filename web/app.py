@@ -712,7 +712,6 @@ def get_agent(session_id=None):
     # / _distillation_loop)保留 — 它们是 agent 属性而非 chain handler,builder 不管。
     agent = (
         AgentBuilder()
-        .use_real_session_persist(True)  # 走 SessionPersistHandler 真实现(D6-3,production 默认)
         .build({
             "llm_router": router,
             "tool_registry": registry,
@@ -734,12 +733,20 @@ def get_agent(session_id=None):
         from agent_core.tools.permission_engine import PermissionEngine
         from agent_core.tools.permission_hook import default_hooks
         from agent_core.tools.sandbox_manager import sandbox_manager
+        from agent_core.tools.sandbox_backends import NativeBackend, SrtBackend
         from agent_core.tools.audit_logger import init_audit_logger
 
         # M2: 加载 sandbox 配置(settings.json 的 sandbox 段)
         settings_json = load_settings_json()
         sandbox_cfg = settings_json.get("sandbox") if isinstance(settings_json, dict) else None
         sandbox_manager.load_config(sandbox_cfg)
+        # 设计 §3 静态显式注入:顺序不隐含优先级,priority 由 config.backend_priority 决定。
+        # backends.{srt,native} 嵌套私有配置透传给各 backend 构造(决策 D)。
+        backends_cfg = sandbox_cfg.get("backends") if isinstance(sandbox_cfg, dict) else None
+        sandbox_manager.configure_backends([
+            NativeBackend(config=backends_cfg.get("native") if backends_cfg else None),
+            SrtBackend(config=backends_cfg.get("srt") if backends_cfg else None),
+        ])
         sandbox_enabled = sandbox_manager.is_sandbox_enabled()
 
         # M2: 把 sandbox_enabled 透传到 permission context
@@ -880,13 +887,16 @@ if _loaded_sid != _current_sid and _current_sid:
         history = _storage.get_messages(include_compact_summary=False)
 
         loaded_count = 0
-        for entry in history:
+        # 元数据跳过类型(assistant look-ahead 也要用)
+        _SKIP_TYPES = ("custom-title", "ai-title", "agent-name", "mode", "tag",
+                       "compact_boundary", "summary")
+
+        for i, entry in enumerate(history):
             etype = entry.get("type", "")
             msg = entry.get("message")
 
             # 元数据类型不显示在 UI
-            if etype in ("custom-title", "ai-title", "agent-name", "mode", "tag",
-                         "compact_boundary", "summary"):
+            if etype in _SKIP_TYPES:
                 continue
 
             # 从 message 字段取 API 原始消息（信封套信纸）
@@ -901,21 +911,102 @@ if _loaded_sid != _current_sid and _current_sid:
             tool_logs = entry.get("tool_logs", []) or []
 
             text_content = extract_text(content)
+            # reload 鲁棒(2026-07-03):纯 tool_use 无 text 的 assistant(如 zhipu 直产
+            # tool_call)也要加载,否则 _derive_action_logs_from_content 没机会反推
+            # Action。_has_tool_use_in_content 定义在本块之后(顶层执行顺序),内联判断。
+            _has_tool_use = isinstance(content, list) and any(
+                isinstance(_b, dict) and _b.get("type") == "tool_use" for _b in content
+            )
+
+            # C(2026-07-03):assistant 行 + 紧邻 user(tool_result) 配对合并成一条 entry,
+            # 把 user 后续的 tool_result block push 进 assistant.tool_logs,这样 reload
+            # 渲染时同一个 expander 同时出 Action + Observation(不再 "只有 Action 框")。
+            # 配对通过 tool_use_id:assistant content tool_use[name]+user tool_result 关联。
+            _effective_logs = tool_logs or (
+                # inline _derive_action_logs_from_content(原 L1085)— 该 def 在
+                # 本 LOAD loop 之后定义,脚本顶层执行顺序会 NameError。
+                # inline 避免依赖,逻辑等价。
+                [
+                    {
+                        "type": "action",
+                        "name": _b.get("name", ""),
+                        "input": _b.get("input", {}),
+                    }
+                    for _b in content
+                    if isinstance(_b, dict) and _b.get("type") == "tool_use"
+                ]
+                if isinstance(content, list) and _has_tool_use
+                else []
+            )
+            _consume_user_idx = -1
+            if (
+                i + 1 < len(history)
+                and role == "assistant"
+                and isinstance(content, list)
+            ):
+                _ne = history[i + 1]
+                if _ne.get("type") not in _SKIP_TYPES:
+                    _nm = _ne.get("message")
+                    if _nm and _nm.get("role") == "user":
+                        _nc = _nm.get("content", "")
+                        if isinstance(_nc, list) and any(
+                            isinstance(_b, dict) and _b.get("type") == "tool_result"
+                            for _b in _nc
+                        ):
+                            _tu_by_id = {
+                                _b.get("id"): _b.get("name", "")
+                                for _b in content
+                                if isinstance(_b, dict) and _b.get("type") == "tool_use"
+                            }
+                            for _b in _nc:
+                                if not isinstance(_b, dict) or _b.get("type") != "tool_result":
+                                    continue
+                                _out = _b.get("content", "")
+                                if not isinstance(_out, str):
+                                    try:
+                                        _out = json.dumps(_out, ensure_ascii=False)
+                                    except Exception:
+                                        _out = str(_out)
+                                _effective_logs.append({
+                                    "type": "result",
+                                    "name": _tu_by_id.get(_b.get("tool_use_id"), ""),
+                                    "output": _out,
+                                    "success": not _b.get("is_error", False),
+                                    "elapsed": 0,
+                                })
+                            _consume_user_idx = i + 1
 
             # 只显示有文本内容的 user 和 assistant
+            if i == _consume_user_idx:
+                # 已被 assistant 合并消费,这里不重复 append
+                continue
             if role == "user" and text_content:
                 st.session_state.messages.append({"role": "user", "content": text_content})
                 loaded_count += 1
-            elif role == "assistant" and text_content:
-                # Day 7：从 entry 顶层取 usage（API 真实 token 统计）
-                # 加载后 sidebar 会话信息面板能直接用这个数字，不用重算
+            elif role == "assistant" and (text_content or _has_tool_use or _effective_logs):
+                # 2026-07-03 session compat:跳过 fallback row(content 含 tool_use 但
+                # entry.tool_logs=0)。这类 row 是 SessionPersistHandler 在 tool_chain
+                # 跑前早期持久化的 assistant 块,同 session 后续 SessionFlushHandler
+                # 会写出 final assistant row(entry.tool_logs 含完整 action+result)覆盖。
+                # 不 skip 会让同一工具调用显示两次(fallback 仅 Action + final 完整)。
+                if not tool_logs and _has_tool_use:
+                    continue
+                # Day 7:从 entry 顶层取 usage(API 真实 token 统计)。
                 entry_usage = entry.get("usage")
+                # M11 修复:存原 content(list 含 text+tool_use blocks),
+                # 不抽 text_content。理由:
+                # 1) SessionPersistHandler 写盘时 content 是 list,reload
+                #   抽 text 会丢 tool_use → UI 看不到 Action + 参数
+                # 2) 渲染端 L1102-1108 已能 handle list content
+                # 3) tool_use 由 _derive_action_logs_from_content fallback 反推
+                #   成 action logs;现在(C)进一步把 user tool_result 配对合并成
+                #   result logs,reload 一次进 expander 同时显示 Action + Observation
                 st.session_state.messages.append({
                     "role": "assistant",
-                    "content": text_content,
+                    "content": content,
                     "thinking": thinking,
-                    "tool_logs": tool_logs,
-                    "usage": entry_usage,  # 可能为 None（老 session）
+                    "tool_logs": _effective_logs,
+                    "usage": entry_usage,
                 })
                 loaded_count += 1
 
@@ -932,12 +1023,11 @@ def run_agent(user_input: str):
     运行 ReAct Agent，yield 中间过程。
     返回：(msg_type, content）
 
-    Plan A (v2 state machine 集成,2026-06-30):
-    - 不再调 agent.run() — 改为 start_run + step 循环
+    Plan A (v2 state machine 集成,2026-06-30) + Plan B Step 7 (2026-07-01):
+    - agent.run() 已删,唯一入口是 start_run + step 循环
     - 每次 step() 推进 state machine 直到暂停点(完成 / awaiting_permission / interrupted)
     - awaiting_permission 触发 → yield event + return → streamlit rerun → dialog 渲染
     - 三个按钮调 agent.resume_after_permission() 解锁 + 重 trigger state machine
-    - 兼容:agent.run() 仍工作(v1 路径,向后兼容测试 / 老调用方)
     """
     # 标记 session_state phase
     st.session_state._run_phase = "running"
@@ -1024,11 +1114,17 @@ def _handle_permission_dialog(agent):
     col1, col2, col3 = st.columns(3)
     with col1:
         if st.button("✅ Allow once", key=f"allow_{tool_name}", use_container_width=True):
-            agent.resume_after_permission("allow")
-            # 清 _pending: resolve_permission 不清它(避免弹窗条件残留)
-            agent._pending_permission_request = None
-            st.session_state._run_phase = "running"  # 重启 step() 循环
-            st.rerun()
+            try:
+                agent.resume_after_permission("allow")
+            except Exception as e:
+                # 诊断(2026-07-03):resume 抛异常会让 _run_phase 没改成 running → 弹窗不消失
+                logging.exception("▶️ [allow] resume_after_permission 抛异常")
+                st.error(f"resume 异常: {e}")
+            else:
+                # 清 _pending: resolve_permission 不清它(避免弹窗条件残留)
+                agent._pending_permission_request = None
+                st.session_state._run_phase = "running"  # 重启 step() 循环
+                st.rerun()
     with col2:
         if st.button("🚫 Deny", key=f"deny_{tool_name}", use_container_width=True):
             # Deny = 结束本次对话(用户明确语义:不再继续、不调 LLM、不显示 Stop)。
@@ -1056,24 +1152,83 @@ def _handle_permission_dialog(agent):
 
 # ── 主聊天界面 ────────────────────────────────────────────────
 
+
+def _has_tool_use_in_content(msg: dict) -> bool:
+    """assistant message 的 content 是否含 tool_use block。
+
+    用于在 tool_logs 缺失时(老 session / JSONL reload)反推 action 渲染。
+    """
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("type") == "tool_use"
+        for item in content
+    )
+
+
+def _derive_action_logs_from_content(msg: dict) -> list:
+    """从 assistant message.content[].tool_use 反推 action logs。
+
+    用于在 st.session_state.messages 中 tool_logs 字段为空时(常见于:
+    1) JSONL reload 路径,SessionPersistHandler 未写 tool_logs 到 entry
+    2) 老 session 写于 tool_logs 字段加入之前
+    ),保证 action + 参数仍能渲染。
+
+    Note: 不会反推 result(observation),result 在 JSONL 中是后续 user message,
+    本函数只关心 action 阶段。
+    """
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return []
+    return [
+        {
+            "type": "action",
+            "name": item.get("name", ""),
+            "input": item.get("input", {}),
+        }
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "tool_use"
+    ]
+
+
 # 渲染历史消息
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg.get("thinking"):
             with st.expander("💭 思考过程", expanded=False):
                 st.code(msg["thinking"])
-        if msg.get("tool_logs"):
-            with st.expander("🔧 工具调用", expanded=False):
-                for log in msg["tool_logs"]:
+        if msg.get("tool_logs") or _has_tool_use_in_content(msg):
+            # 工具调用详情:action 永远显示,带格式化参数;observation 在下方
+            # 之前 expanded=False 让用户看不到 action + 参数,改成 True
+            # Fallback: 若 tool_logs 缺失(从 JSONL reload / 老 session),
+            # 从 content[].tool_use 反推 action — 让历史回放也能看到参数
+            effective_logs = msg.get("tool_logs") or _derive_action_logs_from_content(msg)
+            with st.expander("🔧 工具调用", expanded=True):
+                for log in effective_logs:
                     if isinstance(log, dict):
                         if log["type"] == "parallel_start":
                             st.markdown(f"\n⚡ **并行调用**: {', '.join(log['names'])}")
                         elif log["type"] == "action":
                             st.markdown(f"\n🔧 **Action**: `{log['name']}`")
-                            st.caption(f"参数: `{log['input']}`")
+                            # 用 st.code 格式化 JSON,比 caption 清晰
+                            try:
+                                st.code(
+                                    json.dumps(log["input"], indent=2, ensure_ascii=False),
+                                    language="json",
+                                )
+                            except (TypeError, ValueError):
+                                st.code(str(log["input"]))
                         elif log["type"] == "result":
                             icon = "✅" if log["success"] else "❌"
-                            st.markdown(f"{icon} **Observation** (`{log['name']}`)")
+                            elapsed_str = (
+                                f" ({log.get('elapsed', 0):.2f}s)"
+                                if log.get("elapsed")
+                                else ""
+                            )
+                            st.markdown(
+                                f"{icon} **Observation** (`{log['name']}`{elapsed_str})"
+                            )
                             output = str(log['output'])
                             if len(output) > 200:
                                 with st.expander("查看完整结果"):
@@ -1083,15 +1238,17 @@ for msg in st.session_state.messages:
                     else:
                         # 兼容旧格式（纯字符串）
                         st.markdown(log)
-        # 处理 content：如果是包含 tool_use 的 JSON 数组，提取 text 部分
+        # 处理 content:list 提取 text 部分;无 text block(纯 tool_use / tool_result
+        # /其他 block)时不渲染,避免把 list 字面量如 [{'type':'tool_use',...}] 泄漏到 UI
+        # (tool_use 已有 expander Action 渲染,tool_result 单独处理,这里只显示文本)
         content = msg.get("content", "")
         if isinstance(content, list):
-            # 从 content 数组中提取 text 类型的内容
             texts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
-            display_content = "".join(texts) if texts else str(content)
+            display_content = "".join(texts) if texts else None
         else:
             display_content = content
-        st.markdown(display_content)
+        if display_content:
+            st.markdown(display_content)
 
         # 显示该条消息的 Token 消耗（如果有）
         msg_usage = msg.get("usage")
@@ -1136,6 +1293,10 @@ if (st.session_state.get("_run_phase") == "running"
         _res_thinking = ""
         _res_tool_logs = []
         _res_usage = None
+        # 2026-07-03:实时 bubble 统一在 expander "🔧 工具调用" 里渲染 tool_call +
+        # tool_result(DeltaGenerator 跨 yield 累积,Action 和 Observation 一个框)。
+        # 修复前用 st.info + st.markdown 独立 widget 会被分成两个视觉区块。
+        _tool_exp = None
         try:
             for msg_type, content in agent.step():
                 if msg_type == "text":
@@ -1145,28 +1306,43 @@ if (st.session_state.get("_run_phase") == "running"
                     _res_thinking += content
                     st.caption(f"💭 {content}")
                 elif msg_type == "tool_call":
+                    # 2026-07-03:实时累积到 _tool_exp,与 tool_result 共享"🔧 工具调用"
+                    # expander(DeltaGenerator 跨 yield 累积,Action/Observation 一个框)
+                    if _tool_exp is None:
+                        _tool_exp = st.expander("🔧 工具调用", expanded=True)
                     if content.get("parallel"):
                         names = content.get("names", [])
-                        st.info(f"⚡ 并行执行 {len(names)} 个工具")
+                        _tool_exp.markdown(f"⚡ **并行执行**: {', '.join(names)}")
                         _res_tool_logs.append({"type": "parallel_start", "names": names})
                     else:
                         tool_name = content.get("name", "")
                         tool_input = content.get("input", {})
-                        st.info(f"🔧 执行工具: `{tool_name}`")
-                        _res_tool_logs.append({"type": "action", "name": tool_name, "input": tool_input})
+                        _tool_exp.markdown(f"🔧 **Action**: `{tool_name}`")
+                        try:
+                            _tool_exp.code(
+                                json.dumps(tool_input, indent=2, ensure_ascii=False),
+                                language="json",
+                            )
+                        except (TypeError, ValueError):
+                            _tool_exp.code(str(tool_input))
+                        _res_tool_logs.append(
+                            {"type": "action", "name": tool_name, "input": tool_input}
+                        )
                 elif msg_type == "tool_result":
+                    # 2026-07-03:同上累积到同一 expander,与 Action 一个框;
+                    # 输出始终 st.code(>=200 也只 code,不嵌二级 expander,避免 DeltaGenerator 嵌套限制)
+                    if _tool_exp is None:
+                        _tool_exp = st.expander("🔧 工具调用", expanded=True)
                     tool_name = content.get("name", "")
                     tool_output = content.get("output", "")
                     success = content.get("success", False)
                     elapsed = content.get("elapsed", 0)
                     icon = "✅" if success else "❌"
                     elapsed_str = f" ({elapsed:.2f}s)" if elapsed else ""
-                    st.markdown(f"{icon} **{tool_name}**{elapsed_str}")
-                    if len(tool_output) > 200:
-                        with st.expander("查看完整结果"):
-                            st.code(tool_output)
-                    else:
-                        st.code(tool_output)
+                    _tool_exp.markdown(
+                        f"{icon} **Observation** (`{tool_name}`{elapsed_str})"
+                    )
+                    _tool_exp.code(tool_output)
                     _res_tool_logs.append({
                         "type": "result", "name": tool_name,
                         "output": tool_output, "success": success,
@@ -1202,7 +1378,24 @@ if (st.session_state.get("_run_phase") == "running"
             # af73c8d1 fix (2026-06-30): 把累积的 assistant 内容 append 到
             # session_state.messages。chat_input 路径(line 1447)也做这件事,
             # 但续 run handler 是独立路径 — 之前漏了,导致 st.rerun 后历史区空白。
-            if _res_full_text or _res_thinking or _res_tool_logs:
+            # A+B(2026-07-03):append 完整性 + 终态 check。
+            # 完整性:每个 action 配对对应 result(action 数 <= result 数)才入库;
+            # 部分状态(用户在 tool_call/tool_result 中间刷新,try-finally 的 finally
+            # 仍会跑)被丢弃,避免 session_state.messages 累积 only-action 残条。
+            # 终态:SM done/interrupted 时 append 全部(哪怕 partial)— 留个尾巴,
+            # 防止 runtime 异常时整个 step 都没存。
+            _action_n = sum(1 for _l in _res_tool_logs if _l.get("type") == "action")
+            _result_n = sum(1 for _l in _res_tool_logs if _l.get("type") == "result")
+            _tool_logs_complete = _result_n >= _action_n
+            _sm_settled = bool(
+                getattr(agent, "_sm", None)
+                and (agent._sm.is_done or agent._sm.is_interrupted)
+            )
+            if (
+                _res_full_text or _res_thinking or _res_tool_logs
+            ) and (
+                _tool_logs_complete or _sm_settled
+            ):
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": _res_full_text,
@@ -1469,7 +1662,14 @@ if prompt := st.chat_input("输入消息..."):
                         st.markdown(f"\n⚡ **并行调用**: {', '.join(log['names'])}")
                     elif log["type"] == "action":
                         st.markdown(f"\n🔧 **Action**: `{log['name']}`")
-                        st.caption(f"参数: `{log['input']}`")
+                        # 用 st.code 格式化 JSON 参数,比 caption 清晰
+                        try:
+                            st.code(
+                                json.dumps(log["input"], indent=2, ensure_ascii=False),
+                                language="json",
+                            )
+                        except (TypeError, ValueError):
+                            st.code(str(log["input"]))
                     elif log["type"] == "result":
                         icon = "✅" if log["success"] else "❌"
                         elapsed_str = f" ({log.get('elapsed', 0):.2f}s)" if log.get('elapsed') else ""
@@ -1524,7 +1724,7 @@ if prompt := st.chat_input("输入消息..."):
     })
 
     # 更新 agent history
-    # （agent.run() 内部已经更新了 agent.messages）
+    # （step() 内部已经更新了 agent.messages）
 
     # 触发 sidebar 刷新：让上下文预算面板、History 长度等 widget
     # 重新从 agent.messages 读取最新值（Streamlit 渲染顺序：sidebar 先、

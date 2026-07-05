@@ -17,6 +17,7 @@ Permission Matcher — 规则匹配 + compound rule 解析
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -28,6 +29,10 @@ from .permission_types import (
     PermissionRuleValue,
     ToolPermissionContext,
 )
+
+
+# 🛡️ permission 子系统 logger
+permission_logger = logging.getLogger("agent_core.permission")
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -159,6 +164,11 @@ def parse_permission_rule(tool_name: str, content: Optional[str]) -> ShellPermis
     if not content:
         return ShellPermissionRule(type="exact", command="")
 
+    permission_logger.debug(
+        "🛡️ [parse_permission_rule] tool=%s content=%s",
+        tool_name, content[:120],
+    )
+
     # 2. compound 形态:含 separator(优先于 prefix 检查,
     #    因为 "rm:* && echo:*" 也以 ":*" 结尾,但其实是 compound)
     if any(sep in content for sep in _COMPOUND_SEPARATORS):
@@ -209,22 +219,43 @@ def match_permission_rule(rule: ShellPermissionRule, input_str: str) -> bool:
         # exact 空 = 整个 tool 命中
         if rule.command == "":
             return True
-        return input_str == rule.command
+        matched = input_str == rule.command
+        permission_logger.debug(
+            "🛡️ [match_exact] command=%s matched=%s",
+            rule.command[:80], matched,
+        )
+        return matched
 
     elif rule.type == "prefix":
-        return input_str.startswith(rule.prefix or "")
+        matched = input_str.startswith(rule.prefix or "")
+        permission_logger.debug(
+            "🛡️ [match_prefix] prefix=%s matched=%s",
+            (rule.prefix or "")[:80], matched,
+        )
+        return matched
 
     elif rule.type == "wildcard":
         # Bash rule wildcard(*xxx* / *xxx)语义:字符串包含 pattern
         # 不做 glob 通配(* 在 Bash rule 里只是"含"的标记)
         pattern = rule.pattern or ""
-        return pattern in input_str
+        matched = pattern in input_str
+        permission_logger.debug(
+            "🛡️ [match_wildcard] pattern=%s matched=%s",
+            pattern[:80], matched,
+        )
+        return matched
 
     elif rule.type == "compound":
         # compound AND 语义:所有 part 都匹配才算
-        return all(match_permission_rule(part, input_str) for part in rule.parts)
+        matched = all(match_permission_rule(part, input_str) for part in rule.parts)
+        permission_logger.debug(
+            "🛡️ [match_compound] parts=%d matched=%s",
+            len(rule.parts), matched,
+        )
+        return matched
 
     else:  # unsupported
+        permission_logger.debug("🛡️ [match_unsupported] type=%s → False", rule.type)
         return False
 
 
@@ -425,6 +456,11 @@ def matching_rules_for_input(
         PermissionBehavior.ASK.value: [],
     }
 
+    permission_logger.debug(
+        "🛡️ [matching_rules_entry] tool=%s input=%s",
+        tool_name, input_str[:120],
+    )
+
     # 按 source 优先级从低到高(command < flag),第一个匹配的 source 决定优先级
     for source in PermissionRuleSource.ordered_sources():
         for behavior in [PermissionBehavior.DENY, PermissionBehavior.ASK, PermissionBehavior.ALLOW]:
@@ -449,6 +485,13 @@ def matching_rules_for_input(
                     if match_permission_rule(parsed, input_str):
                         result[behavior.value].append(rule)
 
+    permission_logger.info(
+        "🛡️ [matching_rules_summary] tool=%s allow=%d deny=%d ask=%d",
+        tool_name,
+        len(result[PermissionBehavior.ALLOW.value]),
+        len(result[PermissionBehavior.DENY.value]),
+        len(result[PermissionBehavior.ASK.value]),
+    )
     return result
 
 

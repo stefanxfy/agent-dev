@@ -29,6 +29,9 @@ from .permission_types import PermissionMode, ToolPermissionContext
 
 logger = logging.getLogger(__name__)
 
+# 🤖 classifier 子系统 logger — 可被 AGENT_LOG_CLASSIFIER 单独调级别
+classifier_logger = logging.getLogger("agent_core.classifier")
+
 
 # ────────────────────────────────────────────────────────────────────
 # 常量
@@ -113,6 +116,12 @@ def is_classifier_enabled(
         >>> is_classifier_enabled("anthropic", PermissionMode.BYPASS, True)
         False
     """
+    env_val = os.environ.get(ENV_CLASSIFIER_ENABLED, "").strip().lower()
+    classifier_logger.debug(
+        "🤖 [classifier_enabled_check] provider=%s mode=%s no_settings_match=%s env=%s",
+        provider, mode.value if hasattr(mode, "value") else mode,
+        no_settings_match, env_val,
+    )
     # 1. Provider 必须是 anthropic
     if provider != "anthropic":
         return False
@@ -126,9 +135,13 @@ def is_classifier_enabled(
         return False
 
     # 4. 显式 opt-in env(M1 安全:必须显式开启)
-    if not os.environ.get(ENV_CLASSIFIER_ENABLED, "").strip().lower() in ("1", "true", "yes", "on"):
+    if env_val not in ("1", "true", "yes", "on"):
         return False
 
+    classifier_logger.info(
+        "🤖 [classifier_enabled] provider=anthropic mode=%s no_settings_match=True → enabled",
+        mode.value if hasattr(mode, "value") else mode,
+    )
     return True
 
 
@@ -192,10 +205,18 @@ class HaikuClassifier:
           3. 否则调用 llm_callable,parse 出 should_block + reason
         """
         start = time.time()
+        classifier_logger.debug(
+            "🤖 [classify_entry] tool=%s messages=%d model=%s",
+            tool_name, len(messages), self.model,
+        )
 
         # 1. 检查 transcript 长度(简化:每条 message 估 1 token)
         estimated_tokens = self._estimate_tokens(messages)
         if estimated_tokens > self.max_transcript_tokens:
+            classifier_logger.info(
+                "🤖 [classify_transcript_too_long] estimated_tokens=%d max=%d → unavailable",
+                estimated_tokens, self.max_transcript_tokens,
+            )
             return ClassifierResult(
                 should_block=False,
                 reason="transcript too long",
@@ -207,6 +228,10 @@ class HaikuClassifier:
 
         # 2. 检查是否启用
         if not self.llm_callable:
+            classifier_logger.debug(
+                "🤖 [classify_no_llm_callable] model=%s → unavailable (M1 stub)",
+                self.model,
+            )
             return ClassifierResult(
                 should_block=False,
                 reason="classifier not configured (no llm_callable)",
@@ -218,13 +243,24 @@ class HaikuClassifier:
         # 3. 调真 classifier
         try:
             prompt = self._build_classifier_prompt(messages, tool_name, tool_input, context)
+            classifier_logger.debug(
+                "🤖 [classify_llm_call] model=%s max_tokens=256 temperature=0",
+                self.model,
+            )
             response_text = self.llm_callable(
                 messages=prompt,
                 model=self.model,
                 max_tokens=256,
                 temperature=0.0,
             )
-            return self._parse_classifier_response(response_text, start)
+            result = self._parse_classifier_response(response_text, start)
+            classifier_logger.info(
+                "🤖 [classify_result] tool=%s should_block=%s unavailable=%s "
+                "duration_ms=%.1f reason=%s",
+                tool_name, result.should_block, result.unavailable,
+                result.duration_ms or 0, (result.reason or "")[:120],
+            )
+            return result
         except Exception as e:
             logger.warning("classifier 调用失败,降级为 unavailable: %s", e)
             return ClassifierResult(
@@ -358,6 +394,7 @@ def start_speculative_classifier_check(
     Returns:
         SpeculativeClassifierHandle(可 .result() 取结果 / .cancel() 取消)
     """
+    classifier_logger.debug("🤖 [classifier_speculative_start] tool=%s", tool_name)
     classifier = classifier or HaikuClassifier()
     # M1 简化:同步调用
     result = classifier.classify(messages, tool_name, tool_input, context)
@@ -374,6 +411,7 @@ class SpeculativeClassifierHandle:
     def result(self) -> ClassifierResult:
         """取结果(同步)"""
         if self._cancelled:
+            classifier_logger.debug("🤖 [classifier_handle_result] cancelled=True → unavailable")
             return ClassifierResult(
                 should_block=False,
                 reason="cancelled",
@@ -384,6 +422,7 @@ class SpeculativeClassifierHandle:
     def cancel(self) -> None:
         """取消(M1 stub:仅标记)"""
         self._cancelled = True
+        classifier_logger.debug("🤖 [classifier_handle_cancel] cancelled")
 
     def is_cancelled(self) -> bool:
         return self._cancelled

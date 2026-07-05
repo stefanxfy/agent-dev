@@ -1,5 +1,6 @@
 """
-SessionPersistHandler 真实现回归测试(2026-06-30 — orphan tool_result fix)。
+SessionPersistHandler 真实现回归测试(2026-06-30 — orphan tool_result fix + 2026-07-01
+扩到 final assistant text)。
 
 覆盖(每个独立 case,D4 清单):
     D4.1: 空 _pending_tool_results → early return,no session call
@@ -9,7 +10,16 @@ SessionPersistHandler 真实现回归测试(2026-06-30 — orphan tool_result fi
           (常规中间轮 — 保持 v1 _iter_phase_finalize 行为)
     D4.4: agent._session_manager is None → no-op,不抛(扩展点模式兼容)
 
+扩展覆盖(2026-07-01 final text 接管):
+    FT.1: stage_out final-answer(no tool_calls)+ full_text → add_assistant_message 调一次,
+          4 字段对齐 v1 _iter_phase_llm:2263(full_text + thinking + tool_logs + usage)
+    FT.2: stage_out intermediate(tool_calls truthy)+ full_text → 不调 add_assistant_message
+          (中间轮由 v1 _iter_phase_tools:1340 / 2475 写,本 handler 不接管)
+    FT.3: stage_out final-answer + thinking / tool_logs / usage → 4 字段全部正确传入
+    FT.4: final text 写入后清空 _run_state.pending_tool_logs,避免跨 turn double-write
+
 设计参考:docs/agent-state-machine-and-chain-of-responsibility-design.md §4 / §10
+        + docs/session-management-implementation-design.md §2.2 / §2.4
 """
 
 from __future__ import annotations
@@ -44,9 +54,12 @@ def _make_fake_turn_ctx(stage_out=None) -> TurnContext:
     return ctx
 
 
-def _make_fake_agent(pending=None, has_session_manager=True):
+def _make_fake_agent(pending=None, has_session_manager=True, pending_tool_logs=None):
     """构造最小 fake agent:SessionPersistHandler 只需要 ._session_manager 和
     ._pending_tool_results 两个属性(handle() 用 getattr 防 attribute error)。
+
+    2026-07-01 扩展:final text 写入需要从 agent._run_state.pending_tool_logs
+    取 tool_logs,并在写入后清空。所以 fake agent 也提供 _run_state 字段。
     """
     agent = MagicMock()
     if has_session_manager:
@@ -54,6 +67,10 @@ def _make_fake_agent(pending=None, has_session_manager=True):
     else:
         agent._session_manager = None
     agent._pending_tool_results = pending if pending is not None else []
+    # _run_state 模拟 RunState,handler 会读 .pending_tool_logs 字段
+    run_state = MagicMock()
+    run_state.pending_tool_logs = pending_tool_logs if pending_tool_logs is not None else []
+    agent._run_state = run_state
     # _logger 在 handler 内部用 agent._logger.warning 找不到时 fallback 到模块 logger
     agent._logger = MagicMock()
     return agent
@@ -298,4 +315,234 @@ class TestSessionPersistBoundary:
         # add_assistant_with_tools 仍是 1 次(没被 SessionPersistHandler 重复调)
         assert agent._session_manager.add_assistant_with_tools.call_count == 1, (
             "D6-3 边界:v1 streaming 已写的 assistant entity 不该被 SessionPersistHandler 重写"
+        )
+
+
+# ────────────────────────────────────────────────────────────────────
+# FT (2026-07-01):SessionPersistHandler 扩到接 final assistant text
+# ────────────────────────────────────────────────────────────────────
+# 触发场景:v2 路径(via start_run + step)走 FINALIZING phase → output_chain
+# SessionPersistHandler 检测 stage_out 有 full_text + 无 tool_calls →
+# 调 session_manager.add_assistant_message 写 final text(对齐 v1 L2263 4 字段)。
+#
+# 修复目标:c212e367.jsonl 缺第 5 条 final answer entry 的根因
+# (v2 路径不经过 v1 _iter_phase_llm:2263,SessionPersistHandler 必须接管)。
+#
+# 设计参考:docs/agent-state-machine-and-chain-of-responsibility-design.md §10
+#        + docs/session-management-implementation-design.md §2.4
+
+
+class TestSessionPersistFinalText:
+    """FT:SessionPersistHandler 真实现扩到接 final assistant text(2026-07-01)。"""
+
+    def test_ft_1_final_answer_writes_assistant_message_with_full_text(self):
+        """FT.1 (★ 关键 fix):stage_out final-answer + full_text →
+        add_assistant_message 调一次,full_text 走 content 位置参数。
+
+        触发场景:LLM 给最终回答 → FINALIZING → output_chain SessionPersistHandler。
+        修复前:c212e367.jsonl 复现 — 缺第 5 条 final assistant entry。
+        修复后:handler 把 full_text 写入 session,UI 重渲染可看到 final text。
+        """
+        stage_out = MagicMock()
+        stage_out.tool_calls = []  # final-answer,no tool_calls
+        stage_out.full_text = "23*34 = 782.0"
+        stage_out.stop_reason = "end_turn"
+        # thinking_text / usage 也存在(handler 会读)
+        stage_out.thinking_text = "用户计算 23*34,直接给答案"
+        stage_out.usage = MagicMock()
+
+        agent = _make_fake_agent(pending=[])  # 纯 final answer,无 pending
+        handler = SessionPersistHandler(agent)
+        ctx = _make_fake_turn_ctx(stage_out=stage_out)
+
+        handler.handle(ctx)
+
+        # ★ 关键断言:add_assistant_message 被调一次,full_text 走 content 参数
+        agent._session_manager.add_assistant_message.assert_called_once()
+        call_args = agent._session_manager.add_assistant_message.call_args
+        # content 走第一个位置参数(对齐 v1 _iter_phase_llm:2263)
+        assert call_args[0][0] == "23*34 = 782.0", (
+            "final assistant text 应走 add_assistant_message 的 content 位置参数"
+        )
+
+    def test_ft_2_intermediate_turn_with_tool_calls_skips_assistant_message(self):
+        """FT.2:stage_out intermediate(tool_calls truthy)+ full_text →
+        不调 add_assistant_message。
+
+        触发场景:中间轮(LLM 调 tool)。中间轮的 assistant_with_tools 由
+        _iter_phase_tools:1340 / 2475 在 awaiting_permission 前实时写,本 handler
+        不接管,避免 double-write。
+        """
+        tc = MagicMock()
+        tc.tool_use_id = "toolu_int_001"
+        stage_out = MagicMock()
+        stage_out.tool_calls = [tc]  # intermediate,有 tool_calls
+        stage_out.full_text = "我来执行"
+        stage_out.stop_reason = "tool_use"
+
+        agent = _make_fake_agent(pending=[("toolu_int_001", "out")])
+        handler = SessionPersistHandler(agent)
+        ctx = _make_fake_turn_ctx(stage_out=stage_out)
+
+        handler.handle(ctx)
+
+        # add_assistant_message 不该被调(中间轮由 v1 streaming 负责)
+        agent._session_manager.add_assistant_message.assert_not_called()
+        # tool_results 仍写(中间轮也要刷)
+        agent._session_manager.add_tool_results.assert_called_once()
+
+    def test_ft_3_final_answer_writes_thinking_tool_logs_usage(self):
+        """FT.3:final answer 写入时,4 字段(full_text + thinking + tool_logs + usage)
+        全部正确传入 add_assistant_message。
+
+        对齐 v1 _iter_phase_llm:2263 的 4 字段签名:
+            add_assistant_message(full_text, thinking=..., tool_logs=..., usage=...)
+        """
+        stage_out = MagicMock()
+        stage_out.tool_calls = []
+        stage_out.full_text = "answer text"
+        stage_out.thinking_text = "thinking reasoning"
+        stage_out.usage = {"input_tokens": 100, "output_tokens": 50}
+
+        tool_logs_payload = [
+            {"type": "action", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "result", "name": "Bash", "success": True},
+        ]
+        agent = _make_fake_agent(pending=[], pending_tool_logs=list(tool_logs_payload))
+        handler = SessionPersistHandler(agent)
+        ctx = _make_fake_turn_ctx(stage_out=stage_out)
+
+        handler.handle(ctx)
+
+        agent._session_manager.add_assistant_message.assert_called_once()
+        call_args = agent._session_manager.add_assistant_message.call_args
+        # content(full_text)走第一个位置参数
+        assert call_args[0][0] == "answer text"
+        # thinking / tool_logs / usage 走 kwargs(对齐 v1 _iter_phase_llm:2263)
+        kwargs = call_args.kwargs
+        assert kwargs.get("thinking") == "thinking reasoning", (
+            "thinking 字段应对齐 L2263,走 thinking kwarg"
+        )
+        assert kwargs.get("tool_logs") == tool_logs_payload, (
+            "tool_logs 字段应对齐 L2263,从 _run_state.pending_tool_logs 取"
+        )
+        assert kwargs.get("usage") == {"input_tokens": 100, "output_tokens": 50}
+
+    def test_ft_4_pending_tool_logs_cleared_after_final_write(self):
+        """FT.4:final text 写入后清空 _run_state.pending_tool_logs,
+        避免下次 turn double-write。
+
+        跟 D4 tool_results 的 finally 清空是同一个 invariant:落库即清。
+        """
+        stage_out = MagicMock()
+        stage_out.tool_calls = []
+        stage_out.full_text = "final answer"
+        stage_out.thinking_text = ""
+        stage_out.usage = None
+
+        pending_logs = [
+            {"type": "result", "name": "calc", "success": True, "output": "42"}
+        ]
+        agent = _make_fake_agent(pending=[], pending_tool_logs=list(pending_logs))
+        handler = SessionPersistHandler(agent)
+        ctx = _make_fake_turn_ctx(stage_out=stage_out)
+
+        handler.handle(ctx)
+
+        # 写入后 pending_tool_logs 应清空
+        assert agent._run_state.pending_tool_logs == [], (
+            "FT invariant:final text 落库后必须清空 pending_tool_logs,"
+            "否则下次 turn 又写一次 double-write"
+        )
+
+    def test_ft_5_usage_dataclass_serialized_to_dict(self):
+        """FT.5 (回归 2026-07-01):stage_out.usage 是 UsageStats dataclass 时,
+        handler 必须 asdict() 转 dict 再传给 add_assistant_message。
+
+        Bug 复现:session.storage.flush 报 "Object of type UsageStats is not
+        JSON serializable" — 原 handler 直接传 UsageStats 对象,add_assistant_message
+        的 **extra 把它当 dict 字段存 → flush 时 JSON dumps 失败。
+
+        v1 _iter_phase_llm:2263 / 1039 / 1098 / 2131 / 2215 都用 asdict() 转,
+        本 handler 必须对齐。
+        """
+        from dataclasses import dataclass
+
+        @dataclass
+        class FakeUsageStats:
+            input_tokens: int = 100
+            output_tokens: int = 50
+            thinking_tokens: int = 0
+            cached_tokens: int = 0
+
+        usage_obj = FakeUsageStats(input_tokens=200, output_tokens=80)
+
+        stage_out = MagicMock()
+        stage_out.tool_calls = []
+        stage_out.full_text = "done"
+        stage_out.thinking_text = ""
+        stage_out.usage = usage_obj  # dataclass 对象,不是 dict
+
+        agent = _make_fake_agent(pending=[])
+        handler = SessionPersistHandler(agent)
+        ctx = _make_fake_turn_ctx(stage_out=stage_out)
+
+        handler.handle(ctx)
+
+        agent._session_manager.add_assistant_message.assert_called_once()
+        kwargs = agent._session_manager.add_assistant_message.call_args.kwargs
+        passed_usage = kwargs.get("usage")
+        # 必须不是原 dataclass 对象(否则 flush 时 json.dumps 失败)
+        assert not hasattr(passed_usage, "__dataclass_fields__"), (
+            "FT.5 回归:UsageStats dataclass 必须 asdict() 转 dict 再传,"
+            "否则 session.storage.flush 会报 'not JSON serializable'"
+        )
+        # 应是 dict,字段值保留
+        assert isinstance(passed_usage, dict)
+        assert passed_usage["input_tokens"] == 200
+        assert passed_usage["output_tokens"] == 80
+
+    def test_ft_6_tool_result_written_before_final_text(self):
+        """FT.6 (回归 2026-07-01):tool_result 必须先于 final assistant text 落库。
+
+        用户偏好 2026-07-01:JSONL 顺序应为 tool_use → tool_result → final,
+        即 tool_result 是 "倒数第二行",final 是最后一行 — 对齐 Anthropic API
+        协议 tool_use → tool_result → final_answer 的因果链。
+
+        验证方式:用 manager 顶层 mock_calls 列表,断言 add_tool_results
+        在 add_assistant_message 之前。
+        """
+        stage_out = MagicMock()
+        stage_out.tool_calls = []  # final-answer
+        stage_out.full_text = "答案是 782"
+        stage_out.thinking_text = "thinking"
+        stage_out.usage = None
+
+        # 同时有 tool_result pending(模拟 calc tool 执行完 + LLM 给 final answer 的 FINALIZING 场景)
+        pending = [("toolu_calc_001", "782.0")]
+        agent = _make_fake_agent(pending=list(pending))
+        handler = SessionPersistHandler(agent)
+        ctx = _make_fake_turn_ctx(stage_out=stage_out)
+
+        handler.handle(ctx)
+
+        # 两个调用都应发生
+        agent._session_manager.add_tool_results.assert_called_once()
+        agent._session_manager.add_assistant_message.assert_called_once()
+
+        # ★ 关键断言:add_tool_results 必须在 add_assistant_message 之前调
+        # (用户偏好 2026-07-01:JSONL 顺序 tool_use → tool_result → final,
+        # 对齐 Anthropic API 协议 tool_use → tool_result → final_answer 因果链)
+        all_calls = agent._session_manager.mock_calls
+        method_names = [c[0] for c in all_calls]
+        first_tool_result_idx = next(
+            i for i, n in enumerate(method_names) if "add_tool_results" in n
+        )
+        first_assistant_idx = next(
+            i for i, n in enumerate(method_names) if "add_assistant_message" in n
+        )
+        assert first_tool_result_idx < first_assistant_idx, (
+            "FT.6 用户偏好:tool_result 必须先于 final text 落库,"
+            "JSONL 顺序 = tool_use → tool_result → final,"
+            "tool_result 是倒数第二行,final 是最后一行"
         )

@@ -13,33 +13,37 @@ v2 重构引入(详见 docs/agent-state-machine-and-chain-of-responsibility-desi
 - with_handler:在指定 handler 之后/之前插入
 - with_termination:替换 termination 条件
 - with_plugin_handler:注册受限的 plugin handler(详见 §12)
-- use_real_session_persist:切换 SessionPersistHandler 模式(NORMAL 完整接管 / DELEGATE 旧 delegation)
 - build_default_*_chain:4 个默认 chain factory(从 agent_core.py 抽离,§4.3 / §15)
 - build:组装并返回 agent(agent 仍由 ReactAgent 构造)
 """
 
 from __future__ import annotations
 
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 from agent_core.agent_state import AgentPhase, Phase, TerminationCondition
 from agent_core.turn_chain import (
     AuditLogHandler,
     ChunkParseHandler,
+    ContextCompactionHandler,
+    FinalAnswerBookkeepingHandler,
+    FinalAnswerPersistHandler,
     Handler,
-    HandlerResult,
+    L3SMExtractTriggerHandler,
     LLMCallHandler,
+    LLMCallPersistHandler,
     MemoryBridgeExtractHandler,
     MemoryRetrievalHandler,
     PermissionCheckHandler,
     PluginHandler,
-    SessionPersistHandler,
+    SessionFlushHandler,
     SystemPromptHandler,
     ToolDispatchHandler,
     ToolExecuteHandler,
+    ToolPairPersistHandler,
     ToolsSchemaPrepareHandler,
     TurnChain,
+    TurnIndicatorHandler,
 )
 
 
@@ -49,34 +53,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AgentBuilder",
-    "SessionPersistMode",
     "build_default_inputs_chain",
     "build_default_llm_chain",
     "build_default_tool_chain",
     "build_default_output_chain",
 ]
-
-
-# ────────────────────────────────────────────────────────────────────
-# SessionPersistHandler 模式(2026-06-30 D6-4 引入)
-# ────────────────────────────────────────────────────────────────────
-
-
-class SessionPersistMode(str, Enum):
-    """SessionPersistHandler 行为模式(D6-4 引入)。
-
-    NORMAL:
-        - SessionPersistHandler 真实现 + 完整接管 session 写入
-          (assistant_with_tools / assistant_message / tool_results)
-        - 这是生产默认,跟 docs/agent-state-machine-and-chain-of-responsibility-design.md §10 一致
-
-    DELEGATE:
-        - SessionPersistHandler 走 no-op delegation,返回 HandlerResult() early
-        - session 写入回到 v1 streaming 路径
-        - 用于:过渡期兼容 / 3rd party 扩展 / debug 对比
-    """
-    NORMAL = "normal"
-    DELEGATE = "delegate"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -87,77 +68,94 @@ class SessionPersistMode(str, Enum):
 
 
 def build_default_inputs_chain(agent) -> TurnChain:
-    """SETUP phase 默认 chain(MemoryRetrieval → SystemPrompt → ToolsSchemaPrepare)。
+    """SETUP phase 默认 chain(TurnIndicator → ContextCompaction → SystemPrompt → MemoryRetrieval → ToolsSchemaPrepare)。
 
-    对应 docs §4.3 table inputs_chain 行 + §15 step 2。
+    对应 docs §4.3 table inputs_chain 行 + §15 step 2 + Plan B R4 修复 (2026-07-01) +
+    SRP 重构 (2026-07-02):
+    - TurnIndicator:emit turn indicator event(独立职责)
+    - ContextCompactionHandler:每个 turn 入口做 token 预算压缩(L3 SM fast path + ContextManager fallback)
+    - SystemPromptHandler:真实现,确保 stage_inputs 头部有 system message
+    - MemoryRetrievalHandler:真实现,检索记忆 + 把 mem_block 拼到 system
+    - ToolsSchemaPrepareHandler:准备 tool schemas
+
+    每个 handler 单一职责,无僵尸 anchor。Plan A 时代 inputs_chain 由
+    MemoryRetrievalHandler 一手包办(stop_chain),现已拆分为 5 个真 handler。
     """
     return TurnChain([
-        MemoryRetrievalHandler(agent),
+        TurnIndicatorHandler(agent),
+        ContextCompactionHandler(agent),
         SystemPromptHandler(agent),
+        MemoryRetrievalHandler(agent),
         ToolsSchemaPrepareHandler(agent),
     ])
 
 
 def build_default_llm_chain(agent) -> TurnChain:
-    """LLM_THINKING phase 默认 chain(LLMCall → ChunkParse)。
+    """LLM_THINKING phase 默认 chain(LLMCall → ChunkParse → **LLMCallPersist [Stage A]**)。
 
-    对应 docs §4.3 table llm_chain 行 + §15 step 2。
+    对应 docs §4.3 table llm_chain 行 + §15 step 2 + Plan B §15 step 21
+    (Stage A 接管 7 处 v1 add_* 调用,见 LLMCallPersistHandler docstring)。
     """
     return TurnChain([
         LLMCallHandler(agent),
         ChunkParseHandler(agent),
+        LLMCallPersistHandler(agent),
     ])
 
 
 def build_default_tool_chain(agent) -> TurnChain:
-    """EXECUTING_TOOLS phase 默认 chain(PermissionCheck → ToolDispatch → ToolExecute)。
+    """EXECUTING_TOOLS phase 默认 chain(PermissionCheck → ToolDispatch → ToolExecute → **ToolPairPersist [Stage B]**)。
 
-    对应 docs §4.3 table tool_chain 行 + §15 step 2。
+    对应 docs §4.3 table tool_chain 行 + §15 step 2 + Plan B §15 step 22
+    (Stage B 接管 _iter_phase_tools 普通 tool_result 路径,见 ToolPairPersistHandler docstring)。
+
+    Plan B:ToolExecuteHandler 不再返 `_StopChain`,让 Stage B 读到
+    RunState.pending_tool_results → flush add_tool_results + 清空。
     """
     return TurnChain([
         PermissionCheckHandler(agent),
         ToolDispatchHandler(agent),
         ToolExecuteHandler(agent),
+        ToolPairPersistHandler(agent),
     ])
 
 
-def build_default_output_chain(
-    agent,
-    *,
-    session_persist_mode: SessionPersistMode = SessionPersistMode.NORMAL,
-) -> TurnChain:
-    """FINALIZING phase 默认 chain(SessionPersist → AuditLog → MemoryBridgeExtract)。
+def build_default_output_chain(agent) -> TurnChain:
+    """FINALIZING phase 默认 chain(6 handler CoR)。
 
-    对应 docs §4.3 table output_chain 行 + §15 step 2。
+    链顺序(Plan B Final Phase Step 2, 2026-07-02):
+      Bookkeeping → FinalAnswerPersist [Stage C] → AuditLog →
+      MemoryBridgeExtract → L3SMExtractTrigger → SessionFlush
 
-    Args:
-        agent: ReactAgent 实例(handler 构造需要)
-        session_persist_mode:
-            NORMAL(默认):SessionPersistHandler 真实现 + 完整接管 session 写入
-            DELEGATE:SessionPersistHandler 走 no-op,v1 streaming 路径负责
+    顺序依据:
+      - Bookkeeping 首位:设 _run_state.final_answer 供后续 handler 读
+      - Persist 紧跟 Bookkeeping:crash-safety,final answer 立刻落盘
+      - AuditLog:扩展点位置,默认 no-op
+      - MemoryBridgeExtract 在 Persist 之后:确保数据已落盘再触发外部抽取
+      - L3SMExtractTrigger 在 MBE 之后:final_answer 已确定;在 SessionFlush
+        之前:flush 兜底仍是末位, fire-and-forget 后台线程不阻塞 chain
+      - SessionFlush 末位:所有持久化收尾后才 flush
+
+    对应 docs §4.3 table output_chain 行 + §15 step 2 + Plan B §15 step 23
+    (Stage C 接管原 SessionPersistHandler (B) 分支 + 原 #7 v1 final answer 写入)。
+
+    Plan B Step 8 (2026-07-01):删除 SessionPersistMode DELEGATE toggle —
+    FinalAnswerPersistHandler 现在恒为真实现(NORMAL),无 no-op 模式。
+
+    Plan B Final Phase (2026-07-02):新增 Bookkeeping + SessionFlush handler,
+    取代原 v1 _iter_phase_finalize monolithic 方法。
+
+    Plan B Final Phase Step 2 (2026-07-02):新增 L3SMExtractTriggerHandler,
+    取代原 v1 run() L1776-L1821 内联块。
     """
-    persist_handler = SessionPersistHandler(agent)
-    if session_persist_mode == SessionPersistMode.DELEGATE:
-        # DELEGATE 模式:把 handler 的 handle() 替换成 no-op
-        _make_session_persist_delegate(persist_handler)
     return TurnChain([
-        persist_handler,
+        FinalAnswerBookkeepingHandler(agent),
+        FinalAnswerPersistHandler(agent),
         AuditLogHandler(agent),
         MemoryBridgeExtractHandler(agent),
+        L3SMExtractTriggerHandler(agent),
+        SessionFlushHandler(agent),
     ])
-
-
-def _make_session_persist_delegate(handler: SessionPersistHandler) -> None:
-    """把 SessionPersistHandler 实例切换成 DELEGATE 模式(handle() 变 no-op)。
-
-    实现细节:monkey-patch 实例方法。
-    为什么这样:不引入新类,纯 runtime 切换,build 调用结束后不污染 import。
-    设计文档 §11.1 "with_handler / with_phase_override" 都是 runtime 切换,
-    跟本设计一致。
-    """
-    def _noop_handle(ctx):  # noqa: ANN001 - ctx 不强类型,跟原 handle 一致
-        return HandlerResult()
-    handler.handle = _noop_handle  # type: ignore[method-assign]  # monkey-patch instance method
 
 
 def _append_plugin_to_all_chains(
@@ -210,8 +208,6 @@ class AgentBuilder:
         self._handler_inserts: list[tuple[Handler, dict]] = []
         self._plugin_handler_inserts: list[tuple[PluginHandler, dict]] = []
         self._termination_override: Optional[TerminationCondition] = None
-        # 默认 SessionPersistHandler 模式(NORMAL=真实现)
-        self._real_session_persist: bool = True
 
     def with_phase_override(self, phase: AgentPhase, override: Phase) -> "AgentBuilder":
         """完全替换某个 phase(高级用法:换 phase 自己的 chain 或 enter/next 行为)。
@@ -297,26 +293,6 @@ class AgentBuilder:
         self._termination_override = termination
         return self
 
-    def use_real_session_persist(self, enabled: bool = True) -> "AgentBuilder":
-        """切换 SessionPersistHandler 模式(D6-4 引入)。
-
-        enabled=True(默认生产):SessionPersistHandler 真实现 + 完整接管 session 写入
-        enabled=False(DELEGATE):SessionPersistHandler 走 no-op,
-                                 session 写入交给 v1 streaming 路径(_iter_phase_tools /
-                                 _iter_phase_llm / _iter_phase_finalize)
-
-        DELEGATE 用法:
-            - 过渡期兼容(老测试 / 老外部集成)
-            - 调试对比(Switch 前后 JSONL 行为差异验证)
-            - 3rd party 扩展(用户想自己接管 session 写入)
-
-        注意:D6-3 让 SessionPersistHandler 接管了所有 session 写入。DELEGATE 模式下,
-        v1 streaming 路径的 add_* 调用必须同时存在才能正常写盘。本 builder 通过
-        build_default_output_chain(session_persist_mode=...) 同步切换两个写入路径。
-        """
-        self._real_session_persist = enabled
-        return self
-
     def build(self, agent_kwargs: dict) -> "ReactAgent":
         """构造 agent + 应用所有 builder 改动。
 
@@ -348,14 +324,8 @@ class AgentBuilder:
         if not agent_kwargs.get("_tool_chain"):
             agent._tool_chain = build_default_tool_chain(agent)
         if not agent_kwargs.get("_output_chain"):
-            mode = (
-                SessionPersistMode.NORMAL
-                if self._real_session_persist
-                else SessionPersistMode.DELEGATE
-            )
-            agent._output_chain = build_default_output_chain(
-                agent, session_persist_mode=mode,
-            )
+            # Plan B Step 8:FinalAnswerPersistHandler 恒为真实现,无 DELEGATE 模式
+            agent._output_chain = build_default_output_chain(agent)
 
         # Step 3: 重建 SM phases(因为 chain 实例换了 — 原本 phase 持有的是 __init__ 时的 chain)
         _rebuild_phases_from_chains(agent)

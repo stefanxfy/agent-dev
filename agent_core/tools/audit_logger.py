@@ -34,6 +34,33 @@ from .permission_types import (
 
 logger = logging.getLogger(__name__)
 
+# 📋 audit 子系统 logger — 与 AGENT_LOG_AUDIT env 联动
+audit_logger = logging.getLogger("agent_core.audit")
+
+
+# ────────────────────────────────────────────────────────────────────
+# 默认 sessions root 解析(对齐 doc §4.8 + SessionStorage 默认路径)
+# ────────────────────────────────────────────────────────────────────
+
+
+def _resolve_sessions_root(sessions_root: Optional[str]) -> Path:
+    """
+    解析 sessions 根目录,优先级(对齐 SessionStorage._get_default_data_dir):
+      1. 显式传入的 sessions_root
+      2. 环境变量 AGENT_DATA_DIR / sessions 子目录
+      3. 仓库级 ./data/sessions/(开发默认)
+      4. ~/.agent_data/sessions/(用户级)
+    """
+    if sessions_root:
+        return Path(sessions_root)
+    env = os.environ.get("AGENT_DATA_DIR")
+    if env:
+        return Path(env) / "sessions"
+    cwd_candidate = Path("data") / "sessions"
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return Path.home() / ".agent_data" / "sessions"
+
 
 # ────────────────────────────────────────────────────────────────────
 # AuditRecord — 单次决策记录(对齐 CC telemetry 字段集)
@@ -122,6 +149,10 @@ class AuditLogger:
             self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         except OSError as e:
             logger.warning("audit 目录创建失败: %s", e)
+        audit_logger.info(
+            "📋 [audit_logger_init] session_id=%s path=%s",
+            self.session_id, self.path,
+        )
 
     def log(
         self,
@@ -153,6 +184,10 @@ class AuditLogger:
             stage: PermissionEngine 决策阶段(step_1a_global_deny 等)
         """
         try:
+            audit_logger.debug(
+                "📋 [audit_log_entry] tool=%s behavior=%s",
+                tool_name, getattr(decision, "behavior", "?"),
+            )
             tool_input_hash = compute_tool_input_hash(tool_input or {})
 
             reason = decision.decision_reason
@@ -205,6 +240,12 @@ class AuditLogger:
                 classifier_decision=classifier_decision_str,
                 denial_state=denial_state,
             )
+            audit_logger.info(
+                "📋 [audit_record_built] tool=%s decision=%s reason_type=%s "
+                "stage=%s sandbox_used=%s classifier_used=%s",
+                tool_name, record.decision, record.reason_type, record.stage,
+                record.sandbox_used, record.classifier_used,
+            )
 
             self._write_record(record)
         except Exception as e:
@@ -213,30 +254,67 @@ class AuditLogger:
 
     def _write_record(self, record: AuditRecord) -> None:
         """atomic append 一条 record(flush + fsync 保证 durability)"""
+        line = json.dumps(asdict(record), ensure_ascii=False)
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
+            f.write(line + "\n")
             f.flush()
             os.fsync(f.fileno())  # atomic durability
+        audit_logger.debug(
+            "📋 [audit_record_written] tool=%s bytes=%d path=%s",
+            record.tool_name, len(line), self.path,
+        )
 
-    # ── 查询接口(M2 简化版,M3 再加复杂查询)─────────────────
+    # ── 查询接口(M2 简化版 + M3 增强)─────────────────
+    #
+    # M2:M2 阶段实现 since_ts / tool_name / decision 三个基础 filter
+    # M3 (本版) 新增 reason_type / rule_source / stage / sandbox_used /
+    #     limit / reverse 等维度,补全 doc §4.8 查询接口
 
     def query(
         self,
         since_ts: Optional[float] = None,
         tool_name: Optional[str] = None,
         decision: Optional[str] = None,
+        reason_type: Optional[str] = None,
+        rule_source: Optional[str] = None,
+        stage: Optional[str] = None,
+        sandbox_used: Optional[bool] = None,
+        limit: Optional[int] = None,
+        reverse: bool = False,
     ) -> list[AuditRecord]:
         """
-        事后审计查询(M2 简化:读 + filter)
+        事后审计查询实例方法(读 self.path)
 
         Args:
-            since_ts: 只返 timestamp >= since_ts 的记录
-            tool_name: 按 tool 名 filter
-            decision: 按 decision filter
+            since_ts: 仅返 timestamp >= since_ts 的记录
+            tool_name: 按 tool 名精确匹配
+            decision: 按 decision 精确匹配(allow / deny / ask / passthrough)
+            reason_type: 按 reason_type 精确匹配(rule/mode/hook/...)
+            rule_source: 按 rule_source 精确匹配(仅 reason_type=rule 的记录有意义)
+            stage: 按 PermissionEngine 阶段匹配(step_1a_global_deny 等)
+            sandbox_used: True/False 过滤是否走沙箱
+            limit: 最多返 N 条(None=全部)
+            reverse: True → 倒序(最新在前);默认 False(按写入顺序)
 
         Returns:
-            匹配的 AuditRecord 列表(按时间序)
+            匹配的 AuditRecord 列表;文件不存在 / 异常 → []
         """
+        records = self._read_all_records()
+        return _filter_records(
+            records,
+            since_ts=since_ts,
+            tool_name=tool_name,
+            decision=decision,
+            reason_type=reason_type,
+            rule_source=rule_source,
+            stage=stage,
+            sandbox_used=sandbox_used,
+            limit=limit,
+            reverse=reverse,
+        )
+
+    def _read_all_records(self) -> list[AuditRecord]:
+        """读 self.path 全部记录(malformed line 跳过)"""
         if not self.path.exists():
             return []
         results: list[AuditRecord] = []
@@ -250,17 +328,121 @@ class AuditLogger:
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    # filter
-                    if since_ts is not None and data.get("timestamp", 0) < since_ts:
-                        continue
-                    if tool_name is not None and data.get("tool_name") != tool_name:
-                        continue
-                    if decision is not None and data.get("decision") != decision:
-                        continue
-                    results.append(AuditRecord(**data))
+                    try:
+                        results.append(AuditRecord(**data))
+                    except (TypeError, ValueError) as e:
+                        # 字段不匹配(旧 schema / 损坏 schema)→ 跳过
+                        logger.warning("audit record 字段不匹配,跳过: %s", e)
         except OSError as e:
-            logger.warning("audit query 失败: %s", e)
+            logger.warning("audit query 读文件失败: %s", e)
         return results
+
+
+# ────────────────────────────────────────────────────────────────────
+# M3 查询扩展 — 多维 filter helper + 模块级 query_audit
+# ────────────────────────────────────────────────────────────────────
+
+
+def _filter_records(
+    records: list[AuditRecord],
+    *,
+    since_ts: Optional[float] = None,
+    tool_name: Optional[str] = None,
+    decision: Optional[str] = None,
+    reason_type: Optional[str] = None,
+    rule_source: Optional[str] = None,
+    stage: Optional[str] = None,
+    sandbox_used: Optional[bool] = None,
+    limit: Optional[int] = None,
+    reverse: bool = False,
+) -> list[AuditRecord]:
+    """
+    多维 filter helper(独立函数,无副作用,便于跨 session 共用)
+
+    字段过滤语义:None = 不参与过滤;值 = 精确匹配(字符串)或严格 bool 匹配
+    时间序:默认按文件写入顺序;reverse=True 倒序(最新在前)
+    limit:None = 不限;正整数 = 最多返 N 条
+    """
+    results: list[AuditRecord] = []
+    for r in records:
+        if since_ts is not None and r.timestamp < since_ts:
+            continue
+        if tool_name is not None and r.tool_name != tool_name:
+            continue
+        if decision is not None and r.decision != decision:
+            continue
+        if reason_type is not None and r.reason_type != reason_type:
+            continue
+        if rule_source is not None and r.rule_source != rule_source:
+            continue
+        if stage is not None and r.stage != stage:
+            continue
+        if sandbox_used is not None and r.sandbox_used != sandbox_used:
+            continue
+        results.append(r)
+    if reverse:
+        results.reverse()
+    if limit is not None and limit >= 0:
+        results = results[:limit]
+    return results
+
+
+def query_audit(
+    session_id: str,
+    *,
+    tool_name: Optional[str] = None,
+    decision: Optional[str] = None,
+    reason_type: Optional[str] = None,
+    rule_source: Optional[str] = None,
+    stage: Optional[str] = None,
+    sandbox_used: Optional[bool] = None,
+    since_ts: Optional[float] = None,
+    limit: Optional[int] = None,
+    reverse: bool = False,
+    sessions_root: Optional[str] = None,
+) -> list[AuditRecord]:
+    """
+    事后审计查询(模块级,doc §4.8 spec)
+
+    不依赖单例/实例,直接根据 session_id 找到对应 audit.jsonl 读 + 多维过滤。
+    适合后台审计、合规导出、UI 表格渲染等场景。
+
+    Args:
+        session_id: 目标 session ID(对应 data/sessions/<id>/audit.jsonl)
+        tool_name / decision / reason_type / rule_source / stage /
+            sandbox_used / since_ts: 与 AuditLogger.query 同语义
+        limit: 最多返 N 条(None=全部)
+        reverse: True → 倒序
+        sessions_root: 显式指定 sessions 根目录;None → 见 _resolve_sessions_root
+
+    Returns:
+        匹配的 AuditRecord 列表;session 不存在 / 读失败 → []
+    """
+    root = _resolve_sessions_root(sessions_root)
+    audit_path = root / session_id / "audit.jsonl"
+    if not audit_path.exists():
+        # sessions_root 可能直接是 data 目录本身(sessions 子层)
+        alt = root.parent / "sessions" / session_id / "audit.jsonl" if root.name != "sessions" else None
+        if alt is not None and alt.exists():
+            audit_path = alt
+        else:
+            return []
+    # 复用 AuditLogger 的 _read_all_records(单实例即可,不需写盘)
+    reader = AuditLogger(str(audit_path.parent))
+    reader.path = audit_path  # path 必须用 <session>/audit.jsonl
+    records = reader._read_all_records()
+    return _filter_records(
+        records,
+        since_ts=since_ts,
+        tool_name=tool_name,
+        decision=decision,
+        reason_type=reason_type,
+        rule_source=rule_source,
+        stage=stage,
+        sandbox_used=sandbox_used,
+        limit=limit,
+        reverse=reverse,
+    )
 
 
 # ────────────────────────────────────────────────────────────────────

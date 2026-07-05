@@ -29,7 +29,6 @@ import pytest
 
 from agent_core.builder import (
     AgentBuilder,
-    SessionPersistMode,
 )
 from agent_core.turn_chain import (
     HandlerResult,
@@ -101,16 +100,22 @@ class TestAgentBuilderBuildE2E:
         assert isinstance(agent._tool_chain, TurnChain)
         assert isinstance(agent._output_chain, TurnChain)
 
-        # 默认 handler 顺序(D6-5 验证过,这里确认 build() 后没乱序)
+        # 默认 handler 顺序(Plan B Step 1-2 加 Stage A/B + R4 加 ContextCompaction + Step 8 改 output head 名)
+        # 2026-07-02 SRP 重构:加 TurnIndicator + SystemPrompt/MemoryRetrieval 改为真实现
         assert [h.name for h in agent._inputs_chain] == [
-            "memory_retrieval", "system_prompt", "tools_schema_prepare",
+            "turn_indicator", "context_compaction", "system_prompt", "memory_retrieval", "tools_schema_prepare",
         ]
-        assert [h.name for h in agent._llm_chain] == ["llm_call", "chunk_parse"]
+        assert [h.name for h in agent._llm_chain] == [
+            "llm_call", "chunk_parse", "llm_call_persist",  # Stage A
+        ]
         assert [h.name for h in agent._tool_chain] == [
-            "permission_check", "tool_dispatch", "tool_execute",
+            "permission_check", "tool_dispatch", "tool_execute", "tool_pair_persist",  # Stage B
         ]
         assert [h.name for h in agent._output_chain] == [
-            "session_persist", "audit_log", "memory_bridge_extract",
+            "final_answer_bookkeeping", "final_answer_persist", "audit_log",
+            "memory_bridge_extract", "l3_sm_extract_trigger", "session_flush",
+            # Plan B Final Phase:5 handler + Plan B Final Phase Step 2 (2026-07-02)
+            # 加 L3SMExtractTrigger 取代 v1 run() L1776-L1821 内联块
         ]
 
         # 7 phase 都被重建
@@ -222,33 +227,9 @@ class TestAgentBuilderBuildE2E:
         assert agent._sm._phases[AgentPhase.LLM_THINKING] is not custom_phase
         assert agent._sm._phases[AgentPhase.FINALIZING] is not custom_phase
 
-    def test_d8_6_delegate_mode_makes_session_persist_noop(self):
-        """D8-6:build() use_real_session_persist(False) → output_chain.SessionPersistHandler
-        在运行时是 no-op(handle 不调 session_manager)。"""
-        from agent_core.turn_chain import SessionPersistHandler
-
-        agent = (
-            AgentBuilder()
-            .use_real_session_persist(False)
-            .build(_build_agent_kwargs())
-        )
-
-        # 找到 output_chain 里的 SessionPersistHandler
-        sp = next(
-            h for h in agent._output_chain
-            if h.name == "session_persist"
-        )
-        assert isinstance(sp, SessionPersistHandler)
-
-        # 即使 agent 没 session_manager + 没 pending,也能调 handle 不抛
-        ctx = MagicMock()
-        ctx.stage_outputs = None
-        ctx.events = []
-        ctx.emit = lambda e: ctx.events.append(e)
-        result = sp.handle(ctx)
-
-        assert isinstance(result, HandlerResult)
-        assert result.stop_chain is False
+    # Plan B Step 8 (2026-07-01):删 test_d8_6_delegate_mode_makes_session_persist_noop
+    # — SessionPersistMode DELEGATE 模式 + use_real_session_persist toggle 整体删除,
+    # output_chain 恒为真实现(Plan B Step 3 Stage C 接管)。
 
     def test_d8_7_kwargs_only_accept_real_reactagent_args(self):
         """D8-7:agent_kwargs 只接受 ReactAgent.__init__ 真实参数,builder 不暴露

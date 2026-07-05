@@ -1,14 +1,17 @@
 """
 AgentBuilder API 单元测试(2026-06-30 — D6-5)。
 
-覆盖(7 case):
+覆盖(5 case,Plan B Step 8 删 D6-5.4 + D6-5.6):
     D6-5.1: factory 函数返回的 TurnChain 包含预期 handler 顺序
     D6-5.2: with_handler(after=...) / before=... / at=... 顺序正确
     D6-5.3: with_plugin_handler 拒绝非 PluginHandler 子类
-    D6-5.4: use_real_session_persist 切换影响 build_default_output_chain 模式
     D6-5.5: with_termination / with_phase_override 状态被记录
-    D6-5.6: SessionPersistHandler 在 DELEGATE 模式下 handle() 返回 HandlerResult() early
     D6-5.7: factory 函数对 stub agent 友好(handler __init__ 不访问 agent 属性)
+
+Plan B Step 8 (2026-07-01):删 use_real_session_persist / SessionPersistMode DELEGATE 模式
+(D6-5.4 + D6-5.6),output_chain 恒为真实现 — TestSessionPersistToggle +
+TestSessionPersistDelegateMode 类删除,test_output_chain_delegate_mode_session_persist_is_noop
+并入 test_output_chain_has_three_handlers。
 
 设计参考:docs/agent-state-machine-and-chain-of-responsibility-design.md §11(AgentBuilder)
 + §15(Chain of Responsibility)
@@ -23,12 +26,10 @@ import pytest
 
 from agent_core.builder import (
     AgentBuilder,
-    SessionPersistMode,
     build_default_inputs_chain,
     build_default_llm_chain,
     build_default_output_chain,
     build_default_tool_chain,
-    _make_session_persist_delegate,
 )
 from agent_core.turn_chain import (
     AuditLogHandler,
@@ -39,7 +40,6 @@ from agent_core.turn_chain import (
     MemoryRetrievalHandler,
     PermissionCheckHandler,
     PluginHandler,
-    SessionPersistHandler,
     SystemPromptHandler,
     ToolDispatchHandler,
     ToolExecuteHandler,
@@ -70,55 +70,62 @@ class _StubAgent:
 class TestFactoryChains:
     """D6-5.1:4 个 build_default_*_chain() 返回的 TurnChain 包含预期 handler 顺序。"""
 
-    def test_inputs_chain_has_three_handlers_in_order(self):
+    def test_inputs_chain_has_five_handlers_in_order(self):
+        """inputs_chain 5 个 handler:turn_indicator + context_compaction + system_prompt + memory_retrieval + tools_schema_prepare。
+
+        Plan B R4 修复(2026-07-01):ContextCompactionHandler 在 inputs_chain 首位做
+        L3 SM fast path + ContextManager fallback token 预算压缩。
+        SRP 重构(2026-07-02):加 TurnIndicator + SystemPrompt/MemoryRetrieval 改为真实现。
+        """
         agent = _StubAgent()
         chain = build_default_inputs_chain(agent)
 
         names = [h.name for h in chain]
         assert names == [
-            "memory_retrieval",
+            "turn_indicator",
+            "context_compaction",
             "system_prompt",
+            "memory_retrieval",
             "tools_schema_prepare",
         ], f"unexpected order: {names}"
 
-    def test_llm_chain_has_two_handlers_in_order(self):
+    def test_llm_chain_has_three_handlers_in_order(self):
+        """LLM chain:llm_call + chunk_parse + llm_call_persist(Stage A,Plan B Step 1)。"""
         agent = _StubAgent()
         chain = build_default_llm_chain(agent)
 
         names = [h.name for h in chain]
-        assert names == ["llm_call", "chunk_parse"]
+        assert names == ["llm_call", "chunk_parse", "llm_call_persist"]
 
-    def test_tool_chain_has_three_handlers_in_order(self):
+    def test_tool_chain_has_four_handlers_in_order(self):
+        """Tool chain:permission_check + tool_dispatch + tool_execute + tool_pair_persist(Stage B,Plan B Step 2)。"""
         agent = _StubAgent()
         chain = build_default_tool_chain(agent)
 
         names = [h.name for h in chain]
-        assert names == ["permission_check", "tool_dispatch", "tool_execute"]
+        assert names == ["permission_check", "tool_dispatch", "tool_execute", "tool_pair_persist"]
 
-    def test_output_chain_normal_mode_has_three_handlers(self):
-        """NORMAL 模式:SessionPersist + AuditLog + MemoryBridgeExtract。"""
+    def test_output_chain_has_six_handlers(self):
+        """output_chain 6 个 handler:final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush。
+
+        Plan B Step 8:SessionPersistMode DELEGATE 模式已删,output_chain 恒为真实现。
+        Plan B Final Phase (2026-07-02):_iter_phase_finalize 拆为 4 handler,
+        output_chain 从 3 handler 扩展为 5(handler count +2)。
+        Plan B Final Phase Step 2 (2026-07-02):加 L3SMExtractTriggerHandler
+        取代 v1 run() L1776-L1821 内联块,output_chain 扩展为 6(handler count +1)。
+        """
         agent = _StubAgent()
-        chain = build_default_output_chain(agent, session_persist_mode=SessionPersistMode.NORMAL)
+        chain = build_default_output_chain(agent)
 
         names = [h.name for h in chain]
         assert names == [
-            "session_persist",
+            "final_answer_bookkeeping",
+            "final_answer_persist",
             "audit_log",
             "memory_bridge_extract",
+            "l3_sm_extract_trigger",
+            "session_flush",
         ]
-
-    def test_output_chain_delegate_mode_session_persist_is_noop(self):
-        """DELEGATE 模式:SessionPersistHandler.handle() 被替换成 no-op。"""
-        agent = _StubAgent()
-        chain = build_default_output_chain(agent, session_persist_mode=SessionPersistMode.DELEGATE)
-
-        # 找 session_persist handler 实例
-        session_persist = next(h for h in chain if h.name == "session_persist")
-        # 调 handle(),应该返回 HandlerResult(stop_chain=False) early,无副作用
-        ctx = MagicMock()
-        result = session_persist.handle(ctx)
-        assert isinstance(result, HandlerResult)
-        assert result.stop_chain is False
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -214,34 +221,6 @@ class TestPluginHandlerTypeCheck:
 
 
 # ────────────────────────────────────────────────────────────────────
-# D6-5.4 use_real_session_persist toggle
-# ────────────────────────────────────────────────────────────────────
-
-
-class TestSessionPersistToggle:
-    """D6-5.4:use_real_session_persist() 切换后,_real_session_persist 字段被设。"""
-
-    def test_default_is_true(self):
-        builder = AgentBuilder()
-        assert builder._real_session_persist is True
-
-    def test_set_false(self):
-        builder = AgentBuilder()
-        builder.use_real_session_persist(False)
-        assert builder._real_session_persist is False
-
-    def test_set_true_explicitly(self):
-        builder = AgentBuilder()
-        builder.use_real_session_persist(False)
-        builder.use_real_session_persist(True)
-        assert builder._real_session_persist is True
-
-    def test_session_persist_mode_enum_values(self):
-        assert SessionPersistMode.NORMAL.value == "normal"
-        assert SessionPersistMode.DELEGATE.value == "delegate"
-
-
-# ────────────────────────────────────────────────────────────────────
 # D6-5.5 with_termination / with_phase_override 状态记录
 # ────────────────────────────────────────────────────────────────────
 
@@ -285,44 +264,8 @@ class TestBuilderStateRecording:
 
         builder = AgentBuilder()
         assert builder.with_termination(MagicMock()) is builder
-        assert builder.use_real_session_persist(False) is builder
         custom_phase = SetupPhase(TurnChain([MemoryRetrievalHandler(_StubAgent())]))
         assert builder.with_phase_override(AgentPhase.SETUP, custom_phase) is builder
-
-
-# ────────────────────────────────────────────────────────────────────
-# D6-5.6 SessionPersistHandler DELEGATE mode 内部行为
-# ────────────────────────────────────────────────────────────────────
-
-
-class TestSessionPersistDelegateMode:
-    """D6-5.6:_make_session_persist_delegate() 把 handle() 替换成 no-op。"""
-
-    def test_make_session_persist_delegate_returns_handler_result(self):
-        """直接调:替换 handle 后,无 _pending_tool_results 也无 session_manager 也能跑。"""
-        agent = _StubAgent()
-        handler = SessionPersistHandler(agent)
-        _make_session_persist_delegate(handler)
-
-        ctx = MagicMock()
-        result = handler.handle(ctx)
-        assert isinstance(result, HandlerResult)
-        assert result.stop_chain is False
-
-    def test_make_session_persist_delegate_no_session_calls(self):
-        """DELEGATE 模式:即使 agent 有 _pending_tool_results,也不调 session_manager。"""
-        agent = MagicMock()
-        agent._pending_tool_results = [("tu_x", "out")]
-        agent._session_manager = MagicMock()
-        handler = SessionPersistHandler(agent)
-        _make_session_persist_delegate(handler)
-
-        ctx = MagicMock()
-        handler.handle(ctx)
-        # 不调 add_tool_results
-        agent._session_manager.add_tool_results.assert_not_called()
-        # pending 不清(因为 DELEGATE 模式不进 try/finally)
-        assert agent._pending_tool_results == [("tu_x", "out")]
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -343,10 +286,12 @@ class TestFactoryStubAgentFriendliness:
         tool_chain = build_default_tool_chain(agent)
         output_chain = build_default_output_chain(agent)
 
-        assert len(inputs_chain) == 3
-        assert len(llm_chain) == 2
-        assert len(tool_chain) == 3
-        assert len(output_chain) == 3
+        # Plan B Step 1-2 加 Stage A/B 持久化 handler + R4 加 ContextCompaction +
+        # 2026-07-02 SRP 重构加 TurnIndicator 并把 SystemPrompt/MemoryRetrieval 拆为真实现
+        assert len(inputs_chain) == 5    # turn_indicator + context_compaction + system_prompt + memory_retrieval + tools_schema_prepare
+        assert len(llm_chain) == 3       # llm_call + chunk_parse + llm_call_persist
+        assert len(tool_chain) == 4      # permission_check + tool_dispatch + tool_execute + tool_pair_persist
+        assert len(output_chain) == 6    # final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush (Plan B Final Phase Step 2 2026-07-02)
 
 
 # ────────────────────────────────────────────────────────────────────

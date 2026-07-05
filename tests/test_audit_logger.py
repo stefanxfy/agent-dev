@@ -27,6 +27,7 @@ from agent_core.tools.audit_logger import (
     compute_tool_input_hash,
     get_audit_logger,
     init_audit_logger,
+    query_audit,
     reset_audit_logger_for_testing,
 )
 from agent_core.tools.permission_types import (
@@ -452,3 +453,273 @@ class TestAuditRecordSerialization:
         assert len(results) == 1
         assert results[0].tool_name == "Bash"
         assert results[0].decision == "allow"
+
+
+# ────────────────────────────────────────────────────────────────────
+# M3 查询扩展 — 多维 filter
+# ────────────────────────────────────────────────────────────────────
+
+class TestQueryM3Filters:
+    def _make_rule_decision(self, behavior, source=PermissionRuleSource.PROJECT, content="Bash(rm:*)"):
+        rule_value = PermissionRuleValue(tool_name="Bash", rule_content=content)
+        rule = PermissionRule(
+            source=source,
+            behavior=behavior,
+            value=rule_value,
+        )
+        return PermissionDecision(
+            behavior=behavior.value,
+            decision_reason=RuleReason(
+                rule=PermissionRuleData.from_dataclass(rule),
+                reason=f"hit {source.value}",
+            ),
+        )
+
+    def test_filter_by_reason_type(self, logger):
+        rule_decision = self._make_rule_decision(PermissionBehavior.DENY)
+        logger.log("Bash", {"command": "rm"}, rule_decision, _make_ctx())
+        logger.log(
+            "Bash", {"command": "ls"},
+            _make_decision(reason=OtherReason(reason="no rule")),
+            _make_ctx(),
+        )
+        results = logger.query(reason_type="rule")
+        assert len(results) == 1
+        assert results[0].reason_type == "rule"
+
+        results = logger.query(reason_type="other")
+        assert len(results) == 1
+        assert results[0].reason_type == "other"
+
+    def test_filter_by_rule_source(self, logger):
+        logger.log(
+            "Bash", {"command": "rm"},
+            self._make_rule_decision(PermissionBehavior.DENY, source=PermissionRuleSource.PROJECT),
+            _make_ctx(),
+        )
+        logger.log(
+            "Bash", {"command": "rm"},
+            self._make_rule_decision(PermissionBehavior.DENY, source=PermissionRuleSource.LOCAL),
+            _make_ctx(),
+        )
+        results = logger.query(rule_source="projectSettings")
+        assert len(results) == 1
+        assert results[0].rule_source == "projectSettings"
+
+    def test_filter_by_stage(self, logger):
+        logger.log(
+            "Bash", {"command": "ls"},
+            _make_decision(), _make_ctx(),
+            stage="step_1a_global_deny",
+        )
+        logger.log(
+            "Bash", {"command": "rm"},
+            _make_decision(), _make_ctx(),
+            stage="step_2a_bypass_mode",
+        )
+        results = logger.query(stage="step_1a_global_deny")
+        assert len(results) == 1
+        assert results[0].stage == "step_1a_global_deny"
+
+    def test_filter_by_sandbox_used(self, logger):
+        ctx_with_sb = _make_ctx(sandbox_enabled=True)
+        ctx_no_sb = _make_ctx(sandbox_enabled=False)
+        logger.log("Bash", {"command": "ls"}, _make_decision(), ctx_with_sb)
+        logger.log("Bash", {"command": "ls"}, _make_decision(), ctx_no_sb)
+        results = logger.query(sandbox_used=True)
+        assert len(results) == 1
+        assert results[0].sandbox_used is True
+
+        results = logger.query(sandbox_used=False)
+        assert len(results) == 1
+        assert results[0].sandbox_used is False
+
+    def test_limit(self, logger):
+        for i in range(5):
+            logger.log(
+                "Bash", {"command": f"cmd-{i}"},
+                _make_decision(), _make_ctx(),
+            )
+        results = logger.query(limit=3)
+        assert len(results) == 3
+
+    def test_reverse(self, logger):
+        for i in range(3):
+            logger.log(
+                "Bash", {"command": f"cmd-{i}"},
+                _make_decision(), _make_ctx(),
+            )
+        forward = logger.query()
+        backward = logger.query(reverse=True)
+        assert forward[0].tool_input_hash != backward[0].tool_input_hash or forward[0] is not backward[0]
+        # 倒序首条 = 正序末条
+        assert backward[0].tool_input_hash == forward[-1].tool_input_hash
+
+    def test_combined_filters(self, logger):
+        # 2 条 Bash/rule/projectSettings + 1 条 Bash/other + 1 条 Read/rule
+        logger.log(
+            "Bash", {"command": "rm"},
+            self._make_rule_decision(PermissionBehavior.DENY, source=PermissionRuleSource.PROJECT),
+            _make_ctx(),
+        )
+        logger.log(
+            "Bash", {"command": "sudo"},
+            self._make_rule_decision(PermissionBehavior.DENY, source=PermissionRuleSource.PROJECT),
+            _make_ctx(),
+        )
+        logger.log(
+            "Bash", {"command": "ls"},
+            _make_decision(reason=OtherReason(reason="default")),
+            _make_ctx(),
+        )
+        logger.log(
+            "Read", {"path": "/etc/passwd"},
+            self._make_rule_decision(PermissionBehavior.DENY, source=PermissionRuleSource.LOCAL),
+            _make_ctx(),
+        )
+        # tool_name=Bash + reason_type=rule + rule_source=projectSettings → 2 条
+        results = logger.query(
+            tool_name="Bash", reason_type="rule", rule_source="projectSettings",
+        )
+        assert len(results) == 2
+        assert all(r.tool_name == "Bash" for r in results)
+        assert all(r.reason_type == "rule" for r in results)
+        assert all(r.rule_source == "projectSettings" for r in results)
+
+
+# ────────────────────────────────────────────────────────────────────
+# M3 查询扩展 — 模块级 query_audit
+# ────────────────────────────────────────────────────────────────────
+
+class TestQueryAuditModule:
+    def _populate_session(self, sessions_root: Path, session_id: str, records):
+        """在 sessions_root/<session_id>/audit.jsonl 写入 records"""
+        session_dir = sessions_root / session_id
+        session_dir.mkdir(parents=True, exist_ok=True)
+        logger = AuditLogger(str(session_dir))
+        for tool, behavior, reason_type, stage in records:
+            logger.log(
+                tool, {"command": f"{tool}-{behavior.value}"},
+                _make_decision(behavior=behavior, reason=OtherReason(reason=reason_type)),
+                _make_ctx(),
+                stage=stage,
+            )
+        return logger
+
+    def test_resolves_via_explicit_root(self, tmp_path):
+        self._populate_session(
+            tmp_path, "session-1",
+            [("Bash", PermissionBehavior.ALLOW, "default", "step_1c")],
+        )
+        results = query_audit("session-1", sessions_root=str(tmp_path))
+        assert len(results) == 1
+        assert results[0].session_id == "session-1"
+
+    def test_nonexistent_session_returns_empty(self, tmp_path):
+        results = query_audit("ghost-session", sessions_root=str(tmp_path))
+        assert results == []
+
+    def test_query_audit_with_filters(self, tmp_path):
+        # 两条 Bash + 一条 Read,含一个带 RuleReason 的记录用于测试 reason_type 维度
+        session_dir = tmp_path / "session-A"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        al = AuditLogger(str(session_dir))
+        # 1. Bash allow / other reason
+        al.log(
+            "Bash", {"command": "ls"}, _make_decision(), _make_ctx(),
+            stage="step_1c",
+        )
+        # 2. Bash deny / rule reason / projectSettings
+        rule = PermissionRule(
+            source=PermissionRuleSource.PROJECT,
+            behavior=PermissionBehavior.DENY,
+            value=PermissionRuleValue(tool_name="Bash", rule_content="Bash(rm:*)"),
+        )
+        al.log(
+            "Bash", {"command": "rm"},
+            PermissionDecision(
+                behavior=PermissionBehavior.DENY.value,
+                decision_reason=RuleReason(
+                    rule=PermissionRuleData.from_dataclass(rule),
+                    reason="hit deny",
+                ),
+            ),
+            _make_ctx(),
+            stage="step_1a_global_deny",
+        )
+        # 3. Read ask / other reason
+        al.log(
+            "Read", {"path": "/x"},
+            _make_decision(behavior=PermissionBehavior.ASK),
+            _make_ctx(),
+            stage="step_1b_global_ask",
+        )
+
+        # tool_name=Bash → 2
+        results = query_audit(
+            "session-A", tool_name="Bash", sessions_root=str(tmp_path),
+        )
+        assert len(results) == 2
+
+        # decision=deny → 1
+        results = query_audit(
+            "session-A", decision="deny", sessions_root=str(tmp_path),
+        )
+        assert len(results) == 1
+        assert results[0].decision == "deny"
+
+        # reason_type=rule + stage 过滤
+        results = query_audit(
+            "session-A", reason_type="rule", stage="step_1a_global_deny",
+            sessions_root=str(tmp_path),
+        )
+        assert len(results) == 1
+        assert results[0].stage == "step_1a_global_deny"
+        assert results[0].rule_source == "projectSettings"
+
+    def test_query_audit_limit_and_reverse(self, tmp_path):
+        self._populate_session(
+            tmp_path, "session-B",
+            [(f"Bash", PermissionBehavior.ALLOW, "default", "step_1c") for _ in range(5)],
+        )
+        results = query_audit(
+            "session-B", limit=3, sessions_root=str(tmp_path),
+        )
+        assert len(results) == 3
+
+    def test_query_audit_does_not_require_global_singleton(self, tmp_path):
+        # 即使全局 audit logger 是 None,query_audit 也能正常工作
+        reset_audit_logger_for_testing()
+        assert get_audit_logger() is None
+        self._populate_session(
+            tmp_path, "session-C",
+            [("Bash", PermissionBehavior.ALLOW, "default", "step_1c")],
+        )
+        results = query_audit("session-C", sessions_root=str(tmp_path))
+        assert len(results) == 1
+
+    def test_corrupt_lines_skipped(self, tmp_path):
+        session_dir = tmp_path / "session-D"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = session_dir / "audit.jsonl"
+        # 写一条坏 JSON + 一条好 JSON
+        with open(audit_path, "w", encoding="utf-8") as f:
+            f.write("{not valid json\n")
+            f.write(json.dumps({
+                "timestamp": time.time(), "session_id": "session-D",
+                "tool_name": "Bash", "tool_input_hash": "abc",
+                "decision": "allow", "reason_type": "other",
+            }) + "\n")
+        results = query_audit("session-D", sessions_root=str(tmp_path))
+        assert len(results) == 1
+        assert results[0].tool_name == "Bash"
+
+    def test_auto_root_picks_existing_cwd_data_sessions(self, tmp_path, monkeypatch):
+        # 切到 tmp_path,创建 data/sessions/sX/audit.jsonl
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "data" / "sessions" / "auto-session").mkdir(parents=True)
+        AuditLogger(str(tmp_path / "data" / "sessions" / "auto-session")).log(
+            "Bash", {"command": "ls"}, _make_decision(), _make_ctx(),
+        )
+        results = query_audit("auto-session")  # 不传 sessions_root
+        assert len(results) == 1

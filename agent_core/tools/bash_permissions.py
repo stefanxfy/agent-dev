@@ -40,6 +40,10 @@ from .permission_types import (
 
 logger = logging.getLogger(__name__)
 
+# 🛡️ permission + ⚙️ sandbox 子系统 logger — Bash 路径最危险,日志最详尽
+permission_logger = logging.getLogger("agent_core.permission")
+sandbox_logger = logging.getLogger("agent_core.sandbox")
+
 
 # ── 配置:tree-sitter 是否启用(对齐 CC env TREE_SITTER_BASH) ──
 
@@ -117,10 +121,14 @@ def parse_subcommands(command: str) -> list[Subcommand]:
     - TREE_SITTER_BASH=true → _parse_via_tree_sitter(AST)
     - else → _parse_via_regex(legacy)
     """
+    permission_logger.debug("🛡️ [bash_parse_subcommands] command=%s", command[:200])
     if not command or not command.strip():
+        permission_logger.debug("🛡️ [bash_parse_empty] command empty → []")
         return []
     if _tree_sitter_enabled():
+        permission_logger.debug("🛡️ [bash_parse_path] using=tree_sitter")
         return _parse_via_tree_sitter(command)
+    permission_logger.debug("🛡️ [bash_parse_path] using=regex")
     return _parse_via_regex(command)
 
 
@@ -365,8 +373,14 @@ def bash_check_permissions(
     """
     command = tool_input.get("command", "") or ""
 
+    permission_logger.info(
+        "🛡️ [bash_check_entry] command=%s mode=%s",
+        command[:200], context.mode,
+    )
+
     # Step 0: empty command
     if not command.strip():
+        permission_logger.info("🛡️ [bash_check_empty] command empty → ASK")
         return PermissionDecision(
             behavior=PermissionBehavior.ASK.value,
             decision_reason=OtherReason(reason="empty command"),
@@ -375,15 +389,22 @@ def bash_check_permissions(
     # ── Step 0: sandbox auto-allow 提前检查(对齐 doc §5.4 + §6.3) ──
     # 三段条件:is_sandbox_enabled + auto_allow_bash_if_sandboxed + should_use_sandbox
     sandbox_auto = _check_sandbox_auto_allow_conditions(tool_input)
+    sandbox_logger.debug("⚙️ [sandbox_auto_allow_check] conditions=%s", sandbox_auto)
     if sandbox_auto:
         auto = check_sandbox_auto_allow(tool_input, context)
         if auto.behavior in (PermissionBehavior.DENY.value, PermissionBehavior.ASK.value):
+            sandbox_logger.info(
+                "⚙️ [sandbox_auto_allow_blocked] behavior=%s message=%s",
+                auto.behavior, (auto.message or "")[:120],
+            )
             return auto  # deny/ask rule 在沙箱内仍生效,不绕过
         # 否则 fall through(沙箱兜底)—— 但仍跑 subcommand check
         # (对齐 CC §6.3:即便 auto-allow,subcommand-level deny 仍触发)
+        sandbox_logger.debug("⚙️ [sandbox_auto_allow_pass] → fall through to subcommand check")
 
     # ── Step 1: 拆分 subcommand ──
     subcommands = parse_subcommands(command)
+    permission_logger.debug("🛡️ [bash_subs_parsed] count=%d", len(subcommands))
     if not subcommands:
         return PermissionDecision(
             behavior=PermissionBehavior.ASK.value,
@@ -392,6 +413,10 @@ def bash_check_permissions(
 
     # ── Step 1.5: MAX_SUBCOMMANDS cap ──
     if len(subcommands) > MAX_SUBCOMMANDS:
+        permission_logger.info(
+            "🛡️ [bash_subs_cap_exceeded] count=%d max=%d → ASK",
+            len(subcommands), MAX_SUBCOMMANDS,
+        )
         return PermissionDecision(
             behavior=PermissionBehavior.ASK.value,
             decision_reason=OtherReason(
@@ -402,7 +427,11 @@ def bash_check_permissions(
     # ── Step 2: cd + git 检测(对齐 CC bare-git scrub attack #29316) ──
     has_cd = any(is_cd_command(sc.command) for sc in subcommands)
     has_git = any(sc.name == "git" for sc in subcommands)
+    permission_logger.debug("🛡️ [bash_cd_git_check] has_cd=%s has_git=%s", has_cd, has_git)
     if has_cd and has_git:
+        permission_logger.info(
+            "🧪 [bash_cd_git_attack] cd+git combo detected → ASK (CC #29316)",
+        )
         return PermissionDecision(
             behavior=PermissionBehavior.ASK.value,
             decision_reason=SafetyCheckReason(
@@ -417,7 +446,9 @@ def bash_check_permissions(
     classifier_should_block = False
     classifier_reason = ""
     if classifier is not None and getattr(context, "is_anthropic_provider", False):
+        permission_logger.debug("🤖 [bash_classifier_speculative_start] tool=Bash")
         try:
+            import time as _cls_time
             from .classifier import is_classifier_enabled
             provider = "anthropic"  # classifier 仅 ANT 启用
             if is_classifier_enabled(
@@ -425,13 +456,19 @@ def bash_check_permissions(
                 mode=PermissionMode(context.mode),
                 no_settings_match=context.no_settings_match,
             ):
+                _cls_t0 = _cls_time.time()
                 result = classifier.classify(
                     messages or [],
                     "Bash",
                     tool_input,
                     context,
                 )
+                _cls_ms = (_cls_time.time() - _cls_t0) * 1000
                 classifier_result = result
+                permission_logger.info(
+                    "🤖 [bash_classifier_result] should_block=%s unavailable=%s duration_ms=%.1f",
+                    result.should_block, result.unavailable, _cls_ms,
+                )
                 if not result.unavailable:
                     classifier_should_block = result.should_block
                     classifier_reason = result.reason
@@ -443,9 +480,14 @@ def bash_check_permissions(
     ask_count = 0
     allow_count = 0
     first_blocking: Optional[PermissionDecision] = None
-    for sc in subcommands:
+    permission_logger.debug("🛡️ [bash_subs_loop_start] n=%d", len(subcommands))
+    for i, sc in enumerate(subcommands):
         sc_stripped = strip_safe_wrappers(sc.command)
         result = _check_single_command(sc_stripped, tool_input, context)
+        permission_logger.debug(
+            "🛡️ [bash_sub_check] idx=%d cmd=%s behavior=%s",
+            i, sc_stripped[:80], result.behavior,
+        )
         if result.behavior == PermissionBehavior.DENY.value:
             deny_count += 1
             if first_blocking is None:
@@ -459,6 +501,10 @@ def bash_check_permissions(
 
     # 任一 subcommand deny/ask → 立即返回(不等 classifier,对齐 doc §4.5 Step 5)
     if first_blocking is not None:
+        permission_logger.info(
+            "🛡️ [bash_sub_blocked_aggregate] allow=%d ask=%d deny=%d → %s",
+            allow_count, ask_count, deny_count, first_blocking.behavior,
+        )
         return PermissionDecision(
             behavior=first_blocking.behavior,
             decision_reason=SubcommandResultsReason(
@@ -472,6 +518,10 @@ def bash_check_permissions(
 
     # ── Step 5: 等 classifier 结果(M2 同步,结果已在 Step 3 拿到) ──
     if classifier_should_block:
+        permission_logger.info(
+            "🤖 [bash_classifier_deny] reason=%s",
+            (classifier_reason or "")[:120],
+        )
         return PermissionDecision(
             behavior=PermissionBehavior.DENY.value,
             decision_reason=ClassifierReason(
@@ -484,6 +534,9 @@ def bash_check_permissions(
     # ── Step 6: 全部 subcommand 通过 → ALLOW ──
     # sandbox auto-allow 路径 → ALLOW(sandbox 兜底)
     if sandbox_auto:
+        sandbox_logger.info(
+            "⚙️ [sandbox_auto_allow_pass] all subs pass under sandbox → ALLOW",
+        )
         return PermissionDecision(
             behavior=PermissionBehavior.ALLOW.value,
             decision_reason=OtherReason(
@@ -542,10 +595,15 @@ def _check_single_command(
     Returns:
         DENY / ASK / ALLOW / PASSTHROUGH
     """
+    permission_logger.debug("🛡️ [bash_single_cmd_entry] cmd=%s", cmd[:120])
     # deny rules(按 source 优先级)
     for source in _HIGH_PRIORITY_SOURCES:
         for rule_str in context.always_deny_rules.get(source.value, []):
             if _rule_matches(rule_str, cmd):
+                permission_logger.info(
+                    "🛡️ [bash_single_cmd_deny] cmd=%s source=%s rule=%s",
+                    cmd[:60], source.value, rule_str,
+                )
                 return PermissionDecision(
                     behavior=PermissionBehavior.DENY.value,
                     decision_reason=OtherReason(reason=f"deny rule: {rule_str}"),
@@ -555,6 +613,10 @@ def _check_single_command(
     for source in _HIGH_PRIORITY_SOURCES:
         for rule_str in context.always_ask_rules.get(source.value, []):
             if _rule_matches(rule_str, cmd):
+                permission_logger.info(
+                    "🛡️ [bash_single_cmd_ask] cmd=%s source=%s rule=%s",
+                    cmd[:60], source.value, rule_str,
+                )
                 return PermissionDecision(
                     behavior=PermissionBehavior.ASK.value,
                     decision_reason=OtherReason(reason=f"ask rule: {rule_str}"),
@@ -564,6 +626,10 @@ def _check_single_command(
     for source in _HIGH_PRIORITY_SOURCES:
         for rule_str in context.always_allow_rules.get(source.value, []):
             if _rule_matches(rule_str, cmd):
+                permission_logger.info(
+                    "🛡️ [bash_single_cmd_allow] cmd=%s source=%s rule=%s",
+                    cmd[:60], source.value, rule_str,
+                )
                 return PermissionDecision(
                     behavior=PermissionBehavior.ALLOW.value,
                     decision_reason=OtherReason(reason=f"allow rule: {rule_str}"),
@@ -633,7 +699,9 @@ def check_sandbox_auto_allow(
     实现:复刻 bash_check_permissions Step 1-4 但去掉 ask fallback
     """
     command = tool_input.get("command", "") or ""
+    sandbox_logger.info("⚙️ [sandbox_auto_allow_entry] command=%s", command[:120])
     subcommands = parse_subcommands(command)
+    sandbox_logger.debug("⚙️ [sandbox_auto_allow_subs] count=%d", len(subcommands))
 
     if not subcommands:
         return PermissionDecision(
@@ -655,6 +723,9 @@ def check_sandbox_auto_allow(
         sc_stripped = strip_safe_wrappers(sc.command)
         result = _check_single_command(sc_stripped, tool_input, context)
         if result.behavior == PermissionBehavior.DENY.value:
+            sandbox_logger.info(
+                "⚙️ [sandbox_sub_deny] cmd=%s", sc.command[:60],
+            )
             return PermissionDecision(
                 behavior=PermissionBehavior.DENY.value,
                 decision_reason=OtherReason(
@@ -664,6 +735,9 @@ def check_sandbox_auto_allow(
             )
         if result.behavior == PermissionBehavior.ASK.value:
             # ask rule 在沙箱内也透传(不绕过)
+            sandbox_logger.info(
+                "⚙️ [sandbox_sub_ask] cmd=%s", sc.command[:60],
+            )
             return PermissionDecision(
                 behavior=PermissionBehavior.ASK.value,
                 decision_reason=OtherReason(
@@ -673,6 +747,9 @@ def check_sandbox_auto_allow(
             )
 
     # 全 allow → ALLOW(沙箱兜底,不再弹窗)
+    sandbox_logger.info(
+        "⚙️ [sandbox_auto_allow_success] command=%s", command[:80],
+    )
     return PermissionDecision(
         behavior=PermissionBehavior.ALLOW.value,
         decision_reason=OtherReason(

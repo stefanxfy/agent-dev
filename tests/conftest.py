@@ -100,3 +100,24 @@ def writer(meta_db, memory_store, memory_root, chroma_dir):
 @pytest.fixture
 def config():
     return DistillationConfig()
+
+
+# ──────────────────────────────────────────────────────────────────
+# Sandbox 单例隔离(防跨 test 污染,Step 6 可插拔 backend 重构引入)
+# ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _reset_sandbox_singleton():
+    """每个 test 前后 reset sandbox_manager 单例。
+
+    Step 6 重构后,多个 fixture 调 configure_backends 改模块级 sandbox_manager 单例。
+    本 autouse fixture 确保每个 test 起始时单例处于默认状态(防跨文件/跨 test 污染)。
+    对非 sandbox 测试无副作用(_reset_for_testing 只重置 sandbox 状态)。
+    """
+    try:
+        from agent_core.tools.sandbox_manager import sandbox_manager
+        sandbox_manager._reset_for_testing()
+        yield
+        sandbox_manager._reset_for_testing()
+    except Exception:
+        yield

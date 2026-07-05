@@ -4,7 +4,7 @@ PermissionRequest hook 测试(M3 Task 2)
 覆盖:
 1. HookRegistry.run_permission_request(短路 / 异常隔离 / updated_input merge)
 2. make_webhook_permission_request_hook(requests mock)
-3. ReactAgent._ask_user_permission 集成(hook allow/deny 跳过 UI)
+3. ReactAgent._ask_user_permission_v2 集成(hook allow/deny 跳过 UI)
 """
 
 from __future__ import annotations
@@ -216,10 +216,10 @@ class TestWebhookHook:
 
 
 # ────────────────────────────────────────────────────────────────────
-# ReactAgent._ask_user_permission 集成
+# ReactAgent._ask_user_permission_v2 集成
 # ────────────────────────────────────────────────────────────────────
 
-class TestAskUserPermissionIntegration:
+class TestAskUserPermissionV2Integration:
     def _make_agent(self, hook_registry=None):
         from agent_core.agent_core import ReactAgent
         agent = ReactAgent.__new__(ReactAgent)
@@ -229,11 +229,10 @@ class TestAskUserPermissionIntegration:
         agent.permission_engine = engine
         agent.auto_allow_ask = False
         agent._pending_permission_request = None
-        agent._permission_resolved = None
+        agent._permission_resolved = None  # __new__ 绕过 __init__,需手动补对齐初始值
         return agent
 
-    def test_hook_allow_skips_ui(self):
-        # hook allow → 直接 allow,不等 Event.wait
+    def test_hook_allow_returns_sentinel(self):
         reg = HookRegistry()
         reg.register_hook(
             "PermissionRequest", "h",
@@ -244,11 +243,10 @@ class TestAskUserPermissionIntegration:
             decision_reason=SimpleNamespace(reason="ask"),
             message="ask",
         )
-        allowed, err, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is True
-        assert err is None
+        sentinel = agent._ask_user_permission_v2("Bash", {"command": "ls"}, decision)
+        assert sentinel == "ALLOW"
 
-    def test_hook_deny_skips_ui(self):
+    def test_hook_deny_returns_sentinel(self):
         reg = HookRegistry()
         reg.register_hook(
             "PermissionRequest", "h",
@@ -259,12 +257,10 @@ class TestAskUserPermissionIntegration:
             decision_reason=SimpleNamespace(reason="ask"),
             message="ask",
         )
-        allowed, err, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is False
-        assert "PermissionRequest hook" in err
+        sentinel = agent._ask_user_permission_v2("Bash", {"command": "ls"}, decision)
+        assert sentinel == "DENY_BY_HOOK"
 
-    def test_no_decision_falls_through_to_ui(self):
-        # hook 未决策 → 走 UI(Event.wait 0.1s 超时 → deny)
+    def test_no_decision_sets_pending_request(self):
         reg = HookRegistry()
         reg.register_hook(
             "PermissionRequest", "silent",
@@ -275,13 +271,13 @@ class TestAskUserPermissionIntegration:
             decision_reason=SimpleNamespace(reason="ask"),
             message="ask",
         )
-        allowed, err, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        # UI 超时 → deny
-        assert allowed is False
-        assert "timed out" in err or "user" in err.lower()
+        sentinel = agent._ask_user_permission_v2("Bash", {"command": "ls"}, decision)
+        assert sentinel == "AWAITING_PERMISSION"
+        assert agent._pending_permission_request is not None
+        assert agent._pending_permission_request["tool_name"] == "Bash"
+        assert agent._pending_permission_request["tool_input"] == {"command": "ls"}
 
     def test_hook_exception_falls_through(self):
-        # hook 异常 → 走 UI
         reg = HookRegistry()
         reg.register_hook(
             "PermissionRequest", "bad",
@@ -292,30 +288,28 @@ class TestAskUserPermissionIntegration:
             decision_reason=SimpleNamespace(reason="ask"),
             message="ask",
         )
-        # 不应抛,走 UI 超时 deny
-        allowed, err, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is False
+        # 异常被吞,fall through 到 pending request 设置
+        sentinel = agent._ask_user_permission_v2("Bash", {"command": "ls"}, decision)
+        assert sentinel == "AWAITING_PERMISSION"
 
-    def test_no_hook_registry_falls_through(self):
-        # permission_engine 无 hook_registry → 走 UI
+    def test_no_hook_registry_returns_awaiting(self):
         agent = self._make_agent(hook_registry=None)
         decision = SimpleNamespace(
             decision_reason=SimpleNamespace(reason="ask"),
             message="ask",
         )
-        allowed, _, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is False  # UI 超时 deny
+        sentinel = agent._ask_user_permission_v2("Bash", {"command": "ls"}, decision)
+        assert sentinel == "AWAITING_PERMISSION"
 
-    def test_no_engine_falls_through(self):
+    def test_no_engine_returns_awaiting(self):
         from agent_core.agent_core import ReactAgent
         agent = ReactAgent.__new__(ReactAgent)
         agent.permission_engine = None
         agent._pending_permission_request = None
-        agent._permission_resolved = None
+        agent._permission_resolved = None  # __new__ 绕过 __init__,需手动补
         decision = SimpleNamespace(
             decision_reason=SimpleNamespace(reason="ask"),
             message="ask",
         )
-        # 无 engine → hook 返 None → 走 UI(Event.wait 超时 deny)
-        allowed, _, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is False
+        sentinel = agent._ask_user_permission_v2("Bash", {"command": "ls"}, decision)
+        assert sentinel == "AWAITING_PERMISSION"

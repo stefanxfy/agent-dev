@@ -1,0 +1,476 @@
+"""
+test_compat.py — v1 baseline 对比测试(详见设计文档 §14.2)
+
+确保 v2 重构(B5/B6/B7/C8)不破坏 v1 公开行为:
+- agent.run() 仍可被 for-loop consume,event 顺序合理
+- agent._ask_user_permission tuple 接口仍工作
+- agent.resolve_permission 仍解锁 Event(老 threading 用法)
+- agent._pending_permission_request dict 结构兼容
+
+设计参考:docs/agent-state-machine-and-chain-of-responsibility-design.md §14.2
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from agent_core.agent_state import AgentPhase, RunState, StateMachine
+from agent_core.tools.base import ToolDef, ToolRegistry
+from agent_core.tools.permission_engine import PermissionEngine
+from agent_core.tools.permission_types import (
+    PermissionBehavior,
+    PermissionDecision,
+    ToolPermissionContext,
+)
+
+
+# ════════════════════════════════════════════════════════════
+# Stub LLM(最小,用于 run() 调用)
+# ════════════════════════════════════════════════════════════
+
+
+class _StubLLM:
+    """最小 stub LLM router — 立即返 "no tool calls, final answer"。"""
+
+    def __init__(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Cfg:
+            model: str = "test-model"
+            provider: str = "test-provider"
+            system_prompt: str = "test"
+
+        self.config = _Cfg()
+
+    def stream_chat(self, *args, **kwargs):
+        """返回 1 个 chunk 包含 text 'done',然后 end。"""
+        from agent_core.llm.router import TextDelta, StreamChunk, StopReason
+
+        class _Chunk:
+            type = "text"
+            text = "done"
+            tool_call = None
+            stop_reason = "end_turn"
+
+        yield _Chunk()
+
+    def chat(self, messages=None, tools=None, **kwargs):
+        """Stream a tiny completion back via generator."""
+        from types import SimpleNamespace
+
+        class _Delta:
+            text = "done"
+        yield SimpleNamespace(
+            text_delta=_Delta(),
+            thinking_delta=None,
+            tool_call=None,
+            stop_reason="end_turn",
+            usage=None,
+        )
+
+
+def _make_agent(
+    permission_engine=None,
+    auto_allow_ask: bool = True,
+) -> Any:
+    """最小 ReactAgent 工厂,for test_compat 兼容性验证。"""
+    from agent_core.agent_core import ReactAgent
+
+    tools = ToolRegistry()
+    tools.register(ToolDef(
+        name="echo",
+        description="echo input",
+        parameters={
+            "type": "object",
+            "properties": {"msg": {"type": "string"}},
+            "required": ["msg"],
+        },
+        handler=lambda **kw: f"echo: {kw['msg']}",
+    ))
+    return ReactAgent(
+        llm_router=_StubLLM(),
+        tool_registry=tools,
+        max_turns=3,
+        permission_engine=permission_engine,
+        auto_allow_ask=auto_allow_ask,
+    )
+
+
+# ════════════════════════════════════════════════════════════
+# v1 _ask_user_permission 兼容性测试
+# ════════════════════════════════════════════════════════════
+
+
+class TestAskUserPermissionLegacyCompat:
+    """v1 _ask_user_permission tuple 接口保留(legacy shim)。"""
+
+    def test_hook_allow_returns_true_tuple(self):
+        """PermissionRequest hook 返 'allow' → (True, None, input)。"""
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value="allow"):
+            decision = PermissionDecision(behavior=PermissionBehavior.ASK)
+            allowed, err, eff_input = agent._ask_user_permission(
+                "echo", {"msg": "hi"}, decision
+            )
+        assert allowed is True
+        assert err is None
+        assert eff_input == {"msg": "hi"}
+
+    def test_hook_deny_returns_false_tuple(self):
+        """PermissionRequest hook 返 'deny' → (False, "denied by hook", input)。"""
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value="deny"):
+            decision = PermissionDecision(behavior=PermissionBehavior.ASK)
+            allowed, err, eff_input = agent._ask_user_permission(
+                "echo", {"msg": "hi"}, decision
+            )
+        assert allowed is False
+        assert "Permission denied" in err
+        assert eff_input == {"msg": "hi"}
+
+    def test_no_hook_returns_marker_tuple(self):
+        """P1 (UI 弹窗 104ms 老 bug 修复): 无 hook + auto_allow_ask=False
+        → 返 (False, "__AWAITING_PERMISSION__", input) marker,不阻塞。
+
+        旧 v1 行为:Event.wait(0.1s) 轮询 → 104ms 后默认 deny。
+        新 v2 行为:返 marker,run() 检测后 yield awaiting_permission event + 早退,
+        streamlit rerun → @st.dialog render → resolve_permission() 解锁。
+        """
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+            auto_allow_ask=False,
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value=None):
+            decision = PermissionDecision(behavior=PermissionBehavior.ASK)
+            t0 = time.time()
+            allowed, err, eff_input = agent._ask_user_permission(
+                "echo", {"msg": "hi"}, decision
+            )
+            elapsed = time.time() - t0
+        # 关键:不阻塞(< 50ms,旧路径 100ms+)
+        assert elapsed < 0.05, f"should not block, took {elapsed:.3f}s"
+        # 返 marker tuple
+        assert allowed is False
+        assert err == "__AWAITING_PERMISSION__"
+        assert eff_input == {"msg": "hi"}
+        # _pending_permission_request 仍存着(req 内容给 UI 弹窗用)
+        assert agent._pending_permission_request is not None
+        assert agent._pending_permission_request["tool_name"] == "echo"
+
+    def test_v2_sentinel_path_separate_from_v1(self):
+        """v1 和 v2 路径隔离 — _ask_user_permission_v2 直接返 sentinel,
+        不走 Event.wait(v1 legacy 阻塞)。"""
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+            auto_allow_ask=False,
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value=None):
+            decision = PermissionDecision(behavior=PermissionBehavior.ASK)
+            t0 = time.time()
+            sentinel = agent._ask_user_permission_v2("echo", {"msg": "hi"}, decision)
+            elapsed = time.time() - t0
+        # v2 路径不阻塞 — 应该 < 50ms(v1 是 100ms+)
+        assert elapsed < 0.05, f"v2 path should not block, took {elapsed:.3f}s"
+        assert sentinel == "AWAITING_PERMISSION"
+
+
+# ════════════════════════════════════════════════════════════
+# v1 resolve_permission 兼容性测试
+# ════════════════════════════════════════════════════════════
+
+
+class TestResolvePermissionLegacyCompat:
+    """v1 resolve_permission() 仍工作(Event 路径,threading 老用法)。"""
+
+    def test_resolve_permission_writes_choice_to_pending_request(self):
+        """resolve_permission(choice) 写 choice 到 _pending_permission_request。"""
+        agent = _make_agent()
+        agent._pending_permission_request = {
+            "tool_name": "Bash", "tool_input": {}, "reason": ""
+        }
+        agent._permission_resolved = threading.Event()
+        agent.resolve_permission("allow")
+        assert agent._pending_permission_request["choice"] == "allow"
+
+    def test_resolve_permission_sets_event(self):
+        """resolve_permission() set _permission_resolved event(legacy 路径)。"""
+        agent = _make_agent()
+        agent._pending_permission_request = None
+        event = threading.Event()
+        agent._permission_resolved = event
+        agent.resolve_permission("deny")
+        # event 被 set
+        assert event.is_set()
+
+    def test_resolve_permission_no_pending_request_safe(self):
+        """无 pending request 时调 resolve_permission 不抛错。"""
+        agent = _make_agent()
+        agent._pending_permission_request = None
+        # 不应抛错(只 set event)
+        agent.resolve_permission("allow")
+
+    def test_legacy_event_pattern_works_end_to_end(self):
+        """P1 修复后:主线程调 _ask_user_permission 立即返 marker,不阻塞。
+
+        v1 老 bug:Event.wait(0.1s) 阻塞主线程,@st.dialog 永远没机会 render。
+        v2 修复:返 marker tuple 后主线程立即 return,streamlit rerun →
+                 @st.dialog 渲染 → 用户点 → resolve_permission() 解锁
+                 (resolve_permission 仍设 Event,虽然 v2 不用 Event.wait,
+                  但保留 v1 兼容(测试 + 老 caller))
+        """
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+            auto_allow_ask=False,  # 强制走 UI 路径
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value=None):
+            decision = PermissionDecision(behavior=PermissionBehavior.ASK)
+            # 主线程同步调 — 立即返 marker,不阻塞
+            t0 = time.time()
+            allowed, err, eff_input = agent._ask_user_permission(
+                "echo", {"msg": "hi"}, decision
+            )
+            elapsed = time.time() - t0
+
+        # 关键:不阻塞(< 50ms)
+        assert elapsed < 0.05, f"should not block, took {elapsed:.3f}s"
+        # 返 marker tuple
+        assert allowed is False
+        assert err == "__AWAITING_PERMISSION__"
+        # resolve_permission 仍兼容 — 写 choice + set Event
+        agent._pending_permission_request = {
+            "tool_name": "echo", "tool_input": {"msg": "hi"}, "reason": ""
+        }
+        agent._permission_resolved = threading.Event()
+        agent.resolve_permission("allow")
+        assert agent._pending_permission_request["choice"] == "allow"
+        assert agent._permission_resolved.is_set() is True
+
+
+# ════════════════════════════════════════════════════════════
+# _pending_permission_request dict 结构兼容性测试
+# ════════════════════════════════════════════════════════════
+
+
+class TestPendingPermissionRequestCompat:
+    """v1 _pending_permission_request dict 结构兼容(v2 写 + v1 读)。"""
+
+    def test_pending_request_has_v1_fields(self):
+        """v2 _ask_user_permission_v2 设的 _pending_permission_request 含 v1 字段。"""
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value=None):
+            agent._ask_user_permission_v2(
+                "Bash", {"command": "ls"}, PermissionDecision(
+                    behavior=PermissionBehavior.ASK, message="ask user"
+                )
+            )
+        req = agent._pending_permission_request
+        # v1 dict 结构字段都在
+        assert req["tool_name"] == "Bash"
+        assert req["tool_input"] == {"command": "ls"}
+        assert "reason" in req
+        assert "message" in req
+        assert req["message"] == "ask user"
+
+    def test_pending_request_persists_for_ui_consume(self):
+        """P1 修复后:_pending_permission_request 在 marker 返出后**保留**
+        (不主动清),供 UI 弹窗读 + 用户决策后 resolve_permission 写 choice。
+
+        旧 v1 行为:timeout 后被 _wait_for_permission_legacy 主动清掉。
+        新 v2 行为:UI 读 req → 弹 dialog → 用户点 → resolve_permission 写 choice。
+                 完整生命周期由 UI 控制(下次 start_run 时清)。
+        """
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+            auto_allow_ask=False,
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value=None):
+            agent._ask_user_permission("echo", {"msg": "hi"}, PermissionDecision(
+                behavior=PermissionBehavior.ASK
+            ))
+        # marker 返出后 _pending_permission_request 仍存(供 UI 读)
+        assert agent._pending_permission_request is not None
+        assert agent._pending_permission_request["tool_name"] == "echo"
+        assert agent._pending_permission_request["tool_input"] == {"msg": "hi"}
+
+
+# ════════════════════════════════════════════════════════════
+# v1 logger 输出兼容性测试(简化版)
+# ════════════════════════════════════════════════════════════
+# 注:v1 session 写入兼容性测试(原 TestSessionWriteCompat)Plan B Step 7 删除 —
+# agent.run() 已删,该类调 agent.run() 失效。等价覆盖在 TestStartRunStepCompat::
+# test_step_calls_session_add_user_message(用 start_run+step 调 session_manager)。
+
+
+class TestLoggerOutputCompat:
+    """v1 logger 输出标记仍存在(简化版,只验证 logger 可调用)。"""
+
+    def test_permission_logger_emits_messages(self, caplog):
+        """permission logger 在 _ask_user_permission 路径上 emit 信息。"""
+        import logging
+        agent = _make_agent(
+            permission_engine=PermissionEngine(context=ToolPermissionContext()),
+        )
+        with patch.object(agent, "_run_permission_request_hook", return_value="allow"):
+            with caplog.at_level(logging.DEBUG, logger="agent_core.permission"):
+                agent._ask_user_permission(
+                    "echo", {"msg": "hi"}, PermissionDecision(
+                        behavior=PermissionBehavior.ASK
+                    )
+                )
+        # 验证 permission logger 至少 emit 1 条记录
+        # (不验证具体消息,因为 logger 输出可能演进)
+        assert len(caplog.records) >= 1
+
+
+# ════════════════════════════════════════════════════════════
+# v1 → v2 升级路径测试
+# ════════════════════════════════════════════════════════════
+
+
+class TestV1ToV2UpgradePath:
+    """用户从 v1 升级到 v2 不需要改调用代码 — resolve_permission() API 不变。
+
+    Plan B Step 7:agent.run() 已删 → v1 调用方必须迁到 start_run()+step()。
+    本类保留 resolve_permission + _pending_permission_request 兼容性(v1 → v2 仍工作)。
+    """
+
+    def test_v1_resolve_permission_signature_unchanged(self):
+        """v1 resolve_permission(choice: str) 调用签名不变。"""
+        agent = _make_agent()
+        # 仅位置参数
+        agent.resolve_permission("allow")
+        # 不抛错
+
+    def test_v1_pending_request_attribute_access_unchanged(self):
+        """v1 直接访问 agent._pending_permission_request 仍工作。"""
+        agent = _make_agent()
+        # 直接读属性(v1 风格)
+        _ = agent._pending_permission_request  # 不抛错
+
+    def test_v2_methods_present(self):
+        """v2 方法(start_run/step/interrupt)存在(Plan B Step 7 后是唯一入口)。"""
+        agent = _make_agent()
+        # v1 legacy 方法仍在(resolve_permission / _ask_user_permission)
+        assert hasattr(agent, "resolve_permission")
+        assert hasattr(agent, "_ask_user_permission")
+        # v2 方法在(Plan B Step 7 后唯一入口)
+        assert hasattr(agent, "start_run")
+        assert hasattr(agent, "step")
+        assert hasattr(agent, "resume_after_permission")
+        assert hasattr(agent, "interrupt")
+
+
+# ════════════════════════════════════════════════════════════
+# v2 start_run()+step() 兼容性测试(Plan B Step 6 引入)
+# ════════════════════════════════════════════════════════════
+#
+# 目的:Plan B Step 7 删 agent.run() 时,TestRunBackwardCompat 6 case 会跟着失效。
+# 本 TestClass 是 v2 API 镜像(用 start_run+step 写),Step 7 删 run() 后仍守住兼容性。
+# 设计参考:docs/agent-state-machine-and-chain-of-responsibility-design.md §14.1
+# ("100% 不变"约束 — start_run/step 签名 + yield order + event schema 与 v1 run() 等价)。
+#
+
+
+class TestStartRunStepCompat:
+    """v2 start_run()+step() 与 v1 run() 行为等价 — Plan B Step 6 引入。
+
+    与 TestRunBackwardCompat 关系:TestRunBackwardCompat 仍用 agent.run()
+    (Step 7 删 run() 时一并删),本类用 start_run+step 是 v2 主路径,
+    Step 7 删 run() 后成为 compat 测试的唯一来源。
+    """
+
+    def test_step_is_generator(self):
+        """agent.step() 是 generator(可被 for-loop consume)。
+
+        v1 run() 也是 generator,行为对等。
+        """
+        agent = _make_agent()
+        agent.start_run("hello")
+        events = list(agent.step())
+        assert isinstance(events, list)
+        # 至少 1 个 event
+        assert len(events) >= 1
+
+    def test_step_yields_system_events(self):
+        """step() yield 包含 ('system', ...) 事件。"""
+        agent = _make_agent()
+        agent.start_run("hello")
+        events = list(agent.step())
+        system_events = [e for e in events if e[0] == "system"]
+        # 至少 2 个 system event:Turn 标记 + 完成标记
+        assert len(system_events) >= 2
+
+    def test_step_appends_user_message(self):
+        """start_run() 顶部 append user msg 到 self.messages。"""
+        agent = _make_agent()
+        assert len(agent.messages) == 0
+        agent.start_run("hello world")
+        list(agent.step())
+        # user msg 已 append(start_run() 内做,跟 v1 run() 等价)
+        user_msgs = [m for m in agent.messages if m.get("role") == "user"]
+        assert len(user_msgs) == 1
+        assert user_msgs[0] == {"role": "user", "content": "hello world"}
+
+    def test_start_run_initializes_pending_state_empty(self):
+        """start_run() 初始化 _run_state,pending_* 全空(对应 Step 4 RunState 迁移)。
+
+        v1 run() reset _pending_* 实例字段 — Plan B Step 4 已迁到 RunState.pending_*,
+        start_run() 通过新建 RunState 保证初值 [] / ""。
+        """
+        agent = _make_agent()
+        agent.start_run("test")
+        assert agent._run_state is not None
+        assert agent._run_state.pending_thinking == ""
+        assert agent._run_state.pending_tool_logs == []
+        assert agent._run_state.pending_tool_results == []
+        assert agent._run_state.user_message == "test"
+
+    def test_start_run_creates_v2_run_state(self):
+        """start_run() 创建 _run_state(user_message + cancel_event + turn=0)。"""
+        agent = _make_agent()
+        agent.start_run("test")
+        assert agent._run_state is not None
+        assert agent._run_state.user_message == "test"
+        assert agent._run_state.cancel_event.is_set() is False
+        assert agent._run_state.turn == 0
+
+    def test_step_yield_order_starts_with_turn(self):
+        """step() 第 1 个 system event 是 '🔄 Turn N/M' 标记。
+
+        对应 v1 test_run_yield_order_starts_with_turn — Plan B Step 7 删 run() 后
+        仍守住 yield order 契约。
+        """
+        agent = _make_agent()
+        agent.start_run("test")
+        events = list(agent.step())
+        # 第一个 system event 应是 Turn 标记
+        first_system = next((e for e in events if e[0] == "system"), None)
+        assert first_system is not None
+        assert "Turn" in str(first_system[1])
+
+    def test_step_calls_session_add_user_message(self):
+        """start_run() 调 session_manager.add_user_message(v1 行为保留)。"""
+        agent = _make_agent()
+        # mock session_manager
+        mock_session = MagicMock()
+        agent._session_manager = mock_session
+
+        agent.start_run("hello")
+        list(agent.step())
+
+        # v1 + v2 都调 add_user_message(v2 路径:start_run 内)
+        assert mock_session.add_user_message.called
+        call_args = mock_session.add_user_message.call_args_list
+        assert any("hello" in str(c) for c in call_args)

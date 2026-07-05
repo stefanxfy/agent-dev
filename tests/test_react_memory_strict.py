@@ -11,6 +11,7 @@ from agent_core.memory.react_memory_bridge import (
     ReactMemoryBridge,
     MemoryEventKind,
 )
+from agent_core.session_counter import EXTRACTION, SessionCounter
 from agent_core.memory.dual_channel_writer import DualChannelWriter
 from agent_core.memory.extraction_gate import ExtractionGate
 from agent_core.memory.memory_store import MemoryStore
@@ -55,7 +56,7 @@ def test_persist_turn_writes_to_memory_tasks():
         # daily_cursor 初始为 0,turn_index=0 会被短路;这里用 1 绕过.
         list(bridge.on_turn_end(
             user_msg="hello", assistant_resp="hi",
-            turn_index=1, input_tokens=100, output_tokens=50, tool_calls_in_turn=0,
+            turn_index=1, counter=SessionCounter(),
         ))
         with dual.meta_db.transaction() as conn:
             row = conn.execute(
@@ -82,14 +83,16 @@ def test_gate1_clears_counter_after_extract():
         '"source_quote": "我叫张三"}]}'
     )
     try:
-        # 累计到 12K(过门1)
+        # 累计到 12K(过门1)— token 在 SessionCounter 累计(资源发生点模型)
+        counter = SessionCounter()
+        counter.add_token(12000)
         list(bridge.on_turn_end(
             user_msg="Python 协程", assistant_resp="asyncio",
-            turn_index=0, input_tokens=6000, output_tokens=6000, tool_calls_in_turn=0,
+            turn_index=0, counter=counter,
         ))
-        # 跑完后累计应清零
-        assert bridge.cumulative_tokens == 0
-        assert bridge.cumulative_tool_calls == 0
+        # gate1 过 → mark_token(EXTRACTION) → since 归零
+        assert counter.since_token(EXTRACTION) == 0
+        assert counter.since_tool(EXTRACTION) == 0
     finally:
         bridge.shutdown(timeout=5)
         dual.shutdown(timeout=5)
@@ -105,13 +108,15 @@ def test_gate2_does_not_clear_counter():
     )
     try:
         # 累计 200(没过门1,但有"记住"关键词)
+        counter = SessionCounter()
+        counter.add_token(200)
         list(bridge.on_turn_end(
             user_msg="记住我叫张三", assistant_resp="好",
-            turn_index=0, input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+            turn_index=0, counter=counter,
         ))
-        # 累计应保留(门2 跑完不清零)
-        assert bridge.cumulative_tokens == 200
-        assert bridge.cumulative_tool_calls == 0
+        # 门2 跑完不清零(只有 gate1 via 才 mark)→ since 保留
+        assert counter.since_token(EXTRACTION) == 200
+        assert counter.since_tool(EXTRACTION) == 0
     finally:
         bridge.shutdown(timeout=5)
         dual.shutdown(timeout=5)
@@ -144,9 +149,11 @@ def test_extract_prompt_has_no_existing_memories_block():
             source_quote="turn 1", tags=[],
             extra={"session_id": "s1", "turn_index": 1},
         )
+        counter = SessionCounter()
+        counter.add_token(12000)  # 过 gate1 cumulative 阈值 → gate2 LLM 被调
         list(bridge.on_turn_end(
             user_msg="Python", assistant_resp="解释",
-            turn_index=5, input_tokens=6000, output_tokens=6000, tool_calls_in_turn=0,
+            turn_index=5, counter=counter,
         ))
         assert len(captured_prompts) > 0
         user_msg = captured_prompts[0][-1]["content"]

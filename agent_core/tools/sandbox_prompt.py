@@ -10,7 +10,14 @@ $TMPDIR 处理:CC 把它字面量化(替换成实际 sandbox tmp dir 路径)注�
 
 from __future__ import annotations
 
+import logging
+
 from .sandbox_manager import sandbox_manager
+from .sandbox_backends._cleanup import get_sandbox_tmp_dir
+
+
+# ⚙️ sandbox 子系统 logger
+sandbox_logger = logging.getLogger("agent_core.sandbox")
 
 
 def get_sandbox_prompt_section() -> str:
@@ -29,10 +36,16 @@ def get_sandbox_prompt_section() -> str:
     - strict mode(allow_unsandboxed_commands=False)追加 STRICT MODE 块
     """
     if not sandbox_manager.is_sandbox_enabled():
+        sandbox_logger.debug("⚙️ [sandbox_prompt_empty] sandbox not enabled → return empty")
         return ""
+    sandbox_logger.debug(
+        "⚙️ [sandbox_prompt_build] strict_mode=%s tmpdir=%s",
+        not sandbox_manager._config.allow_unsandboxed_commands,
+        get_sandbox_tmp_dir(),
+    )
 
     cfg = sandbox_manager._config
-    tmpdir_literal = sandbox_manager._get_sandbox_tmp_dir()  # 字面化,非 $TMPDIR
+    tmpdir_literal = get_sandbox_tmp_dir()  # 字面化,非 $TMPDIR
     strict_mode = not cfg.allow_unsandboxed_commands
 
     fs_read = cfg.fs_allow_read or []
@@ -83,4 +96,8 @@ fails inside the sandbox, you must work around the restriction by:
   - or asking the user to explicitly run the command outside this session
 """
 
+    sandbox_logger.info(
+        "⚙️ [sandbox_prompt_built] length=%d strict_mode=%s",
+        len(prompt), strict_mode,
+    )
     return prompt

@@ -511,9 +511,7 @@ class TestSandboxAutoAllow:
     @pytest.fixture
     def enabled_sandbox(self, reset_sandbox):
         reset_sandbox.load_config({"enabled": True, "autoAllowBashIfSandboxed": True})
-        with patch.object(reset_sandbox, "_is_supported_platform", return_value=True), \
-             patch.object(reset_sandbox, "_check_dependencies", return_value=True), \
-             patch.object(reset_sandbox, "initialize", lambda: setattr(reset_sandbox, "_initialized", True)):
+        with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True):
             yield reset_sandbox
 
     def test_sandbox_auto_allow_when_all_clean(self, enabled_sandbox):
@@ -538,9 +536,7 @@ class TestSandboxAutoAllow:
             "enabled": True,
             "autoAllowBashIfSandboxed": False,
         })
-        with patch.object(reset_sandbox, "_is_supported_platform", return_value=True), \
-             patch.object(reset_sandbox, "_check_dependencies", return_value=True), \
-             patch.object(reset_sandbox, "initialize", lambda: setattr(reset_sandbox, "_initialized", True)):
+        with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True):
             ctx = _ctx()
             decision = bash_check_permissions({"command": "npm install"}, ctx)
         assert decision.behavior == PermissionBehavior.PASSTHROUGH.value
@@ -563,9 +559,7 @@ class TestCheckSandboxAutoAllow:
     @pytest.fixture
     def enabled_sandbox(self, reset_sandbox):
         reset_sandbox.load_config({"enabled": True})
-        with patch.object(reset_sandbox, "_is_supported_platform", return_value=True), \
-             patch.object(reset_sandbox, "_check_dependencies", return_value=True), \
-             patch.object(reset_sandbox, "initialize", lambda: setattr(reset_sandbox, "_initialized", True)):
+        with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True):
             yield reset_sandbox
 
     def test_all_clean_returns_allow(self, enabled_sandbox):

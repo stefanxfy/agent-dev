@@ -19,6 +19,7 @@ from agent_core.memory.dual_channel_writer import (
 )
 from agent_core.memory.extraction_gate import ExtractionGate, TurnContext
 from agent_core.memory.latency import LatencyTimeout
+from agent_core.session_counter import EXTRACTION
 
 logger = logging.getLogger("memory.react_bridge")
 
@@ -82,9 +83,8 @@ class ReactMemoryBridge:
         self.memory_store = memory_store
         self.session_id = session_id
 
-        # 会话级累计(每次 new bridge 都从 0 开始)
-        self.cumulative_tokens = 0
-        self.cumulative_tool_calls = 0
+        # token/tool 计数已下沉到 SessionCounter(agent.session_counter,2026-07-03);
+        # bridge 不再 own,extraction 通过 on_turn_end 的 counter 参数 since/mark。
 
         # M10 C1.2: secret 事件 queue(executor 线程 → generator 线程)
         self._pending_secret_events: list[MemoryEvent] = []
@@ -116,16 +116,14 @@ class ReactMemoryBridge:
         user_msg: str,
         assistant_resp: str,
         turn_index: int,
-        input_tokens: int,
-        output_tokens: int,
-        tool_calls_in_turn: int,
+        counter,  # SessionCounter — extraction 消费 tool/token(since_*/mark_* + EXTRACTION)
     ) -> Iterator[MemoryEvent]:
         # M10 C1.2: 先 drain 之前 turn 的 secret 事件
         yield from self._drain_secret_events()
 
-        # 1. 累计 token / tool
-        self.cumulative_tokens += input_tokens + output_tokens
-        self.cumulative_tool_calls += tool_calls_in_turn
+        # 1. token/tool 累计已下沉到 SessionCounter(资源发生点记账:ToolExecuteHandler /
+        #    LLM handler)。bridge 此处只作 extraction 消费者:下面构造 TurnContext 读
+        #    counter.since_*(EXTRACTION),gate1 通过后 mark 推进水位(替代原"清零预算窗口")。
 
         # 2. persist_turn(同步,无 LLM)
         # Bug 1 修复(2026-06-24):不传 turn_index,让 persist_turn 内部用 daily_cursor + 1
@@ -170,8 +168,8 @@ class ReactMemoryBridge:
         ]
         ctx = TurnContext(
             session_id=self.session_id,
-            cumulative_tokens=self.cumulative_tokens,
-            cumulative_tool_calls=self.cumulative_tool_calls,
+            cumulative_tokens=counter.since_token(EXTRACTION),
+            cumulative_tool_calls=counter.since_tool(EXTRACTION),
             last_messages=current_turn_messages,
         )
         # M10 C6.2 + C6.3: 预算/超时异常 → yield 对应 MemoryEvent,跳过本轮
@@ -208,11 +206,11 @@ class ReactMemoryBridge:
             candidates_count=len(decision.candidates),
         )
 
-        # 4. ★ 门1 跑完清零 token/工具预算窗口(只在 LLM 评分过 0.6 时)
+        # 4. ★ 门1 跑完推进 extraction 水位(原"清零预算窗口",2026-07-03 改 watermark)
         if decision.via_gate1:
-            self.cumulative_tokens = 0
-            self.cumulative_tool_calls = 0
-            logger.info(f"门1 跑完清零 token/工具预算窗口 (turn={turn_index})")
+            counter.mark_token(EXTRACTION)
+            counter.mark_tool(EXTRACTION)
+            logger.info(f"门1 跑完推进 extraction 水位 (turn={turn_index})")
 
         # 5. extract_candidates(异步)
         # Bug 1b:用 persist_turn 写回的 session-global cursor,而非 run-local turn_index,

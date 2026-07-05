@@ -68,7 +68,15 @@ def test_handle_permission_dialog_defined():
 
 
 def test_run_agent_wraps_permission():
-    """run_agent 包装了 _pending_permission_request 检查"""
+    """Plan A (2026-06-30): run_agent 走 start_run + step 循环。
+
+    权限 dialog 不再由 run_agent 触发(避免阻塞),而是在 _run_phase ==
+    "awaiting_permission" 时由顶层触发 _handle_permission_dialog。
+    验证:
+    - run_agent 调 agent.start_run() + agent.step()(v2 状态机入口)
+    - 检测 awaiting_permission event 后 yield + return(不阻塞)
+    - 顶层有 _handle_permission_dialog 触发点
+    """
     from pathlib import Path
     app_path = Path(__file__).parent.parent / "web" / "app.py"
     if not app_path.exists():
@@ -76,7 +84,7 @@ def test_run_agent_wraps_permission():
         pytest.skip("web/app.py not found")
 
     content = app_path.read_text(encoding="utf-8")
-    # 验证 run_agent 函数体内有 permission 检查
+    # 验证 run_agent 函数体内有 start_run + step(v2 状态机入口)
     run_agent_idx = content.find("def run_agent")
     assert run_agent_idx > 0
     # 取函数体片段
@@ -84,8 +92,15 @@ def test_run_agent_wraps_permission():
     if next_def == -1:
         next_def = len(content)
     run_agent_body = content[run_agent_idx:next_def]
-    assert "_pending_permission_request" in run_agent_body
-    assert "_handle_permission_dialog" in run_agent_body
+    # v2 入口(替代 v1 的 agent.run(user_input))
+    assert "agent.start_run" in run_agent_body, "Plan A: run_agent must call agent.start_run"
+    assert "agent.step" in run_agent_body, "Plan A: run_agent must call agent.step"
+    # awaiting_permission 早退(避免阻塞 streamlit rerun)
+    assert "awaiting_permission" in run_agent_body
+    # resume_after_permission(替代 v1 的 resolve_permission)
+    assert "resume_after_permission" in content
+    # 顶层触发 dialog(避免阻塞)
+    assert "_handle_permission_dialog(agent)" in content
 
 
 def test_get_agent_injects_permission_engine():

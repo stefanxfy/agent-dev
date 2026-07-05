@@ -59,18 +59,20 @@ def _ctx(**kwargs):
 
 def _enabled_sandbox_fixture(auto_allow=True):
     """返回一个 enabled sandbox 的 patch context manager stack(手动进/出)"""
+    from agent_core.tools.sandbox_backends import NativeBackend
+
     mgr = SandboxManager()
     mgr.load_config({"enabled": True, "autoAllowBashIfSandboxed": auto_allow})
+    mgr.configure_backends([NativeBackend()])  # 注入 native backend(macOS/Linux 真实可用)
     return mgr
 
 
 @pytest.fixture
 def enabled_sandbox():
     mgr = _enabled_sandbox_fixture()
-    with patch.object(mgr, "_is_supported_platform", return_value=True), \
-         patch.object(mgr, "_check_dependencies", return_value=True), \
-         patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+    with patch.object(mgr, "is_sandbox_enabled", return_value=True):
         yield mgr
+    mgr._reset_for_testing()  # teardown:清单例状态,避免污染其他测试
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -128,7 +130,7 @@ class TestBareGitScrubRegression:
         evil_git.mkdir()
         (evil_git / "config").write_text("[alias] x = !rm -rf /")
 
-        with patch.object(sandbox_manager, "_get_sandbox_tmp_dir", return_value=str(fake_tmp)):
+        with patch("agent_core.tools.sandbox_backends._cleanup.get_sandbox_tmp_dir", return_value=str(fake_tmp)):
             sandbox_manager.cleanup_after_command()
         assert not evil_git.exists()
 
@@ -243,7 +245,7 @@ class TestBashToolE2E:
         with patch("agent_core.tools.builtin.subprocess.run", spy_run):
             registry.execute("Bash", {"command": "echo wrap_me"})
         # sandbox 启用 → 命令被 wrap(含 npx)
-        assert any("npx" in str(c) for c in captured_cmds)
+        assert any("sandbox-exec" in str(c) for c in captured_cmds)
 
     def test_bash_dangerously_disable_skips_wrap(self, enabled_sandbox):
         registry = ToolRegistry()
@@ -381,8 +383,8 @@ class TestSandboxTmpAndCleanup:
         import tempfile
         monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
         monkeypatch.setattr(os, "getuid", lambda: 54321, raising=False)
-        from agent_core.tools.sandbox_manager import sandbox_manager
-        result = sandbox_manager._get_sandbox_tmp_dir()
+        from agent_core.tools.sandbox_backends._cleanup import get_sandbox_tmp_dir
+        result = get_sandbox_tmp_dir()
         result_path = Path(result)
         assert result_path.exists()
         assert (result_path.stat().st_mode & 0o777) == 0o700
@@ -393,9 +395,9 @@ class TestSandboxTmpAndCleanup:
         old_time = time.time() - 25 * 3600
         os.utime(old, (old_time, old_time))
 
-        from agent_core.tools.sandbox_manager import sandbox_manager
-        with patch.object(sandbox_manager, "_get_sandbox_tmp_dir", return_value=str(tmp_path)):
-            sandbox_manager._cleanup_sandbox_tmp_dir(max_age_hours=24.0)
+        from agent_core.tools.sandbox_backends._cleanup import cleanup_sandbox_tmp_dir
+        with patch("agent_core.tools.sandbox_backends._cleanup.get_sandbox_tmp_dir", return_value=str(tmp_path)):
+            cleanup_sandbox_tmp_dir(max_age_hours=24.0)
         assert not old.exists()
 
 
@@ -406,21 +408,23 @@ class TestSandboxTmpAndCleanup:
 class TestSystemPromptE2E:
     def _make_agent(self, sandbox_enabled):
         from agent_core.agent_core import ReactAgent
+        from agent_core.turn_chain import SystemPromptAssembler
         agent = ReactAgent.__new__(ReactAgent)
         agent.permission_engine = PermissionEngine(context=_ctx(sandbox_enabled=sandbox_enabled))
         agent.system_prompt = "You are a helpful agent."
         agent.memory_index = None
+        agent._assembler = SystemPromptAssembler(agent)  # 手动建,不走 __init__
         return agent
 
     def test_prompt_includes_sandbox_section_when_enabled(self, enabled_sandbox):
         agent = self._make_agent(sandbox_enabled=True)
-        prompt = agent._build_system_prompt_with_memory()
+        prompt = agent._assembler.build()
         assert "## Command sandbox" in prompt
         assert "You are a helpful agent." in prompt
 
     def test_prompt_omits_sandbox_section_when_disabled(self):
         agent = self._make_agent(sandbox_enabled=False)
-        prompt = agent._build_system_prompt_with_memory()
+        prompt = agent._assembler.build()
         assert "## Command sandbox" not in prompt
 
 

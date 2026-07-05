@@ -24,7 +24,7 @@ _logger = logging.getLogger("agent_core.agent_state")
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 
 # 抑制 unused import 警告(forward reference)
@@ -103,6 +103,10 @@ class RunState:
     """
     cancel_event: threading.Event = field(default_factory=threading.Event)
     turn: int = 0
+    # R5 修复(2026-07-01): 记录 LLM_THINKING 进入次数(每次 enter 增 1),
+    # 让 MaxTurnsTermination 在 SM 链式 self-trigger(LLM_THINKING ⇄ EXECUTING_TOOLS)
+    # 内也能正确终止(turn 在链内不变 → 旧 check 永不命中)。
+    tool_call_cycles: int = 0
     # A1-H2 (review 修复): 记录 run 起点 wall-clock 给 TimeoutTermination 用
     # 用 time.monotonic() 防系统时间漂移。
     created_at: float = field(default_factory=time.monotonic)
@@ -117,8 +121,21 @@ class RunState:
     pending_thinking: str = ""
     surfaced_memories: set = field(default_factory=set)
     awaiting_permission: Optional[dict] = None
+    # 2026-07-02 引入(Plan B 完整实现 PermissionCheckHandler 拆分):
+    # PermissionCheckHandler 看到 batch 中 ≥1 ASK 时,把整 batch 的 permission request
+    # 列表写到这里(back-compat:awaiting_permission 单字段仍填 batch[0],web/app.py 读它)。
+    # 下游 multi-req UI 改造时可以读 awaiting_permission_batch 全 list。
+    # resume 后 PermissionCheckHandler 已走 _is_resume 路径(整 batch pre-ALLOW),
+    # 不再读这个字段,只有清理时被清空。
+    awaiting_permission_batch: List[Dict[str, Any]] = field(default_factory=list)
     termination_reason: Optional[str] = None
     logger: logging.Logger = field(default_factory=lambda: logging.getLogger("agent_core.run"))
+    # Plan B Final Phase Step 2 (2026-07-02):L3 SessionMemory extract trigger 返回的
+    # Future(fire-and-forget,sm_layer 后台 ThreadPoolExecutor 跑 extract_incremental)。
+    # 移到 RunState 而不是 ReactAgent 属性的原因:start_run() 每次重置 RunState,
+    # 上一 run 的 stale future 自动丢弃,不需要手动清空。L3SMExtractTriggerHandler
+    # 写一次, 测试或后续 block 等待可以读它(参考 v1 run() L1817)。
+    pending_sm_extract_future: Optional[Any] = None
 
 
 # ────────────────────────────────────────────────────────────
@@ -245,13 +262,24 @@ class TerminationCondition(ABC):
 
 
 class MaxTurnsTermination(TerminationCondition):
-    """达到 max_turns 强制终止。"""
+    """达到 max_turns 强制终止。
+
+    Plan B R5 修复 (2026-07-01):看 turn + tool_call_cycles 任一 ≥ max。
+
+    - turn:`_new_turn_ctx()` 每 drive +1(v1 模式 / 每次 step() 边界)
+    - tool_call_cycles:LLMThinkingPhase.enter 入口每 LLM_THINKING 进入 +1
+      (v2 链式 self-trigger 内 LLM_THINKING ⇄ EXECUTING_TOOLS 反复 enter)
+
+    两者都生效:既兼容 v1 行为(turn 数到 max 终止),又修复 R5(v2 链式
+    self-trigger 内 LLM 持续 tool_call 时 cycles 数到 max 终止)。
+    """
 
     def __init__(self, max_turns: int):
         self._max = max_turns
 
     def check(self, run_state: RunState, turn_ctx: TurnContext) -> Optional[str]:
-        if run_state.turn >= self._max:
+        # 任一 ≥ max 即触发终止
+        if run_state.turn >= self._max or run_state.tool_call_cycles >= self._max:
             return f"max_turns_reached ({self._max})"
         return None
 
@@ -509,8 +537,28 @@ class LLMThinkingPhase(Phase):
     - permission_request 非空 → AWAITING_PERMISSION
     - 无 tool_call → FINALIZING
     - 有 tool_call → EXECUTING_TOOLS
+
+    R5 修复(2026-07-01):enter 入口增 `run_state.tool_call_cycles` 计数,
+    让 SM 链式 self-trigger 内 LLM_THINKING ⇄ EXECUTING_TOOLS 反复 enter
+    时,MaxTurnsTermination 能正确终止(看 cycles ≥ max)。
     """
     def enter(self, trigger: str, ctx: PhaseContext) -> Iterator[Event]:
+        # R5:每次进入 LLM_THINKING 累加 cycle,SM 入口 termination.check
+        # 在下次递归 trigger 时会看到新 cycles → LLM 持续 tool_call 时
+        # 链式循环到 max_turns 终止
+        ctx.run_state.tool_call_cycles += 1
+        # Fix allow-loop(2026-07-03):清 turn_ctx.stage_outputs 残留。_is_resume 路径
+        # (EXECUTING_TOOLS 的 PermissionCheckHandler)会重建 stage_outputs 写到 turn_ctx,
+        # SM 链式推进到 LLM_THINKING 时共享 turn_ctx → stage_outputs 残留非 None →
+        # ChunkParseHandler 误跳过 LLM stream 消费(见 turn_chain.py ChunkParse SKIP)→
+        # 用旧 tool_calls → allow-loop。LLM_THINKING 每轮都该重新调 LLM,进 phase 前清掉。
+        ctx.turn_ctx.stage_outputs = None
+        # Fix snapshot-stale(2026-07-04,本次修复):同样清 stage_inputs。
+        # SM 链式递归触发多个 phase(agent_state.py:437 yield from self.trigger)共享同 turn_ctx,
+        # 若不显式作废,SystemPromptHandler(turn_chain.py:906)看到 stage_inputs 非 None 会跳过
+        # snapshot → LLMCallHandler 用旧的 tool_call 前快照(不含 tool_result)→ LLM 看不到
+        # 工具结果 → 重复发 tool_use → 死循环。对称于 stage_outputs 清残留。
+        ctx.turn_ctx.stage_inputs = None
         yield from self._chain.run(ctx.turn_ctx)
 
     def next(self, trigger: str, ctx: PhaseContext) -> tuple[str, AgentPhase]:
@@ -548,9 +596,13 @@ class AwaitingPermissionPhase(Phase):
 class ExecutingToolsPhase(Phase):
     """EXECUTING_TOOLS 阶段:执行 tool_call + 写 tool_result。
 
-    Plan A: 检测 turn_ctx.permission_request(由 ToolExecuteHandler 在
-    _iter_phase_tools 写入)→ 若有,转 AWAITING_PERMISSION 暂停。
+    Plan A: 检测 turn_ctx.permission_request(由 PermissionCheckHandler 在
+    tool_chain 首位写入 — ASK 路径时同步设 ctx.permission_request + 强制
+    SM 转 AWAITING_PERMISSION)→ 若有,转 AWAITING_PERMISSION 暂停。
     否则正常回 LLM_THINKING 走下一轮。
+
+    2026-07-02 SRP 拆分:_iter_phase_tools thin orchestrator 已删,permission_request
+    由 PermissionCheckHandler 直接写(不再经过任何中间层)。
     """
     def enter(self, trigger: str, ctx: PhaseContext) -> Iterator[Event]:
         yield from self._chain.run(ctx.turn_ctx)

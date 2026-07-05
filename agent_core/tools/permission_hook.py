@@ -30,6 +30,9 @@ from .permission_types import (
 
 logger = logging.getLogger(__name__)
 
+# 🪝 hook 子系统 logger — 可被 AGENT_LOG_HOOK 单独调级别
+hook_logger = logging.getLogger("agent_core.hook")
+
 
 # ────────────────────────────────────────────────────────────────────
 # PreToolUseResult — hook 返回值
@@ -212,7 +215,12 @@ class HookRegistry:
             聚合后的 PreToolUseResult
         """
         hooks = self._collect_hooks("PreToolUse")
+        hook_logger.debug(
+            "🪝 [pre_tool_use_entry] tool=%s hooks=%d",
+            tool_name, len(hooks),
+        )
         if not hooks:
+            hook_logger.debug("🪝 [pre_tool_use_no_hooks] tool=%s → default allow", tool_name)
             return PreToolUseResult.allow()
 
         # 共享状态(线程安全)
@@ -227,6 +235,10 @@ class HookRegistry:
                 result = entry.callback(tool_name, dict(merged_input), context)
                 result.hook_name = entry.name
                 result.hook_source = entry.source
+                hook_logger.debug(
+                    "🪝 [hook_completed] name=%s source=%s behavior=%s",
+                    entry.name, entry.source, result.behavior,
+                )
                 return result
             except Exception as e:
                 logger.warning(
@@ -241,11 +253,16 @@ class HookRegistry:
 
         # 并行执行
         results: list[PreToolUseResult] = []
+        hook_logger.debug(
+            "🪝 [pre_tool_use_dispatch] tool=%s max_workers=%d",
+            tool_name, self._max_workers,
+        )
         with concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers) as executor:
             futures = {}
             for hook in hooks:
                 if cancel_event.is_set():
                     break  # prevent_continuation 触发,不再提交
+                hook_logger.debug("🪝 [hook_dispatch] name=%s source=%s", hook.name, hook.source)
                 future = executor.submit(_run_hook, hook)
                 futures[future] = hook
 
@@ -264,21 +281,37 @@ class HookRegistry:
                 # 链式 merge updated_input
                 if result.updated_input is not None:
                     merged_input.update(result.updated_input)
+                    hook_logger.debug(
+                        "🪝 [hook_merge_input] hook=%s updated_keys=%s",
+                        result.hook_name, list(result.updated_input.keys()),
+                    )
 
                 # DENY 短路
                 if result.behavior == PermissionBehavior.DENY.value:
                     first_deny.setdefault("result", result)
                     cancel_event.set()
+                    hook_logger.info(
+                        "🪝 [hook_deny_short_circuit] hook=%s reason=%s",
+                        result.hook_name, (result.reason or "")[:120],
+                    )
 
                 # prevent_continuation
                 if result.prevent_continuation:
                     cancel_event.set()
+                    hook_logger.info(
+                        "🪝 [hook_prevent_continuation] hook=%s",
+                        result.hook_name,
+                    )
 
         # 决定最终结果
         if first_deny:
             deny_result = first_deny["result"]
             if deny_result.updated_input is not None:
                 merged_input.update(deny_result.updated_input)
+            hook_logger.info(
+                "🪝 [pre_tool_use_final_deny] tool=%s hook=%s reason=%s",
+                tool_name, deny_result.hook_name, (deny_result.reason or "")[:120],
+            )
             return replace(
                 deny_result,
                 updated_input=merged_input if any(r.updated_input for r in results) else None,
@@ -289,6 +322,10 @@ class HookRegistry:
         if ask_results:
             # 取第一个 ASK(M1 简化:用 first)
             primary = ask_results[0]
+            hook_logger.info(
+                "🪝 [pre_tool_use_final_ask] tool=%s hook=%s reason=%s",
+                tool_name, primary.hook_name, (primary.reason or "")[:80],
+            )
             return replace(
                 primary,
                 updated_input=merged_input if any(r.updated_input for r in results) else None,
@@ -298,6 +335,10 @@ class HookRegistry:
         allow_results = [r for r in results if r.behavior == PermissionBehavior.ALLOW.value]
         if allow_results:
             primary = allow_results[0]
+            hook_logger.debug(
+                "🪝 [pre_tool_use_final_allow] tool=%s hooks_ran=%d",
+                tool_name, len(results),
+            )
             return PreToolUseResult(
                 behavior=PermissionBehavior.ALLOW.value,
                 updated_input=merged_input if any(r.updated_input for r in results) else None,
@@ -344,12 +385,18 @@ class HookRegistry:
             PermissionRequestResult(decision=None 表示走默认 UI)
         """
         hooks = self._collect_hooks("PermissionRequest")
+        hook_logger.debug(
+            "🪝 [permission_request_entry] tool=%s hooks=%d",
+            tool_name, len(hooks),
+        )
         if not hooks:
+            hook_logger.debug("🪝 [permission_request_no_hooks] tool=%s → default UI", tool_name)
             return PermissionRequestResult()
 
         merged_input = dict(tool_input)
         for entry in hooks:
             try:
+                hook_logger.debug("🪝 [permission_request_run] hook=%s", entry.name)
                 result = entry.callback(tool_name, dict(merged_input), context)
                 # 兼容 PermissionRequestResult 和 PreToolUseResult(旧签名)
                 decision = getattr(result, "decision", None) or getattr(result, "behavior", None)
@@ -358,6 +405,10 @@ class HookRegistry:
                     updated = getattr(result, "updated_input", None)
                     if updated:
                         merged_input.update(updated)
+                    hook_logger.info(
+                        "🪝 [permission_request_decision] hook=%s decision=%s reason=%s",
+                        entry.name, decision, (reason or "")[:80],
+                    )
                     return PermissionRequestResult(
                         decision=decision,
                         reason=reason,
@@ -398,6 +449,10 @@ class HookRegistry:
             PermissionDeniedResult(聚合所有 hook 输出)
         """
         hooks = self._collect_hooks("PermissionDenied")
+        hook_logger.debug(
+            "🪝 [permission_denied_entry] tool=%s hooks=%d",
+            tool_name, len(hooks),
+        )
         if not hooks:
             return PermissionDeniedResult()
 
@@ -406,6 +461,7 @@ class HookRegistry:
         context_parts: list[str] = []
         for entry in hooks:
             try:
+                hook_logger.debug("🪝 [permission_denied_run] hook=%s", entry.name)
                 # 兼容 4 参(含 decision)和 3 参(旧签名)hook
                 try:
                     result = entry.callback(tool_name, tool_input, context, decision)
@@ -425,6 +481,13 @@ class HookRegistry:
                     "PermissionDenied hook %s 异常,跳过: %s", entry.name, e,
                 )
                 continue
+        hook_logger.info(
+            "🪝 [permission_denied_result] tool=%s retry_prompt=%s notify=%s context=%s",
+            tool_name,
+            "yes" if retry_parts else "no",
+            "yes" if notify_parts else "no",
+            "yes" if context_parts else "no",
+        )
         return PermissionDeniedResult(
             retry_prompt="\n".join(retry_parts) if retry_parts else None,
             notify_message="\n".join(notify_parts) if notify_parts else None,
@@ -484,8 +547,13 @@ def default_secret_hook(
     if tool_name not in _SECRET_CHECK_TOOLS:
         return PreToolUseResult.allow(hook_name="default_secret")
 
+    hook_logger.debug("🪝 [default_secret_hook] tool=%s scanning input", tool_name)
     for value in tool_input.values():
         if isinstance(value, str) and contains_secret(value):
+            hook_logger.info(
+                "🧪 [default_secret_hook_hit] tool=%s reason=secret in str field",
+                tool_name,
+            )
             return PreToolUseResult.ask(
                 reason=f"secret pattern detected in {tool_name} input",
                 hook_name="default_secret",
@@ -495,11 +563,19 @@ def default_secret_hook(
                 if isinstance(item, dict):
                     for v in item.values():
                         if isinstance(v, str) and contains_secret(v):
+                            hook_logger.info(
+                                "🧪 [default_secret_hook_hit] tool=%s reason=secret in list[dict]",
+                                tool_name,
+                            )
                             return PreToolUseResult.ask(
                                 reason="secret pattern detected in content list",
                                 hook_name="default_secret",
                             )
                 elif isinstance(item, str) and contains_secret(item):
+                    hook_logger.info(
+                        "🧪 [default_secret_hook_hit] tool=%s reason=secret in list[str]",
+                        tool_name,
+                    )
                     return PreToolUseResult.ask(
                         reason="secret pattern detected in list item",
                         hook_name="default_secret",
@@ -507,6 +583,10 @@ def default_secret_hook(
         elif isinstance(value, dict):
             for v in value.values():
                 if isinstance(v, str) and contains_secret(v):
+                    hook_logger.info(
+                        "🧪 [default_secret_hook_hit] tool=%s reason=secret in dict",
+                        tool_name,
+                    )
                     return PreToolUseResult.ask(
                         reason="secret pattern detected in nested dict",
                         hook_name="default_secret",
@@ -536,7 +616,12 @@ def default_path_validation_hook(
         return PreToolUseResult.allow(hook_name="default_path")
 
     path = tool_input.get("path") or tool_input.get("file_path") or ""
+    hook_logger.debug("🪝 [default_path_hook] tool=%s path=%s", tool_name, path[:120])
     if path and is_sensitive_path(path):
+        hook_logger.info(
+            "🧪 [default_path_hook_hit] tool=%s path=%s",
+            tool_name, path[:120],
+        )
         return PreToolUseResult.deny(
             reason=f"sensitive path detected: {path}",
             hook_name="default_path",

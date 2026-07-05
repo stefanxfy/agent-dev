@@ -32,6 +32,7 @@ from agent_core.session import (
 )
 from agent_core.session.manager import TitleState
 from agent_core.session.progress import FileChangeType
+from agent_core.turn_chain import ContextCompactionHandler  # Plan C:_persist_compacted_messages 迁此
 
 # ── 测试工具 ────────────────────────────────────────────────────────────────
 
@@ -1327,7 +1328,7 @@ def test_persist_compacted_writes_all_messages():
         agent.messages = []
 
         # 调用新增的 _persist_compacted_messages
-        agent._persist_compacted_messages(compacted, MockCompactResult())
+        ContextCompactionHandler(agent)._persist_compacted(agent,compacted, MockCompactResult())
 
         # 验证落盘结果
         sm.storage.flush()
@@ -1390,7 +1391,7 @@ def test_persist_compacted_skips_system_and_summary():
         agent = ReactAgent.__new__(ReactAgent)
         agent._session_manager = sm
         agent.messages = []
-        agent._persist_compacted_messages(compacted, MockCompactResult())
+        ContextCompactionHandler(agent)._persist_compacted(agent,compacted, MockCompactResult())
         sm.storage.flush()
 
         # 验证：主链应该有 4 条 (boundary + summary + 2 preserved)
@@ -1427,7 +1428,7 @@ def test_persist_compacted_no_session_manager():
         tokens_freed = 50
         summary = "sum"
     # 不应该抛异常
-    agent._persist_compacted_messages(compacted, MockCompactResult())
+    ContextCompactionHandler(agent)._persist_compacted(agent,compacted, MockCompactResult())
     Test.check("无 session_manager 不报错", True)
 
 
@@ -1570,7 +1571,7 @@ def test_persist_compacted_syncs_manager_last_uuid():
         agent = ReactAgent.__new__(ReactAgent)
         agent._session_manager = sm
         agent.messages = []
-        agent._persist_compacted_messages(compacted, R())
+        ContextCompactionHandler(agent)._persist_compacted(agent,compacted, R())
         
         # 验证：manager._last_uuid 应该被同步
         after_uuid = sm._last_uuid

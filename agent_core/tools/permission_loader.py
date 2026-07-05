@@ -46,6 +46,9 @@ from .permission_types import (
 
 logger = logging.getLogger(__name__)
 
+# 🛡️ permission 子系统 logger
+permission_logger = logging.getLogger("agent_core.permission")
+
 
 # ────────────────────────────────────────────────────────────────────
 # 默认 settings 路径
@@ -101,6 +104,7 @@ def load_settings_json(settings_path: Optional[Path] = None) -> dict:
         settings dict(解析失败或不存在 → 返空 dict)
     """
     path = settings_path or get_settings_path()
+    permission_logger.debug("🛡️ [load_settings_json] path=%s exists=%s", path, path.exists())
     if not path.exists():
         return {}
 
@@ -110,6 +114,10 @@ def load_settings_json(settings_path: Optional[Path] = None) -> dict:
         if not isinstance(data, dict):
             logger.warning("settings.json 顶层不是 dict: %s", path)
             return {}
+        permission_logger.info(
+            "🛡️ [settings_loaded] path=%s top_keys=%s",
+            path, list(data.keys())[:8],
+        )
         return data
     except json.JSONDecodeError as e:
         logger.warning("settings.json 解析失败,返空 dict: %s — %s", path, e)
@@ -216,6 +224,14 @@ def load_rules_by_source() -> dict[str, dict[str, list[str]]]:
         result_deny[PermissionRuleSource.POLICY.value] = [str(x) for x in deny_rules_str if isinstance(x, str)]
         result_ask[PermissionRuleSource.POLICY.value] = [str(x) for x in ask_rules_str if isinstance(x, str)]
 
+        permission_logger.info(
+            "🛡️ [load_rules_summary] managed_only=True allow_total=%d "
+            "deny_total=%d ask_total=%d policy_path=%s",
+            sum(len(v) for v in result_allow.values()),
+            sum(len(v) for v in result_deny.values()),
+            sum(len(v) for v in result_ask.values()),
+            policy_path,
+        )
         return {
             "always_allow_rules": result_allow,
             "always_deny_rules": result_deny,
@@ -262,6 +278,14 @@ def load_rules_by_source() -> dict[str, dict[str, list[str]]]:
         if isinstance(ask, list):
             result_ask[source.value] = [str(x) for x in ask if isinstance(x, str)]
 
+    permission_logger.info(
+        "🛡️ [load_rules_summary] managed_only=%s allow_total=%d "
+        "deny_total=%d ask_total=%d",
+        is_managed_only(),
+        sum(len(v) for v in result_allow.values()),
+        sum(len(v) for v in result_deny.values()),
+        sum(len(v) for v in result_ask.values()),
+    )
     return {
         "always_allow_rules": result_allow,
         "always_deny_rules": result_deny,
@@ -342,6 +366,10 @@ def load_tool_permission_context(
     # 1. 解析 mode
     if mode is None:
         mode = os.environ.get("AGENT_PERMISSION_MODE", "default").strip().lower() or "default"
+    permission_logger.info(
+        "🛡️ [load_context] mode=%s sandbox_enabled=%s",
+        mode, sandbox_enabled,
+    )
 
     # 2. 加载 rules
     rules = load_rules_by_source()
@@ -562,8 +590,14 @@ def load_excluded_commands(destination: Optional[PermissionRuleSource] = None) -
     settings = load_settings_json(path)
     sandbox = settings.get("sandbox", {})
     if not isinstance(sandbox, dict):
+        permission_logger.debug("🛡️ [load_excluded_commands] no sandbox section")
         return []
     excluded = sandbox.get("excludedCommands", [])
     if not isinstance(excluded, list):
         return []
-    return [str(p) for p in excluded if isinstance(p, str) and p.strip()]
+    result = [str(p) for p in excluded if isinstance(p, str) and p.strip()]
+    permission_logger.debug(
+        "🛡️ [load_excluded_commands] destination=%s count=%d",
+        destination.value, len(result),
+    )
+    return result

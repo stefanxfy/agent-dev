@@ -76,9 +76,7 @@ class TestSandboxEnabled:
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
         # mock 平台 + 依赖 + 初始化
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True):
             yield
 
     def test_bash_uses_sandbox_when_enabled(self):
@@ -112,9 +110,7 @@ class TestDangerouslyDisableSandbox:
     def enable_sandbox(self):
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True):
             yield
 
     def test_disable_skips_sandbox_when_allowed(self):
@@ -131,9 +127,7 @@ class TestDangerouslyDisableSandbox:
             "enabled": True,
             "allowUnsandboxedCommands": False,
         })
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True):
             assert should_use_sandbox("Bash", {
                 "command": "ls",
                 "dangerously_disable_sandbox": True,
@@ -169,9 +163,7 @@ class TestIsExcludedCommand:
             "enabled": True,
             "excludedCommands": ["git commit", "npm"],
         })
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True):
             yield
 
     def test_exact_match_excludes(self):
@@ -223,8 +215,6 @@ class TestEdgeCases:
         # command 字段值是 None
         mgr = SandboxManager()
         mgr.load_config({"enabled": True, "excludedCommands": ["x"]})
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True):
             # command=None → 当空串处理,不匹配 excluded
             assert _is_excluded_command("Bash", {"command": None}) is False

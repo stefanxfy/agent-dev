@@ -258,10 +258,15 @@ class TestIntegration:
         """被排除的命令:should_use_sandbox 返 False,但应用层仍过 permission check"""
         from agent_core.tools.sandbox_decision import should_use_sandbox
 
-        # 直接设全局 singleton 上的 _initialized 跳过依赖检查
-        sandbox_manager._initialized = True
+        # 启用沙箱(新 API:configure_backends + enabled)
+        from unittest.mock import MagicMock
+
+        mock_backend = MagicMock()
+        mock_backend.name = "mock"
+        mock_backend.is_available.return_value = True
         sandbox_manager._config.enabled = True
         sandbox_manager._config.excluded_commands = ["git commit"]
+        sandbox_manager.configure_backends([mock_backend])
 
         # 应该被排除 → 不走沙箱
         assert should_use_sandbox("Bash", {"command": "git commit -m x"}) is False
@@ -269,8 +274,7 @@ class TestIntegration:
         assert should_use_sandbox("Bash", {"command": "ls -la"}) is True
 
         # reset
-        sandbox_manager._initialized = False
-        sandbox_manager._config.enabled = False
+        sandbox_manager._reset_for_testing()
 
     def test_message_visible_to_model_via_get(self):
         """模型/UI 可调 get_excluded_command_message 拿提示语"""

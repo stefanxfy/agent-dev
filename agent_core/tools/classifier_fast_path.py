@@ -31,6 +31,9 @@ from .permission_types import (
 
 logger = logging.getLogger(__name__)
 
+# 🛡️ fast-path 仍属 permission 子系统
+permission_logger = logging.getLogger("agent_core.permission")
+
 
 # ────────────────────────────────────────────────────────────────────
 # 常量
@@ -212,12 +215,21 @@ def check_classifier_fast_path(
         FastPathResult(hit / behavior / reason / stage)
     """
     if not _is_tool_like(tool):
+        permission_logger.debug("🛡️ [fast_path_miss] not tool-like")
         return FastPathResult.miss()
 
     tool_name = tool.name
+    permission_logger.debug(
+        "🛡️ [fast_path_entry] tool=%s mode=%s",
+        tool_name, context.mode,
+    )
 
     # ── 阶段 0:agent-like tool 强制 ASK ──────────────────────────
     if _get_requires_user_interaction(tool):
+        permission_logger.info(
+            "🛡️ [fast_path_stage_0_agent] tool=%s → ASK requires_user_interaction",
+            tool_name,
+        )
         return FastPathResult.ask(
             reason=f"tool {tool_name} requires user interaction",
             stage="stage_0_agent",
@@ -227,6 +239,10 @@ def check_classifier_fast_path(
     if context.mode == PermissionMode.ACCEPT_EDITS.value:
         # fast-path-disabled tool 仍走完整 pipeline
         if is_fast_path_disabled_tool(tool_name):
+            permission_logger.debug(
+                "🛡️ [fast_path_stage_1_disabled] tool=%s in fast_path_disabled list",
+                tool_name,
+            )
             return FastPathResult.miss()
 
         # 调用 tool.check_permissions(如有)
@@ -235,6 +251,10 @@ def check_classifier_fast_path(
             try:
                 tool_decision = check_permissions_fn(tool_input, context)
                 if tool_decision.behavior == PermissionBehavior.ALLOW.value:
+                    permission_logger.info(
+                        "🛡️ [fast_path_stage_1_allow] tool=%s reason=check_permissions allow in acceptEdits",
+                        tool_name,
+                    )
                     return FastPathResult.allow(
                         reason=f"tool {tool_name} check_permissions allow in acceptEdits mode",
                         stage="stage_1_accept_edits",
@@ -249,6 +269,10 @@ def check_classifier_fast_path(
         else:
             # acceptEdits mode + 无 check_permissions → 默认 ALLOW(对齐 CC)
             # 例:内置 Read/Edit tool 的处理
+            permission_logger.info(
+                "🛡️ [fast_path_stage_1_default_allow] tool=%s no check_permissions",
+                tool_name,
+            )
             return FastPathResult.allow(
                 reason=f"tool {tool_name} auto-allowed in acceptEdits mode",
                 stage="stage_1_accept_edits",
@@ -256,13 +280,26 @@ def check_classifier_fast_path(
 
     # ── 阶段 2:auto mode + allowlist ──────────────────────────────
     if context.mode == PermissionMode.AUTO.value:
-        if is_auto_mode_allowlisted_tool(tool_name):
+        is_allowlisted = is_auto_mode_allowlisted_tool(tool_name)
+        permission_logger.debug(
+            "🛡️ [fast_path_stage_2_check] tool=%s auto_allowlisted=%s",
+            tool_name, is_allowlisted,
+        )
+        if is_allowlisted:
+            permission_logger.info(
+                "🛡️ [fast_path_stage_2_allow] tool=%s in auto mode allowlist",
+                tool_name,
+            )
             return FastPathResult.allow(
                 reason=f"tool {tool_name} in auto mode allowlist",
                 stage="stage_2_allowlist",
             )
 
     # ── 阶段 3:fall through ──────────────────────────────────────
+    permission_logger.debug(
+        "🛡️ [fast_path_miss] fall through to full pipeline tool=%s",
+        tool_name,
+    )
     return FastPathResult.miss()
 
 

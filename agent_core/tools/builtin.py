@@ -11,12 +11,110 @@ Phase 2 (M2) 增量:
 from __future__ import annotations
 
 import ast
+import contextvars
+import logging
 import operator
 import shlex
 import subprocess
-from typing import Any, Dict
+import threading
+import time
+from typing import Any, Dict, Optional
 
 from .base import ToolDef, ToolRegistry
+
+
+# ⚙️ sandbox 子系统 logger(也覆盖 builtin 工具链路)
+sandbox_logger = logging.getLogger("agent_core.sandbox")
+
+
+# ── D15-b: in-flight cancel 通道 ─────────────────────────────────────
+# 线程安全的 ContextVar:agent.run() 在执行 tool 前 set 当前 cancel_event,
+# bash_handler 读它启动 watcher。ContextVar 在 thread 间共享同一 var。
+_current_cancel_event: contextvars.ContextVar[Optional[threading.Event]] = (
+    contextvars.ContextVar("current_cancel_event", default=None)
+)
+
+
+def set_current_cancel_event(event: Optional[threading.Event]) -> contextvars.Token:
+    """agent.run() 调用:设当前 cancel_event 给 sub-process handler 读。
+
+    返回 token,调用方负责 reset (用 reset_current_cancel_event)。
+    """
+    return _current_cancel_event.set(event)
+
+
+def reset_current_cancel_event(token: contextvars.Token) -> None:
+    """配合 set_current_cancel_event — finally 块中复原。"""
+    _current_cancel_event.reset(token)
+
+
+# ── D15-b subprocess 调度 helper ─────────────────────────────────────
+# 把 subprocess 实际调用包成 helper,便于测试 patch + 保持 cancel 能力。
+# 有 cancel_event → Popen + watcher(支持 in-flight interrupt)
+# 无 cancel_event → subprocess.run(timeout=...) 简单路径(向后兼容,
+#   测试可以 patch 这个名字,不影响 production)。
+def _run_subprocess_with_cancel(
+    cmd: str,
+    *,
+    cwd: Optional[str] = None,
+    timeout: float,
+    cancel_event: Optional[threading.Event],
+) -> "tuple[str, str, int]":
+    """执行 shell 命令,可选监听 cancel_event。
+
+    Returns: (stdout, stderr, returncode)
+    Returns signal-handled error string appended to stderr if not found.
+    """
+    if cancel_event is None:
+        # 简单路径:测试 / CLI / direct 调用都走这里,保持旧 API
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return result.stdout or "", result.stderr or "", result.returncode
+
+    # D15-b: Popen + cancel watcher 路径
+    process = subprocess.Popen(
+        cmd,
+        shell=True,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def _watcher():
+        while process.poll() is None:
+            if cancel_event.is_set():
+                sandbox_logger.warning(
+                    "⚙️ [bash_subprocess_cancelled] cmd=%s — terminate SIGTERM",
+                    cmd[:80],
+                )
+                process.terminate()
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    try:
+                        process.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                break
+            time.sleep(0.1)
+
+    watcher_thread = threading.Thread(
+        target=_watcher, name="bash-cancel-watcher", daemon=True
+    )
+    watcher_thread.start()
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return stdout or "", stderr or "", process.returncode
+    finally:
+        watcher_thread.join(timeout=1.0)
 
 
 # ── 安全计算器 ────────────────────────────────────────────────────────────
@@ -182,6 +280,18 @@ def bash_handler(**kwargs) -> str:
     working_dir = kwargs.get("working_dir") or None
     dangerously_disable = bool(kwargs.get("dangerously_disable_sandbox", False))
 
+    # R1 (review): ContextVar 不跨 thread boundary,所以 worker thread
+    # (Tools.execute 用 ThreadPoolExecutor 调 handler)看不到父 thread 设
+    # 的 cancel_event。Tools.execute 现在把 cancel_event 注入 _cancel_event kwarg
+    # (闭包捕获走,跨 thread 安全),优先用;ContextVar 留作 legacy fallback。
+    cancel_event = kwargs.get("_cancel_event") or _current_cancel_event.get(None)
+
+    sandbox_logger.info(
+        "⚙️ [bash_handler_entry] command=%s timeout=%s working_dir=%s "
+        "dangerously_disable=%s",
+        command[:200], timeout, working_dir, dangerously_disable,
+    )
+
     # 决定是否 wrap sandbox
     effective_command = command
     try:
@@ -193,53 +303,105 @@ def bash_handler(**kwargs) -> str:
             "dangerously_disable_sandbox": dangerously_disable,
         }
         if should_use_sandbox("Bash", effective_input):
+            _wrap_t0 = time.time()
             wrapped = sandbox_manager.wrap_with_sandbox(
                 command, working_dir=working_dir or ".",
             )
+            sandbox_logger.info(
+                "⚙️ [bash_sandbox_wrapped] duration_ms=%.1f wrapped=%s",
+                (time.time() - _wrap_t0) * 1000, wrapped != command,
+            )
             if wrapped != command:
                 effective_command = wrapped
-    except Exception:
+    except Exception as e:
         # sandbox 判断失败 → 不 wrap,直接执行(graceful degradation)
+        sandbox_logger.warning("⚙️ [bash_sandbox_decide_failed] err=%s — passthrough", e)
         effective_command = command
 
     # 执行
+    _sub_t0 = time.time()
+    sandbox_logger.debug(
+        "⚙️ [bash_subprocess_start] cmd_preview=%s timeout=%s",
+        effective_command[:120], timeout,
+    )
+    # ── 执行:经 _run_subprocess_with_cancel helper────────────
+    # cancel_event 已在函数顶部优先从 _cancel_event kwarg 取(review R1 修复:
+    # ContextVar 跨 thread 不传播)
+
     try:
-        result = subprocess.run(
+        stdout, stderr, return_code = _run_subprocess_with_cancel(
             effective_command,
-            shell=True,
             cwd=working_dir,
-            capture_output=True,
-            text=True,
             timeout=timeout,
+            cancel_event=cancel_event,
         )
     except subprocess.TimeoutExpired:
+        sandbox_logger.warning(
+            "⚙️ [bash_subprocess_timeout] cmd=%s timeout=%s duration_ms=%.1f",
+            command[:80], timeout, (time.time() - _sub_t0) * 1000,
+        )
         return f"Bash command timed out after {timeout}s"
     except FileNotFoundError as e:
-        # sandbox binary(npx 等)不存在 → helpful error
-        if "npx" in str(e) or "sandbox" in effective_command:
+        sandbox_logger.warning(
+            "⚙️ [bash_subprocess_not_found] cmd=%s err=%s",
+            command[:80], e,
+        )
+        # 沙箱二进制缺失:不同 backend 依赖不同(sandbox-exec / bwrap / srt)
+        if "sandbox-exec" in effective_command or "bwrap" in effective_command or "srt" in effective_command:
             return (
-                "Sandbox binary not found, please run "
-                "'npm install -g @anthropic-ai/sandbox-runtime' "
-                "or disable sandbox in settings.json"
+                "Sandbox binary not found. 请确认对应 backend 的依赖可用:"
+                "NativeBackend 需 sandbox-exec(macOS 内建)/ bwrap(Linux `apt install bubblewrap`);"
+                "SrtBackend 需 srt 二进制(`npm i -g @anthropic-ai/sandbox-runtime`)。"
+                "或在 settings.json 设 sandbox.enabled=false 禁用沙箱。"
             )
         return f"Bash command not found: {e}"
 
-    # 合并 stdout + stderr
+    # ── 中断检测:cancel 触发 → 返 marker 给 LLM ─────────────────
+    # cancel 触发后 Popen 已把 stdout 写入,我们把 marker 拼到 stdout 头部
+    # (这样 LLM 收到的 tool_result 知道是被中断的)
+    if cancel_event is not None and cancel_event.is_set():
+        sandbox_logger.info(
+            "⚙️ [bash_cancelled] cmd=%s — append cancel marker",
+            command[:80],
+        )
+        cancelled_text = (
+            "[Bash command cancelled by user interrupt]\n"
+            f"(partial stdout: {(stdout or '')[:200]})"
+        )
+        stdout = cancelled_text
+
+    # 合并 stdout + stderr(类 subprocess.CompletedProcess 行为)
     output = ""
-    if result.stdout:
-        output += result.stdout
-    if result.stderr:
+    if stdout:
+        output += stdout
+    if stderr:
         if output:
             output += "\n"
-        output += result.stderr
+        output += stderr
 
     # 截断(对齐 CC 5000 字符)
     if len(output) > _BASH_OUTPUT_MAX_CHARS:
         output = output[:_BASH_OUTPUT_MAX_CHARS] + f"\n... (truncated, {len(output)} chars total)"
 
+    sandbox_logger.info(
+        "⚙️ [bash_subprocess_done] exit_code=%s duration_ms=%.1f "
+        "stdout_len=%d stderr_len=%d",
+        return_code, (time.time() - _sub_t0) * 1000,
+        len(stdout or ""), len(stderr or ""),
+    )
+
+    # P1 修复(设计 §10):每次 bash 执行后接 cleanup_after_command。
+    # 防 CC #29316 bare-git scrub + sandbox_tmp_dir mtime 过期。
+    # 三条 return 路径(空输出 / 正常 / cancel 已 return)都过此 cleanup。
+    try:
+        from .sandbox_manager import sandbox_manager
+        sandbox_manager.cleanup_after_command()
+    except Exception as cleanup_err:
+        sandbox_logger.warning("⚙️ [sandbox_cleanup_failed] err=%s", cleanup_err)
+
     if not output:
         # 空输出(命令成功但无 stdout)→ 返回 exit code
-        return f"(command succeeded, exit code {result.returncode})"
+        return f"(command succeeded, exit code {return_code})"
 
     return output
 

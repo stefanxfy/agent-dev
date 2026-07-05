@@ -113,7 +113,7 @@ class ToolRegistry:
 
     # ── 执行工具 ────────────────────────────────────────────────────────
 
-    def execute(self, tool_name: str, tool_input: dict, max_retries: int = 3, timeout: float = 10.0) -> dict:
+    def execute(self, tool_name: str, tool_input: dict, max_retries: int = 3, timeout: float = 10.0, *, cancel_event: Any = None) -> dict:
         """
         执行工具，带超时控制、重试和详细错误处理。
 
@@ -151,9 +151,16 @@ class ToolRegistry:
                 # 校验失败 → 立即 error,不重试
                 return {"status": "error", "error": f"参数校验失败: {validation_error}"}
 
+        # 把 cancel_event 注入 kwargs(handler 通过 _current_cancel_event
+        # ContextVar 读;review R1:ContextVar 在 worker thread 中不继承,
+        # 所以通过 kwarg 显式传递,handler 直接读)。
+        tool_input_with_cancel = dict(tool_input)
+        if cancel_event is not None:
+            tool_input_with_cancel["_cancel_event"] = cancel_event
+
         def _run_handler():
             """封装 handler 执行，用于超时控制"""
-            return tool_def.handler(**tool_input)
+            return tool_def.handler(**tool_input_with_cancel)
 
         last_error = None
         for attempt in range(1, max_retries + 1):

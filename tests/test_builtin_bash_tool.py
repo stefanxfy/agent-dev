@@ -137,12 +137,13 @@ class TestDangerouslyDisableSandbox:
 class TestSandboxWrap:
     @pytest.fixture
     def enabled_sandbox(self):
+        from agent_core.tools.sandbox_backends import NativeBackend
+
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
-            yield mgr
+        mgr.configure_backends([NativeBackend()])  # 真实 native backend(macOS 可用)
+        yield mgr
+        mgr._reset_for_testing()  # teardown:清单例状态,避免污染其他测试
 
     def test_wraps_command_when_sandbox_enabled(self, enabled_sandbox):
         # sandbox 启用 → wrap_with_sandbox 被调,实际执行 wrap 后命令
@@ -162,7 +163,7 @@ class TestSandboxWrap:
         with patch("agent_core.tools.builtin.subprocess.run", spy_run):
             bash_handler(command="echo hello")
         # sandbox 启用 → 命令应被 wrap(含 npx 前缀)
-        assert any("npx" in str(c) for c in wrapped_commands)
+        assert any("sandbox-exec" in str(c) for c in wrapped_commands)
 
     def test_does_not_wrap_when_dangerously_disable(self, enabled_sandbox):
         wrapped_commands = []

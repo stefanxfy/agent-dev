@@ -57,6 +57,9 @@ from .safety_check import safety_check
 
 logger = logging.getLogger(__name__)
 
+# 🛡️ permission 子系统统一 logger — 可被 AGENT_LOG_PERMISSION 单独调级别
+permission_logger = logging.getLogger("agent_core.permission")
+
 
 # ────────────────────────────────────────────────────────────────────
 # PermissionEngine — 主类
@@ -127,9 +130,20 @@ class PermissionEngine:
         """
         tool_name = getattr(tool, "name", "unknown")
 
+        # 🛡️ [engine_entry] 决策入口 — 7 步 pipeline 起点
+        permission_logger.debug(
+            "🛡️ [engine_entry] tool=%s input=%s mode=%s",
+            tool_name, tool_input, getattr(self.context, "mode", "?"),
+        )
+
         # ── Step 1a: 全局 deny rule ──────────────────────────────
+        permission_logger.debug("🛡️ [step_1a_global_deny] checking deny rules for tool=%s", tool_name)
         deny_rule = self._check_global_deny_rule(tool_name)
         if deny_rule is not None:
+            permission_logger.info(
+                "🛡️ [step_1a_global_deny] HIT tool=%s rule=%s",
+                tool_name, deny_rule,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -144,8 +158,13 @@ class PermissionEngine:
             )
 
         # ── Step 1b: 全局 ask rule ──────────────────────────────
+        permission_logger.debug("🛡️ [step_1b_global_ask] checking ask rules for tool=%s", tool_name)
         ask_rule = self._check_global_ask_rule(tool_name)
         if ask_rule is not None:
+            permission_logger.info(
+                "🛡️ [step_1b_global_ask] HIT tool=%s rule=%s",
+                tool_name, ask_rule,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -161,10 +180,18 @@ class PermissionEngine:
 
         # ── Step 1c: tool.check_permissions ──────────────────────
         check_permissions_fn = getattr(tool, "check_permissions", None)
+        permission_logger.debug(
+            "🛡️ [step_1c_tool_check] tool=%s has_check_permissions=%s",
+            tool_name, check_permissions_fn is not None,
+        )
         if check_permissions_fn is not None:
             try:
                 tool_decision = check_permissions_fn(tool_input, self.context)
                 if tool_decision.behavior == PermissionBehavior.DENY.value:
+                    permission_logger.info(
+                        "🛡️ [step_1c_tool_check_deny] tool=%s behavior=deny reason=%s",
+                        tool_name, (getattr(tool_decision, "message", "") or "")[:120],
+                    )
                     return self._log_and_return(
                         tool_name, tool_input,
                         tool_decision,
@@ -181,6 +208,7 @@ class PermissionEngine:
         # bash_check_permissions(subcommand 级 rule + classifier + sandbox auto-allow)
         # ToolDef.check_permissions 保持 None — 由这里专属路径调,避免闭包循环 import
         if tool_name == "Bash":
+            permission_logger.debug("🛡️ [step_1c_bash] tool=Bash → run bash_check_permissions")
             try:
                 bash_decision = self._run_bash_check_permissions(tool_input)
             except Exception as e:
@@ -192,12 +220,20 @@ class PermissionEngine:
                 bash_decision = None
             if bash_decision is not None:
                 if bash_decision.behavior == PermissionBehavior.DENY.value:
+                    permission_logger.info(
+                        "🛡️ [step_1c_bash_deny] tool=Bash reason=%s",
+                        (getattr(bash_decision, "message", "") or "")[:120],
+                    )
                     return self._log_and_return(
                         tool_name, tool_input,
                         bash_decision,
                         stage="step_1c_bash_deny",
                     )
                 if bash_decision.behavior == PermissionBehavior.ASK.value:
+                    permission_logger.info(
+                        "🛡️ [step_1c_bash_ask] tool=Bash reason=%s",
+                        (getattr(bash_decision, "message", "") or "")[:120],
+                    )
                     return self._log_and_return(
                         tool_name, tool_input,
                         bash_decision,
@@ -205,15 +241,31 @@ class PermissionEngine:
                     )
                 # ALLOW → 直接返(不走后续 rule match;bash sandbox auto-allow 已覆盖)
                 if bash_decision.behavior == PermissionBehavior.ALLOW.value:
+                    permission_logger.info(
+                        "🛡️ [step_1c_bash_allow] tool=Bash reason=%s",
+                        (getattr(bash_decision, "message", "") or "")[:120],
+                    )
                     return self._log_and_return(
                         tool_name, tool_input,
                         bash_decision,
                         stage="step_1c_bash_allow",
                     )
                 # PASSTHROUGH → fall through 到后续 Step 1d+ 继续判断
+                permission_logger.debug(
+                    "🛡️ [step_1c_bash_passthrough] tool=Bash fall through to 1d+",
+                )
 
         # ── Step 1d: requires_user_interaction ──────────────────
-        if getattr(tool, "requires_user_interaction", False):
+        requires_user = getattr(tool, "requires_user_interaction", False)
+        permission_logger.debug(
+            "🛡️ [step_1d_requires_user] tool=%s requires_user_interaction=%s",
+            tool_name, requires_user,
+        )
+        if requires_user:
+            permission_logger.info(
+                "🛡️ [step_1d_requires_user] HIT tool=%s → ASK",
+                tool_name,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -227,7 +279,12 @@ class PermissionEngine:
             )
 
         # ── Step 1e: safety_check ───────────────────────────────
+        permission_logger.debug("🛡️ [step_1e_safety_check] running for tool=%s", tool_name)
         if safety_check(tool_name, tool_input):
+            permission_logger.info(
+                "🧪 [step_1e_safety_check] HIT tool=%s → ASK (敏感路径或含 secret)",
+                tool_name,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -243,10 +300,19 @@ class PermissionEngine:
 
         # ── Step 1.5: hook chain(PreToolUse) 在 safety_check 之后、
         #    bypass mode 之前;hook 可覆盖后续 global allow(对齐 CC)───
+        hook_count_1_5 = len(self.hook_registry.list_hooks("PreToolUse")) if self.hook_registry else 0
+        permission_logger.debug(
+            "🛡️ [step_1_5_hook] running PreToolUse hook chain (n=%d)",
+            hook_count_1_5,
+        )
         hook_result = self.hook_registry.run_pre_tool_use(
             tool_name, tool_input, self.context,
         )
         if hook_result.behavior == PermissionBehavior.DENY.value:
+            permission_logger.info(
+                "🛡️ [step_1_5_hook_deny] hook=%s reason=%s",
+                hook_result.hook_name, (hook_result.reason or "")[:120],
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -259,6 +325,10 @@ class PermissionEngine:
                 stage="step_1_5_hook_deny",
             )
         if hook_result.behavior == PermissionBehavior.ASK.value:
+            permission_logger.info(
+                "🛡️ [step_1_5_hook_ask] hook=%s reason=%s",
+                hook_result.hook_name, (hook_result.reason or "")[:120],
+            )
             updated = hook_result.updated_input or tool_input
             return self._log_and_return(
                 tool_name, tool_input,
@@ -274,7 +344,15 @@ class PermissionEngine:
             )
 
         # ── Step 2a: bypass mode ────────────────────────────────
+        permission_logger.debug(
+            "🛡️ [step_2a_bypass] mode=%s",
+            getattr(self.context, "mode", "?"),
+        )
         if self.context.mode == PermissionMode.BYPASS.value:
+            permission_logger.info(
+                "🛡️ [step_2a_bypass_mode] mode=bypassPermissions → ALLOW tool=%s",
+                tool_name,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -288,8 +366,16 @@ class PermissionEngine:
             )
 
         # ── Step 2b: tool 全局 allow rule ───────────────────────
+        permission_logger.debug(
+            "🛡️ [step_2b_global_allow] checking allow rules for tool=%s",
+            tool_name,
+        )
         allow_rule = self._check_global_allow_rule(tool_name)
         if allow_rule is not None:
+            permission_logger.info(
+                "🛡️ [step_2b_global_allow] HIT tool=%s rule=%s",
+                tool_name, allow_rule,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -303,8 +389,14 @@ class PermissionEngine:
             )
 
         # ── Step 3: classifier fast-path ────────────────────────
+        permission_logger.debug("🛡️ [step_3_fast_path] running check_classifier_fast_path")
         fast_path = check_classifier_fast_path(tool, tool_input, self.context)
         if fast_path.hit:
+            permission_logger.info(
+                "🛡️ [step_3_fast_path_hit] stage=%s behavior=%s reason=%s",
+                fast_path.stage, fast_path.behavior,
+                getattr(fast_path, "reason", "")[:120] if hasattr(fast_path, "reason") else "",
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 fast_path.to_permission_decision(),
@@ -313,19 +405,33 @@ class PermissionEngine:
 
         # ── Step 4: mode 后处理 ─────────────────────────────────
         # auto mode → classifier(classifier 在 fast-path 阶段未命中才用)
-        if (
+        classifier_enabled = (
             self.context.mode == PermissionMode.AUTO.value
             and is_classifier_enabled(
                 provider=self.provider,
                 mode=PermissionMode.AUTO,
                 no_settings_match=self.context.no_settings_match,
             )
-        ):
+        )
+        permission_logger.debug(
+            "🛡️ [step_4_classifier] mode=%s classifier_enabled=%s",
+            self.context.mode, classifier_enabled,
+        )
+        if classifier_enabled:
+            import time as _classifier_time
+            _cls_t0 = _classifier_time.time()
             result = self.classifier.classify(
                 messages or [],
                 tool_name,
                 tool_input,
                 self.context,
+            )
+            _cls_ms = (_classifier_time.time() - _cls_t0) * 1000
+            permission_logger.info(
+                "🤖 [step_4_classifier_result] tool=%s should_block=%s unavailable=%s "
+                "duration_ms=%.1f reason=%s",
+                tool_name, result.should_block, result.unavailable,
+                _cls_ms, (result.reason or "")[:120],
             )
             if not result.unavailable and result.should_block:
                 return self._log_and_return(
@@ -357,6 +463,10 @@ class PermissionEngine:
 
         # should_avoid_permission_prompts(后台 agent)→ auto-deny
         if self.context.should_avoid_permission_prompts:
+            permission_logger.info(
+                "🛡️ [step_4_async_agent] should_avoid_permission_prompts=True → DENY tool=%s",
+                tool_name,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -370,6 +480,10 @@ class PermissionEngine:
 
         # dontAsk mode → ASK 强制转 DENY(到这步还没匹配 → 默认 ASK → 转 DENY)
         if self.context.mode == PermissionMode.DONT_ASK.value:
+            permission_logger.info(
+                "🛡️ [step_4_dontask] mode=dontAsk → DENY tool=%s",
+                tool_name,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -383,10 +497,19 @@ class PermissionEngine:
             )
 
         # ── Step 5: hook chain(PreToolUse)───────────────────────
+        hook_count_5 = len(self.hook_registry.list_hooks("PreToolUse")) if self.hook_registry else 0
+        permission_logger.debug(
+            "🛡️ [step_5_hook] running PreToolUse hook chain (n=%d)",
+            hook_count_5,
+        )
         hook_result = self.hook_registry.run_pre_tool_use(
             tool_name, tool_input, self.context,
         )
         if hook_result.behavior == PermissionBehavior.DENY.value:
+            permission_logger.info(
+                "🛡️ [step_5_hook_deny] hook=%s reason=%s",
+                hook_result.hook_name, (hook_result.reason or "")[:120],
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 PermissionDecision(
@@ -399,6 +522,10 @@ class PermissionEngine:
                 stage="step_5_hook_deny",
             )
         if hook_result.behavior == PermissionBehavior.ASK.value:
+            permission_logger.info(
+                "🛡️ [step_5_hook_ask] hook=%s reason=%s",
+                hook_result.hook_name, (hook_result.reason or "")[:120],
+            )
             updated = hook_result.updated_input or tool_input
             return self._log_and_return(
                 tool_name, tool_input,
@@ -414,8 +541,18 @@ class PermissionEngine:
             )
 
         # ── Step 6: denial limit ─────────────────────────────────
+        consecutive = getattr(self.denial_state, "consecutive_denials", 0)
+        total = getattr(self.denial_state, "total_denials", 0)
+        permission_logger.debug(
+            "🛡️ [step_6_denial_limit] consecutive=%d total=%d",
+            consecutive, total,
+        )
         limit_decision = check_denial_limit(self.denial_state)
         if limit_decision is not None:
+            permission_logger.info(
+                "🛡️ [step_6_denial_limit] HIT tool=%s consecutive=%d total=%d",
+                tool_name, consecutive, total,
+            )
             return self._log_and_return(
                 tool_name, tool_input,
                 limit_decision,
@@ -423,6 +560,10 @@ class PermissionEngine:
             )
 
         # ── Step 7: 默认 ASK(passthrough)───────────────────────
+        permission_logger.info(
+            "🛡️ [step_7_default_ask] no matching rule → ASK tool=%s",
+            tool_name,
+        )
         return self._log_and_return(
             tool_name, tool_input,
             PermissionDecision(
@@ -539,6 +680,20 @@ class PermissionEngine:
         这是唯一审计点(对齐 doc §4.8):engine 每条 decision 都经此,
         记录 stage + context + classifier + denial_state。
         """
+        # 🛡️ [decision] 同步打 INFO:每条决策都进主日志(与 audit.jsonl 互为补充)
+        try:
+            reason_type = "unknown"
+            reason_text = ""
+            if decision.decision_reason is not None:
+                reason_type = getattr(decision.decision_reason, "type", "unknown") or "unknown"
+                reason_text = getattr(decision.decision_reason, "reason", "") or ""
+            permission_logger.info(
+                "🛡️ [decision] stage=%s tool=%s behavior=%s reason_type=%s reason=%s",
+                stage, tool_name, decision.behavior, reason_type, reason_text[:120],
+            )
+        except Exception as _log_e:
+            logger.warning("_log_and_return INFO 日志失败: %s", _log_e)
+
         # 更新 deny state
         if decision.behavior == PermissionBehavior.DENY.value:
             self.denial_state = record_denial(self.denial_state)

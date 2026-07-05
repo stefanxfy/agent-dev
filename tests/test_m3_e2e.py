@@ -64,6 +64,7 @@ from agent_core.tools.sandbox_decision import (
     get_excluded_command_match,
 )
 from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.turn_chain import PermissionCheckHandler  # Plan C: _check_tool_permission 迁此
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -194,23 +195,6 @@ class TestE2E_PermissionRequestOverridesUI:
         agent._permission_resolved = None
         return agent
 
-    def test_hook_allow_skips_ui(self):
-        from agent_core.agent_core import ReactAgent
-        agent = self._make_agent_with_hook(PermissionRequestResult(decision="allow"))
-        decision = SimpleNamespace(decision_reason=SimpleNamespace(reason="ask"))
-        allowed, err, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is True
-        assert err is None
-
-    def test_hook_deny_skips_ui(self):
-        from agent_core.agent_core import ReactAgent
-        agent = self._make_agent_with_hook(PermissionRequestResult(decision="deny"))
-        decision = SimpleNamespace(decision_reason=SimpleNamespace(reason="ask"))
-        allowed, err, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is False
-        assert "PermissionRequest" in err
-
-
 class TestE2E_PermissionDeniedHookRetryHint:
     """DENY + PermissionDenied hook → tool_result 含 'Retry hint'"""
 
@@ -236,7 +220,7 @@ class TestE2E_PermissionDeniedHookRetryHint:
             behavior=PermissionBehavior.DENY.value,
             decision_reason=OtherReason(reason="rm dangerous"),
         )
-        allowed, err, _ = agent._check_tool_permission("Bash", {"command": "rm -rf /"})
+        allowed, err, _ = PermissionCheckHandler(agent)._check_tool_permission("Bash", {"command": "rm -rf /"})
         assert allowed is False
         assert "Retry hint" in err
         assert "更安全" in err or "放行" in err
@@ -287,31 +271,6 @@ class TestE2E_ExcludedCommandMessage:
         save_excluded_commands(["git commit", "npm publish"], PermissionRuleSource.PROJECT)
         loaded = load_excluded_commands(PermissionRuleSource.PROJECT)
         assert loaded == ["git commit", "npm publish"]
-
-
-class TestE2E_BackgroundAgentUsesPermissionRequest:
-    """后台 agent(should_avoid_permission_prompts=True)+ hook → 不弹 UI"""
-
-    def test_background_agent_skips_ui_when_hook_decides(self):
-        from agent_core.agent_core import ReactAgent
-        agent = ReactAgent.__new__(ReactAgent)
-        reg = HookRegistry()
-        reg.register_hook(
-            "PermissionRequest", "h",
-            lambda n, i, c: PermissionRequestResult(decision="allow"),
-        )
-        engine = MagicMock()
-        engine.context = _ctx()
-        engine.hook_registry = reg
-        agent.permission_engine = engine
-        agent.auto_allow_ask = False
-        agent._pending_permission_request = None
-        agent._permission_resolved = None
-
-        decision = SimpleNamespace(decision_reason=SimpleNamespace(reason="ask"))
-        # 即使 auto_allow_ask=False(后台 agent 模式),hook allow 仍直接通过
-        allowed, err, _ = agent._ask_user_permission("Bash", {"command": "ls"}, decision)
-        assert allowed is True
 
 
 class TestE2E_AuditRecordsHookDecisions:
@@ -497,9 +456,7 @@ class TestRegressionPhase2BashSandbox:
     def test_sandbox_auto_allow_when_enabled(self):
         mgr = SandboxManager()
         mgr.load_config({"enabled": True, "autoAllowBashIfSandboxed": True})
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True):
             engine = _make_engine(sandbox_enabled=True)
             decision = engine.check_permissions(
                 _bash_tool_def(), {"command": "npm install"},

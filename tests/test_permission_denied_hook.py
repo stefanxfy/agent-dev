@@ -27,6 +27,7 @@ from agent_core.tools.permission_types import (
     PermissionDecision,
     ToolPermissionContext,
 )
+from agent_core.turn_chain import PermissionCheckHandler  # Plan C: _check_tool_permission 迁此
 
 
 def _ctx():
@@ -265,7 +266,7 @@ class TestCheckPermissionDenyIntegration:
         # mock engine 返 DENY
         agent = self._make_agent(reg)
         agent.permission_engine.check_permissions.return_value = _make_deny_decision()
-        allowed, err, _ = agent._check_tool_permission("Bash", {"command": "rm"})
+        allowed, err, _ = PermissionCheckHandler(agent)._check_tool_permission("Bash", {"command": "rm"})
         assert allowed is False
         assert "Retry hint" in err
         assert "更安全" in err or "放行" in err
@@ -274,7 +275,7 @@ class TestCheckPermissionDenyIntegration:
         # 无 hook → err 不含 "Retry hint"
         agent = self._make_agent(HookRegistry())
         agent.permission_engine.check_permissions.return_value = _make_deny_decision()
-        allowed, err, _ = agent._check_tool_permission("Bash", {"command": "rm"})
+        allowed, err, _ = PermissionCheckHandler(agent)._check_tool_permission("Bash", {"command": "rm"})
         assert allowed is False
         assert "Retry hint" not in err
         assert "Permission denied" in err
@@ -283,7 +284,7 @@ class TestCheckPermissionDenyIntegration:
         # hook 异常 → err 仍返(不含 hint)
         agent = self._make_agent(None)  # 无 hook_registry
         agent.permission_engine.check_permissions.return_value = _make_deny_decision()
-        allowed, err, _ = agent._check_tool_permission("Bash", {"command": "rm"})
+        allowed, err, _ = PermissionCheckHandler(agent)._check_tool_permission("Bash", {"command": "rm"})
         assert allowed is False
         assert "Permission denied" in err
 
@@ -297,6 +298,6 @@ class TestCheckPermissionDenyIntegration:
         agent.permission_engine.check_permissions.return_value = _make_deny_decision(
             reason="deny rule: Bash(rm:*)",
         )
-        _, err, _ = agent._check_tool_permission("Bash", {"command": "rm"})
+        _, err, _ = PermissionCheckHandler(agent)._check_tool_permission("Bash", {"command": "rm"})
         assert "deny rule: Bash(rm:*)" in err
         assert "Retry hint" in err

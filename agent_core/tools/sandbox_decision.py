@@ -13,9 +13,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from .sandbox_manager import sandbox_manager
+
+
+# ⚙️ sandbox 子系统 logger
+sandbox_logger = logging.getLogger("agent_core.sandbox")
 
 
 # 哪些工具需要走沙箱(对齐 doc §5.3 表)
@@ -39,25 +44,47 @@ def should_use_sandbox(tool_name: str, tool_input: dict) -> bool:
       3. 工具不在沙箱化名单(calc/search 等不需要)
       4. 命令被 excluded_commands 排除(UX)
     """
+    sandbox_logger.debug(
+        "⚙️ [should_use_sandbox] tool=%s disable_flag=%s",
+        tool_name, bool(tool_input.get("dangerously_disable_sandbox")),
+    )
     # 1. sandbox 未启用
     if not sandbox_manager.is_sandbox_enabled():
+        sandbox_logger.debug("⚙️ [should_use_sandbox_disabled] sandbox not enabled")
         return False
 
     # 2. 模型主动 dangerously_disable_sandbox + 用户允许绕过
     if tool_input.get("dangerously_disable_sandbox"):
         if sandbox_manager._config.allow_unsandboxed_commands:
+            sandbox_logger.info(
+                "⚙️ [should_use_sandbox_bypass] tool=%s dangerously_disable=True + "
+                "allow_unsandboxed=True → False",
+                tool_name,
+            )
             return False  # 模型主动绕过 + 用户允许
         # allow_unsandboxed_commands=False(strict mode)→ 仍沙箱化
         # 继续 fall through(不 return),最终落到 SANDBOXED_TOOLS 判断
 
     # 3. 工具不在沙箱化名单
     if tool_name not in SANDBOXED_TOOLS:
+        sandbox_logger.debug(
+            "⚙️ [should_use_sandbox_skip] tool=%s not in SANDBOXED_TOOLS",
+            tool_name,
+        )
         return False
 
     # 4. 命令被 excluded_commands 排除(只对 Bash 检查)
     if _is_excluded_command(tool_name, tool_input):
+        # 找具体哪个 pattern 命中
+        cmd = tool_input.get("command", "") or ""
+        exclude_match = get_excluded_command_match(cmd)
+        sandbox_logger.info(
+            "⚙️ [should_use_sandbox_excluded] tool=%s pattern=%s",
+            tool_name, exclude_match[0] if exclude_match else "?",
+        )
         return False
 
+    sandbox_logger.debug("⚙️ [should_use_sandbox_true] tool=%s → True (will wrap)", tool_name)
     return True
 
 
@@ -103,8 +130,16 @@ def get_excluded_command_match(command: str) -> Optional[tuple[str, str]]:
     """
     if not command:
         return None
+    sandbox_logger.debug(
+        "⚙️ [excluded_command_match] cmd=%s patterns=%d",
+        command[:80], len(sandbox_manager._config.excluded_commands),
+    )
     for pattern in sandbox_manager._config.excluded_commands:
         if pattern and pattern in command:
+            sandbox_logger.debug(
+                "⚙️ [excluded_command_hit] cmd=%s pattern=%s",
+                command[:80], pattern,
+            )
             message = (
                 f"命令匹配排除规则 `{pattern}`,将跳过 OS 沙箱"
                 f"(仍受应用层权限检查约束)"

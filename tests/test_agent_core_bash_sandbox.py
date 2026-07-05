@@ -137,9 +137,7 @@ class TestSandboxAutoAllowViaEngine:
         # 需 sandbox_manager 真启用 → mock 它
         mgr = SandboxManager()
         mgr.load_config({"enabled": True, "autoAllowBashIfSandboxed": True})
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True):
             engine = _make_engine(sandbox_enabled=True)
             tool = _bash_tool_def()
             decision = engine.check_permissions(tool, {"command": "npm install"})
@@ -198,46 +196,51 @@ class TestAuditLoggerIntegration:
 
 class TestSystemPromptSandboxSection:
     def _make_agent_for_prompt(self):
+        """构造一个最小 agent(绕过 __init__)用于 prompt 注入测试。
+
+        2026-07-02:__init__ 才会建 _assembler,所以手动建一个,这样
+        agent._assembler.build() / ._get_sandbox_section() 能用。
+        """
         from agent_core.agent_core import ReactAgent
+        from agent_core.turn_chain import SystemPromptAssembler
         agent = ReactAgent.__new__(ReactAgent)
         agent.permission_engine = _make_engine(sandbox_enabled=False)
         agent.system_prompt = "base prompt"
-        agent.memory_index = None  # _build_system_prompt_with_memory 需要
+        agent.memory_index = None  # SystemPromptAssembler.build() 需要
+        agent._assembler = SystemPromptAssembler(agent)  # 手动建,不走 __init__
         return agent
 
     def test_sandbox_section_omitted_when_disabled(self):
         agent = self._make_agent_for_prompt()
-        section = agent._get_sandbox_prompt_section()
+        section = agent._assembler._get_sandbox_section()
         assert section == ""
 
     def test_sandbox_section_present_when_enabled(self):
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)), \
-             patch.object(mgr, "_get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True), \
+             patch("agent_core.tools.sandbox_manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             agent = self._make_agent_for_prompt()
-            section = agent._get_sandbox_prompt_section()
+            section = agent._assembler._get_sandbox_section()
         assert "## Command sandbox" in section
 
     def test_sandbox_section_injected_into_full_prompt(self):
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
-        with patch.object(mgr, "_is_supported_platform", return_value=True), \
-             patch.object(mgr, "_check_dependencies", return_value=True), \
-             patch.object(mgr, "initialize", lambda: setattr(mgr, "_initialized", True)), \
-             patch.object(mgr, "_get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+        with patch.object(mgr, "is_sandbox_enabled", return_value=True), \
+             patch("agent_core.tools.sandbox_manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             agent = self._make_agent_for_prompt()
-            full = agent._build_system_prompt_with_memory()
+            full = agent._assembler.build()
         assert "base prompt" in full
         assert "## Command sandbox" in full
 
     def test_prompt_omits_sandbox_when_engine_none(self):
         from agent_core.agent_core import ReactAgent
+        from agent_core.turn_chain import SystemPromptAssembler
         agent = ReactAgent.__new__(ReactAgent)
         agent.permission_engine = None
-        assert agent._get_sandbox_prompt_section() == ""
+        agent._assembler = SystemPromptAssembler(agent)  # 手动建
+        assert agent._assembler._get_sandbox_section() == ""
 
     def test_sandbox_prompt_failure_returns_empty(self):
         agent = self._make_agent_for_prompt()
@@ -245,7 +248,7 @@ class TestSystemPromptSandboxSection:
             "agent_core.tools.sandbox_prompt.get_sandbox_prompt_section",
             side_effect=RuntimeError("boom"),
         ):
-            section = agent._get_sandbox_prompt_section()
+            section = agent._assembler._get_sandbox_section()
         assert section == ""
 
 
