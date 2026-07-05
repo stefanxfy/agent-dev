@@ -216,8 +216,9 @@ if user_input:
         full_response = ""
         
         try:
-            # 运行 ReAct 循环
-            for chunk_type, chunk_data in agent.run(user_input):
+            # 运行 ReAct 循环(Plan B Step 7:agent.run() 已删,改用 start_run()+step())
+            agent.start_run(user_input)
+            for chunk_type, chunk_data in agent.step():
                 if chunk_type == "text":
                     full_response += chunk_data
                     message_placeholder.markdown(full_response + "▌")

@@ -142,15 +142,24 @@ def test_get_agent_memory_disabled_bridge_none():
 
 def test_web_app_passes_react_memory_bridge_kwarg():
     """
-    静态检查:即使 streamlit 不可用,也能验证 web/app.py 的
-    ReactAgent(...) 构造调用包含了 react_memory_bridge=react_memory_bridge。
+    静态检查:即使 streamlit 不可用,也能验证 web/app.py 的 agent 构造调用
+    包含 react_memory_bridge kwarg。
+
+    支持两种构造语法:
+        - 旧:ReactAgent(..., react_memory_bridge=react_memory_bridge, ...)
+        - 新(D9):AgentBuilder().build({"react_memory_bridge": react_memory_bridge, ...})
+
+    本测试用 regex token check,不强求等号语法。
     """
+    import re
     source = WEB_APP_PATH.read_text(encoding="utf-8")
-    # 在 ReactAgent( ... ) 块里必须出现 react_memory_bridge=
-    # 用一个简单的 token check 即可(避免引入 ast 依赖)
-    assert "react_memory_bridge=react_memory_bridge" in source, (
-        "web/app.py 的 ReactAgent(...) 调用必须传入 "
-        "react_memory_bridge=react_memory_bridge(Task 8 wiring 未完成)"
+    has_old_style = bool(re.search(r"react_memory_bridge\s*=\s*react_memory_bridge", source))
+    has_new_style = bool(re.search(r"[\"']react_memory_bridge[\"']\s*:\s*react_memory_bridge", source))
+    assert has_old_style or has_new_style, (
+        "web/app.py 的 agent 构造调用必须传入 "
+        "react_memory_bridge(Task 8 wiring 未完成)"
+        "— 期待 ReactAgent(..., react_memory_bridge=..., ...) 或 "
+        'AgentBuilder().build({"react_memory_bridge": ..., ...})'
     )
 
 

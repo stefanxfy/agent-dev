@@ -9,6 +9,7 @@ from agent_core.memory.react_memory_bridge import (
     MemoryEvent,
     MemoryEventKind,
 )
+from agent_core.session_counter import SessionCounter
 from agent_core.memory.dual_channel_writer import DualChannelWriter
 from agent_core.memory.extraction_gate import ExtractionGate, TurnContext
 from agent_core.memory.memory_store import MemoryStore
@@ -54,7 +55,7 @@ def test_on_turn_end_high_confidence_writes():
             user_msg="记住我叫张三",
             assistant_resp="好的张三",
             turn_index=0,
-            input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+            counter=SessionCounter(),
         ))
 
         kinds = [e.kind for e in events]
@@ -91,7 +92,7 @@ def test_on_turn_end_below_threshold_skips():
             user_msg="今天天气不错",
             assistant_resp="是的",
             turn_index=0,
-            input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+            counter=SessionCounter(),
         ))
 
         kinds = [e.kind for e in events]
@@ -146,7 +147,7 @@ def test_gate_extraction_context_is_current_turn_only():
             user_msg="我喜欢周杰伦,请记住",
             assistant_resp="收到,周杰伦已记",
             turn_index=1,
-            input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+            counter=SessionCounter(),
         ))
 
         bridge.shutdown(timeout=5)
@@ -224,7 +225,7 @@ def test_second_turn_persists_when_run_local_turn_index_resets():
             user_msg="我喜欢看书,请记住",
             assistant_resp="好的,已记",
             turn_index=1,
-            input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+            counter=SessionCounter(),
         ))
         assert _wait_extract_done(meta, "s_bug1b", target_turn=1), \
             "第 1 轮提取应完成"
@@ -234,7 +235,7 @@ def test_second_turn_persists_when_run_local_turn_index_resets():
             user_msg="我不喜欢日本人,请记住",
             assistant_resp="好的,已记",
             turn_index=1,  # ← 仍是 1,复现 bug 触发条件
-            input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+            counter=SessionCounter(),
         ))
         # turn 2 在 memory_tasks(看 bridge 内部 persist_turn 自动推到 2)
         assert _wait_extract_done(meta, "s_bug1b", target_turn=2), \

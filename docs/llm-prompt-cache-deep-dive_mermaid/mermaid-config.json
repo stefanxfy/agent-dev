@@ -1,0 +1,7 @@
+{
+  "theme": "default",
+  "themeVariables": {
+    "fontSize": "16px",
+    "fontFamily": "PingFang SC, Microsoft YaHei, sans-serif"
+  }
+}

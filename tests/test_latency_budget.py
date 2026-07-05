@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_core.memory.latency import LatencyTimeout
+from agent_core.session_counter import SessionCounter
 
 
 def test_extraction_gate_raises_latency_timeout_on_slow_llm():
@@ -81,7 +82,7 @@ def test_bridge_emits_timeout_event_on_latency_timeout():
         user_msg="test",
         assistant_resp="reply",
         turn_index=0,
-        input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+        counter=SessionCounter(),
     ))
     kinds = [e.kind for e in events]
     assert MemoryEventKind.TIMEOUT in kinds

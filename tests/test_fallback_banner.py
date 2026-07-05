@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent_core.memory.react_memory_bridge import MemoryEventKind
+from agent_core.session_counter import SessionCounter
 
 
 def test_memory_event_kind_has_5_fallback_kinds():
@@ -41,7 +42,7 @@ def test_bridge_emits_budget_exceeded_event():
         user_msg="test",
         assistant_resp="reply",
         turn_index=0,
-        input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+        counter=SessionCounter(),
     ))
     kinds = [e.kind for e in events]
     assert MemoryEventKind.BUDGET_EXCEEDED in kinds
@@ -87,7 +88,7 @@ def test_bridge_emits_budget_exceeded_from_should_extract_e2e():
         user_msg="test",
         assistant_resp="reply",
         turn_index=3,
-        input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+        counter=SessionCounter(),
     ))
     budget_events = [e for e in events if e.kind == MemoryEventKind.BUDGET_EXCEEDED]
     assert len(budget_events) == 1
@@ -117,7 +118,7 @@ def test_bridge_emits_timeout_from_should_extract_e2e():
         user_msg="test",
         assistant_resp="reply",
         turn_index=5,
-        input_tokens=100, output_tokens=100, tool_calls_in_turn=0,
+        counter=SessionCounter(),
     ))
     timeout_events = [e for e in events if e.kind == MemoryEventKind.TIMEOUT]
     assert len(timeout_events) == 1

@@ -63,7 +63,11 @@ def test_agent_core_no_memory_index_without_store(tmp_path):
 
 
 def test_agent_core_build_system_prompt_with_memory(tmp_path):
-    """L1:_build_system_prompt_with_memory 把 MEMORY.md 拼到 system prompt"""
+    """L1:SystemPromptAssembler.build() 把 MEMORY.md 拼到 system prompt
+
+    2026-07-02:_build_system_prompt_with_memory 已迁入 SystemPromptAssembler。
+    agent._assembler.build() 是新路径(走 L1 启动通道)。
+    """
     from agent_core.memory.memory_store import MemoryStore
     store = MemoryStore(tmp_path / "memory")
     store.write(
@@ -74,7 +78,7 @@ def test_agent_core_build_system_prompt_with_memory(tmp_path):
     agent = _build_agent(tmp_path, store=store)
     # force rebuild after writing
     agent.memory_index.rebuild()
-    prompt = agent._build_system_prompt_with_memory()
+    prompt = agent._assembler.build()
     assert prompt.startswith("BASE")
     assert "# Agent Memory (auto-generated)" in prompt
     assert "[小明]" in prompt
@@ -83,7 +87,7 @@ def test_agent_core_build_system_prompt_with_memory(tmp_path):
 def test_agent_core_build_system_prompt_no_index_returns_base_plus_trust(tmp_path):
     """无 memory_index → base + TRUSTING_RECALL_SECTION H2 段"""
     agent = _build_agent(tmp_path, store=None)
-    prompt = agent._build_system_prompt_with_memory()
+    prompt = agent._assembler.build()
     assert prompt.startswith("BASE")
     assert "## Before recommending from memory" in prompt
 
@@ -99,7 +103,7 @@ def test_agent_core_build_system_prompt_contains_trust_section_with_index(tmp_pa
     )
     agent = _build_agent(tmp_path, store=store)
     agent.memory_index.rebuild()
-    prompt = agent._build_system_prompt_with_memory()
+    prompt = agent._assembler.build()
     assert "## Before recommending from memory" in prompt
     assert "[小明]" in prompt
     # H1 (MEMORY.md) 出现在 H2 (Before recommending) 之前

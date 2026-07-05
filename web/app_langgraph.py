@@ -324,8 +324,10 @@ if prompt := st.chat_input("输入消息..."):
         
         full_text = ""
         tool_logs = []
-        
-        for msg_type, content in agent.run(prompt):
+
+        # Plan B Step 7:agent.run() 已删,改为 start_run() 初始化 + step() generator
+        agent.start_run(prompt)
+        for msg_type, content in agent.step():
             if msg_type == "text":
                 full_text += content
                 text_placeholder.markdown(full_text + "▌")

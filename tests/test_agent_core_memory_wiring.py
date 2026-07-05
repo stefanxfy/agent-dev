@@ -21,6 +21,7 @@ import pytest
 
 from agent_core.agent_core import ReactAgent
 from agent_core.memory.config import MemoryConfig
+from agent_core.turn_chain import MemoryRetrievalHandler  # Plan C:_call_memory_retriever 迁此
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -69,7 +70,7 @@ class TestMemorySearchWiring:
         agent.memory_config.retrieval.mode = "side_query"
         agent.memory_retriever.search.return_value = MagicMock(hits=[])
 
-        agent._call_memory_retriever("test query")
+        MemoryRetrievalHandler(agent)._call_memory_retriever("test query")
 
         call_kwargs = agent.memory_retriever.search.call_args.kwargs
         assert call_kwargs["mode"] == "side_query", (
@@ -82,7 +83,7 @@ class TestMemorySearchWiring:
         agent.memory_config.retrieval.top_k = 9
         agent.memory_retriever.search.return_value = MagicMock(hits=[])
 
-        agent._call_memory_retriever("test query")
+        MemoryRetrievalHandler(agent)._call_memory_retriever("test query")
 
         call_kwargs = agent.memory_retriever.search.call_args.kwargs
         assert call_kwargs["top_k"] == 9, (
@@ -94,7 +95,7 @@ class TestMemorySearchWiring:
         agent.memory_config = None
         agent.memory_retriever.search.return_value = MagicMock(hits=[])
 
-        agent._call_memory_retriever("test query")
+        MemoryRetrievalHandler(agent)._call_memory_retriever("test query")
 
         call_kwargs = agent.memory_retriever.search.call_args.kwargs
         assert call_kwargs["mode"] == "semantic", (
@@ -110,7 +111,7 @@ class TestMemorySearchWiring:
         agent._surfaced_memories = {"user/foo.md", "user/bar.md"}
         agent.memory_retriever.search.return_value = MagicMock(hits=[])
 
-        agent._call_memory_retriever("test query")
+        MemoryRetrievalHandler(agent)._call_memory_retriever("test query")
 
         call_kwargs = agent.memory_retriever.search.call_args.kwargs
         assert call_kwargs["already_surfaced"] == {"user/foo.md", "user/bar.md"}, (
@@ -122,7 +123,7 @@ class TestMemorySearchWiring:
         agent.memory_config = MemoryConfig()
         agent.memory_retriever.search.return_value = MagicMock(hits=[])
 
-        agent._call_memory_retriever("我是谁")
+        MemoryRetrievalHandler(agent)._call_memory_retriever("我是谁")
 
         call_args = agent.memory_retriever.search.call_args.args
         assert call_args[0] == "我是谁"

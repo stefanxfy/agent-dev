@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
@@ -25,6 +26,41 @@ _FILE_HANDLER_TAG = "_agent_app_file_handler"
 # 第三方库在 DEBUG 模式下刷屏,统一降到 WARNING
 _NOISY_LIBS = ("httpx", "httpcore", "urllib3", "openai", "anthropic",
                "watchdog", "git")
+
+# ────────────────────────────────────────────────────────────────────
+# 子 logger 注册表 — 与 AGENT_LOG_<NAME> 环境变量一一对应
+# 默认 DEBUG;设了可降噪(INFO/WARNING/ERROR)
+# 作用:把"工具权限 + 安全沙箱"的 6 个子系统拆成独立 logger,
+#      `grep -E "🛡️|⚙️|🪝|📋|🧪|🤖" logs/app/agent.log` 可还原一次工具调用全链路
+# ────────────────────────────────────────────────────────────────────
+_SUB_LOGGER_ENV = (
+    ("agent_core.permission", "AGENT_LOG_PERMISSION"),   # 🛡️ permission engine / matcher / bash / loader / denial / fast-path
+    ("agent_core.sandbox",    "AGENT_LOG_SANDBOX"),      # ⚙️ sandbox manager / decision / prompt / builtin wrap
+    ("agent_core.hook",       "AGENT_LOG_HOOK"),         # 🪝 PreToolUse / PermissionRequest / PermissionDenied
+    ("agent_core.audit",      "AGENT_LOG_AUDIT"),        # 📋 audit.jsonl 写盘
+    ("agent_core.classifier", "AGENT_LOG_CLASSIFIER"),   # 🤖 Haiku classifier
+    ("agent_core.safety",     "AGENT_LOG_SAFETY"),       # 🧪 safety_check / sensitive_path / secret regex
+)
+
+_LEVEL_NAMES = {
+    "DEBUG":    logging.DEBUG,
+    "INFO":     logging.INFO,
+    "WARNING":  logging.WARNING,
+    "WARN":     logging.WARNING,
+    "ERROR":    logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def _apply_env_level(logger_name: str, env_var: str, default: int = logging.DEBUG) -> None:
+    """按 AGENT_LOG_<NAME> env var 调整子 logger 级别。默认 DEBUG,设了可降噪。
+
+    子 logger 继承 root 的 handlers,本函数只 setLevel,不重复 addHandler。
+    未识别 / 未设置的 env 值 → 默认 DEBUG(对齐"学习项目,日志越详尽越好"的开发规则)。
+    """
+    raw = os.environ.get(env_var, "").strip().upper()
+    level = _LEVEL_NAMES.get(raw, default)
+    logging.getLogger(logger_name).setLevel(level)
 
 _FILE_FMT = logging.Formatter(
     "[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
@@ -89,5 +125,9 @@ def setup_logging(
     if level <= logging.DEBUG:
         for name in _NOISY_LIBS:
             logging.getLogger(name).setLevel(logging.WARNING)
+
+    # 应用 6 个子 logger 的 env 级别覆盖(继承 root 的 handlers,只改 level)
+    for sub_name, env_var in _SUB_LOGGER_ENV:
+        _apply_env_level(sub_name, env_var)
 
     return root
