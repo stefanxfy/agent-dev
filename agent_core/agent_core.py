@@ -246,9 +246,24 @@ class ReactAgent:
         # Skills 系统（specs/001-skill-system）：注入 skills_config 后启用。
         # SkillsRegistry 是 Facade + cache-aside 快照缓存；SkillsPromptHandler
         # 经 agent.skills_registry.snapshot() 取段注入 system message。
+        #
+        # 002-skill-secret-injection (T036/T038, 2026-07-06):
+        # 1) load_user_config 先 overlay entries 字段(default → user yaml)
+        # 2) self.skills_config = skills_config 暴露给 handler(读 entries)
+        # 3) SkillsPromptHandler 用 entries 触发 secret env 注入
         self.skills_registry = None
+        self.skills_config = None
         if skills_config is not None:
             try:
+                # T038: load_user_config overlay entries(FR-002/FR-007)
+                # 先于 SkillsRegistry,这样 validate 能看到 entries
+                from agent_core.skills.env_overrides import load_user_config
+                skills_config = load_user_config(skills_config)
+                self.skills_config = skills_config
+                _logger.debug(
+                    "🧩 skills_config attached: entries=%d",
+                    len(getattr(skills_config, "entries", None) or {}),
+                )
                 from agent_core.skills.registry import SkillsRegistry
                 self.skills_registry = SkillsRegistry(skills_config)
                 _logger.info(
@@ -258,6 +273,7 @@ class ReactAgent:
             except Exception as e:
                 _logger.warning(f"SkillsRegistry 初始化失败，skill 系统关闭: {e}")
                 self.skills_registry = None
+                self.skills_config = None
 
         # 会话级计数器(2026-07-03):tool/token 的中立宿主,累加在"资源发生点"
         # (tool → ToolExecuteHandler,token → LLM handler),消费者(extraction /

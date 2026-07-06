@@ -2,17 +2,32 @@
 
 选项 A 重构 (2026-07-06):handler 用 ctx.append_system 累加 skills 段到 ctx.system_prompt
 (替代原 stage_inputs merge)。范式:真实 TurnContext + mock agent → handle → 断言 ctx.system_prompt。
+
+002-skill-secret-injection (T012/T037/T039, 2026-07-06):
+- TestSecretEnvInjection:handler 触发 secret env 注入 + reverter 登记
+- TestSkillsConfigExposure:agent.skills_config attribute 暴露契约
+- TestEnvCleanupHandler:outputs_chain 末位 cleanup,idempotent,no-op when None
 """
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent_core.agent_state import RunState, TurnContext
 from agent_core.skills.config import SkillsConfig
+from agent_core.skills.env_overrides import (
+    SecretRef,
+    SecretRefKind,
+    SkillEntryConfig,
+)
 from agent_core.skills.registry import SkillsRegistry
-from agent_core.turn_chain import HandlerResult, SkillsPromptHandler
+from agent_core.turn_chain import (
+    EnvCleanupHandler,
+    HandlerResult,
+    SkillsPromptHandler,
+)
 
 
 def _make_registry_with_workspace(tmp_path) -> SkillsRegistry:
@@ -140,3 +155,161 @@ class TestSnapshotFailureIsolation:
         result = SkillsPromptHandler(agent).handle(ctx)
         assert isinstance(result, HandlerResult)
         assert ctx.system_prompt == "BASE"  # 失败 → 不改
+
+
+# ────────────────────────────────────────────────────────────────────
+# 002-skill-secret-injection T012 — handler 触发 secret env 注入
+# ────────────────────────────────────────────────────────────────────
+
+def _make_agent_with_secrets(
+    tmp_path, env_keys: list[str]
+):
+    """构造 mock agent:
+    - skills_registry: 1 skill 'echo', requires.env=env_keys
+    - skills_config.entries['echo'].secrets: 每 key 配 INLINE SecretRef
+    - tools 含 'Read'(通过 C2 guard)
+    """
+    skill_dir = tmp_path / "echo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f'---\nname: echo\ndescription: "echo"\nmetadata:\n  requires:\n    env: {env_keys!r}\n---\nbody\n',
+        encoding="utf-8",
+    )
+    cfg = SkillsConfig.from_dict({"paths": {"workspace_dir": str(tmp_path)}})
+    reg = SkillsRegistry(cfg)
+
+    # 给 cfg 加 entries(echo skill 对应每个 env key 一个 inline secret)
+    cfg.entries = {
+        "echo": SkillEntryConfig(
+            secrets={
+                k: SecretRef(SecretRefKind.INLINE, f"value_for_{k}")
+                for k in env_keys
+            },
+        ),
+    }
+    agent = MagicMock()
+    agent.skills_registry = reg
+    agent.skills_config = cfg
+    agent._pending_env_reverter = None
+    tools = MagicMock()
+    tools.list_names.return_value = ["Read"]
+    agent.tools = tools
+    return agent
+
+
+@pytest.fixture(autouse=False)
+def _clean_inject_env(monkeypatch):
+    """每个 case 前后清掉可能注入的 env key(US1 MVP 隔离)。"""
+    keys = ["SECRET_KEY_A", "SECRET_KEY_B", "SECRET_KEY_C"]
+    for k in keys:
+        monkeypatch.delenv(k, raising=False)
+    yield
+
+
+class TestSecretEnvInjection:
+    """T012: handler 集成后, 注入 env + reverter 在 agent 上登记。
+    验证 'no in-handler-revert' 语义(handler 不应在 handle 期间就 revert)。
+    """
+
+    def test_env_injected_equals_config_value(
+        self, tmp_path, _clean_inject_env
+    ):
+        """handle() 后, agent.skills_config.entries 中的 inline 值出现在 os.environ。"""
+        agent = _make_agent_with_secrets(tmp_path, ["SECRET_KEY_A", "SECRET_KEY_B"])
+        ctx = _make_ctx("BASE")
+        SkillsPromptHandler(agent).handle(ctx)
+        # INLINE 注入完毕
+        assert os.environ.get("SECRET_KEY_A") == "value_for_SECRET_KEY_A"
+        assert os.environ.get("SECRET_KEY_B") == "value_for_SECRET_KEY_B"
+
+    def test_env_still_set_after_handler_no_in_handler_revert(
+        self, tmp_path, _clean_inject_env
+    ):
+        """handle() 不立即 revert(语义:handler 只 inject + register reverter)。
+        EnvCleanupHandler 在 outputs_chain 末位才负责清理。
+        """
+        agent = _make_agent_with_secrets(tmp_path, ["SECRET_KEY_C"])
+        ctx = _make_ctx("BASE")
+        SkillsPromptHandler(agent).handle(ctx)
+        # handler 跑完后 env 仍在(直到 EnvCleanupHandler 触发)
+        assert os.environ.get("SECRET_KEY_C") == "value_for_SECRET_KEY_C"
+        # reverter 已被挂在 agent 上供 outputs_chain 清理
+        assert agent._pending_env_reverter is not None
+        assert callable(agent._pending_env_reverter)
+
+
+class TestSkillsConfigExposure:
+    """T037: agent.skills_config attribute 暴露契约。
+
+    用例:
+    - skills_config 是 SkillsConfig 实例,可读 entries
+    - skills_config is None 时(Skill 系统关)→ handler 不抛
+    """
+
+    def test_skills_config_attribute_readable(self, tmp_path):
+        agent = _make_agent_with_secrets(tmp_path, ["SECRET_KEY_A"])
+        assert isinstance(agent.skills_config, SkillsConfig)
+        assert "echo" in agent.skills_config.entries
+        assert "SECRET_KEY_A" in agent.skills_config.entries["echo"].secrets
+
+    def test_skills_config_none_handler_no_raise(self):
+        """skills_config=None(Skill 系统关)→ handler 不抛, 走原逻辑。"""
+        agent = MagicMock()
+        agent.skills_registry = None
+        agent.skills_config = None
+        agent._pending_env_reverter = None
+        agent.tools = None
+        ctx = _make_ctx("BASE")
+        result = SkillsPromptHandler(agent).handle(ctx)
+        assert isinstance(result, HandlerResult)
+        assert ctx.system_prompt == "BASE"
+
+
+class TestEnvCleanupHandler:
+    """T039: EnvCleanupHandler 行为契约。
+
+    - 注入 → handle → env 不再含注入值
+    - 二次调用 idempotent(agent._pending_env_reverter 已 None,no-op)
+    - reverter is None 时 handle 不抛
+    """
+
+    def test_handle_reverts_injected_env(
+        self, tmp_path, _clean_inject_env
+    ):
+        """handler: 注入 + handle() 后 env 被还原。"""
+        agent = _make_agent_with_secrets(tmp_path, ["SECRET_KEY_A"])
+        ctx = _make_ctx("BASE")
+        SkillsPromptHandler(agent).handle(ctx)
+        # 注入完毕
+        assert os.environ.get("SECRET_KEY_A") == "value_for_SECRET_KEY_A"
+        # cleanup handler 跑
+        EnvCleanupHandler(agent).handle(ctx)
+        # env 还原
+        assert "SECRET_KEY_A" not in os.environ
+        # reverter 已 None(idempotent guard)
+        assert agent._pending_env_reverter is None
+
+    def test_handle_idempotent_when_called_twice(
+        self, tmp_path, _clean_inject_env
+    ):
+        """二次 handle:第二次 no-op,不抛。"""
+        agent = _make_agent_with_secrets(tmp_path, ["SECRET_KEY_B"])
+        ctx = _make_ctx("BASE")
+        SkillsPromptHandler(agent).handle(ctx)
+        # 第一次 cleanup
+        EnvCleanupHandler(agent).handle(ctx)
+        # 第二次 cleanup(应 no-op)
+        EnvCleanupHandler(agent).handle(ctx)
+        # reverter 仍 None
+        assert agent._pending_env_reverter is None
+        assert "SECRET_KEY_B" not in os.environ
+
+    def test_handle_noop_when_reverter_none(self):
+        """agent._pending_env_reverter is None → handle 不抛, 不做任何事。"""
+        agent = MagicMock()
+        agent._pending_env_reverter = None
+        ctx = _make_ctx("BASE")
+        result = EnvCleanupHandler(agent).handle(ctx)
+        assert isinstance(result, HandlerResult)
+        # reverter 仍 None
+        assert agent._pending_env_reverter is None

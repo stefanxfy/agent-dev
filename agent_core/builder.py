@@ -26,6 +26,7 @@ from agent_core.turn_chain import (
     AuditLogHandler,
     ChunkParseHandler,
     ContextCompactionHandler,
+    EnvCleanupHandler,
     FinalAnswerBookkeepingHandler,
     FinalAnswerPersistHandler,
     Handler,
@@ -127,11 +128,12 @@ def build_default_tool_chain(agent) -> TurnChain:
 
 
 def build_default_output_chain(agent) -> TurnChain:
-    """FINALIZING phase 默认 chain(6 handler CoR)。
+    """FINALIZING phase 默认 chain(7 handler CoR)。
 
-    链顺序(Plan B Final Phase Step 2, 2026-07-02):
+    链顺序(Plan B Final Phase Step 2, 2026-07-02) + secret env 收尾
+    (002-skill-secret-injection T035, 2026-07-06):
       Bookkeeping → FinalAnswerPersist [Stage C] → AuditLog →
-      MemoryBridgeExtract → L3SMExtractTrigger → SessionFlush
+      MemoryBridgeExtract → L3SMExtractTrigger → SessionFlush → EnvCleanup
 
     顺序依据:
       - Bookkeeping 首位:设 _run_state.final_answer 供后续 handler 读
@@ -141,6 +143,9 @@ def build_default_output_chain(agent) -> TurnChain:
       - L3SMExtractTrigger 在 MBE 之后:final_answer 已确定;在 SessionFlush
         之前:flush 兜底仍是末位, fire-and-forget 后台线程不阻塞 chain
       - SessionFlush 末位:所有持久化收尾后才 flush
+      - **EnvCleanup 末位**(T035 2026-07-06):在 SessionFlush 之后跑 reverter,
+        保证 secret env 一定在 turn 结束时被还原(防御式务实工程; 即使
+        SessionFlush 抛异常也走 try/finally idempotent cleanup)
 
     对应 docs §4.3 table output_chain 行 + §15 step 2 + Plan B §15 step 23
     (Stage C 接管原 SessionPersistHandler (B) 分支 + 原 #7 v1 final answer 写入)。
@@ -153,7 +158,12 @@ def build_default_output_chain(agent) -> TurnChain:
 
     Plan B Final Phase Step 2 (2026-07-02):新增 L3SMExtractTriggerHandler,
     取代原 v1 run() L1776-L1821 内联块。
+
+    002 T035 (2026-07-06):在 outputs_chain 末位 append EnvCleanupHandler。
     """
+    import logging
+    _logger = logging.getLogger("agent_core.skills.env_overrides")
+    _logger.debug("🧩 EnvCleanupHandler wired into outputs_chain tail")
     return TurnChain([
         FinalAnswerBookkeepingHandler(agent),
         FinalAnswerPersistHandler(agent),
@@ -161,6 +171,7 @@ def build_default_output_chain(agent) -> TurnChain:
         MemoryBridgeExtractHandler(agent),
         L3SMExtractTriggerHandler(agent),
         SessionFlushHandler(agent),
+        EnvCleanupHandler(agent),
     ])
 
 

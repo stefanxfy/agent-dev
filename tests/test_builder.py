@@ -106,14 +106,16 @@ class TestFactoryChains:
         names = [h.name for h in chain]
         assert names == ["permission_check", "tool_dispatch", "tool_execute", "tool_pair_persist"]
 
-    def test_output_chain_has_six_handlers(self):
-        """output_chain 6 个 handler:final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush。
+    def test_output_chain_has_seven_handlers(self):
+        """output_chain 7 个 handler:final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush + env_cleanup。
 
         Plan B Step 8:SessionPersistMode DELEGATE 模式已删,output_chain 恒为真实现。
         Plan B Final Phase (2026-07-02):_iter_phase_finalize 拆为 4 handler,
         output_chain 从 3 handler 扩展为 5(handler count +2)。
         Plan B Final Phase Step 2 (2026-07-02):加 L3SMExtractTriggerHandler
         取代 v1 run() L1776-L1821 内联块,output_chain 扩展为 6(handler count +1)。
+        002-skill-secret-injection T035 (2026-07-06):append EnvCleanupHandler
+        在 outputs_chain 末位(handler count +1 → 7)。
         """
         agent = _StubAgent()
         chain = build_default_output_chain(agent)
@@ -126,6 +128,7 @@ class TestFactoryChains:
             "memory_bridge_extract",
             "l3_sm_extract_trigger",
             "session_flush",
+            "env_cleanup",
         ]
 
 
@@ -292,7 +295,7 @@ class TestFactoryStubAgentFriendliness:
         assert len(inputs_chain) == 6    # turn_indicator + context_compaction + tools_schema_prepare + system_prompt + memory_retrieval + skills_prompt (选项 A)
         assert len(llm_chain) == 3       # llm_call + chunk_parse + llm_call_persist
         assert len(tool_chain) == 4      # permission_check + tool_dispatch + tool_execute + tool_pair_persist
-        assert len(output_chain) == 6    # final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush (Plan B Final Phase Step 2 2026-07-02)
+        assert len(output_chain) == 7    # final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush + env_cleanup (002 T035 2026-07-06)
 
 
 # ────────────────────────────────────────────────────────────────────

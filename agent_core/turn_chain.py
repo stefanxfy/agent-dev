@@ -25,6 +25,8 @@ from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Proto
 
 from agent_core.agent_state import AgentPhase, Event, RunState, TurnContext
 from agent_core.agent_core import _TRUNCATED_STOP_REASONS
+# 002-skill-secret-injection (T009): SkillsPromptHandler 用 apply_skill_env_overrides 注入 secret
+from agent_core.skills.env_overrides import apply_skill_env_overrides
 
 
 __all__ = [
@@ -51,6 +53,7 @@ __all__ = [
     "MemoryBridgeExtractHandler",
     "SessionFlushHandler",
     "L3SMExtractTriggerHandler",
+    "EnvCleanupHandler",
 ]
 
 
@@ -835,6 +838,13 @@ class SkillsPromptHandler:
     - 不再读写 stage_inputs / 调 _merge_skills_into_system
     - 用 ctx.append_system 累加 skills 段;幂等性自检(section 已在 ctx.system_prompt 则跳过)
 
+    002-skill-secret-injection (T009):
+    - 在 section 渲染前, 先调 apply_skill_env_overrides 注入 secret 到 os.environ
+    - 返 reverter 注册到 agent._pending_env_reverter(覆盖式)
+    - **不在 finally 调 reverter** —— 由 EnvCleanupHandler (T034) 在 outputs_chain 末尾兜底调用
+      (解决 run-end 泄漏 C2;同 run 内多次 turn 不重复 snapshot)
+    - guard: agent.skills_config is None or entries is None → 跳过 env 注入(legacy 模式)
+
     guard(C2):Read 工具不在 toolset → 跳过(无 Read 则模型读不到 SKILL.md,注入目录只会误导)。
     顺序:MemoryRetrievalHandler 之后(后者 append mem_block,本 handler append skills 段)。
     """
@@ -855,6 +865,25 @@ class SkillsPromptHandler:
         if tools is None or "Read" not in tools.list_names():
             _logger.debug("🧩 SkillsPrompt skip: Read tool not in toolset (C2 guard)")
             return HandlerResult()
+
+        # T009: 注入 secret 到 os.environ(在 snapshot 渲染前, 这样 Bash tool 跑时能看到)
+        # guard: skills_config 缺失或 entries 为空 → 跳过 env 注入(legacy 模式)
+        skills_config = getattr(agent, "skills_config", None)
+        if skills_config is not None and getattr(skills_config, "entries", None):
+            try:
+                # 用 registry.entries(list[SkillEntry])喂给 apply_skill_env_overrides
+                # — 后者需要每个 entry 的 metadata.requires.env 来过滤 key
+                # (SkillSnapshot 没有 entries 字段, 它只含 prompt + summary)
+                skill_entries = registry.entries
+                reverter = apply_skill_env_overrides(skill_entries, skills_config)
+                # 注册 reverter 给 EnvCleanupHandler(T034)在 outputs_chain 末位兜底
+                # 覆盖式:同 run 多次 turn 时,新 reverter 替换旧的(EnvCleanupHandler
+                # 会在每个 turn 末位调一次,不会跨 turn 重复还原)
+                agent._pending_env_reverter = reverter
+            except Exception as e:
+                _logger.warning(f"🧩 SkillsPrompt env inject failed: {e}")
+                # 不阻断 — 后续 snapshot 仍跑,只是 secret 没注入
+
         # 取 skills 段(类内私有,不调外部 helper)
         try:
             section = self._build_section(registry)
@@ -2122,6 +2151,57 @@ class SessionFlushHandler:
         except Exception as e:
             _logger.warning(f"Failed to flush session: {e}")
         return HandlerResult()  # 不再 _StopChain,让 SessionFlushHandler 跑
+
+
+# ── 14. EnvCleanupHandler(output_chain 最末位, T034) ───────
+class EnvCleanupHandler:
+    """outputs_chain 最末位:run 结束兜底调 env reverter(FR-010, 解决 run-end 泄漏 C2)。
+
+    设计动机:
+      SkillsPromptHandler.handle() 在每个 turn 入口调 apply_skill_env_overrides
+      注入 secret 到 os.environ + 返 reverter。**reverter 不在 handler 内调**
+      (由本 handler 兜底) —— 这样:
+      - 同 run 多次 turn 时,每个 turn 都能保持 secret 注入(Bash tool 任意 turn 可读)
+      - run 真正结束时(本 handler),统一还原 env 到 run 前状态
+
+    行为:
+      - 取 agent._pending_env_reverter;非 None 则调之 + 置 None
+      - 幂等(连续两次调无副作用 —— 第二次 reverter 已 None)
+      - reverter 抛异常时 log warning,不 crash chain
+
+    位置:outputs_chain 末位(SessionFlushHandler 之后)。
+      SessionFlush 先跑(session 已落盘),最后再还原 env —— 即使下游 handler
+      异常也保证 env 不残留(防御式务实工程)。
+
+    不还原的场景(no-op):
+      - agent is None
+      - agent._pending_env_reverter 为 None(无注入或已还原过)
+
+    对应 C2 修复(2026-07-06):原先 reverter 在 SkillsPromptHandler 内 try/finally
+    调 → run 最后一个 turn 结束后 env 永久注入,污染后续 run。C2 修复:延迟到
+    outputs_chain 最末位统一还原,跨 turn 复用、跨 run 隔离。
+    """
+    name = "env_cleanup"
+
+    def __init__(self, agent):
+        self._agent = agent
+
+    def handle(self, ctx: TurnContext) -> HandlerResult:
+        agent = self._agent
+        if agent is None:
+            return HandlerResult()
+        reverter = getattr(agent, "_pending_env_reverter", None)
+        if reverter is None:
+            return HandlerResult()  # 幂等:已还原过
+        try:
+            reverter()
+            _logger.debug("🧩 env reverted: keys=%d", len(getattr(reverter, "_injected_keys", [])))
+        except Exception as e:
+            _logger.warning(f"🧩 EnvCleanupHandler reverter failed: {e}")
+        finally:
+            # 无论成败都置 None —— 失败时不能再调(防止重复 pop 误改 env)
+            agent._pending_env_reverter = None
+        return HandlerResult()
 
 
 # ── 13. L3SMExtractTriggerHandler(output_chain 第 5 位) ─────

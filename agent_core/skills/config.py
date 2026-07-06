@@ -7,6 +7,10 @@ Skill 系统配置（pydantic v2）
 3. from_env(prefix="SKILLS_")：双下划线表嵌套（如 SKILLS_PATHS__WORKSPACE_DIR）
 4. Path 字段自动 expanduser()
 5. 默认值取自 types.py 的 DEFAULT_* 常量（与 OpenClaw workspace.ts:124-128 对齐）
+
+002-skill-secret-injection（T004）：
+- entries: Optional[Mapping[str, SkillEntryConfig]] = None — 用户级 secret 配置
+- from_yaml(path) — 纯文件读取；缺文件返 entries=None 不抛；env 覆盖由 T033 处理
 """
 
 from __future__ import annotations
@@ -15,8 +19,15 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agent_core.skills.env_overrides import (
+    ConfigValidationError,
+    SecretRef,
+    SecretRefKind,
+    SkillEntryConfig,
+)
 from agent_core.skills.types import (
     DEFAULT_MAX_CANDIDATES_PER_ROOT,
     DEFAULT_MAX_SKILL_FILE_BYTES,
@@ -137,6 +148,11 @@ class SkillsConfig(BaseModel):
     load: LoadConfig = Field(default_factory=LoadConfig)
     # US5 (T048)：显式来源列表（可选；None → 从 paths 派生 bundled+workspace 双层）
     sources: Optional[SourcesConfig] = None
+    # 002-skill-secret-injection (T004)：用户级 secret 注入配置
+    # - None（默认）：legacy 模式，无 secret 注入
+    # - {}：用户建了 config 文件但无 entries
+    # - 非空 dict：每个 key MUST 是 loaded skill 名（T005 校验）
+    entries: Optional[Any] = Field(default=None)  # Optional[Mapping[str, SkillEntryConfig]]
 
     def sources_list(self) -> list[SourceConfig]:
         """
@@ -196,6 +212,53 @@ class SkillsConfig(BaseModel):
             return cls()
         return cls.model_validate(nested)
 
+    @classmethod
+    def from_yaml(cls, path: Path) -> "SkillsConfig":
+        """
+        从 YAML 文件构造（T004 / contract: contracts/config-file-format.md）。
+
+        语义：
+        - 文件不存在 → 返 `SkillsConfig()`（entries=None，等价 legacy mode，**不抛**）
+        - 文件存在 → 读 YAML；若含 skills.entries 段 → 解析为 SkillEntryConfig 映射
+          并赋给 entries 字段
+        - YAML 解析错误 / schema 不符 → 抛 ConfigValidationError（fail-fast）
+
+        不处理 env 覆盖：AGENT_CONFIG_PATH 由 T033 `load_user_config` 统一负责，
+        本方法仅做"读文件 + 解析 + 构造"三件事。
+
+        Returns:
+            SkillsConfig（entries 可能为 None / {} / 完整 dict）
+        """
+        path = Path(path).expanduser()
+        if not path.is_file():
+            # 缺文件 → legacy 模式（向后兼容）
+            return cls()
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ConfigValidationError(
+                f"YAML 解析失败: {path}: {e}"
+            ) from e
+        if not isinstance(data, dict):
+            raise ConfigValidationError(
+                f"YAML 顶层必须是 mapping, 实际 {type(data).__name__}: {path}"
+            )
+
+        # 提取 entries 段并解析为 SkillEntryConfig 映射
+        skills_block = data.get("skills") or {}
+        raw_entries = skills_block.get("entries") if isinstance(skills_block, dict) else None
+        parsed_entries = _parse_entries(raw_entries)
+
+        # 其余字段（paths/limits/load/sources）通过 model_validate 解析
+        # 但 entries 已经在我们手里 → 先 validate 其他字段, 再赋值 entries
+        # 否则 pydantic 会把 entries 当 dict 强校验 SkillEntryConfig schema 失败
+        other = {k: v for k, v in data.items() if k != "skills"}
+        cfg = cls.model_validate(other)
+        if parsed_entries is not None:
+            cfg.entries = parsed_entries
+        return cfg
+
 
 def _coerce(raw: str) -> Any:
     """把 env 字符串尽量转成合适的 Python 类型"""
@@ -209,6 +272,74 @@ def _coerce(raw: str) -> Any:
     except ValueError:
         pass
     return s
+
+
+def _parse_secret_ref_value(raw: Any) -> SecretRef:
+    """把 YAML 里的一条 secret value 转成 SecretRef。
+
+    检测逻辑（contracts/config-file-format.md §Detection Logic）：
+    - str 以前缀 "env://" 开头 → kind=ENV, value=env var 名
+    - str 以前缀 "file://" 开头 → kind=FILE, value=绝对路径（去掉 file://）
+    - 其它 str → kind=INLINE, value=字面值
+
+    非 str 值 → ConfigValidationError（fail-fast at load）
+    """
+    if not isinstance(raw, str):
+        raise ConfigValidationError(
+            f"secret value 必须为字符串, 实际 {type(raw).__name__}: {raw!r}"
+        )
+    if raw.startswith("env://"):
+        return SecretRef(kind=SecretRefKind.ENV, value=raw[len("env://"):])
+    if raw.startswith("file://"):
+        return SecretRef(kind=SecretRefKind.FILE, value=raw[len("file://"):])
+    return SecretRef(kind=SecretRefKind.INLINE, value=raw)
+
+
+def _parse_entries(raw: Any) -> Optional[dict[str, SkillEntryConfig]]:
+    """YAML skills.entries 段 → dict[skill_name, SkillEntryConfig]。
+
+    - raw=None / 空 dict → 返 None（与 SkillsConfig.entries=None legacy 模式一致）
+    - raw=dict → 每 entry 解析 secrets 子字段；非 dict entry → raise
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigValidationError(
+            f"skills.entries 必须为 mapping, 实际 {type(raw).__name__}: {raw!r}"
+        )
+    if not raw:
+        return None  # 空 dict 等价 None（向后兼容）
+    parsed: dict[str, SkillEntryConfig] = {}
+    for skill_name, entry_cfg in raw.items():
+        if not isinstance(skill_name, str):
+            raise ConfigValidationError(
+                f"skills.entries 的 key 必须为字符串, 实际 {type(skill_name).__name__}"
+            )
+        if entry_cfg is None:
+            entry_cfg = {}
+        if not isinstance(entry_cfg, dict):
+            raise ConfigValidationError(
+                f"skills.entries[{skill_name!r}] 必须为 mapping, "
+                f"实际 {type(entry_cfg).__name__}: {entry_cfg!r}"
+            )
+        enabled = entry_cfg.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ConfigValidationError(
+                f"skills.entries[{skill_name!r}].enabled 必须为 bool, "
+                f"实际 {type(enabled).__name__}: {enabled!r}"
+            )
+        raw_secrets = entry_cfg.get("secrets") or {}
+        if not isinstance(raw_secrets, dict):
+            raise ConfigValidationError(
+                f"skills.entries[{skill_name!r}].secrets 必须为 mapping, "
+                f"实际 {type(raw_secrets).__name__}: {raw_secrets!r}"
+            )
+        secrets = {
+            k: _parse_secret_ref_value(v)
+            for k, v in raw_secrets.items()
+        }
+        parsed[skill_name] = SkillEntryConfig(enabled=enabled, secrets=secrets)
+    return parsed
 
 
 __all__ = [
