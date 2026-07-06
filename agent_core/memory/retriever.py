@@ -144,6 +144,23 @@ class MemoryRetriever:
         self.config = config or MemoryConfig()
         self.secret_scanner = secret_scanner or get_default_scanner()
         self.llm_router = llm_router  # M11:sideQuery 模式注入主 LLM router
+        # session-scope 已展示集合（封装在 retriever 内，替代原 agent._surfaced_memories）。
+        # 语义：本次 session 内已注入 system prompt 的 memory rel_path，用于 side_query 去重，
+        # 避免同一 memory 跨轮重复 surface。reset_surfaced() 在 session 边界调。
+        self._surfaced: set[str] = set()
+
+    def reset_surfaced(self) -> None:
+        """重置已展示集合（新 session / agent.reset 边界调）。"""
+        self._surfaced.clear()
+
+    def _filter_surfaced(self, entries: list) -> list:
+        """过滤掉已 surface 的 entries（跨轮去重，纯逻辑，可单测）。
+
+        提取为方法便于测试（_side_query_search 内调用，需 memory files + LLM 才能跑端到端）。
+        """
+        if not self._surfaced:
+            return entries
+        return [e for e in entries if getattr(e, "rel_path", "") not in self._surfaced]
 
     # ── 公开 API ─────────────────────────────────────────
 
@@ -154,7 +171,6 @@ class MemoryRetriever:
         mode: str | RetrievalMode = "semantic",
         types: Optional[list[str]] = None,
         min_score: float = 0.0,
-        already_surfaced: Optional[set[str]] = None,  # M11 新增
     ) -> RetrievalReport:
         """
         检索记忆
@@ -165,7 +181,6 @@ class MemoryRetriever:
             mode: semantic | side_query
             types: 限定类型(user/feedback/event/project/reference), None=全部
             min_score: 最低分阈值(过滤低相关)
-            already_surfaced: M11:已展示过的 rel_path 集合,用于 side_query 去重
 
         Returns:
             RetrievalReport(hits=sorted by score desc)
@@ -184,7 +199,7 @@ class MemoryRetriever:
             logger.debug(
                 f"[retriever.search] ENTER query={query!r} "
                 f"top_k_arg={top_k} mode_arg={mode!r} types={types} "
-                f"min_score_arg={min_score} already_surfaced={already_surfaced} | "
+                f"min_score_arg={min_score} | "
                 f"config(retrieval): mode={cfg_mode!r} top_k={cfg_top_k} min_score={cfg_min} | "
                 f"embed_fn={embed_model} vec.count={vec_count}"
             )
@@ -204,7 +219,7 @@ class MemoryRetriever:
             t0 = time.time()
             # 多召 → 重排 → L4 过滤 → 截 top_k
             logger.debug(f"[retriever.search] STAGE 1 retrieve_candidates mode={mode.value}")
-            candidates = self._retrieve_candidates(query, top_k, mode, types, already_surfaced)
+            candidates = self._retrieve_candidates(query, top_k, mode, types)
             logger.debug(
                 f"[retriever.search] STAGE 1 done: "
                 f"candidates={len(candidates)} → "
@@ -231,6 +246,12 @@ class MemoryRetriever:
                 f"[retriever.search] STAGE 4 slice top_k={top_k}: "
                 f"final={len(final)} titles={[h.title[:20] for h in final]}"
             )
+
+            # STAGE 5：命中入 _surfaced（跨轮去重，模式无关更新；过滤仍只在 side_query）。
+            # 替代原 MemoryRetrievalHandler 边算边 add 的副作用 —— 现封装在 retriever 内。
+            new_surfaced = {h.rel_path for h in final if getattr(h, "rel_path", "")}
+            if new_surfaced:
+                self._surfaced.update(new_surfaced)
 
             elapsed_ms = (time.time() - t0) * 1000
 
@@ -277,13 +298,12 @@ class MemoryRetriever:
         top_k: int,
         mode: RetrievalMode,
         types: Optional[list[str]],
-        already_surfaced: Optional[set[str]] = None,
     ) -> list[MemoryHit]:
         """根据 mode 选择召回调,返回候选列表(M11 二选一)"""
         if mode == RetrievalMode.SEMANTIC:
             return self._semantic_search(query, top_k, types)
         if mode == RetrievalMode.SIDE_QUERY:
-            return self._side_query_search(query, top_k, types, already_surfaced)
+            return self._side_query_search(query, top_k, types)
         raise RetrievalError(f"未知检索模式: {mode!r}")
 
     def _semantic_search(
@@ -413,7 +433,6 @@ class MemoryRetriever:
 
     def _side_query_search(
         self, query: str, top_k: int, types: Optional[list[str]],
-        already_surfaced: Optional[set[str]],
     ) -> list[MemoryHit]:
         """side_query 模式:扫描 MEMORY.md manifest → LLM 选 path → 读全文
 
@@ -437,7 +456,7 @@ class MemoryRetriever:
         logger.debug(
             f"[_side_query_search] ENTER query={query!r} top_k={top_k} "
             f"max_files={max_files} max_select={max_select} "
-            f"types={types} already_surfaced_count={len(already_surfaced or set())}"
+            f"types={types}"
         )
 
         t0 = time.time()
@@ -463,12 +482,13 @@ class MemoryRetriever:
         if len(entries) > 10:
             logger.debug(f"  ... and {len(entries) - 10} more entries")
 
-        if already_surfaced:
+        if self._surfaced:
             before = len(entries)
-            entries = [e for e in entries if e.rel_path not in already_surfaced]
+            entries = self._filter_surfaced(entries)
             logger.debug(
-                f"[_side_query_search] already_surfaced filter: "
-                f"{before} → {len(entries)} (-{before - len(entries)})"
+                f"[_side_query_search] surfaced filter (self._surfaced): "
+                f"{before} → {len(entries)} (-{before - len(entries)}) "
+                f"surfaced_count={len(self._surfaced)}"
             )
         if not entries:
             logger.debug(f"[_side_query_search] EXIT: 0 entries after filter,返空")

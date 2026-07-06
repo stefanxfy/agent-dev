@@ -163,6 +163,7 @@ class ReactAgent:
         permission_engine: Optional["PermissionEngine"] = None,  # M12: 权限引擎(可选,None=不启用)
         audit_logger: Optional[Any] = None,  # M12: 审计日志(可选,None=不写)
         auto_allow_ask: bool = True,  # M12: ASK 时是否自动 ALLOW(测试用,UI 路径会 yield 等待)
+        skills_config: Optional[Any] = None,  # skills: 注入后启用 skill 系统（None=关闭）
     ):
         self.llm = llm_router
         self.tools = tool_registry
@@ -197,8 +198,8 @@ class ReactAgent:
                 self.memory_index.rebuild()  # lazy rebuild 兜底
             except Exception as e:
                 _logger.warning(f"MEMORY.md lazy rebuild 失败: {e}")
-        # M11: 已展示过的记忆 rel_path 集合(用于 sideQuery 去重)
-        self._surfaced_memories: set[str] = set()
+        # 注：_surfaced 去重状态已封装进 memory_retriever（替代原 agent._surfaced_memories），
+        # 由 retriever 内部维护（search 时过滤 + 更新；reset_surfaced 在 session 边界调）。
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
         if session_id:
@@ -234,16 +235,29 @@ class ReactAgent:
         self._pending_permission_request: Optional[dict] = None
         self._permission_resolved: Optional[Any] = None  # threading.Event 初始为 None
 
-        # Plan B SRP 接线修复(2026-07-03):实例化 SystemPromptAssembler 并重建
-        # system_prompt = base + sandbox section + MEMORY.md + TRUSTING_RECALL。
-        # 此前 Plan B 拆分写好了 assembler 类、把 SystemPromptHandler 改成依赖
-        # agent._assembler,但 __init__ 漏了实例化 → handler 恒因 _assembler is None
-        # 早退 → ctx.stage_inputs 留 None → MemoryRetrievalHandler 把 None 传给
-        # _merge_memory_into_system 炸 'NoneType' object is not iterable。
-        # 必须在 system_prompt(L180 base)+ memory_index + permission_engine 都赋值后调。
+        # 实例化 SystemPromptAssembler 并构造 system_prompt
+        # = base + sandbox section + MEMORY.md + TRUSTING_RECALL。
+        # SystemPromptHandler 在 inputs_chain 里把 agent.system_prompt append 到 ctx.system_prompt。
+        # 必须在 system_prompt base + memory_index + permission_engine 都赋值后调。
         from agent_core.turn_chain import SystemPromptAssembler
         self._assembler = SystemPromptAssembler(self)
         self.system_prompt = self._assembler.build()
+
+        # Skills 系统（specs/001-skill-system）：注入 skills_config 后启用。
+        # SkillsRegistry 是 Facade + cache-aside 快照缓存；SkillsPromptHandler
+        # 经 agent.skills_registry.snapshot() 取段注入 system message。
+        self.skills_registry = None
+        if skills_config is not None:
+            try:
+                from agent_core.skills.registry import SkillsRegistry
+                self.skills_registry = SkillsRegistry(skills_config)
+                _logger.info(
+                    f"Skills registry enabled: bundled={skills_config.paths.bundled_dir} "
+                    f"workspace={skills_config.paths.workspace_dir}"
+                )
+            except Exception as e:
+                _logger.warning(f"SkillsRegistry 初始化失败，skill 系统关闭: {e}")
+                self.skills_registry = None
 
         # 会话级计数器(2026-07-03):tool/token 的中立宿主,累加在"资源发生点"
         # (tool → ToolExecuteHandler,token → LLM handler),消费者(extraction /
@@ -736,7 +750,7 @@ class ReactAgent:
                 type("_StubCtx", (), {"turn_ctx": type("_StubTC", (), {
                     "events": [], "is_stopped": False, "emit": lambda self, e: None,
                     "stop": lambda self: None,
-                    "permission_request": None, "stage_outputs": None, "stage_inputs": None,
+                    "permission_request": None, "stage_outputs": None,
                 })()})(),
             )
             # 手动 transition(不调 trigger — 避免链式推到 DONE)
@@ -803,6 +817,9 @@ class ReactAgent:
     def reset(self):
         """重置会话历史"""
         self.messages.clear()
+        # 同时清空 memory 去重状态（_surfaced 现归 retriever 所有）
+        if self.memory_retriever is not None:
+            self.memory_retriever.reset_surfaced()
         # Day 4: 同时清空 session
         if self._session_manager:
             try:

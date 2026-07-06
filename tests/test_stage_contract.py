@@ -18,7 +18,6 @@ import pytest
 from agent_core.agent_state import TurnContext, RunState
 from agent_core.stages import (
     LLMResult,
-    StageInputs,
     ToolExecutionResult,
 )
 from agent_core.turn_chain import HandlerResult, TurnChain
@@ -27,51 +26,6 @@ from agent_core.turn_chain import HandlerResult, TurnChain
 # ════════════════════════════════════════════════════════════
 # Stage dataclass 字段完整性测试
 # ════════════════════════════════════════════════════════════
-
-
-class TestStageInputsContract:
-    def test_is_dataclass(self):
-        """StageInputs 是 dataclass。"""
-        assert is_dataclass(StageInputs)
-
-    def test_required_fields(self):
-        """StageInputs 含 messages + system_prompt + tool_schemas。"""
-        field_names = {f.name for f in fields(StageInputs)}
-        assert "messages" in field_names
-        assert "system_prompt" in field_names
-        assert "tool_schemas" in field_names
-
-    def test_messages_required_no_default(self):
-        """messages 字段无默认值(必填)— 用 MISSING 检测。"""
-        from dataclasses import MISSING
-        msgs_field = next(f for f in fields(StageInputs) if f.name == "messages")
-        # 没有 default 也没有 default_factory → MISSING sentinel
-        assert msgs_field.default is MISSING
-        assert msgs_field.default_factory is MISSING
-
-    def test_construction_with_all_fields(self):
-        """构造含全部字段的 StageInputs。"""
-        si = StageInputs(
-            messages=[{"role": "user", "content": "hi"}],
-            system_prompt="You are helpful",
-            tool_schemas=[{"name": "Bash"}],
-        )
-        assert si.messages == [{"role": "user", "content": "hi"}]
-        assert si.system_prompt == "You are helpful"
-        assert si.tool_schemas == [{"name": "Bash"}]
-
-    def test_construction_minimal(self):
-        """只传 messages 也工作(system_prompt/tool_schemas 可选)。"""
-        si = StageInputs(messages=[{"role": "user", "content": "hi"}])
-        assert si.system_prompt is None
-        assert si.tool_schemas == []
-
-    def test_independent_instances(self):
-        """两个 StageInputs 实例的 tool_schemas 独立(不是 shared default)。"""
-        si1 = StageInputs(messages=[])
-        si2 = StageInputs(messages=[])
-        si1.tool_schemas.append({"name": "Bash"})
-        assert si2.tool_schemas == []  # 不受 si1 影响
 
 
 class TestLLMResultContract:
@@ -150,36 +104,25 @@ class TestToolExecutionResultContract:
 # ════════════════════════════════════════════════════════════
 
 
-class _WriteStageInputs:
-    """模拟 inputs_chain 末位 handler:写 StageInputs 到 ctx。"""
-    name = "write_stage_inputs"
+class _WriteSystemPrompt:
+    """模拟 inputs_chain handler:append system_prompt 到 ctx(选项 A 模式)。"""
+    name = "write_system_prompt"
 
-    def __init__(self, messages, system_prompt=None, tool_schemas=None):
-        self._messages = messages
-        self._system_prompt = system_prompt
-        self._tool_schemas = tool_schemas or []
+    def __init__(self, text: str):
+        self._text = text
 
     def handle(self, ctx: TurnContext) -> HandlerResult:
-        ctx.stage_inputs = StageInputs(
-            messages=self._messages,
-            system_prompt=self._system_prompt,
-            tool_schemas=self._tool_schemas,
-        )
+        ctx.append_system(self._text)
         return HandlerResult()
 
 
-class _ReadStageInputs:
-    """模拟 llm_chain 首位 handler:从 ctx.stage_inputs 读取数据。"""
-    name = "read_stage_inputs"
+class _ReadSystemPrompt:
+    """模拟 llm_chain 首位 handler:从 ctx.system_prompt 读取数据。"""
+    name = "read_system_prompt"
 
     def handle(self, ctx: TurnContext) -> HandlerResult:
-        # 验证 stage_inputs 是 StageInputs 实例
-        assert isinstance(ctx.stage_inputs, StageInputs)
-        # 写 stage_outputs.LLMResult
         ctx.stage_outputs = LLMResult(
-            full_text="echo: " + " ".join(
-                m.get("content", "") for m in ctx.stage_inputs.messages
-            ),
+            full_text=ctx.system_prompt,
             stop_reason="end_turn",
         )
         return HandlerResult()
@@ -198,29 +141,23 @@ class _WriteToolResults:
 
 
 class TestCrossHandlerDataFlow:
-    def test_inputs_chain_writes_stage_inputs_for_llm_chain(self):
-        """inputs_chain 写 stage_inputs → llm_chain 读 stage_inputs。"""
+    def test_inputs_chain_writes_system_prompt_for_llm_chain(self):
+        """inputs_chain append ctx.system_prompt → llm_chain 读它。"""
         chain = TurnChain([
-            _WriteStageInputs(
-                messages=[{"role": "user", "content": "hello"}],
-                system_prompt="be helpful",
-            ),
-            _ReadStageInputs(),
+            _WriteSystemPrompt("be helpful"),
+            _ReadSystemPrompt(),
         ])
         ctx = TurnContext(run_state=RunState())
         list(chain.run(ctx))
 
-        # llm_chain 读到了 inputs_chain 写的数据
         assert ctx.stage_outputs is not None
-        assert "hello" in ctx.stage_outputs.full_text
+        assert ctx.stage_outputs.full_text == "be helpful"
 
     def test_tool_results_passed_through_chain(self):
         """tool_chain 写 tool_results,验证 cross-chain 可见性。"""
         chain = TurnChain([
-            _WriteStageInputs(
-                messages=[{"role": "user", "content": "run bash"}],
-            ),
-            _ReadStageInputs(),  # 写 stage_outputs
+            _WriteSystemPrompt("be helpful"),
+            _ReadSystemPrompt(),  # 写 stage_outputs
             _WriteToolResults(),  # 追加 tool_results
         ])
         ctx = TurnContext(run_state=RunState())

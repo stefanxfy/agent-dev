@@ -40,7 +40,7 @@ from agent_core.agent_state import (
     TurnContext,
 )
 from agent_core.builder import AgentBuilder
-from agent_core.stages import LLMResult, StageInputs, ToolExecutionResult
+from agent_core.stages import LLMResult, ToolExecutionResult
 from agent_core.turn_chain import (
     HandlerResult,
     PluginHandler,
@@ -104,7 +104,8 @@ class TestTurnContext:
         rs = RunState()
         ctx = TurnContext(run_state=rs)
         assert ctx.run_state is rs
-        assert ctx.stage_inputs is None
+        assert ctx.system_prompt == ""
+        assert ctx.tool_schemas is None
         assert ctx.stage_outputs is None
         assert ctx.permission_request is None
         assert ctx.events == []
@@ -665,13 +666,6 @@ class TestPluginHandlerWhitelist:
 
 
 class TestStageDataclasses:
-    def test_stage_inputs_default(self):
-        """StageInputs 默认 messages=[],tool_schemas=[]。"""
-        si = StageInputs(messages=[])
-        assert si.messages == []
-        assert si.system_prompt is None
-        assert si.tool_schemas == []
-
     def test_llm_result_default(self):
         """LLMResult 默认空值。"""
         r = LLMResult()

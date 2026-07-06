@@ -5,10 +5,10 @@ Day 3 版本：并行工具调用、Token 预算管理、System Prompt、结构�
 
 from __future__ import annotations
 
+import sys
 import json
 import logging
 import os
-import sys
 import uuid
 from pathlib import Path
 
@@ -710,6 +710,9 @@ def get_agent(session_id=None):
     # 但有了 hook point 接入(后续 M11/M12 想插 handler 不用再改这里)。
     # Post-construction injection(permission_engine / auto_allow_ask / audit_logger
     # / _distillation_loop)保留 — 它们是 agent 属性而非 chain handler,builder 不管。
+    # Skills 系统（specs/001-skill-system, T021）：from_env 读 SKILLS_ 前缀；默认 bundled+workspace
+    from agent_core.skills.config import SkillsConfig as _SkillsConfig
+    skills_config = _SkillsConfig.from_env()
     agent = (
         AgentBuilder()
         .build({
@@ -723,6 +726,7 @@ def get_agent(session_id=None):
             "react_memory_bridge": react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
             "memory_config": memory_config,              # M10 C6.4 + C7.1: 共享 MemoryConfig 实例
             "session_memory": session_memory,            # M10 C2.2: L3 SM 快路径
+            "skills_config": skills_config,              # T021: 启用 skill 系统
         })
     )
 
@@ -1029,6 +1033,45 @@ def run_agent(user_input: str):
     - awaiting_permission 触发 → yield event + return → streamlit rerun → dialog 渲染
     - 三个按钮调 agent.resume_after_permission() 解锁 + 重 trigger state machine
     """
+    # US4 (T043)：slash 命令派发 — /skill-name <args> 显式触发，绕过模型自动选择
+    try:
+        from agent_core.skills.commands import resolve_skill_command
+    except Exception:  # import self-guard：skills 子系统不可用时跳过 slash
+        resolve_skill_command = None  # type: ignore[assignment]
+    if resolve_skill_command is not None:
+        resolved = resolve_skill_command(user_input)
+        if resolved is not None:
+            skill_name, args = resolved
+            registry = getattr(agent, "skills_registry", None)
+            entry = registry.get_entry(skill_name) if registry is not None else None
+            if (entry is None or entry.load_error is not None
+                    or not getattr(entry, "user_invocable", True)):
+                # 失败反馈走 text 通道：system 走 st.info() 是临时 element,
+                # 会被脚本末尾 st.rerun()（web/app.py:1763）擦除 + append 空气泡。
+                # 走 text → full_text 累积 → append 进 session_state.messages → rerun 后持久可见。
+                avail = ""
+                if registry is not None:
+                    try:
+                        names = sorted(
+                            s.name for s in registry.snapshot().skills
+                            if s.user_invocable and s.eligible
+                        )
+                        if names:
+                            avail = "\n\n可用 skill: " + ", ".join(f"`/{n}`" for n in names)
+                    except Exception:
+                        pass
+                yield ("text", f"⚠️ 无匹配 skill 或不可调用: `/{skill_name}`{avail}")
+                return
+            # prompt-rewrite（前缀 Use the "<name>" skill + location + args）
+            rewrite = (
+                f'Use the "{skill_name}" skill. Read its SKILL.md at '
+                f'"{entry.skill.file_path}" and follow its instructions.'
+            )
+            if args:
+                rewrite = f"{rewrite} {args}"
+            yield ("system", f"🎯 显式调用 skill: {skill_name}")
+            user_input = rewrite
+
     # 标记 session_state phase
     st.session_state._run_phase = "running"
     st.session_state._interrupt_requested = False

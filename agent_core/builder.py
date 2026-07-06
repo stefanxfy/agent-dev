@@ -37,6 +37,7 @@ from agent_core.turn_chain import (
     PermissionCheckHandler,
     PluginHandler,
     SessionFlushHandler,
+    SkillsPromptHandler,
     SystemPromptHandler,
     ToolDispatchHandler,
     ToolExecuteHandler,
@@ -68,25 +69,30 @@ __all__ = [
 
 
 def build_default_inputs_chain(agent) -> TurnChain:
-    """SETUP phase 默认 chain(TurnIndicator → ContextCompaction → SystemPrompt → MemoryRetrieval → ToolsSchemaPrepare)。
+    """SETUP phase 默认 chain(选项 A:6 handler 顺序累加 ctx.system_prompt)。
 
-    对应 docs §4.3 table inputs_chain 行 + §15 step 2 + Plan B R4 修复 (2026-07-01) +
-    SRP 重构 (2026-07-02):
-    - TurnIndicator:emit turn indicator event(独立职责)
-    - ContextCompactionHandler:每个 turn 入口做 token 预算压缩(L3 SM fast path + ContextManager fallback)
-    - SystemPromptHandler:真实现,确保 stage_inputs 头部有 system message
-    - MemoryRetrievalHandler:真实现,检索记忆 + 把 mem_block 拼到 system
-    - ToolsSchemaPrepareHandler:准备 tool schemas
+    选项 A 重构 (2026-07-06):system_prompt 装配回归 inputs_chain,由多个 handler
+    通过 ctx.append_system 顺序累加;llm_chain 的 LLMCallHandler 只读 ctx.system_prompt。
+    消灭了方案 D 把装配塞进 LLMCallHandler 导致的 SRP 膨胀 + OCP 封闭,同时避开了
+    原 stage_inputs "混 messages 历史" 的 stale 弊端(ctx.system_prompt 只存装配产物,
+    messages 永远从 agent.messages live 读)。
 
-    每个 handler 单一职责,无僵尸 anchor。Plan A 时代 inputs_chain 由
-    MemoryRetrievalHandler 一手包办(stop_chain),现已拆分为 5 个真 handler。
+    - TurnIndicator:emit turn indicator 事件(独立职责)
+    - ContextCompaction:token 预算压缩(改 agent.messages,与 ctx.system_prompt 正交)
+    - ToolsSchemaPrepare:准备 tool schemas → ctx.tool_schemas(LLMCallHandler 读)
+    - SystemPrompt:append base system_prompt
+    - MemoryRetrieval:检索 memory → append mem_block + emit memory_status
+    - SkillsPrompt:snapshot skills → append skills 段(C2 guard:Read 在 toolset)
+
+    加新 system 段 = AgentBuilder.with_handler(after="skills_prompt") 插入(OCP)。
     """
     return TurnChain([
         TurnIndicatorHandler(agent),
         ContextCompactionHandler(agent),
+        ToolsSchemaPrepareHandler(agent),
         SystemPromptHandler(agent),
         MemoryRetrievalHandler(agent),
-        ToolsSchemaPrepareHandler(agent),
+        SkillsPromptHandler(agent),
     ])
 
 

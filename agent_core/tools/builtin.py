@@ -457,6 +457,61 @@ BASH_TOOL = ToolDef(
 )
 
 
+# ── 文件读取（skill 系统依赖，FR-011）──────────────────────────────────────
+
+READ_MAX_BYTES = 256_000  # 与 SKILL.md 单文件上限一致（types.DEFAULT_MAX_SKILL_FILE_BYTES）
+
+
+def read_file_handler(**kwargs) -> str:
+    """Read 工具处理函数：按绝对路径读文件内容。
+
+    用途：让 LLM 在匹配 skill 后按 `<location>` 加载 SKILL.md（research Decision 1）。
+    填补 permission/safety 子系统早已硬编码 "Read" 名字但未注册的缺口。
+
+    错误处理：所有失败返回错误字符串（不抛），与 calc/bash 一致。
+    安全：拒绝 symlink；大小上限 READ_MAX_BYTES；路径遍历由 permission_engine
+    在 PermissionCheckHandler 层把关（本 handler 不重复实现）。
+    """
+    from pathlib import Path
+
+    path = kwargs.get("path", "")
+    if not path:
+        return "错误：缺少 path 参数"
+    try:
+        p = Path(path).expanduser()
+        if not p.is_file():
+            return f"错误：文件不存在或不是普通文件: {path}"
+        if p.is_symlink():
+            return f"错误：拒绝读取 symlink: {path}"
+        size = p.stat().st_size
+        if size > READ_MAX_BYTES:
+            return f"错误：文件过大（{size} 字节，上限 {READ_MAX_BYTES}）"
+        return p.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return f"读取失败: {e}"
+
+
+READ_TOOL = ToolDef(
+    name="Read",
+    description=(
+        "读取本地文件内容（按绝对路径）。当任务匹配某个 skill 时，用此工具按 "
+        "<available_skills> 中宣告的 <location> 加载该 skill 的 SKILL.md。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "要读取的文件绝对路径（来自 <available_skills> 的 location）",
+            },
+        },
+        "required": ["path"],
+    },
+    handler=read_file_handler,
+    category="read",
+)
+
+
 # ── 注册入口 ──────────────────────────────────────────────────────────────
 
 def register_builtin_tools(registry: ToolRegistry):
@@ -464,3 +519,4 @@ def register_builtin_tools(registry: ToolRegistry):
     registry.register(CALC_TOOL)
     registry.register(SEARCH_TOOL)
     registry.register(BASH_TOOL)
+    registry.register(READ_TOOL)

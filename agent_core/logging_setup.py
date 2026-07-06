@@ -40,6 +40,7 @@ _SUB_LOGGER_ENV = (
     ("agent_core.audit",      "AGENT_LOG_AUDIT"),        # 📋 audit.jsonl 写盘
     ("agent_core.classifier", "AGENT_LOG_CLASSIFIER"),   # 🤖 Haiku classifier
     ("agent_core.safety",     "AGENT_LOG_SAFETY"),       # 🧪 safety_check / sensitive_path / secret regex
+    ("agent_core.skills",     "AGENT_LOG_SKILLS"),       # 🧩 skill discovery / load / snapshot / handler（specs/001-skill-system）
 )
 
 _LEVEL_NAMES = {

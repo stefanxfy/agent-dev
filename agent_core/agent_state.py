@@ -148,7 +148,9 @@ class TurnContext:
 
     关键字段:
     - run_state:RunState(per-run,跨 turn 持久)
-    - stage_inputs:StageInputs(inputs_chain 输出)
+    - system_prompt:inputs_chain 累加的 system 内容(SystemPrompt/MemoryRetrieval/SkillsPrompt
+      handler 通过 append_system 顺序累加;llm_chain 的 LLMCallHandler 只读)
+    - tool_schemas:ToolsSchemaPrepare 准备的工具定义(LLMCallHandler 读)
     - stage_outputs:LLMResult(llm_chain 输出)
     - permission_request:当前 turn 的 permission 请求(AWAITING_PERMISSION 时填)
     - events:本 turn 已产出的 events
@@ -159,11 +161,25 @@ class TurnContext:
     # (例如 SETUP phase 多次进要分"第 1 次进入" vs "后续"
     # 但实际触发是按 run 触发,这里 turn_number 仅作 debug / 日志标识)
     turn_number: int = 0
-    stage_inputs: Optional[Any] = None
+    system_prompt: str = ""
+    tool_schemas: Optional[list] = None
     stage_outputs: Optional[Any] = None
     permission_request: Optional[dict] = None
     events: list = field(default_factory=list)
     _stopped: bool = False
+
+    def append_system(self, section: str) -> None:
+        """inputs_chain handler 累加 system 内容(强制累加,禁止覆盖)。
+
+        消灭原 merge helper "谁覆盖谁" 陷阱 —— 这是 system_prompt 唯一允许的写法。
+        幂等性由 handler 自行检查(如 SkillsPromptHandler 检查 section 是否已存在),
+        符合 "handler 自己负责自己事情"。
+        """
+        if not section:
+            return
+        self.system_prompt = (
+            (self.system_prompt + "\n\n" + section) if self.system_prompt else section
+        )
 
     def emit(self, event: Event) -> None:
         self.events.append(event)
@@ -553,12 +569,9 @@ class LLMThinkingPhase(Phase):
         # ChunkParseHandler 误跳过 LLM stream 消费(见 turn_chain.py ChunkParse SKIP)→
         # 用旧 tool_calls → allow-loop。LLM_THINKING 每轮都该重新调 LLM,进 phase 前清掉。
         ctx.turn_ctx.stage_outputs = None
-        # Fix snapshot-stale(2026-07-04,本次修复):同样清 stage_inputs。
-        # SM 链式递归触发多个 phase(agent_state.py:437 yield from self.trigger)共享同 turn_ctx,
-        # 若不显式作废,SystemPromptHandler(turn_chain.py:906)看到 stage_inputs 非 None 会跳过
-        # snapshot → LLMCallHandler 用旧的 tool_call 前快照(不含 tool_result)→ LLM 看不到
-        # 工具结果 → 重复发 tool_use → 死循环。对称于 stage_outputs 清残留。
-        ctx.turn_ctx.stage_inputs = None
+        # 选项 A 重构 (2026-07-06)：system_prompt 由 inputs_chain 装配(SETUP 每 turn 1 次),
+        # ReAct 多轮 LLM_THINKING 复用同一 ctx.system_prompt(turn 内稳定),无需在此重置。
+        # messages 永远从 agent.messages live 读,故也无 stage_inputs 的 stale 问题。
         yield from self._chain.run(ctx.turn_ctx)
 
     def next(self, trigger: str, ctx: PhaseContext) -> tuple[str, AgentPhase]:

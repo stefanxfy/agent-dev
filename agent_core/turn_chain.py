@@ -35,6 +35,7 @@ __all__ = [
     "_LLMResult",
     "TcPermissionDecision",
     "MemoryRetrievalHandler",
+    "SkillsPromptHandler",
     "SystemPromptHandler",
     "ToolsSchemaPrepareHandler",
     "LLMCallHandler",
@@ -303,30 +304,19 @@ class SecurityError(Exception):
 
 
 # ────────────────────────────────────────────────────────────
-# SystemPromptAssembler — 所有 system_prompt 操作的统一入口(2026-07-02)
+# SystemPromptAssembler — system_prompt 装配的统一入口
 # ────────────────────────────────────────────────────────────
-# 两种职责,两种 lifecycle,两个方法分开,无 "一次性 guard" hack:
-# - L1 build() (startup 一次):装配 base + MEMORY.md + sandbox section + TRUSTING。
-#   由 ReactAgent.__init__ 调一次,产物缓存到 self._cached,赋给 self.system_prompt。
+# build() (startup 一次):装配 base + MEMORY.md + sandbox section + TRUSTING。
+#   由 ReactAgent.__init__ 调一次,产物缓存到 self._cached,赋给 agent.system_prompt。
 #   必须等 permission_engine + memory_index 都 ready 后调(__init__ 末尾位置)。
-# - L7 place() (per-turn):把 self._cached 放进 messages 头部。
-#   由 SystemPromptHandler.handle() 调,每 turn 跑一次。
-#
-# 之前:构建散在 agent_core.py:_build_system_prompt_with_memory + _get_sandbox_prompt_section,
-# 放置在 handler 调模块级 _ensure_system_prompt。两处分散两文件,改一个要同步另一个。
-# 现在:统一进 SystemPromptAssembler,__init__ 调 build(),handler 调 place()。
 
 
 class SystemPromptAssembler:
-    """system_prompt 相关操作的统一入口。
+    """system_prompt 装配的统一入口。
 
-    Usage:
-        # ReactAgent.__init__
+    Usage(ReactAgent.__init__):
         self._assembler = SystemPromptAssembler(self)
         self.system_prompt = self._assembler.build()
-
-        # SystemPromptHandler
-        ctx.stage_inputs = self._assembler.place(list(agent.messages))
     """
     name = "system_prompt_assembler"
 
@@ -363,15 +353,6 @@ class SystemPromptAssembler:
         self._cached = result
         return result
 
-    def place(self, messages: list) -> list:
-        """L7 per-turn:把 self._cached 注入到 messages 头部(若还没注)。
-
-        不会重复注入已存在的 system message。空 cached 时返回原 messages 不动。
-        """
-        if not self._cached:
-            return messages
-        return self._inject_into(messages, self._cached)
-
     def _get_sandbox_section(self) -> str:
         """获取 sandbox 规则 prompt 段(对齐 doc §5.4)。
 
@@ -387,46 +368,6 @@ class SystemPromptAssembler:
         except Exception as e:
             _logger.debug("sandbox prompt 注入失败,跳过: %s", e)
             return ""
-
-    def _inject_into(self, messages: list, system_prompt: str) -> list:
-        """纯注入:头部缺 system message 时注入。返回新 list,不修改原 messages。"""
-        if not system_prompt:
-            return messages
-        if any(m.get("role") == "system" for m in messages):
-            return messages
-        return [{"role": "system", "content": system_prompt}] + messages
-
-
-# ════════════════════════════════════════════════════════════
-# 模块级 pure helper(inputs_chain handlers 共享,无 agent state 依赖)
-# ════════════════════════════════════════════════════════════
-# 放在 turn_chain.py 而非 agent_core.py:
-# helper 的 caller 在 turn_chain.py(MemoryRetrievalHandler),
-# 按 [[feedback-helper-lives-with-caller]] 原则放 caller 所在模块。
-# 决策树:纯函数 → 模块级。需要 agent state → handler / assembler 上的 method。
-# 注:_ensure_system_prompt 已迁入 SystemPromptAssembler._inject_into (2026-07-02 SRP),
-# 因为唯一 caller 是 SystemPromptHandler.handle(),现在转走 assembler.place()。
-
-
-def _merge_memory_into_system(
-    messages: list, system_prompt: str, mem_block: str,
-) -> list:
-    """把 mem_block 拼到 system 消息里,移除其他 system 消息。返回新 list。
-
-    Args:
-        messages: 当前 messages_for_llm
-        system_prompt: agent.system_prompt
-        mem_block: MemoryRetrievalHandler 拼好的记忆 block
-
-    Returns:
-        mem_block 为空 → 原 list 引用(无需改动);
-        否则 → 替换所有 system message 为 [new_system(content=system_prompt+mem_block)]
-              + 其他非 system message。
-    """
-    if not mem_block:
-        return messages
-    new_system = {"role": "system", "content": (system_prompt or "") + mem_block}
-    return [new_system] + [m for m in messages if m.get("role") != "system"]
 
 
 # ────────────────────────────────────────────────────────────
@@ -750,13 +691,17 @@ class ContextCompactionHandler:
 
 # ── 1. MemoryRetrievalHandler(inputs_chain) ───────────────
 class MemoryRetrievalHandler:
-    """inputs_chain 末位:检索相关记忆注入 messages,emit memory_status event。
+    """inputs_chain:检索相关记忆 → append 到 ctx.system_prompt + emit memory_status。
 
-    Plan B (2026-07-02 SRP 重构):不再调 agent._iter_phase_setup() — 改用模块级
-    helper + 本 class 上的 method 真实现:
-    - 调 _call_memory_retriever + 维护 _surfaced_memories → self._build_memory_block
-    - 把 mem_block 拼到 system → _merge_memory_into_system (模块级 helper)
-    - emit memory_status → self._emit_memory_status
+    选项 A 重构 (2026-07-06):
+    - 不再读写 stage_inputs;mem_block 通过 ctx.append_system 累加进 ctx.system_prompt
+    - 装配逻辑内聚为类内私有方法(_find_last_user_query / _retrieve_with_config /
+      _format_block / _count_stored / _emit_memory_status),不调模块级 helper
+    - ★ 修复 side_query bug:_retrieve_with_config 读 agent.memory_config.retrieval.mode/top_k
+      (方案 D 的 LlmInputAssembler 漏传 mode/top_k,导致 .env SIDE_QUERY 永不生效)
+    - _surfaced 跨轮去重封装在 retriever 内部(search 时自动过滤+更新),handler 不维护
+
+    谁检索谁 emit:memory_status 事件由本 handler emit(格式不变,web/app.py 零改动)。
     """
     name = "memory_retrieval"
 
@@ -765,146 +710,170 @@ class MemoryRetrievalHandler:
 
     def handle(self, ctx: TurnContext) -> HandlerResult:
         agent = self._agent
-        if agent is None or agent.memory_retriever is None:
+        if agent is None or getattr(agent, "memory_retriever", None) is None:
             return HandlerResult()
-        # 读 stage_inputs(已被 TurnIndicator + ContextCompaction + SystemPrompt
-        # 准备过,这是 inputs_chain 设计的核心数据流)
-        stage_inputs = getattr(ctx, "stage_inputs", None) or list(agent.messages)
-        last_user_msg = next(
-            (m for m in reversed(stage_inputs) if m.get("role") == "user"),
-            None,
-        )
-        if not last_user_msg or not isinstance(last_user_msg.get("content"), str):
+
+        query = self._find_last_user_query()
+        if not query:
             return HandlerResult()
+
         try:
-            result = self._build_memory_block(last_user_msg["content"])
-            if result["mem_block"]:
-                ctx.stage_inputs = _merge_memory_into_system(
-                    ctx.stage_inputs, agent.system_prompt, result["mem_block"],
-                )
-            self._emit_memory_status(ctx, result)
+            hits, stored_total, injected = self._retrieve_and_format(query)
+            if hits:
+                ctx.append_system(self._format_block(hits))
+            self._emit_memory_status(ctx, hits, stored_total, injected)
         except Exception as e:
-            _logger.warning(f"Memory retrieval failed: {e}")
+            _logger.warning(f"🧩 MemoryRetrievalHandler: retrieve failed: {e}")
         return HandlerResult()
 
-    def _call_memory_retriever(self, query: str):
-        """调 memory_retriever.search(),mode/top_k 从 agent.memory_config 读。
+    # ── 类内私有方法(内聚,不调外部 helper)──────────────────────
 
-        2026-07-02 Plan C:从 ReactAgent._call_memory_retriever 迁入(原 agent_core.py:439)。
-        **修复 bug**:此前 _build_memory_block 调 self._call_memory_retriever() 但 handler
-        无此方法(定义在 agent 上,因 memory_retriever is None 早退未暴露)。迁入后自愈。
+    def _find_last_user_query(self) -> Optional[str]:
+        """从 agent.messages 反查最近一条 user 消息文本(memory 检索 query)。"""
+        agent = self._agent
+        for m in reversed(agent.messages):
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                return m["content"]
+        return None
 
-        为什么独立成方法(2026-06-26 修复,原 docstring 保留):
-        - 之前 inline hardcode top_k=5、不传 mode,导致 .env 里
-          MEMORY_RETRIEVAL__MODE / __TOP_K 改了不生效
-        - 抽成方法后单测可验证 wiring,且未来加 side_query 二次精选 hook 也有落点
+    def _retrieve_with_config(self, query: str):
+        """调 retriever.search,mode/top_k 从 agent.memory_config 读(★ side_query bug 修复)。
+
+        2026-07-06:方案 D 的 LlmInputAssembler._build_memory_part 调 retriever.search(query)
+        没传 mode/top_k → 永远走默认 semantic。本方法恢复从 config 读取,与 .env
+        MEMORY_RETRIEVAL__MODE / __TOP_K 对齐(原 _call_memory_retriever 的正确逻辑)。
         """
         agent = self._agent
-        if agent.memory_config is not None:
-            mode = agent.memory_config.retrieval.mode
-            top_k = agent.memory_config.retrieval.top_k
-            cfg_min_score = agent.memory_config.retrieval.min_score
+        cfg = getattr(agent, "memory_config", None)
+        if cfg is not None:
+            mode = cfg.retrieval.mode
+            top_k = cfg.retrieval.top_k
         else:
             # 向后兼容:老 caller 不传 memory_config
             mode = "semantic"
             top_k = 5
-            cfg_min_score = 0.3
         _logger.debug(
-            f"[_call_memory_retriever] query={query!r} (len={len(query)}) | "
-            f"resolved mode={mode!r} top_k={top_k} min_score={cfg_min_score} | "
-            f"already_surfaced_count={len(agent._surfaced_memories)} "
-            f"already_surfaced_paths={list(agent._surfaced_memories)[:5]}"
-            f"{'...' if len(agent._surfaced_memories) > 5 else ''}"
+            f"[_retrieve_with_config] query={query!r} (len={len(query)}) | "
+            f"resolved mode={mode!r} top_k={top_k}"
         )
-        return agent.memory_retriever.search(
-            query,
-            top_k=top_k,
-            mode=mode,
-            already_surfaced=agent._surfaced_memories,
-        )
+        return agent.memory_retriever.search(query, top_k=top_k, mode=mode)
 
-    def _build_memory_block(self, query: str) -> dict:
-        """调 retriever + 维护 _surfaced_memories。返回 mem_block + 统计字段。
-
-        私有方法而非模块级 helper,因为突变 self._agent._surfaced_memories —
-        依赖 handler 持有的 agent 引用(按 [[feedback-helper-lives-with-caller]]
-        决策树:需要 agent state → method on 持有该 state 的 class)。
-        """
+    def _retrieve_and_format(self, query: str):
+        """retrieve → 返回 (hits, stored_total, injected_tokens)。search 失败降级 hits=[]。"""
         agent = self._agent
-        report = self._call_memory_retriever(query)
-        hits = report.hits if hasattr(report, "hits") else []
-        for h in hits:
-            if hasattr(h, "rel_path") and h.rel_path:
-                agent._surfaced_memories.add(h.rel_path)
-        if not hits:
-            mem_block = ""
-        else:
-            mem_block = "\n\n[记忆库 / {} hits]\n".format(len(hits))
-            for h in hits:
-                mem_block += (
-                    f"- [{getattr(h, 'type', '?')}] {getattr(h, 'title', '')}: "
-                    f"{(getattr(h, 'body', '') or '')[:200]}\n"
-                )
-        stored_total = 0
-        if agent.memory_store:
-            try:
-                counts = agent.memory_store.count_by_type()
-                stored_total = sum(counts.values()) if isinstance(counts, dict) else 0
-            except Exception:
-                pass
-        injected_tokens = sum(
-            len((getattr(h, "body", "") or "")) // 4 for h in hits
-        )
-        return {
-            "mem_block": mem_block,
-            "hits": hits,
-            "stored_total": stored_total,
-            "injected_tokens": injected_tokens,
-        }
+        try:
+            report = self._retrieve_with_config(query)
+        except Exception as e:
+            _logger.warning(f"🧩 MemoryRetrievalHandler: search failed: {e}")
+            return ([], self._count_stored(agent), 0)
+        hits = getattr(report, "hits", None) or []
+        stored_total = self._count_stored(agent)
+        injected = sum(len((getattr(h, "body", "") or "")) // 4 for h in hits)
+        return (hits, stored_total, injected)
 
-    def _emit_memory_status(self, ctx: TurnContext, result: dict) -> None:
+    def _format_block(self, hits) -> str:
+        """拼 [记忆库 / N hits] 文本块。"""
+        mem_block = "\n\n[记忆库 / {} hits]\n".format(len(hits))
+        for h in hits:
+            title = getattr(h, "title", "") or ""
+            body = (getattr(h, "body", "") or "")[:200]
+            mem_block += f"- [{getattr(h, 'type', '?')}] {title}: {body}\n"
+        return mem_block
+
+    def _count_stored(self, agent) -> int:
+        """库内 memory 总数(cumulative 计数器)。失败返 0。"""
+        store = getattr(agent, "memory_store", None)
+        if store is None:
+            return 0
+        try:
+            counts = store.count_by_type()
+            return sum(counts.values()) if isinstance(counts, dict) else 0
+        except Exception:
+            return 0
+
+    def _emit_memory_status(self, ctx: TurnContext, hits, stored_total: int, injected: int) -> None:
         ctx.emit(("memory_status", {
-            "hits": len(result["hits"]),
-            "stored_total": result["stored_total"],
-            "injected_tokens": result["injected_tokens"],
-            "zero_hit": len(result["hits"]) == 0,
+            "hits": len(hits),
+            "stored_total": stored_total,
+            "injected_tokens": injected,
+            "zero_hit": len(hits) == 0,
         }))
 
 
 # ── 2. SystemPromptHandler(inputs_chain) ──────────────────
 class SystemPromptHandler:
-    """inputs_chain 中段:把 agent.system_prompt 注入到 messages 头部。
+    """inputs_chain:把 base system_prompt append 到 ctx.system_prompt。
 
-    Plan B (2026-07-02 SRP 重构):从 _iter_phase_setup 拆出,改用模块级 helper
-    _ensure_system_prompt 真实现。原本是被 MemoryRetrievalHandler 短路的
-    僵尸 anchor,现接管系统 prompt 注入职责。
+    agent.system_prompt 由 SystemPromptAssembler.build() 在 ReactAgent.__init__
+    构造(base + sandbox + MEMORY.md + TRUSTING_RECALL),本 handler 只负责把它
+    累加进 ctx.system_prompt,供 llm_chain 的 LLMCallHandler 读取。
 
-    2026-07-02 二次重构:直接调 SystemPromptAssembler.place() —
-    所有 system_prompt 注入操作统一到 assembler,handler 不再自带注入逻辑。
-    assembler.build() 由 ReactAgent.__init__ 调一次,产物缓存到 agent.system_prompt。
-    handler 这里只负责 per-turn 的"放置"职责。
+    选项 A 重构 (2026-07-06):不再调 SystemPromptAssembler.place()(那是把 system
+    放进 messages 头部,依赖已删除的 stage_inputs);改为 ctx.append_system 累加。
+    SystemPromptAssembler.build() 仍被 __init__ 用 → 类保留。
 
-    顺序约束:inputs_chain 中 ContextCompaction 之后、MemoryRetrieval 之前。
-    ContextCompaction 可能修改 agent.messages(压缩);MemoryRetrieval 依赖
-    stage_inputs 头部有 system message 才能正确合并 mem_block。
+    顺序:inputs_chain 中 ContextCompaction 之后、MemoryRetrievalHandler 之前。
     """
     name = "system_prompt"
 
     def __init__(self, agent):
         self._agent = agent
-        # assembler 必已在 __init__ 里建好(agent_core.py L261 在 build_default_inputs_chain 之前)
-        self._assembler = getattr(agent, "_assembler", None)
 
     def handle(self, ctx: TurnContext) -> HandlerResult:
         agent = self._agent
-        if agent is None or self._assembler is None or not agent.system_prompt:
+        if agent is None or not getattr(agent, "system_prompt", None):
             return HandlerResult()
-        # 仅当 stage_inputs 未被前面 handler(TurnIndicator / ContextCompaction)
-        # 写入时才填。这样后续 MemoryRetrieval 读 stage_inputs 能拿到含
-        # system message 的 messages_for_llm。
-        if getattr(ctx, "stage_inputs", None) is None:
-            ctx.stage_inputs = self._assembler.place(list(agent.messages))
+        ctx.append_system(agent.system_prompt)
         return HandlerResult()
+
+
+# ── 4. SkillsPromptHandler(inputs_chain, 在 MemoryRetrieval 之后) ──
+class SkillsPromptHandler:
+    """inputs_chain:把 ## Skills 段 append 到 ctx.system_prompt(FR-007)。
+
+    选项 A 重构 (2026-07-06):
+    - 不再读写 stage_inputs / 调 _merge_skills_into_system
+    - 用 ctx.append_system 累加 skills 段;幂等性自检(section 已在 ctx.system_prompt 则跳过)
+
+    guard(C2):Read 工具不在 toolset → 跳过(无 Read 则模型读不到 SKILL.md,注入目录只会误导)。
+    顺序:MemoryRetrievalHandler 之后(后者 append mem_block,本 handler append skills 段)。
+    """
+    name = "skills_prompt"
+
+    def __init__(self, agent):
+        self._agent = agent
+
+    def handle(self, ctx: TurnContext) -> HandlerResult:
+        agent = self._agent
+        if agent is None:
+            return HandlerResult()
+        registry = getattr(agent, "skills_registry", None)
+        if registry is None:
+            return HandlerResult()
+        # C2 guard:Read 工具必须可用(否则模型无法读 SKILL.md)
+        tools = getattr(agent, "tools", None)
+        if tools is None or "Read" not in tools.list_names():
+            _logger.debug("🧩 SkillsPrompt skip: Read tool not in toolset (C2 guard)")
+            return HandlerResult()
+        # 取 skills 段(类内私有,不调外部 helper)
+        try:
+            section = self._build_section(registry)
+        except Exception as e:
+            _logger.warning(f"🧩 SkillsPrompt snapshot failed: {e}")
+            return HandlerResult()
+        if not section:
+            return HandlerResult()
+        # 幂等:已在 ctx.system_prompt 则跳过(防 chain 重跑翻倍)
+        if section in ctx.system_prompt:
+            return HandlerResult()
+        ctx.append_system(section)
+        _logger.debug(f"🧩 SkillsPrompt injected: section_len={len(section)}")
+        return HandlerResult()
+
+    def _build_section(self, registry) -> str:
+        """调 registry.snapshot() 取已渲染的 skills prompt 文本。空则返 ''。"""
+        snap = registry.snapshot()
+        return snap.prompt or ""
 
 
 # ── 0. TurnIndicatorHandler(inputs_chain 首位) ────────────
@@ -956,13 +925,16 @@ class ToolsSchemaPrepareHandler:
 class LLMCallHandler:
     """llm_chain 首位:发起 LLM chat 调用,获得 chunk stream。
 
-    2026-07-02 SRP 重构:从 agent._iter_phase_llm() (Plan A 私有方法, 114 行)
-    拆出,只保留 LLM 请求发起 + LLM 错误兜底 2 件事:
-    - 构造 messages_for_llm + tool_schemas + cache_namespace
+    选项 A 重构 (2026-07-06):只保留 LLM 请求发起 + LLM 错误兜底 2 件事(SRP):
+    - 从 ctx 读 system_prompt(inputs_chain 累加)+ tool_schemas(ToolsSchemaPrepare)
+      + agent.messages(live)→ 拼 messages_for_llm
     - 调 self.llm.chat(...) 拿 stream iterator
     - 成功:把 stream 存到 ctx._llm_stream,让 ChunkParseHandler 消费
     - 失败(LLM API 抛):emit 错误 events + 写 stage_outputs(stop_reason="llm_error")
       + 追加 fallback assistant message,ChunkParseHandler 见 stage_outputs 已设就跳过
+
+    不再做(已归位):装配 system/memory/skills(→ inputs_chain 的 3 个 handler)、
+    emit memory_status(→ MemoryRetrievalHandler)、取 tool_schemas(→ ToolsSchemaPrepareHandler)。
 
     ChunkParseHandler 接管剩余职责:stream consumption + cancel_event check +
     4 流(text/thinking/tool_call/usage)聚合 + interrupt 兜底 + stream 异常兜底 +
@@ -980,8 +952,15 @@ class LLMCallHandler:
         if agent is None:
             return HandlerResult()
 
-        # 1. 准备 LLM 调用 args
-        messages_for_llm = getattr(ctx, "stage_inputs", None) or list(agent.messages)
+        # 1. 拼 messages_for_llm:ctx.system_prompt(inputs_chain 累加)+ agent.messages(live)
+        #    选项 A 重构 (2026-07-06):不再调 LlmInputAssembler;system_prompt 由
+        #    inputs_chain 的 SystemPrompt/MemoryRetrieval/SkillsPrompt handler append。
+        system_prompt = ctx.system_prompt
+        if system_prompt:
+            messages_for_llm = [{"role": "system", "content": system_prompt}] + list(agent.messages)
+        else:
+            messages_for_llm = list(agent.messages)
+
         # 诊断(2026-07-03):打印 messages role 序列 + tool_use/tool_result id,
         # 确认 _is_resume 后的 LLM 调用 messages 是否含上一轮 tool_result(allow-loop 排查)。
         _roles = []
@@ -997,11 +976,7 @@ class LLMCallHandler:
                             _r += f"/tr:{(_b.get('tool_use_id') or '')[:10]}"
             _roles.append(_r)
         _logger.warning("▶️ [LLMCall entry] messages roles=%s", _roles)
-        try:
-            tool_schemas = agent.tools.list_schemas(provider=detect_provider(agent.llm))
-        except Exception as e:
-            _logger.warning(f"ToolsSchemaPrepare in LLMCall failed: {e}")
-            tool_schemas = None
+        tool_schemas = ctx.tool_schemas
         cache_namespace = (
             f"react:{agent._session_manager.session_id if agent._session_manager else 'default'}"
         )

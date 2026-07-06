@@ -209,12 +209,36 @@ if user_input:
     # 显示用户消息
     with st.chat_message("user"):
         st.write(user_input)
-    
+
+    # US4 (T044)：slash 命令派发 — /skill-name <args> 显式触发
+    try:
+        from agent_core.skills.commands import resolve_skill_command
+    except Exception:
+        resolve_skill_command = None  # type: ignore[assignment]
+    if resolve_skill_command is not None:
+        resolved = resolve_skill_command(user_input)
+        if resolved is not None:
+            skill_name, args = resolved
+            registry = getattr(agent, "skills_registry", None)
+            entry = registry.get_entry(skill_name) if registry is not None else None
+            if (entry is None or entry.load_error is not None
+                    or not getattr(entry, "user_invocable", True)):
+                with st.chat_message("assistant"):
+                    st.warning(f"⚠️ 无匹配 skill 或不可调用: /{skill_name}")
+                st.stop()
+            rewrite = (
+                f'Use the "{skill_name}" skill. Read its SKILL.md at '
+                f'"{entry.skill.file_path}" and follow its instructions.'
+            )
+            if args:
+                rewrite = f"{rewrite} {args}"
+            user_input = rewrite
+
     # 调用 Agent
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         full_response = ""
-        
+
         try:
             # 运行 ReAct 循环(Plan B Step 7:agent.run() 已删,改用 start_run()+step())
             agent.start_run(user_input)
