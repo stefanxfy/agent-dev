@@ -312,4 +312,104 @@ class TestEnvCleanupHandler:
         result = EnvCleanupHandler(agent).handle(ctx)
         assert isinstance(result, HandlerResult)
         # reverter 仍 None
-        assert agent._pending_env_reverter is None
+
+
+# ────────────────────────────────────────────────────────────────────
+# 2026-07-06 bug fix:SkillsPromptHandler.handle 顺序
+# ────────────────────────────────────────────────────────────────────
+
+class TestHandlerOrderingBug:
+    """2026-07-06 bug fix:handler 必须在 snapshot rebuild 之前注入 secret。
+
+    原 bug:`registry.entries` property 触发 snapshot() → rebuild 时
+    SECRET_DEMO 还没 inject → echo-skill 被 filter exclude。第二次 rebuild
+    是 by accident 触发(env hash 变)。
+
+    修复:handler 用 `registry.load_entries_for_injection()`(不触发 snapshot),
+    然后才 snapshot()。
+    """
+
+    def test_load_entries_for_injection_does_not_trigger_build_snapshot(self, tmp_path):
+        """registry.load_entries_for_injection() 只填 _last_entries_by_name,
+        不写 _cached / _cached_sig → 不触发 build_snapshot。"""
+        reg = _make_registry_with_workspace(tmp_path)
+        # 初始状态:_cached=None(没 snapshot 过)
+        assert reg._cached is None
+        assert reg._cached_sig is None
+
+        entries = reg.load_entries_for_injection()
+
+        # entries 已填,但 snapshot 缓存还是空的
+        assert len(entries) >= 1
+        assert reg._cached is None, "_cached 仍 None — load_entries_for_injection 不应触发 rebuild"
+        assert reg._cached_sig is None
+        # _last_entries_by_name 已填(load 复用)
+        assert "hello" in reg._last_entries_by_name
+
+        # 后续 snapshot() 调用才真正 rebuild(因为 _cached 是 None)
+        reg.snapshot()
+        assert reg._cached is not None
+        assert reg._cached_sig is not None
+
+    def test_handler_injects_secret_before_snapshot_rebuild(self, tmp_path, monkeypatch):
+        """SkillsPromptHandler.handle 注入 secret 在 registry.snapshot() rebuild 之前。
+
+        验证策略:spy on registry.snapshot() call count。
+        - 修复前 (用 entries property):handler 调 2 次 snapshot(load + _build_section)
+          → echo-skill 第 1 次 rebuild 时 SECRET_DEMO 还没注入 → 被 exclude
+        - 修复后 (用 load_entries_for_injection):handler 调 1 次 snapshot(_build_section)
+          → SECRET_DEMO 已注入 → rebuild 时 echo-skill ELIGIBLE
+        """
+        # env 注入的 key 必须在 fixture 启动前清理,避免残留
+        monkeypatch.delenv("ORDERING_KEY_X", raising=False)
+
+        reg = _make_registry_with_workspace(tmp_path)
+        cfg = reg._config
+        # 加一个需要 ORDERING_KEY_X 的 ordering-skill(模拟 echo-skill)
+        skill_dir = tmp_path / "ordering-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            '---\nname: ordering-skill\ndescription: "ordering"\n'
+            'metadata:\n  requires:\n    env: ["ORDERING_KEY_X"]\n---\nbody\n',
+            encoding="utf-8",
+        )
+        cfg.entries = {
+            "ordering-skill": SkillEntryConfig(
+                secrets={"ORDERING_KEY_X": SecretRef(SecretRefKind.INLINE, "ordering_value_zzz")},
+            ),
+        }
+
+        # spy:把 snapshot 替换成计数器版(bind to instance)
+        call_log: list[str] = []
+        orig_snapshot = reg.snapshot
+        def counting_snapshot():
+            call_log.append("snapshot")
+            return orig_snapshot()
+        # monkey-patch via type bound method(避免 __get__ 解析)
+        import types
+        reg.snapshot = types.MethodType(lambda self: counting_snapshot(), reg)
+
+        agent = MagicMock()
+        agent.skills_registry = reg
+        agent.skills_config = cfg
+        agent._pending_env_reverter = None
+        tools = MagicMock()
+        tools.list_names.return_value = ["Read"]
+        agent.tools = tools
+
+        ctx = _make_ctx("BASE")
+        SkillsPromptHandler(agent).handle(ctx)
+
+        # ✅ 修复后:handler 只在 _build_section 调 1 次 snapshot
+        # ❌ 修复前:entries property 调 1 次 + _build_section 调 1 次 = 2 次
+        assert len(call_log) == 1, (
+            f"BUG:handler 应只调 1 次 snapshot (_build_section),实际 {len(call_log)} 次。"
+            f"多出的调用是 entries property 触发的 — 表示 secret 在 snapshot 之后注入"
+        )
+        # env 实际注入
+        assert os.environ.get("ORDERING_KEY_X") == "ordering_value_zzz"
+        # ordering-skill 应在最终 snapshot 中(eligibility 不再 missing)
+        final_snap = reg.snapshot()
+        assert "ordering-skill" in final_snap.prompt, (
+            "ordering-skill 应在最终 prompt — SECRET_DEMO 注入后 rebuild 让 ELIGIBLE"
+        )

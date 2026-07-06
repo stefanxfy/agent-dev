@@ -100,9 +100,37 @@ class SkillsRegistry:
         entry 的 metadata.requires.env 来过滤哪些 key 应注入。
 
         触发 snapshot() 以确保最近一次加载结果可用；空 list 表示还没加载。
+
+        ⚠️ 注意:此 property 会触发 snapshot() rebuild。secret env 注入路径
+        请用 `load_entries_for_injection()`(2026-07-06 bug fix) — 不触发
+        snapshot, 避免 echo-skill 在 SECRET_DEMO 注入前 rebuild 被排除。
         """
         if not self._last_entries_by_name:
             self.snapshot()
+        return list(self._last_entries_by_name.values())
+
+    def load_entries_for_injection(self) -> list[SkillEntry]:
+        """SkillEntry 列表用于 secret env 注入 — **不触发 snapshot rebuild**。
+
+        2026-07-06 bug fix:SkillsPromptHandler 早期实现用 `entries` property,
+        但 property 会自动 snapshot() → 在 SECRET_DEMO 注入前 rebuild →
+        echo-skill 因 `requires.env` 不满足被 filter exclude → prompt 缺这个 skill。
+        第二次 rebuild 是 by accident 触发(env hash 变 → 缓存失效),
+        修复后 inject 必须在 rebuild 之前。
+
+        设计:
+        - 调 `_load_all()` 后缓存到 `_last_entries_by_name`(供后续 entries / get_entry 复用)
+        - **不写** `_cached` / `_cached_sig` → 下次 snapshot() 仍按 env hash 失效触发 rebuild
+        - 与 `entries` property 区别:不调 `build_snapshot`,仅 load + cache by-name map
+
+        调用方应在 load 后立即注入 secret(env_overrides.apply_skill_env_overrides),
+        然后才调 `snapshot()` — 这样 rebuild 看到的 env 已含 secret, echo-skill ELIGIBLE。
+
+        Returns:
+            list[SkillEntry](顺序与 skill_index.load_all 一致)
+        """
+        if not self._last_entries_by_name:
+            self._last_entries_by_name = {e.skill.name: e for e in self._load_all()}
         return list(self._last_entries_by_name.values())
 
     @property

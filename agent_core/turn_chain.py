@@ -871,10 +871,10 @@ class SkillsPromptHandler:
         skills_config = getattr(agent, "skills_config", None)
         if skills_config is not None and getattr(skills_config, "entries", None):
             try:
-                # 用 registry.entries(list[SkillEntry])喂给 apply_skill_env_overrides
-                # — 后者需要每个 entry 的 metadata.requires.env 来过滤 key
-                # (SkillSnapshot 没有 entries 字段, 它只含 prompt + summary)
-                skill_entries = registry.entries
+                # 用 registry.load_entries_for_injection()(不要用 .entries property,
+                # 否则 property 会触发 snapshot rebuild → SECRET_DEMO 注入前
+                # rebuild → echo-skill 被 exclude。2026-07-06 bug fix)
+                skill_entries = registry.load_entries_for_injection()
                 reverter = apply_skill_env_overrides(skill_entries, skills_config)
                 # 注册 reverter 给 EnvCleanupHandler(T034)在 outputs_chain 末位兜底
                 # 覆盖式:同 run 多次 turn 时,新 reverter 替换旧的(EnvCleanupHandler
