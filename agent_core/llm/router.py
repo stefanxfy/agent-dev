@@ -20,7 +20,9 @@ from __future__ import annotations
 from . import providers  # noqa: F401
 
 import concurrent.futures
+import json
 import logging
+import os
 import time
 from typing import Callable, Generator, Optional
 
@@ -28,6 +30,47 @@ from .config import LLMConfig
 from .types import StreamChunk
 from .providers.base import BaseProvider
 from .registry import ProviderRegistry
+
+
+# ──────────────────────────────────────────────────────────────────
+# Secret hygiene (FR-014) — 全 log dump 前先 mask 已注入到 os.environ 的
+# secret values。避免 Bash tool 输出 echo $SECRET_DEMO 后,value 出现在 log。
+# ──────────────────────────────────────────────────────────────────
+def _mask_env_secrets(text: str) -> str:
+    """替换 text 中所有已注入 secret value 为 <MASKED_SECRET[key]>。
+
+    仅 mask 当前 os.environ 里**长度 >= 4** 的 value(避免短串误伤)。
+    仅 mask 一次后 break(每次替换减少 text 长度,后续不重复扫)。
+
+    Args:
+        text: 待 mask 字符串(可能 None)
+
+    Returns:
+        mask 后字符串(若 text 为 None/空则原样返回)
+    """
+    if not text:
+        return text
+    masked = text
+    # 排序按 value 长度降序:长的先替换,避免短 value 是长 value 子串时替换错位
+    items = sorted(os.environ.items(), key=lambda kv: len(kv[1]), reverse=True)
+    for key, value in items:
+        if not value or len(value) < 4 or key.startswith("_") or key.startswith("PATH"):
+            # 跳过太短(易误伤) / sys-prefixed / 路径类(高基数)
+            continue
+        if value in masked:
+            masked = masked.replace(value, f"<MASKED_SECRET[{key}]>")
+    return masked
+
+
+def _dump_json(obj, *, ensure_ascii: bool = False, indent: int = None) -> str:
+    """安全 JSON dump — obj 不一定是 dict(可能是 list[str] / str / int)。"""
+    try:
+        return json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent, default=str)
+    except Exception:
+        return repr(obj)
+
+
+logger = logging.getLogger(__name__)
 
 logger = logging.getLogger("llm.router")
 
@@ -81,17 +124,100 @@ class LLMRouter:
             system_prompt_override: Fork 模式下覆盖 system prompt(保持 cache prefix 字节级一致)
             tool_choice: 工具选择策略(None / "auto" / "none" / "required")
             cache_namespace: M7 prompt cache 命名空间,透传给 provider(目前仅 Anthropic 使用)。
+
+        Debug 日志(2026-07-06):在入口 log 全 messages + tools dump(已 mask 已知
+        secret values — FR-014),在 exit log 全响应聚合(text + tool_calls +
+        usage + finish_reason)。便于 bug 追溯与 cache miss 定位。
         """
+        # ── REQUEST log (entry):全量 dump messages + tools ──
+        # 先用 _mask_env_secrets 处理最后一条 user/tool_result 块;其他 messages
+        # 通常不直接含 secret(value 应只在 env/bash output 里),但也走 mask 兜底。
+        try:
+            msgs_dump = _mask_env_secrets(
+                _dump_json({"messages": messages, "tools": tools})
+            )
+            logger.debug(
+                "🧩 LLM REQUEST: provider=%s model=%s msgs=%d tools=%d tool_choice=%s cache_ns=%s\n%s",
+                self.config.provider,
+                self.config.model,
+                len(messages),
+                len(tools or []),
+                tool_choice,
+                cache_namespace,
+                msgs_dump,
+            )
+        except Exception as e:
+            logger.debug("🧩 LLM REQUEST log failed: %s", e)
+
         system_prompt, filtered_messages = self._resolve_system(
             messages, system_prompt_override
         )
-        yield from self.provider.chat(
+
+        # ── Collect chunks for RESPONSE log ──
+        text_buf: list[str] = []
+        thinking_buf: list[str] = []
+        tool_calls_buf: list = []
+        usage = None
+        stop_reason = None
+        chunks_count = 0
+
+        for chunk in self.provider.chat(
             messages=filtered_messages,
             tools=tools,
             tool_choice=tool_choice,
             system_prompt=system_prompt,
             cache_namespace=cache_namespace,
-        )
+        ):
+            chunks_count += 1
+            if chunk.text_delta and chunk.text_delta.text:
+                text_buf.append(chunk.text_delta.text)
+            if chunk.thinking_delta and chunk.thinking_delta.text:
+                thinking_buf.append(chunk.thinking_delta.text)
+            if chunk.tool_call is not None:
+                # tool_call 单个 dataclass(完整,非增量)— 每次覆盖(最终为终值)
+                tool_calls_buf.append(chunk.tool_call)
+            if chunk.usage is not None:
+                usage = chunk.usage
+            if chunk.stop_reason is not None:
+                stop_reason = chunk.stop_reason
+            yield chunk
+
+        # ── RESPONSE log (exit):聚合 dump ──
+        full_text = "".join(text_buf)
+        full_thinking = "".join(thinking_buf)
+        # mask 全 LLM 输出(避免 tool result 出现在 thinking/text 里,但实测 tool
+        # use 是独立的 tool_call chunk,不进 text_thinking; 仍走 mask 兜底)
+        try:
+            response_dump = _mask_env_secrets(
+                _dump_json({
+                    "text": full_text,
+                    "thinking": full_thinking,
+                    "tool_calls": [
+                        {
+                            "name": getattr(tc, "name", "?"),
+                            "input": getattr(tc, "input", None),
+                            "tool_use_id": getattr(tc, "tool_use_id", None),
+                        }
+                        for tc in tool_calls_buf
+                    ],
+                    "usage": usage.summary(self.config.provider.value) if usage else None,
+                    "stop_reason": stop_reason,
+                    "chunks_count": chunks_count,
+                })
+            )
+            logger.debug(
+                "🧩 LLM RESPONSE: provider=%s model=%s stop=%s chunks=%d tool_calls=%d text_chars=%d thinking_chars=%d\n%s",
+                self.config.provider,
+                self.config.model,
+                stop_reason,
+                chunks_count,
+                len(tool_calls_buf),
+                len(full_text),
+                len(full_thinking),
+                response_dump,
+            )
+        except Exception as e:
+            logger.debug("🧩 LLM RESPONSE log failed: %s", e)
 
     # ── invoke():同步聚合调用(内置重试+超时) ────────────────────
 

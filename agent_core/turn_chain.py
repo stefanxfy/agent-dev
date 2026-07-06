@@ -27,6 +27,37 @@ from agent_core.agent_state import AgentPhase, Event, RunState, TurnContext
 from agent_core.agent_core import _TRUNCATED_STOP_REASONS
 # 002-skill-secret-injection (T009): SkillsPromptHandler 用 apply_skill_env_overrides 注入 secret
 from agent_core.skills.env_overrides import apply_skill_env_overrides
+# 2026-07-06:Tool INPUT/OUTPUT dump helper (FR-014 safe — mask 已注入 secret values)
+from agent_core.llm.router import _dump_json, _mask_env_secrets
+
+
+# ──────────────────────────────────────────────────────────────────
+# Tool debug dump helpers (FR-014 safe)
+# ──────────────────────────────────────────────────────────────────
+# Tool execute 前后打 debug 日志: input (full dump, JSON) + output (full dump, JSON)。
+# FR-014 防御:在 dump 前先 _mask_env_secrets,避免 Bash tool output 含
+# $SECRET_DEMO 字面值后泄漏到 log。
+
+def _safe_dump_tool_input(name: str, inp: Any) -> str:
+    """Tool input → JSON dump(已 mask 已知 secret values)。"""
+    try:
+        return _mask_env_secrets(_dump_json(inp))
+    except Exception as e:
+        return f"<dump-failed: {type(e).__name__}>"
+
+
+def _safe_dump_tool_output(name: str, result: dict) -> str:
+    """Tool result → JSON dump (output string 经 mask)。"""
+    if not isinstance(result, dict):
+        return _mask_env_secrets(repr(result))
+    try:
+        # 复制 result 但对 output 做 mask
+        masked_result = dict(result)
+        if "output" in masked_result:
+            masked_result["output"] = _mask_env_secrets(str(masked_result["output"]))
+        return _mask_env_secrets(_dump_json(masked_result))
+    except Exception as e:
+        return f"<dump-failed: {type(e).__name__}>"
 
 
 __all__ = [
@@ -1637,6 +1668,11 @@ class ToolExecuteHandler:
         # ── DENY pre-result 路径(synthetic error result) ──
         for d in denied:
             output = d.error or "Permission denied"
+            # 🧩 debug:tool 结果 log (DENY 路径也走)
+            _logger.debug(
+                "🧩 TOOL RESULT: name=%s kind=deny output_chars=%d success=False",
+                d.tc.tool_name, len(output),
+            )
             ctx.emit(("tool_result", {
                 "name": d.tc.tool_name,
                 "output": output,
@@ -1664,6 +1700,12 @@ class ToolExecuteHandler:
             d = allowed[0]
             tc = d.tc
             inp = d.effective_input if d.effective_input is not None else tc.tool_input
+            # 🧩 debug:tool INPUT log (entry)
+            _logger.debug(
+                "🧩 TOOL INPUT: name=%s input=%s",
+                tc.tool_name,
+                _safe_dump_tool_input(tc.tool_name, inp),
+            )
             try:
                 start = time.time()
                 result = agent.tools.execute(
@@ -1679,6 +1721,14 @@ class ToolExecuteHandler:
                 )
                 result = {"status": "error", "error": str(e)}
                 elapsed = 0.0
+            # 🧩 debug:tool OUTPUT log (exit, 在 mask 后)
+            _logger.debug(
+                "🧩 TOOL RESULT: name=%s status=%s output=%s elapsed=%.3fs",
+                tc.tool_name,
+                result.get("status"),
+                _safe_dump_tool_output(tc.tool_name, result),
+                elapsed,
+            )
             results_ordered.append((d, result, elapsed))
         else:
             # 并行 — ThreadPoolExecutor
@@ -1688,6 +1738,12 @@ class ToolExecuteHandler:
             def _safe_exec(decision) -> tuple:
                 tc = decision.tc
                 inp = decision.effective_input if decision.effective_input is not None else tc.tool_input
+                # 🧩 debug:tool INPUT log (parallel entry)
+                _logger.debug(
+                    "🧩 TOOL INPUT: name=%s input=%s",
+                    tc.tool_name,
+                    _safe_dump_tool_input(tc.tool_name, inp),
+                )
                 try:
                     start = time.time()
                     r = agent.tools.execute(
@@ -1695,13 +1751,23 @@ class ToolExecuteHandler:
                         max_retries=DEFAULT_MAX_RETRIES,
                         cancel_event=cancel_evt,
                     )
-                    return decision, r, time.time() - start
+                    elapsed_inner = time.time() - start
                 except Exception as e:
                     _logger.error(
                         "[ToolExecuteHandler] parallel tool exception name=%s err=%s",
                         tc.tool_name, e,
                     )
-                    return decision, {"status": "error", "error": str(e)}, 0.0
+                    r = {"status": "error", "error": str(e)}
+                    elapsed_inner = 0.0
+                # 🧩 debug:tool OUTPUT log (parallel exit)
+                _logger.debug(
+                    "🧩 TOOL RESULT: name=%s status=%s output=%s elapsed=%.3fs",
+                    tc.tool_name,
+                    r.get("status"),
+                    _safe_dump_tool_output(tc.tool_name, r),
+                    elapsed_inner,
+                )
+                return decision, r, elapsed_inner
 
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 futures = [executor.submit(_safe_exec, d) for d in allowed]
