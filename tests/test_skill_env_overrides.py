@@ -312,3 +312,133 @@ def test_multi_skill_shared_env_name_reverse_order(monkeypatch):
     assert os.environ.get("SHARED_KEY") == "pre_run_value_2", (
         "reverter 仍应还原到 RUN 前原值, 与 entries 顺序无关"
     )
+
+
+# ──────────────────────────────────────────────────────────────────
+# T022 — US3 源缺失 warn + skip 集成 (2 用例)
+# ──────────────────────────────────────────────────────────────────
+
+def test_missing_env_source_warns_and_skips_without_raising(caplog):
+    """ENV 源 os.environ 未设 → log WARN + 该 key 未注入 + run 不 raise。
+
+    spec FR-012: 缺失 secret 不 fail-fast, 降级为 warn + skip, run 继续。
+    spec US3 AS4 (negative case)。
+    """
+    # 确保目标 env 未设 (fixture _clean_env 已 delenv,但显式再 ensure 一次)
+    os.environ.pop("MISSING_ENV_NAME", None)
+    assert "MISSING_ENV_NAME" not in os.environ
+
+    entry = _make_skill_entry("env-skill", env_requires=["MISSING_ENV_NAME"])
+    cfg = _make_config_with_entries({
+        "env-skill": SkillEntryConfig(
+            secrets={
+                "MISSING_ENV_NAME": SecretRef(
+                    kind=SecretRefKind.ENV,
+                    value="MISSING_ENV_NAME",
+                ),
+            },
+        ),
+    })
+
+    with caplog.at_level("WARNING", logger="agent_core.skills.env_overrides"):
+        # 不应 raise
+        reverter = apply_skill_env_overrides([entry], cfg)
+
+    # key 未注入
+    assert "MISSING_ENV_NAME" not in os.environ
+
+    # log 含 WARN + skill 名 + secret 名 + env kind
+    warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("env-skill" in r.getMessage() for r in warn_records), (
+        f"WARN log 应含 skill 名 'env-skill'; got: {[r.getMessage() for r in warn_records]}"
+    )
+    assert any("MISSING_ENV_NAME" in r.getMessage() for r in warn_records), (
+        f"WARN log 应含 secret 名 'MISSING_ENV_NAME'; got: {[r.getMessage() for r in warn_records]}"
+    )
+    assert any("env" in r.getMessage().lower() for r in warn_records), (
+        f"WARN log 应含源类型 'env'; got: {[r.getMessage() for r in warn_records]}"
+    )
+
+    # reverter 安全 (no-op, 因为没注入)
+    reverter()
+    assert "MISSING_ENV_NAME" not in os.environ
+
+
+def test_missing_file_source_warns_and_skips_without_raising(caplog, tmp_path):
+    """FILE 源路径不存在 → log WARN + 该 key 未注入 + run 不 raise。
+
+    spec FR-012: 缺失 secret 不 fail-fast。
+    spec US3 negative case (类似 AS4)。
+    """
+    missing_file = tmp_path / "nonexistent_token_xyz_abc"
+    assert not missing_file.exists()
+
+    entry = _make_skill_entry("file-skill", env_requires=["MISSING_FILE_PATH"])
+    cfg = _make_config_with_entries({
+        "file-skill": SkillEntryConfig(
+            secrets={
+                "MISSING_FILE_PATH": SecretRef(
+                    kind=SecretRefKind.FILE,
+                    value=str(missing_file),
+                ),
+            },
+        ),
+    })
+
+    with caplog.at_level("WARNING", logger="agent_core.skills.env_overrides"):
+        # 不应 raise
+        reverter = apply_skill_env_overrides([entry], cfg)
+
+    # key 未注入
+    assert "MISSING_FILE_PATH" not in os.environ
+
+    # log 含 WARN + skill 名 + secret 名 + file kind
+    warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("file-skill" in r.getMessage() for r in warn_records), (
+        f"WARN log 应含 skill 名 'file-skill'; got: {[r.getMessage() for r in warn_records]}"
+    )
+    assert any("MISSING_FILE_PATH" in r.getMessage() for r in warn_records), (
+        f"WARN log 应含 secret 名 'MISSING_FILE_PATH'; got: {[r.getMessage() for r in warn_records]}"
+    )
+    assert any("file" in r.getMessage().lower() for r in warn_records), (
+        f"WARN log 应含源类型 'file'; got: {[r.getMessage() for r in warn_records]}"
+    )
+
+    reverter()
+    assert "MISSING_FILE_PATH" not in os.environ
+
+
+def test_secret_ref_kind_warns_with_distinct_message(caplog):
+    """SECRET_REF kind 在 apply 路径同样 try-except, 但 log 内容区分 ("not implemented v1.1")。
+
+    spec Edge Cases "Vault/external secret store" + T020 任务规范:
+    SECRET_REF 与其他缺失源 warn 内容应不同, 便于诊断 vault 误用。
+    """
+    entry = _make_skill_entry("vault-skill", env_requires=["VAULT_KEY"])
+    cfg = _make_config_with_entries({
+        "vault-skill": SkillEntryConfig(
+            secrets={
+                "VAULT_KEY": SecretRef(
+                    kind=SecretRefKind.SECRET_REF,
+                    value="vault://prod/token",
+                ),
+            },
+        ),
+    })
+
+    with caplog.at_level("WARNING", logger="agent_core.skills.env_overrides"):
+        reverter = apply_skill_env_overrides([entry], cfg)
+
+    assert "VAULT_KEY" not in os.environ
+
+    # 找 WARN log, 应含 "v1.1" 或 "not implemented" 标识 (SECRET_REF 专用提示)
+    warn_records = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "v1.1" in r.getMessage() or "not implemented" in r.getMessage().lower()
+        for r in warn_records
+    ), (
+        f"SECRET_REF warn 应含 'v1.1' 或 'not implemented' 标识区分其他缺失源; "
+        f"got: {[r.getMessage() for r in warn_records]}"
+    )
+
+    reverter()

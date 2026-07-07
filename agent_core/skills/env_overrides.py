@@ -150,31 +150,50 @@ def resolve_secret(ref: SecretRef) -> str:  # noqa: D401
     """SecretRef → resolved string。
 
     Raises:
-        SecretResolutionError: ENV/FILE 解析失败(US3 T018/T019 真实现后)
+        SecretResolutionError: ENV/FILE 解析失败(US3 T018/T019 真实现)
         NotImplementedError: SECRET_REF(v1.1 vault 未实现)
 
     Side effects:
         FILE kind 触发磁盘读取(一次,不缓存)。
     """
     if ref.kind == SecretRefKind.INLINE:
-        # US1 T007: 字面值直接返回
+        # US1 T007: 字面值直接返回(不做 strip, 用户显式控制)
         return ref.value
     if ref.kind == SecretRefKind.SECRET_REF:
-        # v1.1 vault 集成保留口
+        # v1.1 vault 集成保留口(Edge Cases "Vault/external secret store")
         raise NotImplementedError(
-            "SecretRefKind.SECRET_REF reserved for v1.1 vault integration (US1 T007 stub)"
+            "SecretRefKind.SECRET_REF reserved for v1.1 vault integration"
         )
-    # ENV / FILE: US3 T018 / T019 真实现
+    # ──────────────────────────────────────────────────────────────────
+    # US3 T018: ENV form — 读 os.environ[ref.value], 不存在抛 SecretResolutionError
+    # ──────────────────────────────────────────────────────────────────
+    # 设计决策(spec FR-004 case 2 + quickstart §3):
+    # - 不存在 raise SecretResolutionError — apply_skill_env_overrides 捕获后 warn+skip
+    # - 返回值不做 strip(与 shell `env` 行为一致 — 保留字面空白)
     if ref.kind == SecretRefKind.ENV:
-        # intentionally stubbed: ENV form implemented in T018 (US3)
-        raise NotImplementedError(
-            "SecretRefKind.ENV resolution implemented in US3 T018"
-        )
+        value = os.environ.get(ref.value)
+        if value is None:
+            raise SecretResolutionError(
+                f"env var {ref.value!r} not set"
+            )
+        return value
+    # ──────────────────────────────────────────────────────────────────
+    # US3 T019: FILE form — 读 Path(ref.value) 文件内容, 不存在/不可读抛 SecretResolutionError
+    # ──────────────────────────────────────────────────────────────────
+    # 设计决策(spec FR-004 case 3 + quickstart §3):
+    # - Path(ref.value).read_text() — SecretRef.__post_init__ 已强制 startswith('/')
+    # - 文件不存在/不可读 → 抛 SecretResolutionError(apply 捕获后 warn+skip, FR-012)
+    # - 返回值 .strip() 移除首尾空白(文件内容通常带 trailing newline, 显式剔除)
     if ref.kind == SecretRefKind.FILE:
-        # intentionally stubbed: FILE form implemented in T019 (US3)
-        raise NotImplementedError(
-            "SecretRefKind.FILE resolution implemented in US3 T019"
-        )
+        path = Path(ref.value)
+        try:
+            content = path.read_text()
+        except (OSError, IOError) as e:
+            # FileNotFoundError / PermissionError / IsADirectoryError 等
+            raise SecretResolutionError(
+                f"file {ref.value!r} unreadable: {e}"
+            ) from e
+        return content.strip()
     # 未识别 kind(理论上 dataclass + Enum 不会到这里; 防御兜底)
     raise SecretResolutionError(f"未知 SecretRefKind: {ref.kind!r}")
 
