@@ -298,37 +298,6 @@ class Config:
             "autocompact_buffer": self.int("MODEL_CONFIG__default__autocompact_buffer", 13_000),
         }
 
-    # ── 003-react-inline-xml-fallback-parser:T005/T006 ──
-    # ReAct SM 在 LLM_THINKING 阶段:某些 provider (GLM-5.1) 不通过结构化
-    # `tool_use` 块而是通过 inline-XML `<tool_call>{...}</tool_call>` 文本表达
-    # 工具调用。本配置控制 InlineXmlFallbackHandler 是否激活 + 日志格式。
-    #
-    # 注:研究阶段考虑过 pydantic BaseModel,但 agent_core 整体无 pydantic 依赖
-    # (grep "from pydantic" → 0 hit)。为最小化依赖扩散,使用 stdlib dataclass。
-    @property
-    def inline_xml_fallback(self) -> "InlineXmlFallbackConfig":
-        """Inline-XML 工具调用 fallback 配置(单例,延迟构造)。"""
-        cached = self._cache.get("__inline_xml_fallback__")
-        if cached is None:
-            cached = InlineXmlFallbackConfig()
-            self._cache["__inline_xml_fallback__"] = cached
-        return cached
-
-
-@dataclass
-class InlineXmlFallbackConfig:
-    """003-react-inline-xml-fallback-parser 配置。
-
-    字段:
-    - enabled:主开关。True(默认)=InlineXmlFallbackHandler 检测到 inline-XML
-      时激活,产出 ToolCallDelta + 覆盖 stop_reason。False=handler 短路为 no-op,
-      仅记 DEBUG(per T028)。
-    - log_provider_hash:INFO 激活日志里是否含 provider 哈希(测试断言用)。
-      关闭 = 省略 hash 字段(避免与 GLM/Zhipu 等的 provider 名混淆)。
-    """
-    enabled: bool = True
-    log_provider_hash: bool = True
-
 
 # ── 索引（按名字查 spec）───────────────────────────────────────
 

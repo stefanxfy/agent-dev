@@ -1,1 +1,0 @@
-{"name":"04_empty_markers","provider":"openai","text":"<tool_call></tool_call>\n<tool_call>{}</tool_call>","expected_tool_calls":[],"expected_malformed":[0,1],"expected_fallback_activated":false}

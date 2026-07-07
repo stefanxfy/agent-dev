@@ -107,7 +107,7 @@ class TestAgentBuilderBuildE2E:
             "system_prompt", "memory_retrieval", "skills_prompt",
         ]
         assert [h.name for h in agent._llm_chain] == [
-            "llm_call", "chunk_parse", "inline_xml_fallback",  # 003:inline-XML 兜底
+            "llm_call", "chunk_parse",
             "llm_call_persist",  # Stage A
         ]
         assert [h.name for h in agent._tool_chain] == [

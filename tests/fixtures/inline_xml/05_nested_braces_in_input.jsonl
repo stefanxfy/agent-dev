@@ -1,1 +1,0 @@
-{"name":"05_nested_braces_in_input","provider":"anthropic","text":"<tool_call>{\"name\":\"Bash\",\"input\":{\"command\":\"echo '{a:1, b:2}'\"}}</tool_call>","expected_tool_calls":[{"name":"Bash","input":{"command":"echo '{a:1, b:2}'"}}],"expected_malformed":[],"expected_fallback_activated":true}

@@ -1,1 +1,0 @@
-{"name":"07_adjacent_other_xml","provider":"zhipu","text":"<tool_call>{\"name\":\"Bash\",\"input\":{\"command\":\"echo a\"}}</tool_call><other/>","expected_tool_calls":[{"name":"Bash","input":{"command":"echo a"}}],"expected_malformed":[],"expected_fallback_activated":true}
