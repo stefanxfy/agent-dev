@@ -42,6 +42,14 @@ from agent_core.skills.config import (
     SourcesConfig,
 )
 from agent_core.skills.eligibility import evaluate_eligibility
+from agent_core.skills.env_overrides import (  # 002-skill-secret-injection (T027)
+    SecretRef,
+    SecretRefKind,
+    SecretResolutionError,
+    SkillEntryConfig,
+    apply_skill_env_overrides,
+    resolve_secret,
+)
 from agent_core.skills.frontmatter import ParsedSkillMd, parse_skill_md
 from agent_core.skills.prompt import escape_xml, render_skills_section
 from agent_core.skills.registry import SkillsRegistry
@@ -79,6 +87,13 @@ __all__ = [
     "LoadConfig",
     "SourceConfig",
     "SourcesConfig",
+    # 002-skill-secret-injection (T027) — secret injection 公开 API
+    "SecretRef",
+    "SecretRefKind",
+    "SkillEntryConfig",
+    "SecretResolutionError",
+    "resolve_secret",
+    "apply_skill_env_overrides",
     # frontmatter / store / index
     "parse_skill_md",
     "ParsedSkillMd",
