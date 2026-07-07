@@ -370,6 +370,90 @@ class SkillsPromptHandler:
 - "没有 Read 工具就不注入" 是 spec edge case 的硬要求:提示 LLM 有 skill 但它读不了 = 浪费 token + 制造幻觉
 - `HandlerResult()` 空返回 = 不修改其它状态(责任链不强制链式副作用)
 
+### 4.9 `env_overrides` — 运行时 secret 注入(002-skill-secret-injection)
+
+文件: `agent_core/skills/env_overrides.py`
+
+UseCase 层模块, 配合 `SkillsPromptHandler` 在 turn 输入侧把 `requires.env`
+声明的 secret 注入 `os.environ`, 在 turn 输出侧 (`EnvCleanupHandler`) 还原。
+模块不读 LLM、不写 session、不做 secret 持久化 — 职责严格限定为"注入+还原"
+这对原子操作。
+
+公开 API:
+- `SecretRef` / `SecretRefKind` / `SkillEntryConfig` / `SecretResolutionError` —
+  数据契约与异常族 (Entity 层嵌入 UseCase 文件)
+- `resolve_secret(ref: SecretRef) -> str` — INLINE 直接返 / ENV 读 `os.environ` /
+  FILE 读 path.strip() / SECRET_REF raise `NotImplementedError` (v1.1 vault)
+- `apply_skill_env_overrides(entries, config) -> Callable[[], None]` —
+  注入 + snapshot-on-first + 返 reverter 闭包 (FR-007/009/010/011)
+- `load_user_config(default)` — AGENT_CONFIG_PATH env 优先, fallback
+  `~/.agent_data/config.yaml` (FR-003 + chmod 600 warn FR-017)
+
+**读这段代码该关注的**:
+- **snapshot-on-first 语义**: 多 skill 共享 env 名时, reverter 还原到 RUN 前原值
+  (不是上一个 skill 注入后的值)。`if secret_name not in injected` 实现等价 `setdefault`,
+  是 FR-011 的关键
+- **per-key try-except**: 单 key 解析失败 log WARN + skip, 不阻断其他 key。
+  这是 FR-012 "graceful degradation" 的实现 (降级路径不 fail-fast)
+- **SECRET_REF 区分日志**: warn 内容含 "v1.1 / not implemented", 区别于其他缺失源,
+  便于诊断 vault 误用 (Edge Cases "Vault/external secret store")
+- **reverter 闭包 setattr**: 把 `_injected_keys` / `_injected_count` 挂到函数对象上,
+  供 `EnvCleanupHandler` 等消费者 inspect 注入面 — 不污染闭包返回值签名
+
+```python
+# 伪代码, 真实实现见 env_overrides.py
+def apply_skill_env_overrides(entries, config):
+    cfg_entries = getattr(config, "entries", None)
+    if not cfg_entries:
+        return _noop_reverter  # legacy mode → no-op
+
+    injected: dict[str, str | None] = {}
+    for entry in entries or []:
+        metadata = getattr(entry, "metadata", None)
+        if metadata is None or not metadata.requires.env:
+            continue
+        skill_cfg = cfg_entries.get(entry.skill.name)
+        if skill_cfg is None:
+            continue
+        for secret_name, secret_ref in skill_cfg.secrets.items():
+            if secret_name not in metadata.requires.env:
+                continue  # runtime gating (FR-008)
+            try:
+                value = resolve_secret(secret_ref)
+            except Exception as e:
+                _logger.warning("🧩 skip inject: skill=%s secret=%s kind=%s — ...",
+                                skill_name, secret_name, secret_ref.kind.value)
+                continue
+            if secret_name not in injected:
+                injected[secret_name] = os.environ.get(secret_name)  # snapshot-on-first
+            os.environ[secret_name] = value
+
+    def _reverter():
+        for k, prev in injected.items():
+            if prev is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = prev
+    setattr(_reverter, "_injected_keys", list(injected.keys()))
+    return _reverter
+```
+
+**EnvCleanupHandler 集成** (`agent_core/turn_chain.py`, outputs_chain 末位):
+```python
+class EnvCleanupHandler:
+    name = "env_cleanup"
+    def handle(self, ctx):
+        reverter = getattr(ctx.agent, "_pending_env_reverter", None)
+        if reverter is None:
+            return HandlerResult()  # 幂等: 没注入 = no-op
+        reverter()
+        ctx.agent._pending_env_reverter = None  # 幂等: 二次调用 no-op
+        return HandlerResult()
+```
+
+**为什么 cleanup 在 outputs_chain 而非 try/finally in SkillsPromptHandler**:
+见 design doc §6.7 — C2 run-end 泄漏防御, 不依赖单 handler 的 try/finally。
+
 ## 5. 核心设计思想(读源码时该带着的几个原则)
 
 ### 5.1 纯函数优先,IO 集中到 Adapter
@@ -440,6 +524,48 @@ US5 多源合并不是写死在代码里的"`bundled` + `workspace` 两层",而�
 
 **改代码前**: 跑相关不变量测试 → 全绿 → 改 → 跑 → 全绿。
 **改代码后**: 新加的不变量必须有测试,否则等于没加。
+
+### 5.7 Secret Hygiene(002-skill-secret-injection 的核心原则)
+
+secret 在三个产物中**绝不能**出现 — system prompt / log / session.jsonl。
+这是 trust boundary, 不变量级别。三层防御:
+
+**第一层: 配置校验 (fail-fast at startup)**
+- `SkillsRegistry._validate_entries_against_skills` 在 load 时一次性聚合所有错误:
+  unknown skill name / secret name ⊄ requires.env / 缺字段
+- 抛 `ConfigValidationError` — ReactAgent.__init__ 透传 → 启动失败
+- 防止"错配的配置进入 run 路径"
+
+**第二层: Runtime gating (defense in depth)**
+- `apply_skill_env_overrides` 每个 secret 注入前再 check `secret_name ∈ required_env`
+- 即使有未声明 secret 通过第一层 (eg. registry 重建 race condition), runtime 不注入
+- 失败 log WARN + skip, 不 fail-fast (FR-012 graceful degradation)
+
+**第三层: Audit script (end-to-end byte-equal scan)**
+- `scripts/verify_skill_secrets_audit.py` 构造 sentinel secret → simulate N runs
+  → byte-equal 扫 prompt/log/session 三个产物
+- 任意产物含 sentinel → exit 1 + diff 行号 (SC-005 hard gate)
+
+**日志纪律** (FR-014):
+- `_logger.debug("🧩 injected: skill=%s secret=%s kind=%s", ...)` — **永不带 value**
+- skill name + secret name + kind 是诊断足够, value 永远不出现
+- 写测试时: 用 `caplog.records` 检查 log content, 断言不含 sentinel 字面值
+
+**EnvCleanupHandler 兜底** (C2 run-end 泄漏防御):
+- `try/finally` in `SkillsPromptHandler` 不够 — handler 抛异常后, 后续 handler 仍运行,
+  此刻 os.environ 已被注入但 cleanup 未触发
+- 改为 outputs_chain 末位 `EnvCleanupHandler(agent)` 兜底, 收口所有 handler 异常路径
+- idempotent: 二次调用 no-op (reverter 已 None)
+
+**chmod 600 warn-not-fail** (FR-017):
+- `stat.S_IMODE` + `0o077` 屏蔽检查, 不支持平台 silent no-op
+- **不 fail** 避免引入 OS-specific 错误路径
+- 用户跑一次 `chmod 600 ~/.agent_data/config.yaml` 即可
+
+**snapshot-on-first** (FR-011):
+- 多 skill 共享 env 名时, reverter 还原到 RUN 前原值, 不是上一个 skill 注入后的值
+- 实现: `if secret_name not in injected: injected[secret_name] = os.environ.get(secret_name)`
+- entries 顺序无关性已由 `test_multi_skill_shared_env_name_reverse_order` 覆盖
 
 ## 6. 已知偏差与取舍(透明记录)
 

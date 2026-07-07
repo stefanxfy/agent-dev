@@ -44,10 +44,11 @@ turn_chain → skills（注册 handler）。**无环**。
 | `eligibility.py` | UseCase | `evaluate_eligibility` 五维 requires + always（纯函数，参数注入） |
 | `commands.py` | UseCase | `/skill-name` 解析 + sanitize |
 | `status.py` | UseCase | `format_skill_status`（诊断表格） |
+| `env_overrides.py` | UseCase | (002-skill-secret-injection) SecretRef/resolve + apply + reverter + load_user_config |
 | `skill_store.py` | Adapter | 单 skill 目录 → SkillEntry；body 相对路径解析 |
 | `skill_index.py` | Adapter | scan_source + `merge_by_priority` + `load_all` |
 | `registry.py` | Adapter | Facade：snapshot() + mtime/env 失效缓存 + version 单调 |
-| `config.py` | Framework | pydantic SkillsConfig + SourcesConfig |
+| `config.py` | Framework | pydantic SkillsConfig + SourcesConfig + (002) entries + from_yaml |
 | `path_validator.py` | Framework | symlink 逃逸校验 |
 
 ## 4. 数据流（snapshot 构建）
@@ -69,6 +70,45 @@ SkillSnapshot{prompt, skills[SkillSummary], version, render_mode, truncated_coun
 
 注入：`SkillsPromptHandler`（turn_chain）读 `agent.skills_registry.snapshot()`，把 `## Skills`
 段并入 system message；若 `agent.tools` 不含 "Read" 则跳过整段（spec Edge Case）。
+
+### 4.1 运行时 secret 注入环（002-skill-secret-injection）
+
+```
+ReactAgent.__init__
+  │  skills_config → load_user_config → SkillsConfig (entries overlay)
+  ▼
+SkillsRegistry(skills_config)
+  │  __init__ → _validate_entries_against_skills (unknown skill / secret ⊄ requires.env)
+  ▼
+SkillsPromptHandler.handle(ctx)  (turn_chain inputs_chain 起始)
+  │  guard: agent.skills_config.entries is None → skip (legacy mode)
+  │  apply_skill_env_overrides(entries, cfg)
+  │    ├─ for each entry: resolve_secret(SecretRef) → os.environ[secret_name] = value
+  │    │  (snapshot-on-first, multi-skill 共享 env 名 语义正确)
+  │    │  resolve 失败 → log WARN + skip (FR-012 graceful degradation)
+  │    └─ 返 reverter() 闭包(注册到 agent._pending_env_reverter)
+  ▼
+LLM call + tool execution (Bash 等继承 process.env, FR-018)
+  ▼
+EnvCleanupHandler.handle(ctx)  (outputs_chain 末位, C2 run-end 兜底)
+  │  取 _pending_env_reverter → 调之 → 置 None (幂等)
+  │  os.environ 还原到 RUN 前状态 (snapshot-on-first 语义)
+```
+
+**三层 secret hygiene 防御**（不变量 SRH-1）：
+1. 配置校验：`SkillsRegistry._validate_entries_against_skills` 在 load 时 fail-fast, 阻止
+   unknown skill / secret name ⊄ requires.env 进入 run 路径 (FR-005/006 + C1 wiring)。
+2. Runtime gating：`apply_skill_env_overrides` 每个 secret 注入前再 check `secret_name ∈
+   required_env`, 防御中间层被绕过 (FR-008)。
+3. Audit script：`scripts/verify_skill_secrets_audit.py` 端到端字节相等扫描 prompt/log/session
+   三个产物, 确保 SC-005 (FR-013/014/015)。
+
+**关键设计点**:
+- snapshot-on-first: reverter 还原到 RUN 前原值, 不是上一个 skill 注入后的值 (FR-011)
+- reverter 走 `EnvCleanupHandler` (兜底在 outputs_chain 末位) 而非 `try/finally` 在
+  `SkillsPromptHandler` 内 — 解决 C2 "run-end 泄漏" 风险, 即使下游 handler 抛异常也
+  能清理 (apply 注册 reverter → handler 异常也由后续 cleanup 兜底)
+- log only key names (NEVER value, FR-014) — `_logger.debug("🧩 injected: skill=%s secret=%s kind=%s", ...)` 不带 value
 
 ## 5. 关键不变量（INV-1..INV-6，data-model §11）
 
@@ -124,6 +164,38 @@ base_dir 的绝对路径，存入 `SkillEntry.body_references`（去重 + 字典
 dirname 构造 sibling 路径对 v1 读可靠性已够用。**已知局限**：regex 扫描无法区分真实引用与举例性
 提及（如 bundled skill-creator body 里 `(e.g. references/cheatsheet.md)` 会被计入），属可接受的
 诊断噪声，作者据列表判断。
+
+### 6.7 Secret Injection 偏差/扩展（002-skill-secret-injection）
+
+**为什么加 SkillEntryConfig.entries 而非扩展 SkillsConfig.paths**：spec 考虑过两类入口
+（per-skill `entries` 字段 vs agent 全局 `Config` 顶层字段）。最终选前者：(a) 与 skill
+lifecycle 同生命周期（registry 重建时 entries 失效，热加载语义统一）；(b) 校验更紧凑
+（unknown skill / secret name ⊄ requires.env 在 registry 构造时一次性聚合 fail-fast）；
+(c) 数据局部性 — secret 跟随 skill 配置, 不污染 agent `Config` 全局 schema。
+
+**为什么 reverter 走 EnvCleanupHandler 而非 try/finally in SkillsPromptHandler**：原
+plan 写 try/finally in handler。实现期发现风险：
+- handler 抛异常时, 后续 handler 仍会运行 → 此时 os.environ 已被注入但 cleanup 未触发
+- run-end 路径 (SessionFlushHandler 后) 无明确清理点 → C2 run-end 泄漏风险
+
+改为 outputs_chain 末位 `EnvCleanupHandler(agent)` 兜底：
+- 收口所有 handler 异常路径 (即使整个 run 抛错, cleanup 在 outputs_chain 末位一定执行)
+- idempotent (二次调用 no-op: reverter 已 None)
+- 与 input/output chain 分层清晰对齐 (输入侧注入 + 输出侧清理)
+
+**为什么 ENV form 不 strip + FILE form strip**：
+- ENV form: shell `env` 不 strip, 一致行为; 用户显式控制空白语义
+- FILE form: 文件通常带 trailing newline (POSIX text file 惯例), `.strip()` 隐式剔除
+  否则 secret value 末尾会带 `\n`, 多数下游 (HTTP header / JWT) 会失败
+
+**chmod 600 warn-not-fail (FR-017)**：OS-dependent (Windows ACL / FAT32 无 unix mode
+bit)。实现走 `stat.S_IMODE` + `0o077` 屏蔽检查, 不支持平台 silent no-op。**不 fail**
+避免引入 OS-specific 错误路径, 符合防御式务实工程。
+
+**三层 secret hygiene 实际效果**（覆盖 SC-005 hard gate）：
+1. 配置校验 + fail-fast: 阻止 100% schema-错的配置进入 run (SC-004)
+2. Runtime gating + warn-skip: 即使有未声明 secret 滑入, runtime 不注入 (FR-008)
+3. Audit script 字节相等扫描: 端到端验证 secret 不出现在产物 (SC-005)
 
 ## 7. 配置（SkillsConfig）
 
