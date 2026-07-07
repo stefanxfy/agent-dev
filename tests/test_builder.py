@@ -75,7 +75,7 @@ class TestFactoryChains:
         tools_schema_prepare + system_prompt + memory_retrieval + skills_prompt。
 
         选项 A 重构 (2026-07-06):system_prompt 装配回归 inputs_chain,3 个 handler 通过
-        ctx.append_system 顺序累加。加新 system 段 = with_handler(after=X)。
+        ctx.run_state.append_system 顺序累加。加新 system 段 = with_handler(after=X)。
         """
         agent = _StubAgent()
         chain = build_default_inputs_chain(agent)

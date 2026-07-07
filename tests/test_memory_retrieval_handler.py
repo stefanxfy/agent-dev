@@ -54,12 +54,12 @@ class TestHandleFlow:
         hits = [_hit(title="反偷懒", body="不准 silent 缩 scope")]
         agent = _make_agent(hits=hits)
         ctx = _make_ctx()
-        ctx.system_prompt = "BASE"
+        ctx.run_state.system_prompt = "BASE"
         MemoryRetrievalHandler(agent).handle(ctx)
-        assert "[记忆库 / 1 hits]" in ctx.system_prompt
-        assert "反偷懒" in ctx.system_prompt
-        assert "不准 silent 缩 scope" in ctx.system_prompt
-        assert "BASE" in ctx.system_prompt  # base 保留(append 不覆盖)
+        assert "[记忆库 / 1 hits]" in ctx.run_state.system_prompt
+        assert "反偷懒" in ctx.run_state.system_prompt
+        assert "不准 silent 缩 scope" in ctx.run_state.system_prompt
+        assert "BASE" in ctx.run_state.system_prompt  # base 保留(append 不覆盖)
 
     def test_emits_memory_status_with_hits(self):
         hits = [_hit(title="a", body="x" * 100), _hit(title="b", body="y" * 100)]
@@ -77,9 +77,9 @@ class TestHandleFlow:
     def test_no_hits_does_not_append_but_emits_zero_hit(self):
         agent = _make_agent(hits=[])
         ctx = _make_ctx()
-        ctx.system_prompt = "BASE"
+        ctx.run_state.system_prompt = "BASE"
         MemoryRetrievalHandler(agent).handle(ctx)
-        assert ctx.system_prompt == "BASE"  # 不 append
+        assert ctx.run_state.system_prompt == "BASE"  # 不 append
         status_events = [e for e in ctx.events if e[0] == "memory_status"]
         assert len(status_events) == 1
         assert status_events[0][1]["zero_hit"] is True
@@ -91,7 +91,7 @@ class TestHandleFlow:
         ctx = _make_ctx()
         result = MemoryRetrievalHandler(agent).handle(ctx)
         assert isinstance(result, HandlerResult)
-        assert ctx.system_prompt == ""  # 未改
+        assert ctx.run_state.system_prompt == ""  # 未改
         assert all(e[0] != "memory_status" for e in ctx.events)  # 不 emit
 
 
@@ -128,10 +128,10 @@ class TestResilience:
     def test_search_failure_emits_zero_hit_and_no_append(self):
         agent = _make_agent(search_raises=True)
         ctx = _make_ctx()
-        ctx.system_prompt = "BASE"
+        ctx.run_state.system_prompt = "BASE"
         result = MemoryRetrievalHandler(agent).handle(ctx)
         assert isinstance(result, HandlerResult)  # 不崩
-        assert ctx.system_prompt == "BASE"  # 不 append
+        assert ctx.run_state.system_prompt == "BASE"  # 不 append
         status_events = [e for e in ctx.events if e[0] == "memory_status"]
         assert status_events[0][1]["zero_hit"] is True
 

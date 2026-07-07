@@ -120,14 +120,12 @@ class RunState:
     pending_tool_results: list = field(default_factory=list)
     pending_thinking: str = ""
     surfaced_memories: set = field(default_factory=set)
-    awaiting_permission: Optional[dict] = None
-    # 2026-07-02 引入(Plan B 完整实现 PermissionCheckHandler 拆分):
-    # PermissionCheckHandler 看到 batch 中 ≥1 ASK 时,把整 batch 的 permission request
-    # 列表写到这里(back-compat:awaiting_permission 单字段仍填 batch[0],web/app.py 读它)。
-    # 下游 multi-req UI 改造时可以读 awaiting_permission_batch 全 list。
-    # resume 后 PermissionCheckHandler 已走 _is_resume 路径(整 batch pre-ALLOW),
-    # 不再读这个字段,只有清理时被清空。
-    awaiting_permission_batch: List[Dict[str, Any]] = field(default_factory=list)
+    # awaiting_permission + awaiting_permission_batch 已从 RunState 搬到 TurnContext (2026-07-07,Step 2):
+    # 这两个字段实际是 per-turn 数据(PermissionCheckHandler 在某 turn 写入 →
+    # ToolExecuteHandler 在同 turn 尾清),跨 turn 用不到。搬到 turn_ctx 后,字段
+    # 生命周期跟读写点严格对齐(都在同一 turn_ctx 内),防止跨 turn stale。
+    # back-compat:web/app.py 不读 _run_state.awaiting_permission(从 event stream 拿),
+    # 所以无需改 web 层访问模式。
     termination_reason: Optional[str] = None
     logger: logging.Logger = field(default_factory=lambda: logging.getLogger("agent_core.run"))
     # Plan B Final Phase Step 2 (2026-07-02):L3 SessionMemory extract trigger 返回的
@@ -136,6 +134,31 @@ class RunState:
     # 上一 run 的 stale future 自动丢弃,不需要手动清空。L3SMExtractTriggerHandler
     # 写一次, 测试或后续 block 等待可以读它(参考 v1 run() L1817)。
     pending_sm_extract_future: Optional[Any] = None
+    # R2 修复(2026-07-07,resume 后 LLM 收到 msgs=3 tools=0 bug):
+    # system_prompt + tool_schemas 是 inputs_chain 在 SETUP 阶段一次性产出的 per-run 数据,
+    # 必须在 resume_after_permission 重新走 step() 链后仍可读。原存 TurnContext (per-turn),
+    # step() 完 turn_ctx 销毁,resume 拿到的是空 TurnContext → LLMCallHandler 拼出
+    # msgs=3 tools=0(只含 system section 占位 + agent.messages 历史,无 system_prompt
+    # 也无 tool_schemas)。挪到 RunState 后,start_run() 新 RunState 初始化为空串/None,
+    # SETUP 跑 inputs_chain 时填入;resume 路径走 EXECUTING_TOOLS → LLM_THINKING
+    # 不重跑 SETUP,run_state.system_prompt / tool_schemas 保留 → LLMCallHandler
+    # 仍能拼出 msgs=6 tools=4 的完整请求。
+    system_prompt: str = ""
+    tool_schemas: Optional[list] = None
+
+    def append_system(self, section: str) -> None:
+        """inputs_chain handler 累加 system 内容(强制累加,禁止覆盖)。
+
+        从 TurnContext 搬到 RunState (R2 修复,2026-07-07):累加结果必须跨 turn 持续,
+        resume_after_permission 重新走 step() 时仍可读到完整 system_prompt。
+        幂等性由 handler 自行检查(如 SkillsPromptHandler 检查 section 是否已存在),
+        符合 "handler 自己负责自己事情"。
+        """
+        if not section:
+            return
+        self.system_prompt = (
+            (self.system_prompt + "\n\n" + section) if self.system_prompt else section
+        )
 
 
 # ────────────────────────────────────────────────────────────
@@ -147,39 +170,44 @@ class TurnContext:
     """per-turn 工作内存(handler 间共享)。
 
     关键字段:
-    - run_state:RunState(per-run,跨 turn 持久)
-    - system_prompt:inputs_chain 累加的 system 内容(SystemPrompt/MemoryRetrieval/SkillsPrompt
-      handler 通过 append_system 顺序累加;llm_chain 的 LLMCallHandler 只读)
-    - tool_schemas:ToolsSchemaPrepare 准备的工具定义(LLMCallHandler 读)
+    - run_state:RunState(per-run,跨 turn 持久)。**system_prompt / tool_schemas
+      现已搬到 run_state**(R2 修复,2026-07-07)——inputs_chain 的产物是 per-run 数据,
+      resume_after_permission 重新走 step() 时新 TurnContext 不能再丢失这部分信息。
+      handler 一律通过 `ctx.run_state.system_prompt` / `ctx.run_state.tool_schemas`
+      访问,不再读 ctx 自身的同名属性。
     - stage_outputs:LLMResult(llm_chain 输出)
     - permission_request:当前 turn 的 permission 请求(AWAITING_PERMISSION 时填)
     - events:本 turn 已产出的 events
     - _stopped:chain 短路 flag
+
+    显式声明的 handler 间 contract 字段(原是运行时 setattr,2026-07-07 显式化):
+    - _llm_stream:LLMCallHandler 写,ChunkParseHandler 读(stream iterator)
+    - _is_resume:PermissionCheckHandler 写/读(resume 路径 flag,跟 stage_outputs 重建逻辑配合)
+    - permission_decisions:PermissionCheckHandler 写,ToolDispatchHandler 读
+    - _dispatch_decisions:ToolDispatchHandler 写,ToolExecuteHandler 读
     """
     run_state: RunState
     # A1-H3 (review 修复): 每 turn 的编号,供 phase 区分上下文用
     # (例如 SETUP phase 多次进要分"第 1 次进入" vs "后续"
     # 但实际触发是按 run 触发,这里 turn_number 仅作 debug / 日志标识)
     turn_number: int = 0
-    system_prompt: str = ""
-    tool_schemas: Optional[list] = None
     stage_outputs: Optional[Any] = None
     permission_request: Optional[dict] = None
     events: list = field(default_factory=list)
     _stopped: bool = False
-
-    def append_system(self, section: str) -> None:
-        """inputs_chain handler 累加 system 内容(强制累加,禁止覆盖)。
-
-        消灭原 merge helper "谁覆盖谁" 陷阱 —— 这是 system_prompt 唯一允许的写法。
-        幂等性由 handler 自行检查(如 SkillsPromptHandler 检查 section 是否已存在),
-        符合 "handler 自己负责自己事情"。
-        """
-        if not section:
-            return
-        self.system_prompt = (
-            (self.system_prompt + "\n\n" + section) if self.system_prompt else section
-        )
+    # ── 显式声明的 handler contract 字段(原是运行时 setattr,2026-07-07 显式化)──
+    _llm_stream: Optional[Any] = None
+    _is_resume: bool = False
+    permission_decisions: Optional[list] = None
+    _dispatch_decisions: Optional[list] = None
+    # ── Step 2 (2026-07-07):从 RunState 搬来 ──
+    # PermissionCheckHandler 看到 batch 中 ≥1 ASK 时,把整 batch 的 request 列表写到
+    # awaiting_permission_batch(全 list,供下游 multi-UI 升级用),单字段 awaiting_permission
+    # 仍填 batch[0](back-compat 兼容旧 reader,虽然 web/app.py 已不直接读)。
+    # ToolExecuteHandler 在尾清理:awaiting_permission = None + batch = []。
+    # 跨 turn 用不到(下一 turn 的 PermissionCheckHandler 会重新写),所以 per-turn 即可。
+    awaiting_permission: Optional[dict] = None
+    awaiting_permission_batch: List[Dict[str, Any]] = field(default_factory=list)
 
     def emit(self, event: Event) -> None:
         self.events.append(event)
@@ -569,8 +597,9 @@ class LLMThinkingPhase(Phase):
         # ChunkParseHandler 误跳过 LLM stream 消费(见 turn_chain.py ChunkParse SKIP)→
         # 用旧 tool_calls → allow-loop。LLM_THINKING 每轮都该重新调 LLM,进 phase 前清掉。
         ctx.turn_ctx.stage_outputs = None
-        # 选项 A 重构 (2026-07-06)：system_prompt 由 inputs_chain 装配(SETUP 每 turn 1 次),
-        # ReAct 多轮 LLM_THINKING 复用同一 ctx.system_prompt(turn 内稳定),无需在此重置。
+        # 选项 A 重构 (2026-07-06):system_prompt 由 inputs_chain 装配(SETUP 每 turn 1 次),
+        # ReAct 多轮 LLM_THINKING 复用同一 run_state.system_prompt(per-run 稳定,跨 turn 持久),无需在此重置。
+        # R2 (2026-07-07):从 turn_ctx 挪到 run_state,resume_after_permission 重新走 step() 时仍能读到。
         # messages 永远从 agent.messages live 读,故也无 stage_inputs 的 stale 问题。
         yield from self._chain.run(ctx.turn_ctx)
 

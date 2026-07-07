@@ -112,17 +112,17 @@ class _WriteSystemPrompt:
         self._text = text
 
     def handle(self, ctx: TurnContext) -> HandlerResult:
-        ctx.append_system(self._text)
+        ctx.run_state.append_system(self._text)
         return HandlerResult()
 
 
 class _ReadSystemPrompt:
-    """模拟 llm_chain 首位 handler:从 ctx.system_prompt 读取数据。"""
+    """模拟 llm_chain 首位 handler:从 ctx.run_state.system_prompt 读取数据。"""
     name = "read_system_prompt"
 
     def handle(self, ctx: TurnContext) -> HandlerResult:
         ctx.stage_outputs = LLMResult(
-            full_text=ctx.system_prompt,
+            full_text=ctx.run_state.system_prompt,
             stop_reason="end_turn",
         )
         return HandlerResult()
@@ -142,7 +142,7 @@ class _WriteToolResults:
 
 class TestCrossHandlerDataFlow:
     def test_inputs_chain_writes_system_prompt_for_llm_chain(self):
-        """inputs_chain append ctx.system_prompt → llm_chain 读它。"""
+        """inputs_chain append ctx.run_state.system_prompt → llm_chain 读它。"""
         chain = TurnChain([
             _WriteSystemPrompt("be helpful"),
             _ReadSystemPrompt(),

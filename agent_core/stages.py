@@ -6,8 +6,9 @@ v2 重构引入(详见 docs/agent-state-machine-and-chain-of-responsibility-desi
 - ToolExecutionResult:tool_chain 输出(被 output_chain 消费)
 
 注:StageInputs(原 inputs_chain 输出契约)于 2026-07-06 选项 A 重构中删除 ——
-inputs_chain 改为累加 ctx.system_prompt(见 TurnContext.append_system),不再产出
+inputs_chain 改为累加 run_state.system_prompt(见 RunState.append_system),不再产出
 强类型 StageInputs 对象。
+R2 (2026-07-07):累加目标从 TurnContext 搬到 RunState(per-run 持久),resume 路径仍能读到。
 
 为什么用 dataclass:
 - v1 靠 ctx.xxx 字段名约定传递(handler 重排会静默失败)

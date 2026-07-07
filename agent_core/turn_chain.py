@@ -732,10 +732,11 @@ class ContextCompactionHandler:
 
 # ── 1. MemoryRetrievalHandler(inputs_chain) ───────────────
 class MemoryRetrievalHandler:
-    """inputs_chain:检索相关记忆 → append 到 ctx.system_prompt + emit memory_status。
+    """inputs_chain:检索相关记忆 → append 到 run_state.system_prompt + emit memory_status。
 
     选项 A 重构 (2026-07-06):
-    - 不再读写 stage_inputs;mem_block 通过 ctx.append_system 累加进 ctx.system_prompt
+    - 不再读写 stage_inputs;mem_block 通过 run_state.append_system 累加进 run_state.system_prompt
+    - R2 (2026-07-07):累加目标从 turn_ctx 改到 run_state(per-run 持久),resume 路径仍能读到。
     - 装配逻辑内聚为类内私有方法(_find_last_user_query / _retrieve_with_config /
       _format_block / _count_stored / _emit_memory_status),不调模块级 helper
     - ★ 修复 side_query bug:_retrieve_with_config 读 agent.memory_config.retrieval.mode/top_k
@@ -761,7 +762,9 @@ class MemoryRetrievalHandler:
         try:
             hits, stored_total, injected = self._retrieve_and_format(query)
             if hits:
-                ctx.append_system(self._format_block(hits))
+                # R2 (2026-07-07):累加到 run_state(per-run)而非 turn_ctx(per-turn),
+                # resume 后新 turn_ctx 仍能读到 memory block。
+                ctx.run_state.append_system(self._format_block(hits))
             self._emit_memory_status(ctx, hits, stored_total, injected)
         except Exception as e:
             _logger.warning(f"🧩 MemoryRetrievalHandler: retrieve failed: {e}")
@@ -843,14 +846,15 @@ class MemoryRetrievalHandler:
 
 # ── 2. SystemPromptHandler(inputs_chain) ──────────────────
 class SystemPromptHandler:
-    """inputs_chain:把 base system_prompt append 到 ctx.system_prompt。
+    """inputs_chain:把 base system_prompt append 到 run_state.system_prompt。
 
     agent.system_prompt 由 SystemPromptAssembler.build() 在 ReactAgent.__init__
     构造(base + sandbox + MEMORY.md + TRUSTING_RECALL),本 handler 只负责把它
-    累加进 ctx.system_prompt,供 llm_chain 的 LLMCallHandler 读取。
+    累加进 run_state.system_prompt,供 llm_chain 的 LLMCallHandler 读取。
 
     选项 A 重构 (2026-07-06):不再调 SystemPromptAssembler.place()(那是把 system
-    放进 messages 头部,依赖已删除的 stage_inputs);改为 ctx.append_system 累加。
+    放进 messages 头部,依赖已删除的 stage_inputs);改为 run_state.append_system 累加。
+    R2 (2026-07-07):累加目标从 turn_ctx 改到 run_state(per-run 持久),resume 路径仍能读到。
     SystemPromptAssembler.build() 仍被 __init__ 用 → 类保留。
 
     顺序:inputs_chain 中 ContextCompaction 之后、MemoryRetrievalHandler 之前。
@@ -864,17 +868,20 @@ class SystemPromptHandler:
         agent = self._agent
         if agent is None or not getattr(agent, "system_prompt", None):
             return HandlerResult()
-        ctx.append_system(agent.system_prompt)
+        # R2 (2026-07-07):累加到 run_state(per-run)而非 turn_ctx(per-turn),
+        # resume_after_permission 重新走 step() 后 LLMCallHandler 仍能读到完整 system_prompt。
+        ctx.run_state.append_system(agent.system_prompt)
         return HandlerResult()
 
 
 # ── 4. SkillsPromptHandler(inputs_chain, 在 MemoryRetrieval 之后) ──
 class SkillsPromptHandler:
-    """inputs_chain:把 ## Skills 段 append 到 ctx.system_prompt(FR-007)。
+    """inputs_chain:把 ## Skills 段 append 到 run_state.system_prompt(FR-007)。
 
     选项 A 重构 (2026-07-06):
     - 不再读写 stage_inputs / 调 _merge_skills_into_system
-    - 用 ctx.append_system 累加 skills 段;幂等性自检(section 已在 ctx.system_prompt 则跳过)
+    - 用 run_state.append_system 累加 skills 段;幂等性自检(section 已在 run_state.system_prompt 则跳过)
+    - R2 (2026-07-07):累加目标 + 幂等检查都从 turn_ctx 改到 run_state(per-run 持久),resume 路径仍能正确去重。
 
     002-skill-secret-injection (T009):
     - 在 section 渲染前, 先调 apply_skill_env_overrides 注入 secret 到 os.environ
@@ -930,10 +937,11 @@ class SkillsPromptHandler:
             return HandlerResult()
         if not section:
             return HandlerResult()
-        # 幂等:已在 ctx.system_prompt 则跳过(防 chain 重跑翻倍)
-        if section in ctx.system_prompt:
+        # 幂等:已在 run_state.system_prompt 则跳过(防 chain 重跑翻倍)。
+        # R2 (2026-07-07):读 run_state(per-run)而非 ctx(per-turn),resume 后仍能正确去重。
+        if section in ctx.run_state.system_prompt:
             return HandlerResult()
-        ctx.append_system(section)
+        ctx.run_state.append_system(section)
         _logger.debug(f"🧩 SkillsPrompt injected: section_len={len(section)}")
         return HandlerResult()
 
@@ -980,9 +988,11 @@ class ToolsSchemaPrepareHandler:
         agent = self._agent
         if agent is None:
             return HandlerResult()
-        # 把 tool_schemas 缓存到 turn_ctx(LLMCallHandler 复用)
+        # 把 tool_schemas 缓存到 run_state(per-run),LLMCallHandler 跨 turn 复用。
+        # R2 (2026-07-07):从 turn_ctx 挪到 run_state,resume_after_permission 重新
+        # 走 step() 后 LLMCallHandler 仍能读到完整 tool_schemas(不再 tools=0)。
         try:
-            ctx.tool_schemas = agent.tools.list_schemas(provider=detect_provider(agent.llm))
+            ctx.run_state.tool_schemas = agent.tools.list_schemas(provider=detect_provider(agent.llm))
         except Exception as e:
             _logger.warning(f"ToolsSchemaPrepare failed: {e}")
         return HandlerResult()
@@ -1019,10 +1029,13 @@ class LLMCallHandler:
         if agent is None:
             return HandlerResult()
 
-        # 1. 拼 messages_for_llm:ctx.system_prompt(inputs_chain 累加)+ agent.messages(live)
+        # 1. 拼 messages_for_llm:ctx.run_state.system_prompt(inputs_chain 累加,
+        #    per-run 持久)+ agent.messages(live)。
         #    选项 A 重构 (2026-07-06):不再调 LlmInputAssembler;system_prompt 由
         #    inputs_chain 的 SystemPrompt/MemoryRetrieval/SkillsPrompt handler append。
-        system_prompt = ctx.system_prompt
+        #    R2 (2026-07-07):从 ctx.system_prompt 改读 ctx.run_state.system_prompt,
+        #    resume_after_permission 重新走 step() 时新 turn_ctx 仍能拿到完整 system_prompt。
+        system_prompt = ctx.run_state.system_prompt
         if system_prompt:
             messages_for_llm = [{"role": "system", "content": system_prompt}] + list(agent.messages)
         else:
@@ -1043,7 +1056,10 @@ class LLMCallHandler:
                             _r += f"/tr:{(_b.get('tool_use_id') or '')[:10]}"
             _roles.append(_r)
         _logger.warning("▶️ [LLMCall entry] messages roles=%s", _roles)
-        tool_schemas = ctx.tool_schemas
+        # R2 (2026-07-07):从 ctx.tool_schemas 改读 ctx.run_state.tool_schemas,
+        # resume_after_permission 重新走 step() 时新 turn_ctx 仍能拿到完整 tool_schemas
+        # (不再 tools=0)。
+        tool_schemas = ctx.run_state.tool_schemas
         cache_namespace = (
             f"react:{agent._session_manager.session_id if agent._session_manager else 'default'}"
         )
@@ -1475,8 +1491,8 @@ class PermissionCheckHandler:
            - perm_err=="__AWAITING_PERMISSION__" → outcome="ask", req=自构造
            - 其他 → outcome="deny", error=perm_err or "Permission denied"
         6. 若有 ASK(asks 非空):
-           - run_state.awaiting_permission_batch = asks
-           - run_state.awaiting_permission = asks[0](back-compat web/app.py)
+           - ctx.awaiting_permission_batch = asks(Step 2,2026-07-07:从 run_state 搬到 turn_ctx)
+           - ctx.awaiting_permission = asks[0](back-compat,虽 web/app.py 已不直接读)
            - ctx.permission_request = asks[0]
            - SM 强制转 AWAITING_PERMISSION(同 agent_core.py:847-857 逻辑)
            - ctx.emit(("awaiting_permission", asks[0]))
@@ -1492,9 +1508,14 @@ class PermissionCheckHandler:
             测试入口:list(agent._tool_chain.run(turn_ctx))(2026-07-02 删 _iter_phase_tools 后)
 
         Fix C 契约(_is_resume):
-            触发条件 `stage_out is None and last_tool_calls and awaiting_permission != None`。
+            触发条件 `stage_out is None and last_tool_calls and 用户已回答(pending.choice 已设)`。
             resume 后:不重 yield tool_call event(已 yield 过)+ 不 append action log,
             整 batch pre-fill ALLOW。用户已点 Allow/Always allow 才进入此分支。
+
+            Step 2 (2026-07-07) 修复:原检测用 ctx.awaiting_permission,但 Step 2 把字段
+            搬到 turn_ctx (per-turn,fresh per step)→ fresh_turn_ctx 上 awaiting_permission
+            默认 None → 永远 not resume → 破裂。改用 agent._pending_permission_request.choice
+            (agent 级跨 turn 持久信号,用户 resume_after_permission 时已 set)。
         """
         agent = self._agent
         if agent is None:
@@ -1503,11 +1524,16 @@ class PermissionCheckHandler:
 
         # ── 步 1:取 stage_outputs,resume 重建 ──
         stage_out = getattr(ctx, "stage_outputs", None)
+        # Step 2 修复:用 agent._pending_permission_request.choice 替代 ctx.awaiting_permission
+        # (后者 per-turn 不跨 resume 持久;前者 agent 级,user 已点 Allow/Deny 后 set)
+        pending = getattr(agent, "_pending_permission_request", None)
+        pending_choice = isinstance(pending, dict) and "choice" in pending
+        _user_answered = pending is not None and pending_choice
         _is_resume = (
             stage_out is None
             and run_state is not None
             and bool(run_state.last_tool_calls)
-            and run_state.awaiting_permission is not None
+            and _user_answered
         )
 
         if _is_resume:
@@ -1558,7 +1584,7 @@ class PermissionCheckHandler:
                 for tc in tool_calls
             ]
             ctx._is_resume = True
-            # 不 clear run_state.awaiting_permission — ToolExecuteHandler 完成后在尾清
+            # 不 clear ctx.awaiting_permission — ToolExecuteHandler 完成后在尾清(Step 2)
             return HandlerResult()
 
         # ── 步 4:首次 entry — append assistant + tool_use blocks ──
@@ -1616,8 +1642,9 @@ class PermissionCheckHandler:
         # ── 步 6:若有 ASK → 暂停 chain ──
         if asks:
             if run_state is not None:
-                run_state.awaiting_permission_batch = asks
-                run_state.awaiting_permission = asks[0]  # back-compat web/app.py
+                # Step 2 (2026-07-07):从 run_state 搬到 turn_ctx(per-turn 生命周期对齐)。
+                ctx.awaiting_permission_batch = asks
+                ctx.awaiting_permission = asks[0]  # back-compat web/app.py
             ctx.permission_request = asks[0]
             # 同步强制 SM 转 AWAITING_PERMISSION(避免 yield 暂停后 SM 卡在 EXECUTING_TOOLS)
             sm = getattr(agent, "_sm", None)
@@ -1728,7 +1755,8 @@ class ToolExecuteHandler:
         - ≥2 个 decisions → ThreadPoolExecutor 并行,as_completed 后按 LLM 顺序 emit
     每个结果:emit tool_result + log result + push self.messages(tool_result block)+ push pending。
 
-    Fix C 尾清理:RunState.awaiting_permission = None + 清 batch(permission ASK 路径完成后必须清,
+    Fix C 尾清理:ctx.awaiting_permission = None + 清 batch(Step 2,2026-07-07:从 run_state 搬到 turn_ctx;
+    permission ASK 路径完成后必须清,
     否则下个 turn 又触发 resume 路径)。
 
     cancellation:每个 tool.execute 接收 cancel_event(由 run_state.cancel_event 传入,
@@ -1915,9 +1943,19 @@ class ToolExecuteHandler:
                 run_state.pending_tool_results.append((tc.tool_use_id, output))
 
         # ── Fix C 尾清理 ──
-        if run_state is not None and run_state.awaiting_permission is not None:
-            run_state.awaiting_permission = None
-            run_state.awaiting_permission_batch = []
+        # Step 2 (2026-07-07):从 run_state 搬到 turn_ctx(per-turn 生命周期对齐)。
+        # Plan A (2026-07-07):gate 不能只看 ctx.awaiting_permission —— _is_resume 路径
+        # (PermissionCheckHandler.handle line 1478)故意不写 ctx.awaiting_permission(避免
+        # LLMThinkingPhase.next 误路由回 AWAITING),所以 _is_resume=True 时无 awaiting_permission
+        # 信号 → tail clear 漏跑 → agent._pending_permission_request 不清 → 下次 ASK 路径
+        # 把旧 pending 当成当前 pending 用 → allow-loop 不只在 tool,连 resume 检测都死了。
+        # 加 ctx._is_resume 到 gate,并把 agent._pending_permission_request 也清掉(让 UI 弹窗正确消失,
+        # 替代 web/app.py 曾经做的提前清空)。
+        if ctx._is_resume or ctx.awaiting_permission is not None:
+            ctx.awaiting_permission = None
+            ctx.awaiting_permission_batch = []
+            if agent._pending_permission_request is not None:
+                agent._pending_permission_request = None
 
         return HandlerResult()
 

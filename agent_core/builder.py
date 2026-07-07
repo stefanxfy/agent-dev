@@ -71,17 +71,20 @@ __all__ = [
 
 
 def build_default_inputs_chain(agent) -> TurnChain:
-    """SETUP phase 默认 chain(选项 A:6 handler 顺序累加 ctx.system_prompt)。
+    """SETUP phase 默认 chain(选项 A:6 handler 顺序累加 run_state.system_prompt)。
 
     选项 A 重构 (2026-07-06):system_prompt 装配回归 inputs_chain,由多个 handler
-    通过 ctx.append_system 顺序累加;llm_chain 的 LLMCallHandler 只读 ctx.system_prompt。
+    通过 run_state.append_system 顺序累加;llm_chain 的 LLMCallHandler 只读 run_state.system_prompt。
     消灭了方案 D 把装配塞进 LLMCallHandler 导致的 SRP 膨胀 + OCP 封闭,同时避开了
-    原 stage_inputs "混 messages 历史" 的 stale 弊端(ctx.system_prompt 只存装配产物,
+    原 stage_inputs "混 messages 历史" 的 stale 弊端(run_state.system_prompt 只存装配产物,
     messages 永远从 agent.messages live 读)。
 
+    R2 (2026-07-07):累加目标从 turn_ctx 挪到 run_state(per-run 持久),resume_after_permission
+    重新走 step() 时新 turn_ctx 仍能读到完整 system_prompt + tool_schemas(不再 msgs=3 tools=0)。
+
     - TurnIndicator:emit turn indicator 事件(独立职责)
-    - ContextCompaction:token 预算压缩(改 agent.messages,与 ctx.system_prompt 正交)
-    - ToolsSchemaPrepare:准备 tool schemas → ctx.tool_schemas(LLMCallHandler 读)
+    - ContextCompaction:token 预算压缩(改 agent.messages,与 run_state.system_prompt 正交)
+    - ToolsSchemaPrepare:准备 tool schemas → run_state.tool_schemas(LLMCallHandler 读)
     - SystemPrompt:append base system_prompt
     - MemoryRetrieval:检索 memory → append mem_block + emit memory_status
     - SkillsPrompt:snapshot skills → append skills 段(C2 guard:Read 在 toolset)
