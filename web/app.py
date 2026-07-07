@@ -1101,7 +1101,7 @@ def run_agent(user_input: str):
                 break
 
             # ── P1 关键:awaiting_permission 触发 → 暂停 + 弹 dialog ──
-            # v2 marker 已写入 _run_state.awaiting_permission,step() 自动
+            # v2 marker 已写入 turn_ctx.awaiting_permission(Step 2,2026-07-07),step() 自动
             # 转 AWAITING_PERMISSION phase 暂停。这里 yield event 让 UI 知道
             # 进入暂停,然后 return 让 streamlit rerun → @st.dialog 渲染。
             if msg_type == "awaiting_permission":
@@ -1158,21 +1158,26 @@ def _handle_permission_dialog(agent):
     with col1:
         if st.button("✅ Allow once", key=f"allow_{tool_name}", use_container_width=True):
             try:
+                # Plan A (2026-07-07):不复位 _pending_permission_request。
+                # step() 期间需要读 pending["choice"] 检测 _is_resume,ToolExecuteHandler
+                # tail-clear(step 2 跟进)会在 tool 执行成功后清掉。
                 agent.resume_after_permission("allow")
             except Exception as e:
                 # 诊断(2026-07-03):resume 抛异常会让 _run_phase 没改成 running → 弹窗不消失
                 logging.exception("▶️ [allow] resume_after_permission 抛异常")
                 st.error(f"resume 异常: {e}")
             else:
-                # 清 _pending: resolve_permission 不清它(避免弹窗条件残留)
-                agent._pending_permission_request = None
+                # 不写 pending=None —— 让 step() 期间 _pending_permission_request[choice] 还在,
+                # PermissionCheckHandler._is_resume 检测能生效。
+                # 完成后由 ToolExecuteHandler.handle tail clear 兜底(step 2,2026-07-07)。
                 st.session_state._run_phase = "running"  # 重启 step() 循环
                 st.rerun()
     with col2:
         if st.button("🚫 Deny", key=f"deny_{tool_name}", use_container_width=True):
             # Deny = 结束本次对话(用户明确语义:不再继续、不调 LLM、不显示 Stop)。
             # - resume_after_permission: 写 denial tool_result + 持久化(给 LLM 上下文一致)
-            # - 清 _pending: resolve_permission 不清它(已知问题),清掉避免弹窗条件残留
+            # - 清 _pending: Deny 路径不跑 ToolExecute,无 tail-clear 兜底,这里必须清
+            #   (避免下次 ASK 路径把旧 pending 当成当前 pending 用)
             # - phase=idle: 续 run 段不跑(不调 LLM),Stop 段 else 分支(不显示按钮)
             # - 弹窗段条件 phase==awaiting,idle 不满足 → 弹窗消失
             # - append 反馈消息: 让用户在主区看到"已拒绝",reload 后这条仍在(tool
@@ -1187,8 +1192,8 @@ def _handle_permission_dialog(agent):
             st.rerun()
     with col3:
         if st.button("✅ Always allow", key=f"always_{tool_name}", use_container_width=True):
+            # Plan A:同 Allow once —— 不在 UI 清 pending,留 ToolExecuteHandler tail-clear 兜底。
             agent.resume_after_permission("always_allow")
-            agent._pending_permission_request = None  # 清 pending(见 allow 注释)
             st.session_state._run_phase = "running"
             st.rerun()
 

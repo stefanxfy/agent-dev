@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Literal, get_args
 from dotenv import load_dotenv, find_dotenv
 

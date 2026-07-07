@@ -237,7 +237,8 @@ class ReactAgent:
 
         # 实例化 SystemPromptAssembler 并构造 system_prompt
         # = base + sandbox section + MEMORY.md + TRUSTING_RECALL。
-        # SystemPromptHandler 在 inputs_chain 里把 agent.system_prompt append 到 ctx.system_prompt。
+        # SystemPromptHandler 在 inputs_chain 里把 agent.system_prompt append 到 run_state.system_prompt。
+        # R2 (2026-07-07):累加目标从 turn_ctx 改到 run_state(per-run 持久)。
         # 必须在 system_prompt base + memory_index + permission_engine 都赋值后调。
         from agent_core.turn_chain import SystemPromptAssembler
         self._assembler = SystemPromptAssembler(self)
@@ -686,7 +687,6 @@ class ReactAgent:
         )
         # 1. 复用 resolve_permission 逻辑(legacy 路径仍可工作)
         self.resolve_permission(choice)
-
         # Deny-loop fix (2026-06-30): deny 路径补 tool_result 给 LLM 看
         # 注意:必须先 append,再 transition — 否则下次 LLM 调用看不到 denial
         if choice == "deny" and self._pending_permission_request is not None:
@@ -719,28 +719,13 @@ class ReactAgent:
         # 只调 AwaitingPermission.next() 决策下一 phase,然后手动 transition。
         from agent_core.agent_state import AgentPhase
 
-        # Fix B (2026-06-30) 防御性补:如果 SM 当前不在 AWAITING_PERMISSION,
-        # 但 _run_state.awaiting_permission 已设(说明 _iter_phase_tools 写了 pending),
-        # 说明之前 yield generator 被提前销毁,SM 没正确转入 AWAITING_PERMISSION。
-        # 这里强制补一次转换,让下面的主 if 块能进。
-        # 通常这种情况不应该发生(Fix A 已在 _iter_phase_tools 同步转过),
-        # 但作为兜底,防止未来再有类似 yield-暂停 bug 把用户卡死。
-        if (
-            self._sm.current != AgentPhase.AWAITING_PERMISSION
-            and self._run_state is not None
-            and self._run_state.awaiting_permission is not None
-        ):
-            _old_phase_recovery = self._sm.current
-            self._sm._phase = AgentPhase.AWAITING_PERMISSION
-            self._sm._history.append((
-                _old_phase_recovery,
-                "permission_needed(recovered)",
-                AgentPhase.AWAITING_PERMISSION,
-            ))
-            _logger.warning(
-                "⚠️ [SM recovery] %s --> awaiting_permission (resume_after_permission 兜底;通常 Fix A 已处理)",
-                _old_phase_recovery.value,
-            )
+        # 历史 Fix B (2026-06-30,2026-07-07 删):原读 _run_state.awaiting_permission 兜底
+        # 修复 yield generator 提前销毁导致 SM 没正确转入 AWAITING 的 bug。
+        # Step 2 把字段搬到 turn_ctx 后,该检查失效(用户 confirm 直接删);
+        # 主 if 块 `if self._sm.current == AWAITING` 已足够挡非法调用,
+        # fail-fast 比静默补一致更安全。
+
+        _logger.debug(f"▶️ [v2 resume_after_permission] choice={choice} sm={self._sm.current} pending={self._pending_permission_request}")
 
         if self._sm.current == AgentPhase.AWAITING_PERMISSION:
             # Deny-loop fix (2026-06-30): choice=="deny" 时直接转 LLM_THINKING,

@@ -221,6 +221,9 @@ class ExtractionGate:
                 source_quote=c.get("source_quote", ""),
                 tags=[],
                 score=confidence,
+                # 透传 why(feedback/project 必须,user/reference 可空)
+                # 见 prompt_templates.build_extract_prompt schema
+                why=c.get("why") or None,
             )
             for c in raw_candidates
         ]

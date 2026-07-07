@@ -75,7 +75,7 @@ class TestFactoryChains:
         tools_schema_prepare + system_prompt + memory_retrieval + skills_prompt。
 
         选项 A 重构 (2026-07-06):system_prompt 装配回归 inputs_chain,3 个 handler 通过
-        ctx.append_system 顺序累加。加新 system 段 = with_handler(after=X)。
+        ctx.run_state.append_system 顺序累加。加新 system 段 = with_handler(after=X)。
         """
         agent = _StubAgent()
         chain = build_default_inputs_chain(agent)
@@ -91,12 +91,14 @@ class TestFactoryChains:
         ], f"unexpected order: {names}"
 
     def test_llm_chain_has_three_handlers_in_order(self):
-        """LLM chain:llm_call + chunk_parse + llm_call_persist(Stage A,Plan B Step 1)。"""
+        """LLM chain:llm_call + chunk_parse + llm_call_persist。"""
         agent = _StubAgent()
         chain = build_default_llm_chain(agent)
 
         names = [h.name for h in chain]
-        assert names == ["llm_call", "chunk_parse", "llm_call_persist"]
+        assert names == [
+            "llm_call", "chunk_parse", "llm_call_persist"
+        ]
 
     def test_tool_chain_has_four_handlers_in_order(self):
         """Tool chain:permission_check + tool_dispatch + tool_execute + tool_pair_persist(Stage B,Plan B Step 2)。"""

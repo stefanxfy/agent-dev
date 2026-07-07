@@ -61,6 +61,7 @@ from agent_core.memory.memory_store import (
 from agent_core.memory.meta_db import MetaDB
 from agent_core.memory.path_validator import MemoryPathValidator, PathSecurityError
 from agent_core.memory.secret_scanner import SecretScanner
+from agent_core.memory.types import _TYPES_REQUIRING_WHY, _WHY_PATTERN
 from agent_core.memory.wal_config import TaskWALConfig
 
 if TYPE_CHECKING:
@@ -112,13 +113,21 @@ class TurnMessage:
 
 @dataclass
 class ExtractionCandidate:
-    """LLM 提取的记忆候选（A5 + L6）"""
+    """LLM 提取的记忆候选（A5 + L6）
+
+    字段:
+    - why: feedback/project 类型必填,LLM 输出的独立 why 字段。
+      写盘前会拼到 body 末尾 (`\\n\\n**Why:** {why}`),
+      以满足 validate_body 的 v2.1 §4.5 #7 不变量。
+      user/reference 类型可空。
+    """
     type: str
     title: str
     body: str
     source_quote: str
     tags: list[str] = field(default_factory=list)
     score: float = 0.5
+    why: Optional[str] = None
 
 
 class VectorStoreProtocol(Protocol):
@@ -637,12 +646,25 @@ class DualChannelWriter:
                         skipped += 1
                         continue
 
+                    # ── M12 修复:把 why 拼到 body 末尾(满足 validate_body 不变量)──
+                    # validate_body 要求 feedback/project 类型 body 含 **Why:** 段落。
+                    # prompt 要求 LLM 把 why 输出成独立 JSON 字段,所以这里在写盘前
+                    # 拼上。若 body 已有 **Why:** 段落(LLM 直接嵌入了),则跳过避免重复。
+                    body_for_write = cand.body or ""
+                    if cand.why and cand.type in _TYPES_REQUIRING_WHY:
+                        if not _WHY_PATTERN.search(body_for_write):
+                            body_for_write = f"{body_for_write}\n\n**Why:** {cand.why}".strip()
+                            logger.debug(
+                                f"extract:  把 why 拼到 body 末尾(type={cand.type}) "
+                                f"why_len={len(cand.why)}"
+                            )
+
                     item_hash = self.memory_store.write(
                         type=cand.type,
                         name=cand.title or "(无名)",
                         description=(cand.body[:200] if cand.body else cand.title or "(无描述)"),
                         title=cand.title,
-                        body=cand.body,
+                        body=body_for_write,
                         source_quote=cand.source_quote,
                         tags=cand.tags,
                         extra={

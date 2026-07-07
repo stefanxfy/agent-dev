@@ -675,7 +675,7 @@ class TurnChain:
 | Chain 名 | 涵盖 handler | 阶段归属 |
 |---|---|---|
 | `inputs_chain` | MemoryRetrieval + SystemPrompt + ToolsSchemaPrepare | SETUP |
-| `llm_chain` | LLMCall + ChunkParse | LLM_THINKING |
+| `llm_chain` | LLMCall + ChunkParse + LLMCallPersist | LLM_THINKING |
 | `tool_chain` | PermissionCheck + ToolDispatch + ToolExecute | EXECUTING_TOOLS |
 | `output_chain` | SessionPersist + AuditLog + MemoryBridgeExtract | FINALIZING |
 

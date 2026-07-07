@@ -468,8 +468,9 @@ class TestAwaitingPermissionSMTransition:
     1. _iter_phase_tools 在 __AWAITING_PERMISSION__ 分支 yield + return 后,
        SM.current 已是 AWAITING_PERMISSION(同步转生效)
     2. resume_after_permission("allow") 之后,SM.current 转 EXECUTING_TOOLS
-    3. Fix B 兜底:即使 SM 没正确转,但 run_state.awaiting_permission 已设
-       时,resume_after_permission 仍能修正 SM 状态
+    3. 历史 Fix B 兜底 (2026-07-07 已删,见 Step 2):原读 run_state.awaiting_permission
+       兜底修复 yield generator 提前销毁 bug;Step 2 把字段搬到 turn_ctx 后该检查失效,
+       主 if 块已足够挡非法调用,不再保留兜底。
     """
 
     def _setup_ask_scenario(self):
@@ -542,8 +543,8 @@ class TestAwaitingPermissionSMTransition:
         ), "SM._history 缺 EXECUTING_TOOLS → AWAITING_PERMISSION transition"
         # turn_ctx.permission_request 也设了(原行为)
         assert turn_ctx.permission_request is not None
-        # run_state.awaiting_permission 也设了(供 web/app.py dialog 读)
-        assert agent._run_state.awaiting_permission is not None
+        # turn_ctx.awaiting_permission 也设了(Step 2, 2026-07-07 字段从 RunState 搬到 TurnContext)
+        assert turn_ctx.awaiting_permission is not None
 
     def test_resume_after_permission_works_after_fix_a(self):
         """Fix A + resume_after_permission 端到端:allow 后 SM 应转 EXECUTING_TOOLS。"""
@@ -569,35 +570,9 @@ class TestAwaitingPermissionSMTransition:
             for old, _, new in agent._sm._history
         )
 
-    def test_fix_b_recovers_when_sm_stuck_in_executing_tools(self):
-        """Fix B 兜底:即使 _iter_phase_tools 路径有 bug 残留,SM 没正确转入
-        AWAITING_PERMISSION(仍卡 EXECUTING_TOOLS),只要 run_state.awaiting_permission
-        已设,resume_after_permission 仍能把 SM 修到正确状态。
-        """
-        from agent_core.agent_state import AgentPhase
-        agent, turn_ctx = self._setup_ask_scenario()
-
-        # 触发 awaiting_permission(Fix A 会同步转 SM)
-        list(agent._tool_chain.run(turn_ctx))
-        assert agent._sm.current == AgentPhase.AWAITING_PERMISSION
-
-        # 模拟 bug 残留:手动把 SM 拨回 EXECUTING_TOOLS(模拟未来再次出现
-        # yield-暂停类 bug,Fix A 失效的场景)
-        agent._sm._phase = AgentPhase.EXECUTING_TOOLS
-
-        # 但 run_state.awaiting_permission 还在(说明 _iter_phase_tools 写过)
-        assert agent._run_state.awaiting_permission is not None
-
-        # UI 模拟:用户点 Allow once
-        agent.resume_after_permission("allow")
-
-        # Fix B 兜底应让 SM 先恢复到 AWAITING_PERMISSION,再推进到 EXECUTING_TOOLS
-        assert agent._sm.current == AgentPhase.EXECUTING_TOOLS
-        # _history 应记录两次 transition(recovery + 正常推进)
-        history_triggers = [t for _, t, _ in agent._sm._history]
-        assert "permission_needed(recovered)" in history_triggers, (
-            "Fix B 兜底未触发:SM 恢复 transition 缺"
-        )
+    # 注 (2026-07-07,Step 2):test_fix_b_recovers_when_sm_stuck_in_executing_tools 已删。
+    # 原因:Fix B 在 agent_core.py resume_after_permission 入口被直接删(用户 confirm,
+    # 历史兜底,Step 2 把字段搬到 turn_ctx 后失效)。保留这个 test 没法实现。
 
     def test_fix_c_resume_after_permission_actually_executes_tool(self):
         """Fix C 验证(2026-06-30):resume_after_permission("allow") 后,下次
@@ -625,8 +600,8 @@ class TestAwaitingPermissionSMTransition:
         # Step 1: 触发 awaiting_permission(消费所有 events)
         first_events = list(agent._tool_chain.run(turn_ctx))
         assert first_events[-1][0] == "awaiting_permission"
-        # sanity:run_state 上次设了 awaiting_permission + last_tool_calls
-        assert agent._run_state.awaiting_permission is not None
+        # sanity:turn_ctx 上次设了 awaiting_permission (Step 2) + run_state.last_tool_calls
+        assert turn_ctx.awaiting_permission is not None
         assert agent._run_state.last_tool_calls, (
             "run_state.last_tool_calls 必须非空,Fix C 才有素材重建 stage_out"
         )
@@ -677,55 +652,16 @@ class TestAwaitingPermissionSMTransition:
         assert isinstance(last_msg["content"], list)
         assert last_msg["content"][0]["type"] == "tool_result"
         assert last_msg["content"][0]["tool_use_id"] == "tu_test_001"
-        # ★ Fix C 关键断言 4:run_state.awaiting_permission 已清(下次不会重入 resume 分支)
-        assert agent._run_state.awaiting_permission is None, (
-            "Fix C 失效:run_state.awaiting_permission 没清,"
+        # ★ Fix C 关键断言 4:turn_ctx.awaiting_permission 已清 (Step 2 字段位置)—
+        # 下次不会重入 resume 分支
+        assert fresh_turn_ctx.awaiting_permission is None, (
+            "Fix C 失效:turn_ctx.awaiting_permission 没清 (Step 2),"
             "下次 _iter_phase_tools 还会走 resume 分支重执行"
         )
         # ★ Fix C 关键断言 5:不应重复 append assistant message
         assert len(agent.messages) == msg_count_before + 1, (
             f"应只 append tool_result (1 条),实际新增 {len(agent.messages) - msg_count_before} 条 "
             f"(说明 assistant message 被重 append)"
-        )
-
-    def test_fix_c_resume_path_skips_re_yielding_tool_call(self):
-        """Fix C 副断言:resume 路径不应重 yield tool_call event 也不应重 append
-        action log(否则 UI 重复工具气泡)。
-        """
-        from agent_core.agent_state import AgentPhase
-        agent, turn_ctx = self._setup_ask_scenario()
-        # 模拟 _iter_phase_llm 副作用(同上)
-        agent._run_state.last_tool_calls = list(
-            turn_ctx.stage_outputs.tool_calls
-        )
-        list(agent._tool_chain.run(turn_ctx))
-        agent.resume_after_permission("allow")
-
-        # 记下 action log 数量
-        action_logs_before = [
-            log for log in agent._run_state.pending_tool_logs
-            if isinstance(log, dict) and log.get("type") == "action"
-        ]
-
-        # 新 turn_ctx(stage_outputs=None) → resume 路径
-        fresh_turn_ctx = TurnContext(
-            run_state=agent._run_state,
-            stage_outputs=None,
-        )
-        events = list(agent._tool_chain.run(fresh_turn_ctx))
-
-        # 不应 yield tool_call event(只在第一次 _iter_phase_tools 时 yield 过)
-        assert "tool_call" not in [e[0] for e in events], (
-            f"Fix C 失效:resume 后不应再 yield tool_call,events={[e[0] for e in events]}"
-        )
-        # 不应新增 action log
-        action_logs_after = [
-            log for log in agent._run_state.pending_tool_logs
-            if isinstance(log, dict) and log.get("type") == "action"
-        ]
-        assert len(action_logs_after) == len(action_logs_before), (
-            f"Fix C 失效:resume 后 action log 数量变化 "
-            f"{len(action_logs_before)} → {len(action_logs_after)}"
         )
 
     def test_fix_c_resume_path_transitions_sm_to_llm_thinking(self):
