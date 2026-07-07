@@ -675,9 +675,22 @@ class TurnChain:
 | Chain 名 | 涵盖 handler | 阶段归属 |
 |---|---|---|
 | `inputs_chain` | MemoryRetrieval + SystemPrompt + ToolsSchemaPrepare | SETUP |
-| `llm_chain` | LLMCall + ChunkParse | LLM_THINKING |
+| `llm_chain` | LLMCall + ChunkParse + **InlineXmlFallback** + LLMCallPersist | LLM_THINKING |
 | `tool_chain` | PermissionCheck + ToolDispatch + ToolExecute | EXECUTING_TOOLS |
 | `output_chain` | SessionPersist + AuditLog + MemoryBridgeExtract | FINALIZING |
+
+> **003-react-inline-xml-fallback-parser 补充(2026-07-07)**:
+> 某些 provider (GLM-5.1 等) 不通过结构化 `tool_use` 块而是通过纯文本中的
+> inline-XML 表达工具调用:
+>
+>    <tool_call>{"name":"Bash","input":{"command":"echo hi"}}</tool_call>
+>
+> ChunkParseHandler 只会 emit 这种文本,不会解析它 → `stage_outputs.tool_calls` 为空
+> → LLMThinkingPhase.next 走 FINALIZING → SM 提前收尾。
+> InlineXmlFallbackHandler(`agent_core/turn_chain.py`)插在 ChunkParseHandler
+> 后、LLMCallPersistHandler 前,扫 `stage_outputs.full_text` 抽 inline-XML 块
+> 补回 `stage_outputs.tool_calls`,覆盖 `stop_reason="tool_use"`。详细设计见
+> `specs/003-react-inline-xml-fallback-parser/{spec,plan,research,data-model}.md`。
 
 ### 4.4 内置 Handler(每个是 class)
 

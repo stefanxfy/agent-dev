@@ -29,6 +29,9 @@ from agent_core.agent_core import _TRUNCATED_STOP_REASONS
 from agent_core.skills.env_overrides import apply_skill_env_overrides
 # 2026-07-06:Tool INPUT/OUTPUT dump helper (FR-014 safe — mask 已注入 secret values)
 from agent_core.llm.router import _dump_json, _mask_env_secrets
+# 003-react-inline-xml-fallback-parser:InlineXmlFallbackHandler 用 parse_inline_xml_tool_calls
+from agent_core.react import parse_inline_xml_tool_calls
+from agent_core.config import config as _config_singleton  # Config singleton for inline_xml_fallback.enabled
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -73,6 +76,7 @@ __all__ = [
     "ToolsSchemaPrepareHandler",
     "LLMCallHandler",
     "ChunkParseHandler",
+    "InlineXmlFallbackHandler",  # 003-react-inline-xml-fallback-parser
     "PermissionCheckHandler",
     "ToolDispatchHandler",
     "ToolExecuteHandler",
@@ -90,6 +94,9 @@ __all__ = [
 
 _logger = logging.getLogger("agent_core.turn_chain")
 permission_logger = logging.getLogger("agent_core.permission")  # Plan C: _check_tool_permission 迁入用
+# 003-react-inline-xml-fallback-parser:InlineXmlFallbackHandler 专用子 logger
+# (per debug logging in core paths 记忆:🧩 agent_core.skills 子 logger 模式)
+_inline_xml_fallback_logger = logging.getLogger("agent_core.react.inline_xml_fallback")
 
 
 # 2026-07-02:tool execute 最大重试次数常量。取代原 _iter_phase_tools L880 + L977 重复字面量 3。
@@ -1195,6 +1202,98 @@ class ChunkParseHandler:
         if agent._run_state is not None:
             agent._run_state.last_tool_calls = list(tool_calls)
         return HandlerResult()
+
+
+# ── 5b. InlineXmlFallbackHandler(llm_chain,ChunkParseHandler 后) ──
+class InlineXmlFallbackHandler:
+    """llm_chain 末段:ChunkParseHandler 已写 stage_outputs 之后,扫 full_text 中的
+    inline-XML `<tool_call>{...}</tool_call>` 块,补回 stage_outputs.tool_calls。
+
+    触发场景(per spec.md US1 + US4):
+    - 某些 provider (GLM-5.1) 不通过结构化 `tool_use` 块而是通过纯文本表达
+      工具调用。ChunkParseHandler 只会 emit 这种文本但不会解析它 → stage_outputs.tool_calls
+      为空 → LLMThinkingPhase.next 走 FINALIZING → SM 提前收尾,用户消息
+      ("为什么没读这个文件?")。
+    - 本 handler 拿到 full_text 后调 parse_inline_xml_tool_calls(),
+      把 valid 块转为 ToolCallDelta append 到 stage_outputs.tool_calls,
+      覆盖 stop_reason="tool_use",让 SM 正确转 EXECUTING_TOOLS。
+
+    设计约束(per 反偷懒规则 第 6 条 + research.md §7):
+    - 不读、不复制、不打印 input 内容(避免 secret 泄漏到 log)
+    - 已存在结构化 tool_calls → no-op(避免重复执行)
+    - cfg.inline_xml_fallback.enabled=False → no-op + DEBUG
+    - 激活时恰好 1 条 INFO(测试断言:blocks + first_tool + original_stop)
+    - 第二次调同 ctx → no-op(FR-008 幂等,自然靠 tool_calls 非空短路)
+    """
+    name = "inline_xml_fallback"
+
+    def __init__(self, agent):
+        self._agent = agent
+
+    def handle(self, ctx: TurnContext) -> HandlerResult:
+        # 1. config 短路(per T028)
+        if not _config_singleton.inline_xml_fallback.enabled:
+            _inline_xml_fallback_logger.debug(
+                "🧩 react.inline_xml_fallback: disabled by config "
+                "(inline_xml_fallback.enabled=False)"
+            )
+            return HandlerResult()
+
+        # 2. ctx / stage 校验
+        if ctx.stage_outputs is None:
+            return HandlerResult()
+        stage = ctx.stage_outputs
+
+        # 3. 已有结构化 tool_call → no-op(per T010 + FR-008 幂等性)
+        #    这条同时让 handler 对同一 ctx 第二次调用自然 no-op
+        if stage.tool_calls:
+            return HandlerResult()
+
+        # 4. 无 full_text → 跳过(ChunkParseHandler 异常路径可能写空 full_text)
+        if not stage.full_text:
+            return HandlerResult()
+
+        # 5. parse
+        outcome = parse_inline_xml_tool_calls(stage.full_text)
+        if not outcome.fallback_activated:
+            return HandlerResult()
+
+        # 6. 追加 ToolCallDelta + 覆盖 stop_reason
+        original_stop = stage.stop_reason or "-"
+        first_tool_name = None
+        for itc in outcome.tool_calls:
+            stage.tool_calls.append(itc.to_tool_call_delta())
+            if first_tool_name is None:
+                first_tool_name = itc.name
+        stage.stop_reason = "tool_use"
+
+        # 7. INFO 激活日志(per T023:单行,含 provider hash + blocks + first_tool + original_stop)
+        #    严禁 input 字节(secret 防御 — 对齐 002 三层 secret 模式)
+        if _config_singleton.inline_xml_fallback.log_provider_hash:
+            provider_hash = _provider_hash(self._agent)
+        else:
+            provider_hash = "-"
+        _inline_xml_fallback_logger.info(
+            "🧩 react.inline_xml_fallback: provider=%s blocks=%d first_tool=%s original_stop=%s",
+            provider_hash, len(outcome.tool_calls), first_tool_name, original_stop,
+        )
+        return HandlerResult()
+
+
+def _provider_hash(agent) -> str:
+    """计算 provider 的 6 字符短 hash(给 INFO log 用)。agent=None → '-'.绝不打印
+    provider 名(避免 log 泄漏第三方 provider 信息;测试断言只匹配 provider= 字段)。"""
+    if agent is None:
+        return "-"
+    try:
+        llm = getattr(agent, "llm", None)
+        if llm is None:
+            return "-"
+        import hashlib
+        provider_str = str(getattr(llm.config, "provider", "unknown"))
+        return hashlib.sha256(provider_str.encode()).hexdigest()[:6]
+    except Exception:
+        return "-"
 
 
 # ── 6. PermissionCheckHandler(tool_chain,首位) ───────────

@@ -90,13 +90,17 @@ class TestFactoryChains:
             "skills_prompt",
         ], f"unexpected order: {names}"
 
-    def test_llm_chain_has_three_handlers_in_order(self):
-        """LLM chain:llm_call + chunk_parse + llm_call_persist(Stage A,Plan B Step 1)。"""
+    def test_llm_chain_has_four_handlers_in_order(self):
+        """LLM chain:llm_call + chunk_parse + **inline_xml_fallback** + llm_call_persist。
+        003-react-inline-xml-fallback-parser(T012):inline_xml_fallback 插在 chunk_parse 后、
+        llm_call_persist 前,确保 stage_outputs.tool_calls 在 assistant message 落盘前补回。"""
         agent = _StubAgent()
         chain = build_default_llm_chain(agent)
 
         names = [h.name for h in chain]
-        assert names == ["llm_call", "chunk_parse", "llm_call_persist"]
+        assert names == [
+            "llm_call", "chunk_parse", "inline_xml_fallback", "llm_call_persist"
+        ]
 
     def test_tool_chain_has_four_handlers_in_order(self):
         """Tool chain:permission_check + tool_dispatch + tool_execute + tool_pair_persist(Stage B,Plan B Step 2)。"""
@@ -293,7 +297,7 @@ class TestFactoryStubAgentFriendliness:
         # Plan B Step 1-2 加 Stage A/B 持久化 handler + R4 加 ContextCompaction +
         # 2026-07-02 SRP 重构加 TurnIndicator 并把 SystemPrompt/MemoryRetrieval 拆为真实现
         assert len(inputs_chain) == 6    # turn_indicator + context_compaction + tools_schema_prepare + system_prompt + memory_retrieval + skills_prompt (选项 A)
-        assert len(llm_chain) == 3       # llm_call + chunk_parse + llm_call_persist
+        assert len(llm_chain) == 4       # llm_call + chunk_parse + inline_xml_fallback + llm_call_persist (003)
         assert len(tool_chain) == 4      # permission_check + tool_dispatch + tool_execute + tool_pair_persist
         assert len(output_chain) == 7    # final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush + env_cleanup (002 T035 2026-07-06)
 

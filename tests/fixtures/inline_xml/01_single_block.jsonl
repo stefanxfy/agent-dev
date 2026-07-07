@@ -1,0 +1,1 @@
+{"name":"01_single_block","provider":"glm","text":"<tool_call>{\"name\":\"Bash\",\"input\":{\"command\":\"echo hi\"}}</tool_call>","expected_tool_calls":[{"name":"Bash","input":{"command":"echo hi"}}],"expected_malformed":[],"expected_fallback_activated":true}

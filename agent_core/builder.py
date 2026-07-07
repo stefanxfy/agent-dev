@@ -30,6 +30,7 @@ from agent_core.turn_chain import (
     FinalAnswerBookkeepingHandler,
     FinalAnswerPersistHandler,
     Handler,
+    InlineXmlFallbackHandler,  # 003-react-inline-xml-fallback-parser
     L3SMExtractTriggerHandler,
     LLMCallHandler,
     LLMCallPersistHandler,
@@ -98,14 +99,19 @@ def build_default_inputs_chain(agent) -> TurnChain:
 
 
 def build_default_llm_chain(agent) -> TurnChain:
-    """LLM_THINKING phase 默认 chain(LLMCall → ChunkParse → **LLMCallPersist [Stage A]**)。
+    """LLM_THINKING phase 默认 chain(LLMCall → ChunkParse → **InlineXmlFallback [T012]** → **LLMCallPersist [Stage A]**)。
 
     对应 docs §4.3 table llm_chain 行 + §15 step 2 + Plan B §15 step 21
     (Stage A 接管 7 处 v1 add_* 调用,见 LLMCallPersistHandler docstring)。
+
+    003-react-inline-xml-fallback-parser(T012):InlineXmlFallbackHandler 插在
+    ChunkParseHandler 后、LLMCallPersistHandler 前,确保 stage_outputs.tool_calls
+    在 assistant message 落盘前已被补回(若 LLM 走 inline-XML 路径)。
     """
     return TurnChain([
         LLMCallHandler(agent),
         ChunkParseHandler(agent),
+        InlineXmlFallbackHandler(agent),  # 003-react-inline-xml-fallback-parser
         LLMCallPersistHandler(agent),
     ])
 
