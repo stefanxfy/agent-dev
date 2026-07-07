@@ -169,10 +169,13 @@ class LLMRouter:
             cache_namespace=cache_namespace,
         ):
             chunks_count += 1
+            # StreamChunk 字段: text_delta (TextDelta.text) + thinking_delta (ThinkingDelta.thinking)
+            # + tool_call (ToolCallDelta, 完整 dataclass) + usage + stop_reason
+            # 2026-07-07 fix:ThinkingDelta 字段名是 .thinking (不是 .text),否则 AttributeError
             if chunk.text_delta and chunk.text_delta.text:
                 text_buf.append(chunk.text_delta.text)
-            if chunk.thinking_delta and chunk.thinking_delta.text:
-                thinking_buf.append(chunk.thinking_delta.text)
+            if chunk.thinking_delta and chunk.thinking_delta.thinking:
+                thinking_buf.append(chunk.thinking_delta.thinking)
             if chunk.tool_call is not None:
                 # tool_call 单个 dataclass(完整,非增量)— 每次覆盖(最终为终值)
                 tool_calls_buf.append(chunk.tool_call)
@@ -194,8 +197,10 @@ class LLMRouter:
                     "thinking": full_thinking,
                     "tool_calls": [
                         {
-                            "name": getattr(tc, "name", "?"),
-                            "input": getattr(tc, "input", None),
+                            # 2026-07-07 fix:ToolCallDelta 字段是 tool_name/tool_input/tool_use_id
+                            # 之前 getattr(tc, "name", ...) 错命中"?" — 输出脏数据但不崩
+                            "tool_name": getattr(tc, "tool_name", None),
+                            "tool_input": getattr(tc, "tool_input", None),
                             "tool_use_id": getattr(tc, "tool_use_id", None),
                         }
                         for tc in tool_calls_buf
