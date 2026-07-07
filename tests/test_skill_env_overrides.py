@@ -10,7 +10,11 @@ T011 + T016 + T022 + T026 — tests/test_skill_env_overrides.py
 4. 下游抛异常时 reverter 仍可调(snapshot 不丢)
 5. 多次 apply/revert 幂等无残留
 
-后续 US2 T016 + US3 T022 + Polish T026 在同文件扩展。
+US2 T016 (2 用例):
+6. 单 skill 3 secret 一次 apply 全部注入 + reverter 全部还原
+7. skill-A 与 skill-B 共享 env 名 X → apply 后 os.environ[X] 等于唯一值 + reverter 后 X 等于 RUN 前原值
+
+后续 US3 T022 + Polish T026 在同文件扩展。
 """
 
 from __future__ import annotations
@@ -72,7 +76,11 @@ def _make_config_with_entries(entries_dict: dict[str, SkillEntryConfig]) -> Skil
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     """每个 case 前后清掉可能由本测试注入的 env key, 避免串扰。"""
-    keys_to_clean = {"TEST_KEY_X", "TEST_KEY_Y", "TEST_KEY_Z", "SHARED_KEY"}
+    keys_to_clean = {
+        "TEST_KEY_X", "TEST_KEY_Y", "TEST_KEY_Z", "SHARED_KEY",
+        "US2_KEY_A", "US2_KEY_B", "US2_KEY_C",
+        "MISSING_ENV_NAME", "MISSING_FILE_PATH",
+    }
     for k in keys_to_clean:
         monkeypatch.delenv(k, raising=False)
     yield
@@ -182,3 +190,125 @@ def test_repeat_apply_revert_no_residual(monkeypatch):
     for v in ["v1", "v2", "v3"]:
         assert _one_round(v) == v
         assert "TEST_KEY_X" not in os.environ
+
+
+# ──────────────────────────────────────────────────────────────────
+# T016 — US2 多 secret + 多 skill 共享 env (2 用例)
+# ──────────────────────────────────────────────────────────────────
+
+def test_single_skill_three_secrets_all_injected_and_reverted(monkeypatch):
+    """单 skill 3 secret 一次 apply 全部注入; reverter 全部还原到 RUN 前状态。
+
+    覆盖 spec US2 AS1+AS2:
+    - Given skill 需 [A, B, C] + config 三个值
+    - When run start
+    - Then 全部注入; reverter 后全部还原
+    """
+    # 预置: A 已存在 'pre_A', B / C 未设
+    monkeypatch.setenv("TEST_KEY_X", "pre_A")  # 复用 fixture 不污染 → 改用 3 个新 key
+    keys_to_set = {"US2_KEY_A": "pre_A_value", "US2_KEY_B": "pre_B_value"}
+    keys_unset = {"US2_KEY_C"}
+    for k in keys_to_set:
+        monkeypatch.setenv(k, keys_to_set[k])
+    for k in keys_unset:
+        monkeypatch.delenv(k, raising=False)
+
+    entry = _make_skill_entry("multi-svc-bot", env_requires=["US2_KEY_A", "US2_KEY_B", "US2_KEY_C"])
+    cfg = _make_config_with_entries({
+        "multi-svc-bot": SkillEntryConfig(
+            secrets={
+                "US2_KEY_A": SecretRef(SecretRefKind.INLINE, "injected_A"),
+                "US2_KEY_B": SecretRef(SecretRefKind.INLINE, "injected_B"),
+                "US2_KEY_C": SecretRef(SecretRefKind.INLINE, "injected_C"),
+            },
+        ),
+    })
+
+    reverter = apply_skill_env_overrides([entry], cfg)
+
+    # 全部注入
+    assert os.environ["US2_KEY_A"] == "injected_A"
+    assert os.environ["US2_KEY_B"] == "injected_B"
+    assert os.environ["US2_KEY_C"] == "injected_C"
+
+    reverter()
+
+    # 还原: A/B 还原到 pre_value, C 被 pop
+    assert os.environ.get("US2_KEY_A") == "pre_A_value"
+    assert os.environ.get("US2_KEY_B") == "pre_B_value"
+    assert "US2_KEY_C" not in os.environ
+
+
+def test_multi_skill_shared_env_name_snapshot_on_first(monkeypatch):
+    """skill-A 与 skill-B 共享同一 env 名 X:
+    - snapshot-on-first: 只在第一次见到 X 时 snapshot, 第二次注入不重置 snapshot
+    - reverter 后 X 等于 RUN 前原值(而非 skill-A 注入后的值)
+    - apply 期间 os.environ[X] 等于唯一最终值(后注入者覆盖, 或先注入者保留)
+
+    覆盖 spec US2 AS3 + Edge Cases "Multiple skills share an env name" + FR-011:
+    snapshot 必须在首次注入时拍, reverter 还原到**原始** RUN 前值,
+    不是上一个 skill 注入后的值。
+    """
+    # RUN 前: SHARED_KEY 已有 'pre_run_value' (RUN 前原始值)
+    monkeypatch.setenv("SHARED_KEY", "pre_run_value")
+
+    # skill-A 与 skill-B 共享 SHARED_KEY
+    entry_a = _make_skill_entry("skill-a", env_requires=["SHARED_KEY"])
+    entry_b = _make_skill_entry("skill-b", env_requires=["SHARED_KEY"])
+
+    cfg = _make_config_with_entries({
+        "skill-a": SkillEntryConfig(
+            secrets={"SHARED_KEY": SecretRef(SecretRefKind.INLINE, "value_from_a")},
+        ),
+        "skill-b": SkillEntryConfig(
+            secrets={"SHARED_KEY": SecretRef(SecretRefKind.INLINE, "value_from_b")},
+        ),
+    })
+
+    # 关键: 先注入 skill-a, 再注入 skill-b (entries 顺序就是 snapshot 顺序)
+    reverter = apply_skill_env_overrides([entry_a, entry_b], cfg)
+
+    # apply 期间: SHARED_KEY 应等于后注入的 value_from_b(后写入覆盖前者)
+    assert os.environ["SHARED_KEY"] == "value_from_b", (
+        "apply 后 os.environ[SHARED_KEY] 应等于后注入者的值"
+    )
+
+    reverter()
+
+    # 关键断言: reverter 还原到 RUN 前原值 'pre_run_value', 而不是 'value_from_a'
+    # (snapshot-on-first 语义: 只在第一次见到时 snapshot, 第二次不重置)
+    assert os.environ.get("SHARED_KEY") == "pre_run_value", (
+        "reverter 后 SHARED_KEY 应还原到 RUN 前原值 (snapshot-on-first), "
+        f"got {os.environ.get('SHARED_KEY')!r}"
+    )
+
+
+def test_multi_skill_shared_env_name_reverse_order(monkeypatch):
+    """顺序相反的版本: skill-b 先, skill-a 后 → snapshot-on-first 仍生效。
+
+    验证 snapshot 与 entries 顺序无关, 只取决于"首次见到"。
+    """
+    monkeypatch.setenv("SHARED_KEY", "pre_run_value_2")
+
+    entry_a = _make_skill_entry("skill-a", env_requires=["SHARED_KEY"])
+    entry_b = _make_skill_entry("skill-b", env_requires=["SHARED_KEY"])
+
+    cfg = _make_config_with_entries({
+        "skill-a": SkillEntryConfig(
+            secrets={"SHARED_KEY": SecretRef(SecretRefKind.INLINE, "value_from_a")},
+        ),
+        "skill-b": SkillEntryConfig(
+            secrets={"SHARED_KEY": SecretRef(SecretRefKind.INLINE, "value_from_b")},
+        ),
+    })
+
+    # 顺序: skill-b 先
+    reverter = apply_skill_env_overrides([entry_b, entry_a], cfg)
+    assert os.environ["SHARED_KEY"] == "value_from_a", (
+        "apply 后 SHARED_KEY 应等于后注入者(skill-a)的值"
+    )
+
+    reverter()
+    assert os.environ.get("SHARED_KEY") == "pre_run_value_2", (
+        "reverter 仍应还原到 RUN 前原值, 与 entries 顺序无关"
+    )
