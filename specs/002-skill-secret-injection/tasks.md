@@ -94,9 +94,9 @@ description: "Task list for Skill Secret Injection (agent_core) implementation"
 
 ### Implementation for User Story 2
 
-- [ ] T015 [US2] (T008 已 iterate all secrets；本任务聚焦) Add 防御 in `apply_skill_env_overrides`：每个 entry 跳过自身无 `metadata.requires.env` 或 `config.entries[entry.skill.name]` 缺失的；key 注入前 log 🧩 debug 含 skill 名 + key 名（无 value）；多 skill 共享 env 名时通过 `injected.setdefault(name, ...)` 实现 snapshot-on-first（research Decision 7）in agent_core/skills/env_overrides.py — 依赖 T008
-- [ ] T016 [P] [US2] Test 多 secret + 多 skill 共享 env (2 用例：单 skill 3 secret 一次 apply 全部注入 + reverter 全部还原；skill-A 与 skill-B 共享 env 名 X，apply 后 os.environ[X] 等于唯一值 + reverter 后 X 等于 RUN 前原值——pre-state 设置一不等的 X 验证) in tests/test_skill_env_overrides.py — 依赖 T015
-- [ ] T017 [US2] Run `python3 -m pytest tests/test_skill_env_overrides.py -q` 全绿 + Commit `feat(skills): multi-secret + multi-skill env sharing (P2/US2)` — 依赖 T016
+- [X] T015 [US2] (T008 已 iterate all secrets；本任务聚焦) Add 防御 in `apply_skill_env_overrides`：每个 entry 跳过自身无 `metadata.requires.env` 或 `config.entries[entry.skill.name]` 缺失的；key 注入前 log 🧩 debug 含 skill 名 + key 名（无 value）；多 skill 共享 env 名时通过 `injected.setdefault(name, ...)` 实现 snapshot-on-first（research Decision 7）in agent_core/skills/env_overrides.py — 依赖 T008
+- [X] T016 [P] [US2] Test 多 secret + 多 skill 共享 env (2 用例：单 skill 3 secret 一次 apply 全部注入 + reverter 全部还原；skill-A 与 skill-B 共享 env 名 X，apply 后 os.environ[X] 等于唯一值 + reverter 后 X 等于 RUN 前原值——pre-state 设置一不等的 X 验证) in tests/test_skill_env_overrides.py — 依赖 T015
+- [X] T017 [US2] Run `python3 -m pytest tests/test_skill_env_overrides.py -q` 全绿 + Commit `feat(skills): multi-secret + multi-skill env sharing (P2/US2)` — 依赖 T016
 
 **Checkpoint**: US2——多 secret 闭环；多 skill 共享语义正确（snapshot-on-first）。
 
@@ -110,12 +110,12 @@ description: "Task list for Skill Secret Injection (agent_core) implementation"
 
 ### Implementation for User Story 3
 
-- [ ] T018 [P] [US3] Extend `resolve_secret` ENV form: `os.environ[ref.value]` 读取；不存在 raise `SecretResolutionError(f"env var {ref.value} not set")`；返回值不做 strip（与 shell 行为一致）in agent_core/skills/env_overrides.py — 依赖 T007
-- [ ] T019 [P] [US3] Extend `resolve_secret` FILE form: `Path(ref.value).read_text()`；文件不存在或不可读 raise `SecretResolutionError(f"file {ref.value} unreadable: {e}")`；返回值 `.strip()` 移除首尾空白（spec FR-004 Case 3 + quickstart §3）in agent_core/skills/env_overrides.py — 依赖 T018
-- [ ] T020 [US3] (T008 已含 try-except 包裹 resolve_secret)；本任务 add 测试验证 warn + skip 行为（FR-012）；guard：`SECRET_REF` kind 在 apply 路径同样 try-except，但 log warning 内容区分 (`not implemented v1.1`)；🧩 debug：每次 warn 含 skill 名 + env key 名 + 源类型 in agent_core/skills/env_overrides.py — 依赖 T019
-- [ ] T021 [P] [US3] Test resolve_secret 全部 kind (5 用例：INLINE 返字面值；ENV 返 `os.environ[name]`；ENV 未设抛 `SecretResolutionError`；FILE 读文件 strip 空白；FILE 不存在抛 `SecretResolutionError`；SECRET_REF 抛 `NotImplementedError`) in tests/test_skill_secret_refs.py — 依赖 T020
-- [ ] T022 [P] [US3] Test 源缺失 warn + skip 集成 (2 用例：env 源 os.environ 未设 → capture log 含 "WARN" + 该 key 未注入 + run 不 raise；file 源路径不存在 → capture log 含 "WARN" + 该 key 未注入 + run 不 raise) 用 `caplog` fixture in tests/test_skill_env_overrides.py — 依赖 T020
-- [ ] T023 [US3] Run `python3 -m pytest tests/test_skill_secret_refs.py tests/test_skill_env_overrides.py -q` 全绿 + Commit `feat(skills): inline/env/file secret source forms with warn-on-error (P3/US3)` — 依赖 T022
+- [X] T018 [P] [US3] Extend `resolve_secret` ENV form: `os.environ[ref.value]` 读取；不存在 raise `SecretResolutionError(f"env var {ref.value} not set")`；返回值不做 strip（与 shell 行为一致）in agent_core/skills/env_overrides.py — 依赖 T007
+- [X] T019 [P] [US3] Extend `resolve_secret` FILE form: `Path(ref.value).read_text()`；文件不存在或不可读 raise `SecretResolutionError(f"file {ref.value} unreadable: {e}")`；返回值 `.strip()` 移除首尾空白（spec FR-004 Case 3 + quickstart §3）in agent_core/skills/env_overrides.py — 依赖 T018
+- [X] T020 [US3] (T008 已含 try-except 包裹 resolve_secret)；本任务 add 测试验证 warn + skip 行为（FR-012）；guard：`SECRET_REF` kind 在 apply 路径同样 try-except，但 log warning 内容区分 (`not implemented v1.1`)；🧩 debug：每次 warn 含 skill 名 + env key 名 + 源类型 in agent_core/skills/env_overrides.py — 依赖 T019
+- [X] T021 [P] [US3] Test resolve_secret 全部 kind (5 用例：INLINE 返字面值；ENV 返 `os.environ[name]`；ENV 未设抛 `SecretResolutionError`；FILE 读文件 strip 空白；FILE 不存在抛 `SecretResolutionError`；SECRET_REF 抛 `NotImplementedError`) in tests/test_skill_secret_refs.py — 依赖 T020
+- [X] T022 [P] [US3] Test 源缺失 warn + skip 集成 (2 用例：env 源 os.environ 未设 → capture log 含 "WARN" + 该 key 未注入 + run 不 raise；file 源路径不存在 → capture log 含 "WARN" + 该 key 未注入 + run 不 raise) 用 `caplog` fixture in tests/test_skill_env_overrides.py — 依赖 T020
+- [X] T023 [US3] Run `python3 -m pytest tests/test_skill_secret_refs.py tests/test_skill_env_overrides.py -q` 全绿 + Commit `feat(skills): inline/env/file secret source forms with warn-on-error (P3/US3)` — 依赖 T022
 
 **Checkpoint**: US3——三种源端到端可用；缺失源 graceful degradation。
 
@@ -125,15 +125,15 @@ description: "Task list for Skill Secret Injection (agent_core) implementation"
 
 **Purpose**: 跨 story 审计能力 + 文档同步 + 全量回归 + secret 热加载。
 
-- [ ] T024 [P] Create `scripts/verify_skill_secrets_audit.py`：CLI 接受 `--config` / `--skills-workspace` / `--run-count N` 参数；workflow：(1) 构造 test skill 含 1 个 secret；(2) run agent N 次；(3) 收集 N 个 session.jsonl + 1 个 agent.log + N 个 SkillSnapshot.prompt；(4) 断言每个 secret 字面值 0 次出现在上述 3 个产物中；(5) 任一非零出现 → exit 1 + diff 打印；为 SC-005 字节相等泄漏检测 (FR-013/FR-014/FR-015) in scripts/verify_skill_secrets_audit.py — 依赖 T023
-- [ ] T025 [P] Test audit script (subprocess.run scripts/verify_skill_secrets_audit.py，assert 退出码 0 + stdout 含 "Audit PASSED") in tests/test_skill_secrets_audit.py — 依赖 T024
-- [ ] T026 [P] Test hot-reload (1 用例：构造 registry 注入 value="v1" + reverter 还原 + 改 config 文件 value="v2" + 构造新 registry + 注入 assert value="v2"——验证 SC-006 同 process 不重启感知 config 变化) in tests/test_skill_env_overrides.py — 依赖 T023
-- [ ] T027 [P] Update barrel `agent_core/skills/__init__.py`：导出 `SecretRef`、`SecretRefKind`、`SkillEntryConfig`、`SecretResolutionError`、`resolve_secret`、`apply_skill_env_overrides` + 加进 `__all__` in agent_core/skills/__init__.py — 依赖 T023
-- [ ] T028 [P] Doc sync (Constitution III)：更新 `docs/agent_core-skill-system-design.md` —— §3 数据流图加 env_overrides 注入→revert 环；§6.7 新增章节 "Secret Injection 偏差/扩展" 说明 SkillEntryConfig.entries + reverter pattern + chmod 600 warn 决策 in docs/agent_core-skill-system-design.md — 依赖 T023
-- [ ] T029 [P] Doc sync (Constitution III)：更新 `docs/skill/agent_core-skill-architecture.md` —— §4.9 新增章节 "env_overrides"（与 既有 §4.1-§4.8 并列）；§5.7 新增核心设计思想 "Secret Hygiene"（log 仅 key 不 log value + 三层防御：config 校验 + runtime gating + audit script）in docs/skill/agent_core-skill-architecture.md — 依赖 T028
-- [ ] T030 Run `python3 -m pytest tests/test_skill_*.py -q` 全套不回归（既有 175+ + 新 20 = 195+；Constitution IV 总门）— 依赖 T029
-- [ ] T031 Run `python3 scripts/verify_skill_secrets_audit.py` 端到端 SC-005 + 手动跑 quickstart.md §1..§7 (除 §6 hot-reload 已被 T026 自动化)；每节报告完成什么 / 测试结果 / 偏差说明 (Constitution V) — 依赖 T030
-- [ ] T032 Commit `docs(skills): sync design + architecture docs for secret injection` + final summary commit `feat(skills): 002-skill-secret-injection complete (P1+P2+P3, SC-001..SC-007)` 推送当前分支 — 依赖 T031
+- [X] T024 [P] Create `scripts/verify_skill_secrets_audit.py`：CLI 接受 `--config` / `--skills-workspace` / `--run-count N` 参数；workflow：(1) 构造 test skill 含 1 个 secret；(2) run agent N 次；(3) 收集 N 个 session.jsonl + 1 个 agent.log + N 个 SkillSnapshot.prompt；(4) 断言每个 secret 字面值 0 次出现在上述 3 个产物中；(5) 任一非零出现 → exit 1 + diff 打印；为 SC-005 字节相等泄漏检测 (FR-013/FR-014/FR-015) in scripts/verify_skill_secrets_audit.py — 依赖 T023
+- [X] T025 [P] Test audit script (subprocess.run scripts/verify_skill_secrets_audit.py，assert 退出码 0 + stdout 含 "Audit PASSED") in tests/test_skill_secrets_audit.py — 依赖 T024
+- [X] T026 [P] Test hot-reload (1 用例：构造 registry 注入 value="v1" + reverter 还原 + 改 config 文件 value="v2" + 构造新 registry + 注入 assert value="v2"——验证 SC-006 同 process 不重启感知 config 变化) in tests/test_skill_env_overrides.py — 依赖 T023
+- [X] T027 [P] Update barrel `agent_core/skills/__init__.py`：导出 `SecretRef`、`SecretRefKind`、`SkillEntryConfig`、`SecretResolutionError`、`resolve_secret`、`apply_skill_env_overrides` + 加进 `__all__` in agent_core/skills/__init__.py — 依赖 T023
+- [X] T028 [P] Doc sync (Constitution III)：更新 `docs/agent_core-skill-system-design.md` —— §3 数据流图加 env_overrides 注入→revert 环；§6.7 新增章节 "Secret Injection 偏差/扩展" 说明 SkillEntryConfig.entries + reverter pattern + chmod 600 warn 决策 in docs/agent_core-skill-system-design.md — 依赖 T023
+- [X] T029 [P] Doc sync (Constitution III)：更新 `docs/skill/agent_core-skill-architecture.md` —— §4.9 新增章节 "env_overrides"（与 既有 §4.1-§4.8 并列）；§5.7 新增核心设计思想 "Secret Hygiene"（log 仅 key 不 log value + 三层防御：config 校验 + runtime gating + audit script）in docs/skill/agent_core-skill-architecture.md — 依赖 T028
+- [X] T030 Run `python3 -m pytest tests/test_skill_*.py -q` 全套不回归（既有 175+ + 新 20 = 195+；Constitution IV 总门）— 依赖 T029
+- [X] T031 Run `python3 scripts/verify_skill_secrets_audit.py` 端到端 SC-005 + 手动跑 quickstart.md §1..§7 (除 §6 hot-reload 已被 T026 自动化)；每节报告完成什么 / 测试结果 / 偏差说明 (Constitution V) — 依赖 T030
+- [X] T032 Commit `docs(skills): sync design + architecture docs for secret injection` + final summary commit `feat(skills): 002-skill-secret-injection complete (P1+P2+P3, SC-001..SC-007)` 推送当前分支 — 依赖 T031
 
 ---
 
