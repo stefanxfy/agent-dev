@@ -129,6 +129,8 @@ class TestLoadRulesBySource:
         """无 settings → 全空 dict"""
         monkeypatch.setenv("AGENT_SETTINGS_PATH", str(tmp_path / "nonexistent.json"))
         monkeypatch.delenv("AGENT_MANAGED_PERMISSIONS_ONLY", raising=False)
+        # 隔离 user 级 ~/.agent_data/settings.json(避免污染测试)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
         result = load_rules_by_source()
         assert result["always_allow_rules"] == {s.value: [] for s in PermissionRuleSource}
         assert result["always_deny_rules"] == {s.value: [] for s in PermissionRuleSource}
@@ -145,6 +147,8 @@ class TestLoadRulesBySource:
         }))
         monkeypatch.setenv("AGENT_SETTINGS_PATH", str(settings_path))
         monkeypatch.delenv("AGENT_MANAGED_PERMISSIONS_ONLY", raising=False)
+        # 隔离 user 级 ~/.agent_data/settings.json(避免污染测试)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         result = load_rules_by_source()
         assert "Edit" in result["always_allow_rules"]["projectSettings"]
@@ -281,6 +285,8 @@ class TestLoadToolPermissionContext:
         monkeypatch.setenv("AGENT_SETTINGS_PATH", str(settings_path))
         monkeypatch.delenv("AGENT_MANAGED_PERMISSIONS_ONLY", raising=False)
         monkeypatch.delenv("AGENT_PERMISSION_MODE", raising=False)
+        # 隔离 user 级 ~/.agent_data/settings.json(避免污染测试)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
         ctx = load_tool_permission_context()
         assert ctx.no_settings_match is True

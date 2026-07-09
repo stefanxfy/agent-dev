@@ -26,6 +26,7 @@ from agent_core.turn_chain import (
     AuditLogHandler,
     ChunkParseHandler,
     ContextCompactionHandler,
+    EnvCleanupHandler,
     FinalAnswerBookkeepingHandler,
     FinalAnswerPersistHandler,
     Handler,
@@ -37,6 +38,7 @@ from agent_core.turn_chain import (
     PermissionCheckHandler,
     PluginHandler,
     SessionFlushHandler,
+    SkillsPromptHandler,
     SystemPromptHandler,
     ToolDispatchHandler,
     ToolExecuteHandler,
@@ -68,30 +70,38 @@ __all__ = [
 
 
 def build_default_inputs_chain(agent) -> TurnChain:
-    """SETUP phase 默认 chain(TurnIndicator → ContextCompaction → SystemPrompt → MemoryRetrieval → ToolsSchemaPrepare)。
+    """SETUP phase 默认 chain(选项 A:6 handler 顺序累加 run_state.system_prompt)。
 
-    对应 docs §4.3 table inputs_chain 行 + §15 step 2 + Plan B R4 修复 (2026-07-01) +
-    SRP 重构 (2026-07-02):
-    - TurnIndicator:emit turn indicator event(独立职责)
-    - ContextCompactionHandler:每个 turn 入口做 token 预算压缩(L3 SM fast path + ContextManager fallback)
-    - SystemPromptHandler:真实现,确保 stage_inputs 头部有 system message
-    - MemoryRetrievalHandler:真实现,检索记忆 + 把 mem_block 拼到 system
-    - ToolsSchemaPrepareHandler:准备 tool schemas
+    选项 A 重构 (2026-07-06):system_prompt 装配回归 inputs_chain,由多个 handler
+    通过 run_state.append_system 顺序累加;llm_chain 的 LLMCallHandler 只读 run_state.system_prompt。
+    消灭了方案 D 把装配塞进 LLMCallHandler 导致的 SRP 膨胀 + OCP 封闭,同时避开了
+    原 stage_inputs "混 messages 历史" 的 stale 弊端(run_state.system_prompt 只存装配产物,
+    messages 永远从 agent.messages live 读)。
 
-    每个 handler 单一职责,无僵尸 anchor。Plan A 时代 inputs_chain 由
-    MemoryRetrievalHandler 一手包办(stop_chain),现已拆分为 5 个真 handler。
+    R2 (2026-07-07):累加目标从 turn_ctx 挪到 run_state(per-run 持久),resume_after_permission
+    重新走 step() 时新 turn_ctx 仍能读到完整 system_prompt + tool_schemas(不再 msgs=3 tools=0)。
+
+    - TurnIndicator:emit turn indicator 事件(独立职责)
+    - ContextCompaction:token 预算压缩(改 agent.messages,与 run_state.system_prompt 正交)
+    - ToolsSchemaPrepare:准备 tool schemas → run_state.tool_schemas(LLMCallHandler 读)
+    - SystemPrompt:append base system_prompt
+    - MemoryRetrieval:检索 memory → append mem_block + emit memory_status
+    - SkillsPrompt:snapshot skills → append skills 段(C2 guard:Read 在 toolset)
+
+    加新 system 段 = AgentBuilder.with_handler(after="skills_prompt") 插入(OCP)。
     """
     return TurnChain([
         TurnIndicatorHandler(agent),
         ContextCompactionHandler(agent),
+        ToolsSchemaPrepareHandler(agent),
         SystemPromptHandler(agent),
         MemoryRetrievalHandler(agent),
-        ToolsSchemaPrepareHandler(agent),
+        SkillsPromptHandler(agent),
     ])
 
 
 def build_default_llm_chain(agent) -> TurnChain:
-    """LLM_THINKING phase 默认 chain(LLMCall → ChunkParse → **LLMCallPersist [Stage A]**)。
+    """LLM_THINKING phase 默认 chain(LLMCall → ChunkParse → LLMCallPersist [Stage A])。
 
     对应 docs §4.3 table llm_chain 行 + §15 step 2 + Plan B §15 step 21
     (Stage A 接管 7 处 v1 add_* 调用,见 LLMCallPersistHandler docstring)。
@@ -121,11 +131,12 @@ def build_default_tool_chain(agent) -> TurnChain:
 
 
 def build_default_output_chain(agent) -> TurnChain:
-    """FINALIZING phase 默认 chain(6 handler CoR)。
+    """FINALIZING phase 默认 chain(7 handler CoR)。
 
-    链顺序(Plan B Final Phase Step 2, 2026-07-02):
+    链顺序(Plan B Final Phase Step 2, 2026-07-02) + secret env 收尾
+    (002-skill-secret-injection T035, 2026-07-06):
       Bookkeeping → FinalAnswerPersist [Stage C] → AuditLog →
-      MemoryBridgeExtract → L3SMExtractTrigger → SessionFlush
+      MemoryBridgeExtract → L3SMExtractTrigger → SessionFlush → EnvCleanup
 
     顺序依据:
       - Bookkeeping 首位:设 _run_state.final_answer 供后续 handler 读
@@ -135,6 +146,9 @@ def build_default_output_chain(agent) -> TurnChain:
       - L3SMExtractTrigger 在 MBE 之后:final_answer 已确定;在 SessionFlush
         之前:flush 兜底仍是末位, fire-and-forget 后台线程不阻塞 chain
       - SessionFlush 末位:所有持久化收尾后才 flush
+      - **EnvCleanup 末位**(T035 2026-07-06):在 SessionFlush 之后跑 reverter,
+        保证 secret env 一定在 turn 结束时被还原(防御式务实工程; 即使
+        SessionFlush 抛异常也走 try/finally idempotent cleanup)
 
     对应 docs §4.3 table output_chain 行 + §15 step 2 + Plan B §15 step 23
     (Stage C 接管原 SessionPersistHandler (B) 分支 + 原 #7 v1 final answer 写入)。
@@ -147,7 +161,12 @@ def build_default_output_chain(agent) -> TurnChain:
 
     Plan B Final Phase Step 2 (2026-07-02):新增 L3SMExtractTriggerHandler,
     取代原 v1 run() L1776-L1821 内联块。
+
+    002 T035 (2026-07-06):在 outputs_chain 末位 append EnvCleanupHandler。
     """
+    import logging
+    _logger = logging.getLogger("agent_core.skills.env_overrides")
+    _logger.debug("🧩 EnvCleanupHandler wired into outputs_chain tail")
     return TurnChain([
         FinalAnswerBookkeepingHandler(agent),
         FinalAnswerPersistHandler(agent),
@@ -155,6 +174,7 @@ def build_default_output_chain(agent) -> TurnChain:
         MemoryBridgeExtractHandler(agent),
         L3SMExtractTriggerHandler(agent),
         SessionFlushHandler(agent),
+        EnvCleanupHandler(agent),
     ])
 
 

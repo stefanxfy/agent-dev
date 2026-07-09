@@ -99,6 +99,36 @@ class TestIsSensitivePath:
         assert is_sensitive_path(".env") is True
         assert is_sensitive_path(".npmrc") is True
 
+    def test_absolute_path_with_home_prefix(self, monkeypatch, tmp_path):
+        """
+        绝对路径形式(/home/alice/.ssh/id_rsa)经 home strip 后应命中。
+        修复 2026-07-07 发现的 bypass:之前 lstrip("/") 后剩 'home/alice/.ssh/id_rsa',
+        prefix '.ssh/' 不匹配,导致 /home/alice/.ssh/id_rsa 被绕过。
+        """
+        from pathlib import Path
+        # 隔离 home 到 tmp_path(用绝对路径 /home/alice/... 触发 strip)
+        fake_home = tmp_path / "alice"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        assert is_sensitive_path(str(fake_home / ".ssh/id_rsa")) is True
+        assert is_sensitive_path(str(fake_home / ".aws/credentials")) is True
+        assert is_sensitive_path(str(fake_home / ".env")) is True
+        assert is_sensitive_path(str(fake_home / ".git/config")) is True
+        # home 下的安全路径仍应 safe
+        assert is_sensitive_path(str(fake_home / "code/foo.txt")) is False
+
+    def test_tilde_prefix_stripped(self, monkeypatch, tmp_path):
+        """~ 形式经 os.path.expanduser 替换后应命中"""
+        import os
+        from pathlib import Path
+        fake_home = tmp_path / "alice"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        monkeypatch.setattr(os.path, "expanduser",
+                            lambda p: str(fake_home) if p == "~" else p)
+        assert is_sensitive_path("~/.ssh/id_rsa") is True
+        assert is_sensitive_path("~/.aws/credentials") is True
+
 
 # ────────────────────────────────────────────────────────────────────
 # contains_secret

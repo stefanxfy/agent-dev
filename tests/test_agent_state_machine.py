@@ -40,7 +40,7 @@ from agent_core.agent_state import (
     TurnContext,
 )
 from agent_core.builder import AgentBuilder
-from agent_core.stages import LLMResult, StageInputs, ToolExecutionResult
+from agent_core.stages import LLMResult, ToolExecutionResult
 from agent_core.turn_chain import (
     HandlerResult,
     PluginHandler,
@@ -56,13 +56,18 @@ from agent_core.turn_chain import (
 
 class TestRunState:
     def test_default_construction(self):
-        """RunState 默认构造:cancel_event 未 set,turn=0,final_answer 空。"""
+        """RunState 默认构造:cancel_event 未 set,turn=0,final_answer 空。
+
+        Step 2 (2026-07-07):awaiting_permission + awaiting_permission_batch 已从 RunState
+        搬到 TurnContext(per-turn 生命周期对齐),RunState 不再含这 2 字段。
+        """
         rs = RunState()
         assert rs.cancel_event.is_set() is False
         assert rs.turn == 0
         assert rs.user_message == ""
         assert rs.final_answer == ""
-        assert rs.awaiting_permission is None
+        assert not hasattr(rs, "awaiting_permission")
+        assert not hasattr(rs, "awaiting_permission_batch")
         assert rs.termination_reason is None
 
     def test_user_message_persisted(self):
@@ -100,11 +105,16 @@ class TestRunState:
 
 class TestTurnContext:
     def test_default_construction(self):
-        """TurnContext 默认 events=[],_stopped=False。"""
+        """TurnContext 默认 events=[],_stopped=False。
+
+        R2 (2026-07-07): system_prompt / tool_schemas 已搬到 RunState(per-run 持久),
+        验证 ctx.run_state 默认值而不是 ctx 自身。
+        """
         rs = RunState()
         ctx = TurnContext(run_state=rs)
         assert ctx.run_state is rs
-        assert ctx.stage_inputs is None
+        assert ctx.run_state.system_prompt == ""
+        assert ctx.run_state.tool_schemas is None
         assert ctx.stage_outputs is None
         assert ctx.permission_request is None
         assert ctx.events == []
@@ -665,13 +675,6 @@ class TestPluginHandlerWhitelist:
 
 
 class TestStageDataclasses:
-    def test_stage_inputs_default(self):
-        """StageInputs 默认 messages=[],tool_schemas=[]。"""
-        si = StageInputs(messages=[])
-        assert si.messages == []
-        assert si.system_prompt is None
-        assert si.tool_schemas == []
-
     def test_llm_result_default(self):
         """LLMResult 默认空值。"""
         r = LLMResult()

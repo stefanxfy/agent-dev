@@ -103,10 +103,12 @@ class TestAgentBuilderBuildE2E:
         # 默认 handler 顺序(Plan B Step 1-2 加 Stage A/B + R4 加 ContextCompaction + Step 8 改 output head 名)
         # 2026-07-02 SRP 重构:加 TurnIndicator + SystemPrompt/MemoryRetrieval 改为真实现
         assert [h.name for h in agent._inputs_chain] == [
-            "turn_indicator", "context_compaction", "system_prompt", "memory_retrieval", "tools_schema_prepare",
+            "turn_indicator", "context_compaction", "tools_schema_prepare",
+            "system_prompt", "memory_retrieval", "skills_prompt",
         ]
         assert [h.name for h in agent._llm_chain] == [
-            "llm_call", "chunk_parse", "llm_call_persist",  # Stage A
+            "llm_call", "chunk_parse",
+            "llm_call_persist",  # Stage A
         ]
         assert [h.name for h in agent._tool_chain] == [
             "permission_check", "tool_dispatch", "tool_execute", "tool_pair_persist",  # Stage B

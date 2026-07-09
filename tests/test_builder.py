@@ -70,12 +70,12 @@ class _StubAgent:
 class TestFactoryChains:
     """D6-5.1:4 个 build_default_*_chain() 返回的 TurnChain 包含预期 handler 顺序。"""
 
-    def test_inputs_chain_has_five_handlers_in_order(self):
-        """inputs_chain 5 个 handler:turn_indicator + context_compaction + system_prompt + memory_retrieval + tools_schema_prepare。
+    def test_inputs_chain_has_six_handlers_in_order(self):
+        """inputs_chain 6 个 handler(选项 A):turn_indicator + context_compaction +
+        tools_schema_prepare + system_prompt + memory_retrieval + skills_prompt。
 
-        Plan B R4 修复(2026-07-01):ContextCompactionHandler 在 inputs_chain 首位做
-        L3 SM fast path + ContextManager fallback token 预算压缩。
-        SRP 重构(2026-07-02):加 TurnIndicator + SystemPrompt/MemoryRetrieval 改为真实现。
+        选项 A 重构 (2026-07-06):system_prompt 装配回归 inputs_chain,3 个 handler 通过
+        ctx.run_state.append_system 顺序累加。加新 system 段 = with_handler(after=X)。
         """
         agent = _StubAgent()
         chain = build_default_inputs_chain(agent)
@@ -84,18 +84,21 @@ class TestFactoryChains:
         assert names == [
             "turn_indicator",
             "context_compaction",
+            "tools_schema_prepare",
             "system_prompt",
             "memory_retrieval",
-            "tools_schema_prepare",
+            "skills_prompt",
         ], f"unexpected order: {names}"
 
     def test_llm_chain_has_three_handlers_in_order(self):
-        """LLM chain:llm_call + chunk_parse + llm_call_persist(Stage A,Plan B Step 1)。"""
+        """LLM chain:llm_call + chunk_parse + llm_call_persist。"""
         agent = _StubAgent()
         chain = build_default_llm_chain(agent)
 
         names = [h.name for h in chain]
-        assert names == ["llm_call", "chunk_parse", "llm_call_persist"]
+        assert names == [
+            "llm_call", "chunk_parse", "llm_call_persist"
+        ]
 
     def test_tool_chain_has_four_handlers_in_order(self):
         """Tool chain:permission_check + tool_dispatch + tool_execute + tool_pair_persist(Stage B,Plan B Step 2)。"""
@@ -105,14 +108,16 @@ class TestFactoryChains:
         names = [h.name for h in chain]
         assert names == ["permission_check", "tool_dispatch", "tool_execute", "tool_pair_persist"]
 
-    def test_output_chain_has_six_handlers(self):
-        """output_chain 6 个 handler:final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush。
+    def test_output_chain_has_seven_handlers(self):
+        """output_chain 7 个 handler:final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush + env_cleanup。
 
         Plan B Step 8:SessionPersistMode DELEGATE 模式已删,output_chain 恒为真实现。
         Plan B Final Phase (2026-07-02):_iter_phase_finalize 拆为 4 handler,
         output_chain 从 3 handler 扩展为 5(handler count +2)。
         Plan B Final Phase Step 2 (2026-07-02):加 L3SMExtractTriggerHandler
         取代 v1 run() L1776-L1821 内联块,output_chain 扩展为 6(handler count +1)。
+        002-skill-secret-injection T035 (2026-07-06):append EnvCleanupHandler
+        在 outputs_chain 末位(handler count +1 → 7)。
         """
         agent = _StubAgent()
         chain = build_default_output_chain(agent)
@@ -125,6 +130,7 @@ class TestFactoryChains:
             "memory_bridge_extract",
             "l3_sm_extract_trigger",
             "session_flush",
+            "env_cleanup",
         ]
 
 
@@ -288,10 +294,10 @@ class TestFactoryStubAgentFriendliness:
 
         # Plan B Step 1-2 加 Stage A/B 持久化 handler + R4 加 ContextCompaction +
         # 2026-07-02 SRP 重构加 TurnIndicator 并把 SystemPrompt/MemoryRetrieval 拆为真实现
-        assert len(inputs_chain) == 5    # turn_indicator + context_compaction + system_prompt + memory_retrieval + tools_schema_prepare
+        assert len(inputs_chain) == 6    # turn_indicator + context_compaction + tools_schema_prepare + system_prompt + memory_retrieval + skills_prompt (选项 A)
         assert len(llm_chain) == 3       # llm_call + chunk_parse + llm_call_persist
         assert len(tool_chain) == 4      # permission_check + tool_dispatch + tool_execute + tool_pair_persist
-        assert len(output_chain) == 6    # final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush (Plan B Final Phase Step 2 2026-07-02)
+        assert len(output_chain) == 7    # final_answer_bookkeeping + final_answer_persist + audit_log + memory_bridge_extract + l3_sm_extract_trigger + session_flush + env_cleanup (002 T035 2026-07-06)
 
 
 # ────────────────────────────────────────────────────────────────────

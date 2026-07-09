@@ -5,10 +5,10 @@ Day 3 版本：并行工具调用、Token 预算管理、System Prompt、结构�
 
 from __future__ import annotations
 
+import sys
 import json
 import logging
 import os
-import sys
 import uuid
 from pathlib import Path
 
@@ -710,6 +710,9 @@ def get_agent(session_id=None):
     # 但有了 hook point 接入(后续 M11/M12 想插 handler 不用再改这里)。
     # Post-construction injection(permission_engine / auto_allow_ask / audit_logger
     # / _distillation_loop)保留 — 它们是 agent 属性而非 chain handler,builder 不管。
+    # Skills 系统（specs/001-skill-system, T021）：from_env 读 SKILLS_ 前缀；默认 bundled+workspace
+    from agent_core.skills.config import SkillsConfig as _SkillsConfig
+    skills_config = _SkillsConfig.from_env()
     agent = (
         AgentBuilder()
         .build({
@@ -723,6 +726,7 @@ def get_agent(session_id=None):
             "react_memory_bridge": react_memory_bridge,  # Task 8: 严格双通道(同步→异步)
             "memory_config": memory_config,              # M10 C6.4 + C7.1: 共享 MemoryConfig 实例
             "session_memory": session_memory,            # M10 C2.2: L3 SM 快路径
+            "skills_config": skills_config,              # T021: 启用 skill 系统
         })
     )
 
@@ -1029,6 +1033,45 @@ def run_agent(user_input: str):
     - awaiting_permission 触发 → yield event + return → streamlit rerun → dialog 渲染
     - 三个按钮调 agent.resume_after_permission() 解锁 + 重 trigger state machine
     """
+    # US4 (T043)：slash 命令派发 — /skill-name <args> 显式触发，绕过模型自动选择
+    try:
+        from agent_core.skills.commands import resolve_skill_command
+    except Exception:  # import self-guard：skills 子系统不可用时跳过 slash
+        resolve_skill_command = None  # type: ignore[assignment]
+    if resolve_skill_command is not None:
+        resolved = resolve_skill_command(user_input)
+        if resolved is not None:
+            skill_name, args = resolved
+            registry = getattr(agent, "skills_registry", None)
+            entry = registry.get_entry(skill_name) if registry is not None else None
+            if (entry is None or entry.load_error is not None
+                    or not getattr(entry, "user_invocable", True)):
+                # 失败反馈走 text 通道：system 走 st.info() 是临时 element,
+                # 会被脚本末尾 st.rerun()（web/app.py:1763）擦除 + append 空气泡。
+                # 走 text → full_text 累积 → append 进 session_state.messages → rerun 后持久可见。
+                avail = ""
+                if registry is not None:
+                    try:
+                        names = sorted(
+                            s.name for s in registry.snapshot().skills
+                            if s.user_invocable and s.eligible
+                        )
+                        if names:
+                            avail = "\n\n可用 skill: " + ", ".join(f"`/{n}`" for n in names)
+                    except Exception:
+                        pass
+                yield ("text", f"⚠️ 无匹配 skill 或不可调用: `/{skill_name}`{avail}")
+                return
+            # prompt-rewrite（前缀 Use the "<name>" skill + location + args）
+            rewrite = (
+                f'Use the "{skill_name}" skill. Read its SKILL.md at '
+                f'"{entry.skill.file_path}" and follow its instructions.'
+            )
+            if args:
+                rewrite = f"{rewrite} {args}"
+            yield ("system", f"🎯 显式调用 skill: {skill_name}")
+            user_input = rewrite
+
     # 标记 session_state phase
     st.session_state._run_phase = "running"
     st.session_state._interrupt_requested = False
@@ -1058,7 +1101,7 @@ def run_agent(user_input: str):
                 break
 
             # ── P1 关键:awaiting_permission 触发 → 暂停 + 弹 dialog ──
-            # v2 marker 已写入 _run_state.awaiting_permission,step() 自动
+            # v2 marker 已写入 turn_ctx.awaiting_permission(Step 2,2026-07-07),step() 自动
             # 转 AWAITING_PERMISSION phase 暂停。这里 yield event 让 UI 知道
             # 进入暂停,然后 return 让 streamlit rerun → @st.dialog 渲染。
             if msg_type == "awaiting_permission":
@@ -1115,21 +1158,26 @@ def _handle_permission_dialog(agent):
     with col1:
         if st.button("✅ Allow once", key=f"allow_{tool_name}", use_container_width=True):
             try:
+                # Plan A (2026-07-07):不复位 _pending_permission_request。
+                # step() 期间需要读 pending["choice"] 检测 _is_resume,ToolExecuteHandler
+                # tail-clear(step 2 跟进)会在 tool 执行成功后清掉。
                 agent.resume_after_permission("allow")
             except Exception as e:
                 # 诊断(2026-07-03):resume 抛异常会让 _run_phase 没改成 running → 弹窗不消失
                 logging.exception("▶️ [allow] resume_after_permission 抛异常")
                 st.error(f"resume 异常: {e}")
             else:
-                # 清 _pending: resolve_permission 不清它(避免弹窗条件残留)
-                agent._pending_permission_request = None
+                # 不写 pending=None —— 让 step() 期间 _pending_permission_request[choice] 还在,
+                # PermissionCheckHandler._is_resume 检测能生效。
+                # 完成后由 ToolExecuteHandler.handle tail clear 兜底(step 2,2026-07-07)。
                 st.session_state._run_phase = "running"  # 重启 step() 循环
                 st.rerun()
     with col2:
         if st.button("🚫 Deny", key=f"deny_{tool_name}", use_container_width=True):
             # Deny = 结束本次对话(用户明确语义:不再继续、不调 LLM、不显示 Stop)。
             # - resume_after_permission: 写 denial tool_result + 持久化(给 LLM 上下文一致)
-            # - 清 _pending: resolve_permission 不清它(已知问题),清掉避免弹窗条件残留
+            # - 清 _pending: Deny 路径不跑 ToolExecute,无 tail-clear 兜底,这里必须清
+            #   (避免下次 ASK 路径把旧 pending 当成当前 pending 用)
             # - phase=idle: 续 run 段不跑(不调 LLM),Stop 段 else 分支(不显示按钮)
             # - 弹窗段条件 phase==awaiting,idle 不满足 → 弹窗消失
             # - append 反馈消息: 让用户在主区看到"已拒绝",reload 后这条仍在(tool
@@ -1144,8 +1192,8 @@ def _handle_permission_dialog(agent):
             st.rerun()
     with col3:
         if st.button("✅ Always allow", key=f"always_{tool_name}", use_container_width=True):
+            # Plan A:同 Allow once —— 不在 UI 清 pending,留 ToolExecuteHandler tail-clear 兜底。
             agent.resume_after_permission("always_allow")
-            agent._pending_permission_request = None  # 清 pending(见 allow 注释)
             st.session_state._run_phase = "running"
             st.rerun()
 

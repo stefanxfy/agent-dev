@@ -125,10 +125,24 @@ def _make_ctx(agent: ReactAgent, tool_calls: Optional[list] = None,
     return ctx
 
 
-def _set_resume_state(agent: ReactAgent, last_tool_calls: list) -> None:
-    """模拟 Fix C resume 状态:run_state 已经有 last_tool_calls + awaiting_permission。"""
+def _set_resume_state(agent: ReactAgent, ctx: TurnContext, last_tool_calls: list) -> None:
+    """模拟 Fix C resume 状态:run_state 已经有 last_tool_calls,turn_ctx 已有 awaiting_permission(Step 2, 2026-07-07),
+    _pending_permission_request["choice"] 已设(Step 2 修复 _is_resume 检测改用此信号)。
+
+    Step 2 把 awaiting_permission 系列从 RunState 搬到 TurnContext(per-turn 生命周期),
+    所以测试模拟 resume 状态时也得写到 turn_ctx 上,这样 PermissionCheckHandler 读得到。
+    此外 Step 2 (turn_chain.py:1423-1431) _is_resume 检测改用 _pending_permission_request["choice"]
+    (agent 级跨 turn 持久信号,user 已点 Allow/Deny 后 set),所以模拟也要补这个。
+    """
     agent._run_state.last_tool_calls = list(last_tool_calls)
-    agent._run_state.awaiting_permission = {"tool_name": "stub", "tool_use_id": "stub"}
+    ctx.awaiting_permission = {"tool_name": "stub", "tool_use_id": "stub"}
+    # Step 2 修复 (2026-07-07):_is_resume 检测改用 _pending_permission_request.choice
+    if agent._pending_permission_request is None:
+        agent._pending_permission_request = {
+            "tool_name": "stub", "tool_use_id": "stub", "choice": "allow",
+        }
+    else:
+        agent._pending_permission_request["choice"] = "allow"
 
 
 # ────────────────────────────────────────────────────────────
@@ -200,11 +214,11 @@ class TestPermissionCheckBatchAsk:
         await_events = [e for e in events if e[0] == "awaiting_permission"]
         assert len(await_events) == 1
         assert await_events[0][1]["tool_use_id"] == "id_ask"
-        # 写入 run_state.awaiting_permission_batch(整 batch)
-        assert len(agent._run_state.awaiting_permission_batch) == 1
-        assert agent._run_state.awaiting_permission_batch[0]["tool_use_id"] == "id_ask"
+        # 写入 turn_ctx.awaiting_permission_batch(整 batch)— Step 2, 2026-07-07
+        assert len(ctx.awaiting_permission_batch) == 1
+        assert ctx.awaiting_permission_batch[0]["tool_use_id"] == "id_ask"
         # back-compat:awaiting_permission 单字段填 batch[0]
-        assert agent._run_state.awaiting_permission is agent._run_state.awaiting_permission_batch[0]
+        assert ctx.awaiting_permission is ctx.awaiting_permission_batch[0]
         # SM 转 AWAITING_PERMISSION
         from agent_core.agent_state import AgentPhase
         assert agent._sm.current == AgentPhase.AWAITING_PERMISSION
@@ -235,8 +249,8 @@ class TestPermissionCheckBatchDeny:
         assert "Permission denied" in tool_result_events[0][1]["output"]
         # 不应 emit awaiting_permission
         assert not any(e[0] == "awaiting_permission" for e in events)
-        # run_state.awaiting_permission_batch 应保持空
-        assert agent._run_state.awaiting_permission_batch == []
+        # turn_ctx.awaiting_permission_batch 应保持空 — Step 2, 2026-07-07
+        assert ctx.awaiting_permission_batch == []
 
 
 class TestPermissionCheckResume:
@@ -245,8 +259,6 @@ class TestPermissionCheckResume:
     def test_permission_check_resume_skips_check(self, monkeypatch):
         agent = _make_agent()
         tc = _make_tool_call("echo", {"msg": "resume"}, id_="id_resume")
-        # 模拟 resume 状态:run_state 已有 last_tool_calls + awaiting_permission
-        _set_resume_state(agent, [tc])
         # 原始 messages 末条 = assistant tool_use(Fix C resume 依赖此恢复 full_text)
         agent.messages.append({
             "role": "assistant",
@@ -255,6 +267,8 @@ class TestPermissionCheckResume:
             ],
         })
         ctx = TurnContext(run_state=agent._run_state)  # stage_outputs=None 触发 resume 分支
+        # 模拟 resume 状态:last_tool_calls 在 run_state,awaiting_permission 在 turn_ctx (Step 2)
+        _set_resume_state(agent, ctx, [tc])
 
         # 关键断言:_check_tool_permission 根本不应该被调
         call_count = {"n": 0}
@@ -291,12 +305,12 @@ class TestPermissionCheckResumeNoRequest:
     def test_permission_check_resume_does_not_set_permission_request(self, monkeypatch):
         agent = _make_agent()
         tc = _make_tool_call("echo", {"msg": "x"}, id_="id1")
-        _set_resume_state(agent, [tc])
         agent.messages.append({
             "role": "assistant",
             "content": [{"type": "tool_use", "id": "id1", "name": "echo", "input": {"msg": "x"}}],
         })
         ctx = TurnContext(run_state=agent._run_state)
+        _set_resume_state(agent, ctx, [tc])
 
         monkeypatch.setattr(_get_perm_handler(agent), "_check_tool_permission", lambda *_: (True, None, {}))
         monkeypatch.setattr(agent.tools, "execute",
@@ -432,36 +446,113 @@ class TestToolExecuteDenyPrefill:
 
 
 class TestToolExecuteFixCCleanup:
-    """9:Fix C 尾清理 — 工具执行完后,run_state.awaiting_permission 应清空"""
+    """9:Fix C 尾清理 — 工具执行完后,turn_ctx.awaiting_permission 应清空(Step 2, 2026-07-07)。"""
 
     def test_tool_execute_clears_awaiting_permission_after_exec(self, monkeypatch):
         agent = _make_agent()
         tc = _make_tool_call("echo", {"msg": "x"}, id_="id_clean")
-        # 模拟 resume 状态:awaiting_permission 已设(用户刚点 Allow)
-        _set_resume_state(agent, [tc])
         agent.messages.append({
             "role": "assistant",
             "content": [{"type": "tool_use", "id": "id_clean", "name": "echo",
                          "input": {"msg": "x"}}],
         })
         ctx = TurnContext(run_state=agent._run_state)
+        # 模拟 resume 状态:awaiting_permission 已设(用户刚点 Allow)— Step 2 写在 turn_ctx
+        _set_resume_state(agent, ctx, [tc])
 
         # 工具执行成功
         monkeypatch.setattr(_get_perm_handler(agent), "_check_tool_permission", lambda n, i: (True, None, i))
         monkeypatch.setattr(agent.tools, "execute",
                             lambda *a, **kw: {"status": "success", "output": "ok"})
 
-        # 起始状态(模拟 resume 入口)
-        assert agent._run_state.awaiting_permission is not None
+        # 起始状态(模拟 resume 入口)— Step 2 写到 turn_ctx
+        assert ctx.awaiting_permission is not None
 
         list(agent._tool_chain.run(ctx))
 
-        # 工具执行完后,ToolExecuteHandler 必须清 run_state.awaiting_permission
-        assert agent._run_state.awaiting_permission is None, (
+        # 工具执行完后,ToolExecuteHandler 必须清 turn_ctx.awaiting_permission
+        assert ctx.awaiting_permission is None, (
             "Fix C:resume 后 tool 执行完未清 awaiting_permission,下次 step() 误触发 resume"
         )
         # batch 也清
-        assert agent._run_state.awaiting_permission_batch == []
+        assert ctx.awaiting_permission_batch == []
+
+
+class TestToolExecuteFixCTailClearPendingRequest:
+    """10b (2026-07-07):Plan A 回归 — `_is_resume=True` 时,ToolExecuteHandler 尾清理必须
+    把 `agent._pending_permission_request` 清空(替代 web/app.py 之前做的提前清空)。
+
+    场景模拟(replay web/app.py 真实流程):
+      1. `_ask_user_permission_v2` 设 `agent._pending_permission_request` dict(无 choice)
+      2. UI 用户点 Allow → `resolve_permission('allow')` 设 `choice='allow'`(**不**清 dict)
+      3. UI 调 `step()` → PermissionCheckHandler `_is_resume=True` 跳 check
+      4. ToolExecuteHandler 工具执行完 → 尾清理必须把 agent-level pending 也清
+
+    旧 gate 只看 `ctx.awaiting_permission is not None` —— 而 `_is_resume=True` 路径
+    故意不写 ctx.awaiting_permission(避免 LLMThinkingPhase.next 误路由 AWAITING),
+    所以旧 tail-clear 漏跑 → agent._pending_permission_request 不清 → 下次 ASK 把旧
+    pending 当成当前 pending → resume 检测死循环(2026-07-07 real bug)。
+
+    关键差异 vs TestToolExecuteFixCCleanup:_set_resume_state() 也写 ctx.awaiting_permission,
+    所以旧测试只覆盖了"ctx.awaiting_permission 路径";本测试只写 agent._pending_permission_request,
+    隔离 `_is_resume=True` gate 分支。
+"""
+
+    def test_tail_clear_clears_pending_permission_request_on_resume(self, monkeypatch):
+        agent = _make_agent()
+        tc = _make_tool_call("echo", {"msg": "resume_tail"}, id_="id_tail_clear")
+        agent.messages.append({
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "id_tail_clear", "name": "echo",
+                         "input": {"msg": "resume_tail"}}],
+        })
+        ctx = TurnContext(run_state=agent._run_state)
+
+        # Plan A 模拟:仅写 agent-level pending(UI 不再写 ctx.awaiting_permission)
+        agent._pending_permission_request = {
+            "tool_name": "echo",
+            "tool_input": {"msg": "resume_tail"},
+            "reason": "needs approval",
+            "message": "Allow?",
+            "choice": "allow",  # resolve_permission 设的
+        }
+        agent._run_state.last_tool_calls = [tc]
+        # 关键:ctx.awaiting_permission **不**设,隔离 _is_resume gate 分支
+        assert ctx.awaiting_permission is None
+
+        monkeypatch.setattr(_get_perm_handler(agent), "_check_tool_permission",
+                            lambda n, i: (True, None, i))
+        execute_calls: list = []
+        monkeypatch.setattr(
+            agent.tools, "execute",
+            lambda name, input_, **kw: (execute_calls.append(name)
+                                          or {"status": "success", "output": "ok_tail"}),
+        )
+
+        # 起始断言:pending 非空(模拟 UI 刚 set choice 后)
+        assert agent._pending_permission_request is not None
+        assert agent._pending_permission_request.get("choice") == "allow"
+
+        events = list(agent._tool_chain.run(ctx))
+
+        # 工具实际执行了
+        assert execute_calls == ["echo"], (
+            "_is_resume=True 路径:tool 应该跑起来,实际没跑说明 _is_resume 检测又死了"
+        )
+        # Plan A 关键断言:工具执行完,尾清理必须把 agent-level pending 也清空
+        assert agent._pending_permission_request is None, (
+            "Plan A 回归失败:_is_resume=True 路径下 ToolExecuteHandler 尾清理漏清 "
+            "agent._pending_permission_request,下次 ASK 会把旧 pending 当当前 pending "
+            "用,resume 检测死循环"
+        )
+        # ctx.awaiting_permission 本来就是 None,仍然应是 None
+        assert ctx.awaiting_permission is None
+        assert ctx.awaiting_permission_batch == []
+        # tool_result event 1 个 success=True
+        tool_result_events = [e for e in events if e[0] == "tool_result"]
+        assert len(tool_result_events) == 1
+        assert tool_result_events[0][1]["success"] is True
+        assert tool_result_events[0][1]["output"] == "ok_tail"
 
 
 class TestToolDispatchResumeSkip:
@@ -475,13 +566,14 @@ class TestToolDispatchResumeSkip:
     def test_tool_dispatch_emits_action_on_resume(self, monkeypatch):
         agent = _make_agent()
         tc = _make_tool_call("echo", {"msg": "x"}, id_="id_resume_d")
-        _set_resume_state(agent, [tc])
         agent.messages.append({
             "role": "assistant",
             "content": [{"type": "tool_use", "id": "id_resume_d", "name": "echo",
                          "input": {"msg": "x"}}],
         })
         ctx = TurnContext(run_state=agent._run_state)
+        # Step 2:awaiting_permission 写到 turn_ctx
+        _set_resume_state(agent, ctx, [tc])
 
         monkeypatch.setattr(_get_perm_handler(agent), "_check_tool_permission", lambda n, i: (True, None, i))
         monkeypatch.setattr(agent.tools, "execute",

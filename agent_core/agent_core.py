@@ -163,6 +163,7 @@ class ReactAgent:
         permission_engine: Optional["PermissionEngine"] = None,  # M12: 权限引擎(可选,None=不启用)
         audit_logger: Optional[Any] = None,  # M12: 审计日志(可选,None=不写)
         auto_allow_ask: bool = True,  # M12: ASK 时是否自动 ALLOW(测试用,UI 路径会 yield 等待)
+        skills_config: Optional[Any] = None,  # skills: 注入后启用 skill 系统（None=关闭）
     ):
         self.llm = llm_router
         self.tools = tool_registry
@@ -197,8 +198,8 @@ class ReactAgent:
                 self.memory_index.rebuild()  # lazy rebuild 兜底
             except Exception as e:
                 _logger.warning(f"MEMORY.md lazy rebuild 失败: {e}")
-        # M11: 已展示过的记忆 rel_path 集合(用于 sideQuery 去重)
-        self._surfaced_memories: set[str] = set()
+        # 注：_surfaced 去重状态已封装进 memory_retriever（替代原 agent._surfaced_memories），
+        # 由 retriever 内部维护（search 时过滤 + 更新；reset_surfaced 在 session 边界调）。
         # ── Day 4: SessionManager 融合 ──────────────────────────────
         self._session_manager: Optional["SessionManager"] = None
         if session_id:
@@ -234,16 +235,46 @@ class ReactAgent:
         self._pending_permission_request: Optional[dict] = None
         self._permission_resolved: Optional[Any] = None  # threading.Event 初始为 None
 
-        # Plan B SRP 接线修复(2026-07-03):实例化 SystemPromptAssembler 并重建
-        # system_prompt = base + sandbox section + MEMORY.md + TRUSTING_RECALL。
-        # 此前 Plan B 拆分写好了 assembler 类、把 SystemPromptHandler 改成依赖
-        # agent._assembler,但 __init__ 漏了实例化 → handler 恒因 _assembler is None
-        # 早退 → ctx.stage_inputs 留 None → MemoryRetrievalHandler 把 None 传给
-        # _merge_memory_into_system 炸 'NoneType' object is not iterable。
-        # 必须在 system_prompt(L180 base)+ memory_index + permission_engine 都赋值后调。
+        # 实例化 SystemPromptAssembler 并构造 system_prompt
+        # = base + sandbox section + MEMORY.md + TRUSTING_RECALL。
+        # SystemPromptHandler 在 inputs_chain 里把 agent.system_prompt append 到 run_state.system_prompt。
+        # R2 (2026-07-07):累加目标从 turn_ctx 改到 run_state(per-run 持久)。
+        # 必须在 system_prompt base + memory_index + permission_engine 都赋值后调。
         from agent_core.turn_chain import SystemPromptAssembler
         self._assembler = SystemPromptAssembler(self)
         self.system_prompt = self._assembler.build()
+
+        # Skills 系统（specs/001-skill-system）：注入 skills_config 后启用。
+        # SkillsRegistry 是 Facade + cache-aside 快照缓存；SkillsPromptHandler
+        # 经 agent.skills_registry.snapshot() 取段注入 system message。
+        #
+        # 002-skill-secret-injection (T036/T038, 2026-07-06):
+        # 1) load_user_config 先 overlay entries 字段(default → user yaml)
+        # 2) self.skills_config = skills_config 暴露给 handler(读 entries)
+        # 3) SkillsPromptHandler 用 entries 触发 secret env 注入
+        self.skills_registry = None
+        self.skills_config = None
+        if skills_config is not None:
+            try:
+                # T038: load_user_config overlay entries(FR-002/FR-007)
+                # 先于 SkillsRegistry,这样 validate 能看到 entries
+                from agent_core.skills.env_overrides import load_user_config
+                skills_config = load_user_config(skills_config)
+                self.skills_config = skills_config
+                _logger.debug(
+                    "🧩 skills_config attached: entries=%d",
+                    len(getattr(skills_config, "entries", None) or {}),
+                )
+                from agent_core.skills.registry import SkillsRegistry
+                self.skills_registry = SkillsRegistry(skills_config)
+                _logger.info(
+                    f"Skills registry enabled: bundled={skills_config.paths.bundled_dir} "
+                    f"workspace={skills_config.paths.workspace_dir}"
+                )
+            except Exception as e:
+                _logger.warning(f"SkillsRegistry 初始化失败，skill 系统关闭: {e}")
+                self.skills_registry = None
+                self.skills_config = None
 
         # 会话级计数器(2026-07-03):tool/token 的中立宿主,累加在"资源发生点"
         # (tool → ToolExecuteHandler,token → LLM handler),消费者(extraction /
@@ -656,7 +687,6 @@ class ReactAgent:
         )
         # 1. 复用 resolve_permission 逻辑(legacy 路径仍可工作)
         self.resolve_permission(choice)
-
         # Deny-loop fix (2026-06-30): deny 路径补 tool_result 给 LLM 看
         # 注意:必须先 append,再 transition — 否则下次 LLM 调用看不到 denial
         if choice == "deny" and self._pending_permission_request is not None:
@@ -689,28 +719,13 @@ class ReactAgent:
         # 只调 AwaitingPermission.next() 决策下一 phase,然后手动 transition。
         from agent_core.agent_state import AgentPhase
 
-        # Fix B (2026-06-30) 防御性补:如果 SM 当前不在 AWAITING_PERMISSION,
-        # 但 _run_state.awaiting_permission 已设(说明 _iter_phase_tools 写了 pending),
-        # 说明之前 yield generator 被提前销毁,SM 没正确转入 AWAITING_PERMISSION。
-        # 这里强制补一次转换,让下面的主 if 块能进。
-        # 通常这种情况不应该发生(Fix A 已在 _iter_phase_tools 同步转过),
-        # 但作为兜底,防止未来再有类似 yield-暂停 bug 把用户卡死。
-        if (
-            self._sm.current != AgentPhase.AWAITING_PERMISSION
-            and self._run_state is not None
-            and self._run_state.awaiting_permission is not None
-        ):
-            _old_phase_recovery = self._sm.current
-            self._sm._phase = AgentPhase.AWAITING_PERMISSION
-            self._sm._history.append((
-                _old_phase_recovery,
-                "permission_needed(recovered)",
-                AgentPhase.AWAITING_PERMISSION,
-            ))
-            _logger.warning(
-                "⚠️ [SM recovery] %s --> awaiting_permission (resume_after_permission 兜底;通常 Fix A 已处理)",
-                _old_phase_recovery.value,
-            )
+        # 历史 Fix B (2026-06-30,2026-07-07 删):原读 _run_state.awaiting_permission 兜底
+        # 修复 yield generator 提前销毁导致 SM 没正确转入 AWAITING 的 bug。
+        # Step 2 把字段搬到 turn_ctx 后,该检查失效(用户 confirm 直接删);
+        # 主 if 块 `if self._sm.current == AWAITING` 已足够挡非法调用,
+        # fail-fast 比静默补一致更安全。
+
+        _logger.debug(f"▶️ [v2 resume_after_permission] choice={choice} sm={self._sm.current} pending={self._pending_permission_request}")
 
         if self._sm.current == AgentPhase.AWAITING_PERMISSION:
             # Deny-loop fix (2026-06-30): choice=="deny" 时直接转 LLM_THINKING,
@@ -736,7 +751,7 @@ class ReactAgent:
                 type("_StubCtx", (), {"turn_ctx": type("_StubTC", (), {
                     "events": [], "is_stopped": False, "emit": lambda self, e: None,
                     "stop": lambda self: None,
-                    "permission_request": None, "stage_outputs": None, "stage_inputs": None,
+                    "permission_request": None, "stage_outputs": None,
                 })()})(),
             )
             # 手动 transition(不调 trigger — 避免链式推到 DONE)
@@ -803,6 +818,9 @@ class ReactAgent:
     def reset(self):
         """重置会话历史"""
         self.messages.clear()
+        # 同时清空 memory 去重状态（_surfaced 现归 retriever 所有）
+        if self.memory_retriever is not None:
+            self.memory_retriever.reset_surfaced()
         # Day 4: 同时清空 session
         if self._session_manager:
             try:

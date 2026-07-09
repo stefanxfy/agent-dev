@@ -148,7 +148,34 @@ class OpenAICompatibleProvider(BaseProvider):
         """OpenAI 兼容 stream 主循环。
 
         重置哨兵 + system_prompt 注入 messages + 调 _build_kwargs + 跑 stream。
+
+        Debug 日志(2026-07-06):入口 dump 转换后的 kwargs(stream 实际
+        发送给 provider 的 payload),便于在 router 层日志之后,再下一层
+        防御 — 如果 provider 内部有重试/format 转换,可定位是 router
+        还是 provider 吞掉了请求。
         """
+        # 🧩 PROVIDER ENTRY log:在 _build_kwargs 之前抓原始 messages
+        try:
+            from agent_core.llm.router import _dump_json, _mask_env_secrets
+            raw_dump = _mask_env_secrets(_dump_json({
+                "messages_chars": sum(len(str(m)) for m in messages),
+                "msgs_count": len(messages),
+                "tools_count": len(tools or []),
+                "tool_choice": tool_choice,
+                "system_prompt_chars": len(system_prompt) if system_prompt else 0,
+                "cache_namespace": cache_namespace,
+                "messages_preview": [
+                    {"role": m.get("role"), "content_chars": len(str(m.get("content", "")))}
+                    for m in messages[:5]
+                ],
+            }))
+            logger.debug(
+                "🧩 PROVIDER ENTRY: provider=%s model=%s\n%s",
+                self.provider_name, self.config.model, raw_dump,
+            )
+        except Exception as e:
+            logger.debug("🧩 PROVIDER ENTRY log failed: %s", e)
+
         # 重置哨兵:每次新 chat() 调用前清零(防御多次复用同一 provider 实例)
         self._consumed_text = False
 

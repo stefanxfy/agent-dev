@@ -67,6 +67,16 @@ class ToolRegistry:
     def register(self, tool: ToolDef):
         """注册一个工具"""
         self._tools[tool.name] = tool
+        # 🧩 debug:log 新注册 + 当前已注册 tool 名单(便于测试追溯与 bug 定位;
+        # Core path MUST 打 debug 日志,复用 sub-logger 机制)
+        logger.debug(
+            "🧩 tool registered: name=%s category=%s version=%s total=%d all=%s",
+            tool.name,
+            getattr(tool, "category", "?"),
+            getattr(tool, "version", "?"),
+            len(self._tools),
+            sorted(self._tools.keys()),
+        )
         # 弃用警告
         if tool.deprecated_since is not None:
             logger.warning(

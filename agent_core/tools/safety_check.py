@@ -104,7 +104,7 @@ def is_sensitive_path(path: str) -> bool:
     检测路径是否命中敏感前缀(对齐 CC pathValidation.ts + doc §4.7)
 
     Args:
-        path: 文件路径(相对或绝对)
+        path: 文件路径(相对或绝对,可以是 ~/... / /Users/... / ./...)
 
     Returns:
         True 如果路径以 SENSITIVE_PATH_PATTERNS 中任一前缀开头
@@ -114,17 +114,20 @@ def is_sensitive_path(path: str) -> bool:
         True
         >>> is_sensitive_path("/Users/alice/.ssh/id_rsa")
         True
+        >>> is_sensitive_path("~/id_rsa")
+        True
         >>> is_sensitive_path("./docs/README.md")
         False
     """
     if not path:
         return False
 
-    # 标准化:去掉前导 "./" 和 "/",转为相对路径形式比较
-    normalized = path.strip()
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    normalized = normalized.lstrip("/")
+    # 复用 normalize_path_for_check:处理 ~/ / /Users/.../ ./... 形式,统一为相对路径
+    # 这步 strip home + cwd prefix 是关键 — 否则 /Users/alice/.ssh/id_rsa 的
+    # prefix 不含 .ssh/,会被绕过(2026-07-07 发现的 bypass)
+    normalized = normalize_path_for_check(path)
+    if not normalized:
+        return False
 
     safety_logger.debug(
         "🧪 [sensitive_path_check] path=%s normalized=%s prefixes=%d",
@@ -288,26 +291,38 @@ def normalize_path_for_check(path: str) -> str:
     规范化路径用于敏感检测(去掉 home / cwd 前缀,统一相对路径形式)
 
     测试和 audit_logger 用 — production 仍走 raw path
+
+    处理顺序:
+      1. ~/... → <home>/...(让后续 home strip 能命中)
+      2. <home>/... → ...
+      3. <cwd>/... → ...
+      4. ./... → ...
+      5. 去掉所有前导 /
     """
     if not path:
         return ""
 
     normalized = path
 
-    # 把 ~/ 转成相对路径
+    # 0. ~/ 前缀替换为 home(否则下一步 home strip 不命中 ~/)
     home = str(Path.home())
+    if normalized.startswith("~") and home:
+        normalized = home + normalized[1:]  # ~ → home, ~/foo → <home>/foo
+
+    # 1. 把 home-prefix 路径转成相对路径
     if normalized.startswith(home):
         normalized = normalized[len(home):].lstrip("/")
-    # 把 cwd 转成相对路径
+    # 2. 把 cwd 转成相对路径
     try:
         cwd = os.getcwd()
         if normalized.startswith(cwd):
             normalized = normalized[len(cwd):].lstrip("/")
     except OSError:
         pass
-    # 去掉前导 "./"
+    # 3. 去掉前导 "./"
     while normalized.startswith("./"):
         normalized = normalized[2:]
+    # 4. 去掉前导 "/"
     normalized = normalized.lstrip("/")
 
     return normalized
