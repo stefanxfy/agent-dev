@@ -295,8 +295,8 @@ def bash_handler(**kwargs) -> str:
     # 决定是否 wrap sandbox
     effective_command = command
     try:
-        from .sandbox_decision import should_use_sandbox
-        from .sandbox_manager import sandbox_manager
+        from .sandbox.decision import should_use_sandbox
+        from .sandbox.manager import sandbox_manager
 
         effective_input = {
             "command": command,
@@ -394,7 +394,7 @@ def bash_handler(**kwargs) -> str:
     # 防 CC #29316 bare-git scrub + sandbox_tmp_dir mtime 过期。
     # 三条 return 路径(空输出 / 正常 / cancel 已 return)都过此 cleanup。
     try:
-        from .sandbox_manager import sandbox_manager
+        from .sandbox.manager import sandbox_manager
         sandbox_manager.cleanup_after_command()
     except Exception as cleanup_err:
         sandbox_logger.warning("⚙️ [sandbox_cleanup_failed] err=%s", cleanup_err)
