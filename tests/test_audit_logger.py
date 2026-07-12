@@ -30,7 +30,7 @@ from agent_core.tools.audit_logger import (
     query_audit,
     reset_audit_logger_for_testing,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,
@@ -143,8 +143,27 @@ class TestLogWrite:
         data = json.loads(logger.path.read_text(encoding="utf-8"))
         for field in ["timestamp", "session_id", "tool_name", "tool_input_hash",
                       "decision", "reason_type", "sandbox_used", "hook_chain",
-                      "classifier_used"]:
+                      "classifier_used", "tool_category"]:
             assert field in data
+
+    def test_tool_category_propagated(self, logger):
+        """B.1 T-C2:tool_category="mcp" 经 log() 写入 AuditRecord 并读回断言"""
+        logger.log(
+            "mcp__fs__write", {"path": "/tmp/x"},
+            _make_decision(), _make_ctx(),
+            tool_category="mcp",
+        )
+        data = json.loads(logger.path.read_text(encoding="utf-8"))
+        assert data["tool_category"] == "mcp"
+
+    def test_tool_category_default_none(self, logger):
+        """B.1 T-C2:不传 tool_category 时默认 None(向后兼容)"""
+        logger.log(
+            "Bash", {"command": "ls"},
+            _make_decision(), _make_ctx(),
+        )
+        data = json.loads(logger.path.read_text(encoding="utf-8"))
+        assert data["tool_category"] is None
 
     def test_hash_not_plaintext(self, logger):
         # 写入 Bash command 含 fake secret → file 里只有 hash

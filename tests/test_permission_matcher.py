@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_core.tools.permission_matcher import (
+from agent_core.tools.permission.matcher import (
     _try_parse_compound,
     match_permission_rule,
     match_wildcard_pattern,
@@ -23,7 +23,7 @@ from agent_core.tools.permission_matcher import (
     parse_permission_rule,
     permission_rule_extract_prefix,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     PermissionRule,
     PermissionRuleSource,
@@ -189,7 +189,7 @@ class TestMatchPermissionRule:
 
     def test_unsupported_never_matches(self):
         """unsupported 永远不匹配"""
-        from agent_core.tools.permission_matcher import ShellPermissionRule
+        from agent_core.tools.permission.matcher import ShellPermissionRule
         rule = ShellPermissionRule(type="unsupported")
         assert match_permission_rule(rule, "anything") is False
 
@@ -412,7 +412,7 @@ class TestParseAllRulesFromStrings:
 class TestShellPermissionRule:
     def test_str_each_type(self):
         """5 种 type 的 __str__ 形态"""
-        from agent_core.tools.permission_matcher import ShellPermissionRule
+        from agent_core.tools.permission.matcher import ShellPermissionRule
         assert str(ShellPermissionRule(type="exact", command="ls")) == "exact(ls)"
         assert str(ShellPermissionRule(type="prefix", prefix="rm ")) == "prefix(rm :*)"
         assert str(ShellPermissionRule(type="wildcard", pattern="echo")) == "wildcard(*echo*)"
@@ -420,7 +420,7 @@ class TestShellPermissionRule:
 
     def test_compound_str(self):
         """compound 的 __str__ 用 && 拼接"""
-        from agent_core.tools.permission_matcher import ShellPermissionRule
+        from agent_core.tools.permission.matcher import ShellPermissionRule
         inner_a = ShellPermissionRule(type="prefix", prefix="rm ")
         inner_b = ShellPermissionRule(type="exact", command="echo")
         rule = ShellPermissionRule(type="compound", parts=[inner_a, inner_b])
@@ -428,7 +428,7 @@ class TestShellPermissionRule:
 
     def test_frozen_dataclass(self):
         """frozen 不可变"""
-        from agent_core.tools.permission_matcher import ShellPermissionRule
+        from agent_core.tools.permission.matcher import ShellPermissionRule
         rule = ShellPermissionRule(type="exact", command="ls")
         with pytest.raises(Exception):  # FrozenInstanceError
             rule.type = "prefix"

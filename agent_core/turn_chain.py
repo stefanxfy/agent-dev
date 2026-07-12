@@ -827,7 +827,7 @@ class SystemPromptHandler:
         if getattr(agent, "permission_engine", None) is None:
             return ""
         try:
-            from .tools.sandbox_prompt import get_sandbox_prompt_section
+            from .tools.sandbox.prompt import get_sandbox_prompt_section
             return get_sandbox_prompt_section()
         except Exception as e:
             _logger.debug("sandbox prompt 注入失败,跳过: %s", e)
@@ -1277,7 +1277,7 @@ class PermissionCheckHandler:
             tool_def, tool_input, list(agent.messages),
         )
 
-        from agent_core.tools.permission_types import PermissionBehavior
+        from agent_core.tools.permission.types import PermissionBehavior
 
         permission_logger.info(
             "🛡️ [check_tool_permission_decision] tool=%s behavior=%s "

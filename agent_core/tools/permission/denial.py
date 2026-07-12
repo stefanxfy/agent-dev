@@ -22,7 +22,7 @@ import threading
 from dataclasses import dataclass, replace
 from typing import Optional
 
-from .permission_types import (
+from .types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,

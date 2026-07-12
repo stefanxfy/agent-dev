@@ -26,7 +26,7 @@ from agent_core.tools.builtin import (
     bash_handler,
     register_builtin_tools,
 )
-from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.tools.sandbox.manager import SandboxManager
 
 
 @pytest.fixture(autouse=True)
@@ -137,7 +137,7 @@ class TestDangerouslyDisableSandbox:
 class TestSandboxWrap:
     @pytest.fixture
     def enabled_sandbox(self):
-        from agent_core.tools.sandbox_backends import NativeBackend
+        from agent_core.tools.sandbox.backends import NativeBackend
 
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
@@ -188,7 +188,7 @@ class TestSandboxWrap:
     def test_sandbox_judgment_failure_falls_back_to_raw(self):
         # should_use_sandbox 抛异常 → 不 wrap,直接执行原命令
         with patch(
-            "agent_core.tools.sandbox_decision.should_use_sandbox",
+            "agent_core.tools.sandbox.decision.should_use_sandbox",
             side_effect=RuntimeError("boom"),
         ):
             result = bash_handler(command="echo resilient")

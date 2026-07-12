@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_core.tools.permission_loader import (
+from agent_core.tools.permission.loader import (
     _settings_for_destination,
     add_permission_rules_to_settings,
     delete_permission_rule_from_settings,
@@ -32,7 +32,7 @@ from agent_core.tools.permission_loader import (
     load_settings_json,
     load_tool_permission_context,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     AdditionalWorkingDirectory,
     PermissionBehavior,
     PermissionRule,

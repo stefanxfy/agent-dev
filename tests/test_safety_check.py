@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_core.tools.safety_check import (
+from agent_core.tools.permission.safety import (
     SENSITIVE_PATH_PATTERNS,
     SECRET_PATTERNS,
     contains_secret,

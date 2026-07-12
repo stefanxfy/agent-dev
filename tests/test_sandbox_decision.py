@@ -14,12 +14,12 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_core.tools.sandbox_decision import (
+from agent_core.tools.sandbox.decision import (
     SANDBOXED_TOOLS,
     _is_excluded_command,
     should_use_sandbox,
 )
-from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.tools.sandbox.manager import SandboxManager
 
 
 @pytest.fixture(autouse=True)

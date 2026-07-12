@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,59 @@ class ToolRegistry:
         """
         self._tools: dict[str, ToolDef] = {}
         self._enable_jsonschema_validation = enable_jsonschema_validation
+        # 🆕 T-C2:on_tool_call 回调(让 UI / audit / 监控订阅工具执行事件)。
+        # 默认 None,无侵入;订阅方 set_on_tool_call(cb) 后,execute 各状态点
+        # 会 fire 一次。callback 异常被吞掉,不阻断主流程。
+        self._on_tool_call: Optional[Callable] = None
+
+    def set_on_tool_call(self, callback: Optional[Callable]) -> None:
+        """
+        注册工具执行回调(订阅模式)。
+
+        callback 签名:
+            def cb(category: str, tool_name: str, status: str,
+                   duration_ms: float, error: Optional[str] = None) -> None
+
+        status 取值:
+            - "running"      进入 execute,schema 校验通过(尚未执行)
+            - "success"      handler 正常返回
+            - "timeout"      handler 超时
+            - "param_error"  jsonschema 校验失败 / ValueError
+            - "network_error" ConnectionError 等网络异常(已重试 max_retries 次)
+            - "error"        其他未捕获异常(已重试 max_retries 次)
+            - "not_found"    工具名不在 registry
+
+        category: ToolDef.category(builtin / shell / read / mcp / general …)
+
+        异常处理:cb 内部异常被 _fire_on_tool_call 吞掉,不阻断 execute 主流程。
+        注销回调:set_on_tool_call(None)
+        """
+        self._on_tool_call = callback
+
+    def _fire_on_tool_call(
+        self,
+        category: str,
+        tool_name: str,
+        status: str,
+        duration_ms: float,
+        error: Optional[str] = None,
+    ) -> None:
+        """触发 on_tool_call 回调(异常被吞掉,不阻断 execute)"""
+        if self._on_tool_call is None:
+            return
+        try:
+            self._on_tool_call(
+                category=category,
+                tool_name=tool_name,
+                status=status,
+                duration_ms=duration_ms,
+                error=error,
+            )
+        except Exception as e:
+            logger.warning(
+                "🧩 on_tool_call callback 异常(吞掉,不阻断 execute): tool=%s status=%s err=%s",
+                tool_name, status, e,
+            )
 
     # ── 注册 / 获取 ─────────────────────────────────────────────────────
 
@@ -83,6 +136,32 @@ class ToolRegistry:
                 "tool %s 自版本 %s 起被弃用(deprecated_since=%s)",
                 tool.name, tool.deprecated_since, tool.deprecated_since,
             )
+
+    def register_many(self, tools: "Iterable[ToolDef]") -> int:
+        """
+        批量注册工具(对称于 `unregister_by_prefix`,MCP server 工具集刷新用)。
+
+        Args:
+            tools: 可迭代的 ToolDef 序列
+
+        Returns:
+            新注册数量(同名覆盖不计)。
+            例:tools=[A, B, A] 且 A 已存在 → 返回 1(只新增 B)
+
+        实现:逐个调 `register`(统一日志 + deprecation warning 行为)。
+        非 list 类型(如 generator)也接受 — 内部 `for tool in tools:` 自然支持。
+        """
+        count = 0
+        for tool in tools:
+            existed = tool.name in self._tools
+            self.register(tool)
+            if not existed:
+                count += 1
+        logger.debug(
+            "🧩 register_many 完成: 新注册 %d 个, 当前总数 %d",
+            count, len(self._tools),
+        )
+        return count
 
     def unregister(self, name: str) -> bool:
         """注销单个工具。返回是否曾存在。
@@ -178,7 +257,14 @@ class ToolRegistry:
         import concurrent.futures
 
         tool_def = self._tools.get(tool_name)
+        # 🆕 T-C2:track duration + category for on_tool_call hook
+        _t0 = time.monotonic()
+        _category = getattr(tool_def, "category", "general") if tool_def else "unknown"
+
         if not tool_def:
+            # 🆕 T-C2:not_found 状态 hook(让 UI 能区分"未注册" vs "执行失败")
+            self._fire_on_tool_call(_category, tool_name, "not_found", 0.0,
+                                    error=f"未找到工具: {tool_name}")
             return {"status": "error", "error": f"未找到工具: {tool_name}"}
 
         # ── Phase 1: jsonschema 校验(对齐 doc §7.2)────────
@@ -186,6 +272,12 @@ class ToolRegistry:
             validation_error = self._validate_tool_input(tool_def, tool_input)
             if validation_error is not None:
                 # 校验失败 → 立即 error,不重试
+                # 🆕 T-C2:param_error hook
+                self._fire_on_tool_call(
+                    _category, tool_name, "param_error",
+                    (time.monotonic() - _t0) * 1000,
+                    error=f"参数校验失败: {validation_error}",
+                )
                 return {"status": "error", "error": f"参数校验失败: {validation_error}"}
 
         # 把 cancel_event 注入 kwargs(handler 通过 _current_cancel_event
@@ -207,13 +299,30 @@ class ToolRegistry:
                     future = executor.submit(_run_handler)
                     try:
                         result = future.result(timeout=timeout)
+                        # 🆕 T-C2:success hook
+                        self._fire_on_tool_call(
+                            _category, tool_name, "success",
+                            (time.monotonic() - _t0) * 1000,
+                        )
                         return {"status": "success", "output": str(result)}
                     except concurrent.futures.TimeoutError:
                         # 超时，不重试，立即返回（防止阻塞 Agent）
+                        # 🆕 T-C2:timeout hook
+                        self._fire_on_tool_call(
+                            _category, tool_name, "timeout",
+                            (time.monotonic() - _t0) * 1000,
+                            error=f"执行超时({timeout}s)",
+                        )
                         return {"status": "error", "error": f"执行超时（{timeout}s），工具 `{tool_name}` 未响应，请检查工具实现或增加 timeout"}
 
             except ValueError as e:
                 # 参数错误，不重试，立即返回
+                # 🆕 T-C2:param_error hook(ValueError 也归类为参数错误)
+                self._fire_on_tool_call(
+                    _category, tool_name, "param_error",
+                    (time.monotonic() - _t0) * 1000,
+                    error=str(e),
+                )
                 return {"status": "error", "error": f"参数错误: {e}"}
 
             except (TimeoutError, ConnectionError) as e:
@@ -222,6 +331,12 @@ class ToolRegistry:
                 if attempt < max_retries:
                     time.sleep(2 ** (attempt - 1))  # 指数退避：1s, 2s, 4s
                     continue
+                # 🆕 T-C2:network_error hook(重试耗尽)
+                self._fire_on_tool_call(
+                    _category, tool_name, "network_error",
+                    (time.monotonic() - _t0) * 1000,
+                    error=f"网络错误(已重试 {max_retries} 次): {e}",
+                )
                 return {"status": "error", "error": f"网络错误（已重试 {max_retries} 次）: {e}"}
 
             except Exception as e:
@@ -229,6 +344,12 @@ class ToolRegistry:
                 if attempt < max_retries:
                     time.sleep(1)  # 简单重试延迟
                     continue
+                # 🆕 T-C2:error hook(重试耗尽)
+                self._fire_on_tool_call(
+                    _category, tool_name, "error",
+                    (time.monotonic() - _t0) * 1000,
+                    error=f"工具执行失败(已重试 {max_retries} 次): {type(e).__name__}: {e}",
+                )
                 return {"status": "error", "error": f"工具执行失败（已重试 {max_retries} 次）: {type(e).__name__}: {e}"}
 
         # 理论上不会到这里

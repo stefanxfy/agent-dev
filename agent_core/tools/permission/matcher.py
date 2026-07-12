@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .permission_types import (
+from .types import (
     PermissionBehavior,
     PermissionRule,
     PermissionRuleSource,

@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from .permission_types import PermissionMode, ToolPermissionContext
+from .types import PermissionMode, ToolPermissionContext
 
 
 logger = logging.getLogger(__name__)

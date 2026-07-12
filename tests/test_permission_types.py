@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     AdditionalWorkingDirectory,
     ModeReason,
     PermissionBehavior,

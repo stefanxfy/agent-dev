@@ -20,15 +20,15 @@ import pytest
 
 from agent_core.tools.base import ToolDef, ToolRegistry
 from agent_core.tools.builtin import register_builtin_tools
-from agent_core.tools.permission_engine import PermissionEngine
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.engine import PermissionEngine
+from agent_core.tools.permission.types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,
     PermissionMode,
     ToolPermissionContext,
 )
-from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.tools.sandbox.manager import SandboxManager
 
 
 @pytest.fixture(autouse=True)
@@ -110,7 +110,7 @@ class TestBashRouting:
             name="Read", check_permissions=None, requires_user_interaction=False,
         )
         with patch(
-            "agent_core.tools.permission_engine.PermissionEngine._run_bash_check_permissions"
+            "agent_core.tools.permission.engine.PermissionEngine._run_bash_check_permissions"
         ) as mock_bash:
             engine.check_permissions(read_tool, {"path": "/tmp/x"})
         mock_bash.assert_not_called()
@@ -220,7 +220,7 @@ class TestSystemPromptSandboxSection:
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
         with patch.object(mgr, "is_sandbox_enabled", return_value=True), \
-             patch("agent_core.tools.sandbox_manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+             patch("agent_core.tools.sandbox.manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             agent = self._make_agent_for_prompt()  # sandbox_enabled 无关(已 patch is_sandbox_enabled)
             section = self._handler._sandbox_section(agent)
         assert "## Command sandbox" in section
@@ -229,7 +229,7 @@ class TestSystemPromptSandboxSection:
         mgr = SandboxManager()
         mgr.load_config({"enabled": True})
         with patch.object(mgr, "is_sandbox_enabled", return_value=True), \
-             patch("agent_core.tools.sandbox_manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+             patch("agent_core.tools.sandbox.manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             agent = self._make_agent_for_prompt()
             full = self._handler._build(agent)
         assert "base prompt" in full
@@ -247,7 +247,7 @@ class TestSystemPromptSandboxSection:
     def test_sandbox_prompt_failure_returns_empty(self):
         agent = self._make_agent_for_prompt()
         with patch(
-            "agent_core.tools.sandbox_prompt.get_sandbox_prompt_section",
+            "agent_core.tools.sandbox.prompt.get_sandbox_prompt_section",
             side_effect=RuntimeError("boom"),
         ):
             section = self._handler._sandbox_section(agent)

@@ -1,5 +1,5 @@
 """
-McpManager — 多 server MCP 编排器（常驻 event loop + 同步门面 + health 调度器）。
+McpManager — 多 server MCP 编排器（常驻 event loop + 同步门面）。
 
 架构（决策 #10）:
   - 一个 daemon 线程跑 loop.run_forever()，所有 server 的 transport+session 全程
@@ -12,12 +12,14 @@ McpManager — 多 server MCP 编排器（常驻 event loop + 同步门面 + hea
     （agent.close() 不 dispose，Phase 5），atexit 兜底进程退出清理。
   - server 级 deny strip 第一道（connect 前过滤，省连接开销）。
 
-keep_alive + health-check（Phase 5）:
+keep_alive + health-check（Phase 5 + C.5 拆分）:
   - _keep_alive: 单 server 单次连接生命周期（connect → 持有 → 断连结束 task）。
-  - _health_loop: 集中调度器（跑在常驻 loop），每 _health_interval 秒取 top-K 最久
-    未检测的 server 并行 probe：connected→ping list_tools，disconnected→spawn 重连。
+  - McpHealthScheduler（C.5 抽出）：集中 health-check 调度器（跑在常驻 loop），
+    每 _health_interval 秒取 top-K 最久未检测的 server 并行 probe：
+    connected→ping list_tools，disconnected→spawn 重连。
     env: MCP_HEALTH_CHECK_INTERVAL(30s) / MCP_HEALTH_CHECK_CONCURRENCY(5)。
-  - 断连：_teardown_server（pop _servers + cancel task + 注销工具）+ _health disconnected。
+  - 断连：scheduler._teardown_server（pop _servers + cancel task + 注销工具）+
+    scheduler.set_health disconnected。
 """
 
 from __future__ import annotations
@@ -26,12 +28,12 @@ import asyncio
 import atexit
 import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Optional
 
 from agent_core.mcp.client import connect_server
+from agent_core.mcp.health import McpHealthScheduler, _ServerHealth   # C.5:re-export _ServerHealth
 from agent_core.mcp.materialize import (
     _normalize_call_result,
     _normalize_prompt_result,
@@ -52,21 +54,12 @@ class _LiveServer:
     prompts: list = field(default_factory=list)     # list[types.Prompt]
 
 
-@dataclass(frozen=True)
-class _ServerHealth:
-    """单个 server 的健康状态快照（frozen，整体替换 → GIL 下跨线程读安全）。
-
-    status: "connected" / "disconnected" / "connecting"
-    last_check_at: time.monotonic() 时间戳（调度器按此取 top-K 最久未检测）
-    last_error: 最近一次检测/断连错误（给 UI 显示）
-    """
-    status: str
-    last_check_at: float
-    last_error: Optional[str] = None
-
-
 class McpManager:
-    """多 server MCP 编排器（跨会话复用，常驻 loop + 同步门面 + health 调度器）。"""
+    """多 server MCP 编排器（跨会话复用，常驻 loop + 同步门面）。
+
+    C.5 拆分后，health-check 调度逻辑委托给 self._scheduler（McpHealthScheduler）。
+    本类聚焦：loop 管理 / 连接编排 / 同步门面 / 资源-提示 facade / 生命周期。
+    """
 
     def __init__(
         self,
@@ -101,17 +94,17 @@ class McpManager:
         self._keep_alive_tasks: dict[str, asyncio.Task] = {}
         self._pending_refresh: dict[str, set[str]] = {}   # name -> {kinds}（连接阶段 race 暂存）
         self._closed = False
-        # health-check 调度器（Phase 5）：env 配置 + 状态
+        # C.5:health-check 调度器（独立类，env 配置由 manager 注入 interval/concurrency）
         try:
             from agent_core.config import config
-            self._health_interval = float(config.int("MCP_HEALTH_CHECK_INTERVAL", 30))
-            self._health_concurrency = max(1, config.int("MCP_HEALTH_CHECK_CONCURRENCY", 5))
+            health_interval = float(config.int("MCP_HEALTH_CHECK_INTERVAL", 30))
+            health_concurrency = max(1, config.int("MCP_HEALTH_CHECK_CONCURRENCY", 5))
         except Exception:
-            self._health_interval = 30.0
-            self._health_concurrency = 5
-        self._health: dict[str, _ServerHealth] = {}            # 所有 enabled server 健康状态
-        self._health_task: Optional[asyncio.Task] = None
-        self._health_sleep_futs: list = []                    # dispose 打断 sleep 用
+            health_interval = 30.0
+            health_concurrency = 5
+        self._scheduler = McpHealthScheduler(
+            self, interval=health_interval, concurrency=health_concurrency,
+        )
         # active agent/registry 引用（组合根每次 rerun set_active 更新）。
         # on_tools_changed 回调跑在 mcp loop 线程，不能查 streamlit session_state（线程局部），
         # 改用这两个引用（跨线程 GIL 安全的引用读）。
@@ -150,6 +143,42 @@ class McpManager:
         return fut.result(timeout=timeout + 2)
 
     # ── 连接编排 ────────────────────────────────────────────────────
+    def _should_connect(self, name: str, cfg) -> bool:
+        """C.3 M-C2:判断 server 是否应被连接(enabled + 非 server 级 deny)。
+
+        返回 True 表示应连接,False 表示跳过(已 log 原因)。
+        """
+        if not cfg.enabled:
+            logger.debug("🔌 mcp server '%s' disabled, skip", name)
+            return False
+        if is_server_denied(name, self._deny_rules):
+            logger.info("🔌 mcp server '%s' 被 server 级 deny，不连接", name)
+            return False
+        return True
+
+    def _init_health_for_new_server(self, name: str) -> None:
+        """C.3 M-C2 + C.5:初始化 health 状态为 connecting（仅当尚未初始化，setdefault 语义）。
+
+        delegate 给 scheduler；保留本方法做 facade（C.3 helper 不变）。
+        """
+        self._scheduler.init_health(name)
+
+    def _connect_one_sync(self, name: str, cfg) -> list:
+        """C.3 M-C2:同步包装单 server 连接 + 故障隔离(失败只 warn 返 [])。"""
+        try:
+            tool_defs = self._run(
+                self._connect_one(name, cfg),
+                timeout=cfg.connect_timeout or self._connect_timeout,
+            )
+            logger.info(
+                "🔌 mcp server '%s' 连接成功: %d tools %s",
+                name, len(tool_defs), [t.name for t in tool_defs],
+            )
+            return tool_defs
+        except Exception as e:
+            logger.warning("🔌 mcp server '%s' 连接失败，跳过: %s", name, e)
+            return []
+
     def connect_all(self) -> dict:
         """
         连接所有 enabled 且未被 deny 的 server，返回 {server_name: [ToolDef]}。
@@ -157,36 +186,19 @@ class McpManager:
         server 级 deny strip 第一道（is_server_denied）+ per-server 故障隔离
         （单 server 失败只 warn 跳过，返空 list，不阻断其余）。
         启动 health-check 调度器（跨会话 mgr 复用时幂等，只启一次）。
+
+        C.3 M-C2:本方法缩到 ~10 行 orchestrator,3 个 helper 各司其职。
+        C.5 M-M1:health 调度委托给 self._scheduler。
         """
         results: dict[str, list] = {}
-        # 初始化所有 enabled+非 deny server 的健康状态为 connecting（调度器监控全集）
         for name, cfg in self._configs.items():
-            if not cfg.enabled or is_server_denied(name, self._deny_rules):
+            if not self._should_connect(name, cfg):
                 continue
-            self._health.setdefault(name, _ServerHealth("connecting", 0.0))
-        for name, cfg in self._configs.items():
-            if not cfg.enabled:
-                logger.debug("🔌 mcp server '%s' disabled, skip", name)
-                continue
-            if is_server_denied(name, self._deny_rules):
-                logger.info("🔌 mcp server '%s' 被 server 级 deny，不连接", name)
-                continue
-            try:
-                tool_defs = self._run(
-                    self._connect_one(name, cfg),
-                    timeout=cfg.connect_timeout or self._connect_timeout,
-                )
-                results[name] = tool_defs
-                logger.info(
-                    "🔌 mcp server '%s' 连接成功: %d tools %s",
-                    name, len(tool_defs), [t.name for t in tool_defs],
-                )
-            except Exception as e:
-                logger.warning("🔌 mcp server '%s' 连接失败，跳过: %s", name, e)
-                results[name] = []
-        # 启动 health-check 调度器（只启一次，跨会话 mgr 复用时已跑）
+            self._init_health_for_new_server(name)
+            results[name] = self._connect_one_sync(name, cfg)
+        # 启动 health-check 调度器(只启一次,跨会话 mgr 复用时已跑)
         self._ensure_loop()
-        self._loop.call_soon_threadsafe(self._ensure_health_task)
+        self._loop.call_soon_threadsafe(self._scheduler.ensure_task)
         return results
 
     async def _connect_one(self, name: str, cfg) -> list:
@@ -228,7 +240,7 @@ class McpManager:
                     logger.info("🔌 mcp server '%s' 连接就绪，补刷 %s（连接阶段 list_changed）", name, sorted(pending_kinds))
                     for kind in sorted(pending_kinds):
                         await self._do_refresh(name, kind, self._servers[name], notify=False)
-                self._set_health(name, "connected")
+                self._scheduler.set_health(name, "connected")
                 self._safe_on_tools_changed(name)   # 注册（首连 + 调度器重连都走这）
                 if ready is not None and not ready.done():
                     ready.set_result(self._servers[name].tool_defs)
@@ -239,7 +251,7 @@ class McpManager:
             # 断连：清死 session + 标记 disconnected + 注销工具（调度器后续重连）
             was_live = name in self._servers
             self._servers.pop(name, None)
-            self._set_health(name, "disconnected", last_error=str(e))
+            self._scheduler.set_health(name, "disconnected", last_error=str(e))
             if ready is not None and not ready.done():
                 ready.set_exception(e)   # 首次连接失败 → connect_all warn 跳过（首连才传 ready）
             elif was_live:
@@ -260,17 +272,13 @@ class McpManager:
         except Exception as e:
             logger.warning("🔌 on_tools_changed 回调异常(server=%s): %s", name, e)
 
-    # ── health-check 调度器（Phase 5）──────────────────────────────
+    # ── health-check 调度器（C.5 M-M1：抽到 self._scheduler）──────────
     def get_health(self) -> dict:
-        """返回 {name: {status, last_check_at, last_error}} 快照（给 UI 跨线程读，GIL 安全）。
+        """返回 {name: {status, last_check_at, last_error}} 快照（UI 跨线程读，GIL 安全）。
 
-        镜像 DistillationLoop.get_status 范式：返回普通 dict，主线程读安全。
+        C.5 delegate 给 McpHealthScheduler.get_health。
         """
-        return {
-            n: {"status": h.status, "last_check_at": h.last_check_at,
-                "last_error": h.last_error}
-            for n, h in self._health.items()
-        }
+        return self._scheduler.get_health()
 
     def set_active(self, agent: Any, registry: Any) -> None:
         """组合根每次 rerun 调：更新当前 agent/registry 引用。
@@ -281,86 +289,6 @@ class McpManager:
         """
         self._active_agent = agent
         self._active_registry = registry
-
-    def _set_health(self, name: str, status: str, last_error: Optional[str] = None) -> None:
-        """整体替换 _health[name]（frozen _ServerHealth，GIL 下跨线程读安全）。"""
-        self._health[name] = _ServerHealth(status, time.monotonic(), last_error)
-
-    def _ensure_health_task(self) -> None:
-        """在常驻 loop 内启动 health-check 调度器（幂等，只启一次）。"""
-        if self._closed or self._loop is None:
-            return
-        if self._health_task is not None and not self._health_task.done():
-            return
-        self._health_task = self._loop.create_task(self._health_loop())
-
-    async def _health_loop(self) -> None:
-        """集中 health-check 调度器（跑在常驻 loop）。
-
-        每 _health_interval 秒一轮：取 top-_health_concurrency 个最久未检测的 server
-        （last_check_at 最小），并行 probe。connected → ping list_tools；disconnected →
-        spawn 重连。错开不批量（top-K 限并发）。dispose 经 _sleep_or_dispose 打断。
-        """
-        while not self._closed:
-            await self._sleep_or_dispose(self._health_interval)
-            if self._closed:
-                return
-            # 取 top-K 最久未检测（快照后排序，避免迭代中 _health 变动）
-            snapshot = list(self._health.items())
-            snapshot.sort(key=lambda nh: nh[1].last_check_at)
-            batch = [n for n, _ in snapshot[: self._health_concurrency]]
-            if batch:
-                await asyncio.gather(*[self._probe(n) for n in batch], return_exceptions=True)
-
-    async def _probe(self, name: str) -> None:
-        """探测单个 server：connected → ping；disconnected/connecting → spawn 重连。"""
-        cfg = self._configs.get(name)
-        if cfg is None:
-            return
-        if name in self._servers:   # connected → ping list_tools
-            try:
-                await asyncio.wait_for(
-                    self._servers[name].session.list_tools(),
-                    timeout=self._health_interval,
-                )
-                self._set_health(name, "connected")
-            except Exception as e:
-                logger.warning("🔌 mcp server '%s' health-check ping 失败 → 断连: %s", name, e)
-                await self._teardown_server(name)
-                self._set_health(name, "disconnected", last_error=str(e))
-        else:   # disconnected/connecting → spawn 重连（不阻塞调度器；ready=None 无人 await）
-            task = self._keep_alive_tasks.get(name)
-            if task is None or task.done():
-                self._set_health(name, "connecting")
-                self._keep_alive_tasks[name] = self._loop.create_task(
-                    self._keep_alive(name, cfg, None))
-
-    async def _teardown_server(self, name: str) -> None:
-        """ping 失败时：pop _servers + cancel keep_alive task + 注销幽灵工具。"""
-        self._servers.pop(name, None)
-        task = self._keep_alive_tasks.get(name)
-        if task is not None and not task.done():
-            task.cancel()
-        self._safe_on_tools_changed(name)
-
-    async def _sleep_or_dispose(self, seconds: float) -> None:
-        """可被 dispose 打断的 sleep：创建 future，wait_for(timeout)；dispose set 全部 future。"""
-        fut = self._loop.create_future()
-        self._health_sleep_futs.append(fut)
-        try:
-            await asyncio.wait_for(fut, timeout=seconds)
-        except asyncio.TimeoutError:
-            pass   # 正常到时
-        finally:
-            if fut in self._health_sleep_futs:
-                self._health_sleep_futs.remove(fut)
-
-    def _wake_health_sleeps(self) -> None:
-        """dispose 时调（loop 线程内）：set 所有 pending sleep future，让 _health_loop 立即退出。"""
-        for fut in list(self._health_sleep_futs):
-            if not fut.done():
-                fut.set_result(None)
-        self._health_sleep_futs.clear()
 
     # ── ClientSession callback 工厂（roots / message_handler）──────────
     def _make_roots_callback(self):
@@ -455,11 +383,10 @@ class McpManager:
             if kind == "tools":
                 result = await live.session.list_tools()
                 live.tool_defs = materialize_tools(name, result.tools or [], self)
-                if notify and self._on_tools_changed is not None:
-                    try:
-                        self._on_tools_changed(name)
-                    except Exception as e:
-                        logger.warning("🔌 on_tools_changed 回调异常(server=%s): %s", name, e)
+                if notify:
+                    # C.2 M-C1:统一走 _safe_on_tools_changed(原 inline 块重复,
+                    # 异常吞掉逻辑跟现有 helper 完全一致)
+                    self._safe_on_tools_changed(name)
             elif kind == "resources":
                 live.resources = (await live.session.list_resources()).resources or []
             elif kind == "prompts":
@@ -540,17 +467,8 @@ class McpManager:
             return
 
         # 0. 停 health-check 调度器（set sleep futs 打断 + cancel task）
-        try:
-            self._loop.call_soon_threadsafe(self._wake_health_sleeps)
-        except RuntimeError:
-            pass   # loop 已停
-        if self._health_task is not None and not self._health_task.done():
-            try:
-                fut = asyncio.run_coroutine_threadsafe(
-                    asyncio.wait_for(self._health_task, timeout=5.0), self._loop)
-                fut.result(timeout=7.0)
-            except Exception as e:
-                logger.debug("🔌 health_task 退出超时/异常: %s", e)
+        # C.5 delegate 给 McpHealthScheduler.stop
+        self._scheduler.stop()
 
         # 1. signal 所有 dispose_events（让 keep_alive 退 with，关连接）
         for evt in list(self._dispose_events.values()):
@@ -581,5 +499,4 @@ class McpManager:
         self._servers.clear()
         self._dispose_events.clear()
         self._keep_alive_tasks.clear()
-        self._health_sleep_futs.clear()
         logger.debug("🔌 McpManager disposed")

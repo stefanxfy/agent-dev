@@ -35,8 +35,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent_core.tools.base import ToolDef
-from agent_core.tools.permission_engine import PermissionEngine
-from agent_core.tools.permission_hook import (
+from agent_core.tools.permission.engine import PermissionEngine
+from agent_core.tools.permission.hook import (
     HookRegistry,
     PermissionDeniedResult,
     PermissionRequestResult,
@@ -44,13 +44,13 @@ from agent_core.tools.permission_hook import (
     make_retry_hint_denied_hook,
     make_webhook_permission_request_hook,
 )
-from agent_core.tools.permission_loader import (
+from agent_core.tools.permission.loader import (
     add_permission_rules_to_settings,
     delete_permission_rule_from_settings,
     load_excluded_commands,
     save_excluded_commands,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,
@@ -59,11 +59,11 @@ from agent_core.tools.permission_types import (
     PermissionRuleValue,
     ToolPermissionContext,
 )
-from agent_core.tools.sandbox_decision import (
+from agent_core.tools.sandbox.decision import (
     get_excluded_command_message,
     get_excluded_command_match,
 )
-from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.tools.sandbox.manager import SandboxManager
 from agent_core.turn_chain import PermissionCheckHandler  # Plan C: _check_tool_permission 迁此
 
 
@@ -113,11 +113,11 @@ class TestE2E_AddRuleThenEngine:
     def test_full_roundtrip(self, tmp_path, monkeypatch):
         fake_settings = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_settings_path",
+            "agent_core.tools.permission.loader.get_settings_path",
             lambda: fake_settings,
         )
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_local_settings_path",
+            "agent_core.tools.permission.loader.get_local_settings_path",
             lambda: tmp_path / "settings.local.json",
         )
 
@@ -134,7 +134,7 @@ class TestE2E_AddRuleThenEngine:
         assert "Bash(rm:*)" in data["permissions"]["deny"]
 
         # 3. loader 读 → engine 用
-        from agent_core.tools.permission_loader import load_all_permission_rules_from_disk
+        from agent_core.tools.permission.loader import load_all_permission_rules_from_disk
         rules = load_all_permission_rules_from_disk()
         deny_rules_for_ctx = {
             PermissionRuleSource.PROJECT.value: ["Bash(rm:*)"],
@@ -152,11 +152,11 @@ class TestE2E_DeleteRuleThenEngine:
     def test_delete_removes_deny(self, tmp_path, monkeypatch):
         fake_settings = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_settings_path",
+            "agent_core.tools.permission.loader.get_settings_path",
             lambda: fake_settings,
         )
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_local_settings_path",
+            "agent_core.tools.permission.loader.get_local_settings_path",
             lambda: tmp_path / "settings.local.json",
         )
 
@@ -230,7 +230,7 @@ class TestE2E_BashWithAllThreeHooks:
     """Bash 命令 + 3 个 hook event 全跑"""
 
     def test_pretooluse_permissionrequest_permissiondenied_chain(self):
-        from agent_core.tools.permission_engine import PermissionEngine
+        from agent_core.tools.permission.engine import PermissionEngine
         reg = HookRegistry()
         # PreToolUse: ASK(让请求往下走)
         reg.register_hook(
@@ -265,7 +265,7 @@ class TestE2E_ExcludedCommandMessage:
     def test_save_load_roundtrip_with_message(self, tmp_path, monkeypatch):
         settings_path = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: settings_path,
         )
         save_excluded_commands(["git commit", "npm publish"], PermissionRuleSource.PROJECT)
@@ -337,7 +337,7 @@ class TestPerformance:
 
     def test_classifier_fast_path_skips_classifier(self):
         # Read allowlist 命中 → classifier.classify 不被调
-        from agent_core.tools.classifier import HaikuClassifier
+        from agent_core.tools.permission.classifier import HaikuClassifier
         engine = _make_engine()
         mock_classifier = MagicMock(spec=HaikuClassifier)
         engine.classifier = mock_classifier
@@ -360,7 +360,7 @@ class TestPerformance:
 
     def test_bash_subcommand_parse_50_under_10ms(self):
         # 50 条复合命令 parse < 10ms
-        from agent_core.tools.bash_permissions import parse_subcommands
+        from agent_core.tools.permission.bash import parse_subcommands
         commands = [
             "echo a && rm -rf /tmp/x",
             "ls | grep foo | head -5",
@@ -465,7 +465,7 @@ class TestRegressionPhase2BashSandbox:
 
     def test_excluded_command_skips_sandbox(self):
         # M2 _is_excluded_command → M3 仍返 bool True(向后兼容)
-        from agent_core.tools.sandbox_decision import _is_excluded_command
+        from agent_core.tools.sandbox.decision import _is_excluded_command
         SandboxManager().load_config({"excludedCommands": ["git commit"]})
         assert _is_excluded_command("Bash", {"command": "git commit -m x"}) is True
 
@@ -497,7 +497,7 @@ class TestRegressionExistingHooksUnaffected:
     """已有 PreToolUse secret/path hook 仍工作"""
 
     def test_default_secret_hook_still_works(self):
-        from agent_core.tools.permission_hook import default_secret_hook
+        from agent_core.tools.permission.hook import default_secret_hook
         # 命中 secret
         result = default_secret_hook(
             "Bash", {"command": "echo sk-abcdef1234567890abcdef"}, _ctx(),
@@ -509,7 +509,7 @@ class TestRegressionExistingHooksUnaffected:
         )
 
     def test_default_path_hook_still_works(self):
-        from agent_core.tools.permission_hook import default_path_validation_hook
+        from agent_core.tools.permission.hook import default_path_validation_hook
         # 敏感路径 → DENY
         result = default_path_validation_hook(
             "Read", {"path": "/Users/x/.ssh/id_rsa"}, _ctx(),

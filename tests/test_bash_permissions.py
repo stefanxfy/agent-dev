@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_core.tools.bash_permissions import (
+from agent_core.tools.permission.bash import (
     MAX_SUBCOMMANDS,
     SAFE_WRAPPERS,
     _parse_rule_string,
@@ -33,12 +33,12 @@ from agent_core.tools.bash_permissions import (
     parse_subcommands,
     strip_safe_wrappers,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     PermissionMode,
     ToolPermissionContext,
 )
-from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.tools.sandbox.manager import SandboxManager
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -133,12 +133,12 @@ class TestParseSubcommandsTreeSitter:
     def test_tree_sitter_default_disabled(self, monkeypatch):
         monkeypatch.delenv("TREE_SITTER_BASH", raising=False)
         # 默认走 regex path
-        from agent_core.tools import bash_permissions as bp
+        from agent_core.tools.permission import bash as bp
         assert bp._tree_sitter_enabled() is False
 
     def test_tree_sitter_enabled_when_env_true(self, monkeypatch):
         monkeypatch.setenv("TREE_SITTER_BASH", "true")
-        from agent_core.tools import bash_permissions as bp
+        from agent_core.tools.permission import bash as bp
         assert bp._tree_sitter_enabled() is True
 
     def test_tree_sitter_path_falls_back_to_regex_on_import_error(self, monkeypatch):
@@ -432,19 +432,19 @@ class TestClassifierIntegration:
         # mock classifier 返 should_block=True
         class FakeClassifier:
             def classify(self, messages, tool_name, tool_input, context):
-                from agent_core.tools.classifier import ClassifierResult
+                from agent_core.tools.permission.classifier import ClassifierResult
                 return ClassifierResult(
                     should_block=True,
                     reason="dangerous command",
                     unavailable=False,
                 )
 
-        with patch("agent_core.tools.bash_permissions.is_classifier_enabled") if False else patch(
-            "agent_core.tools.classifier.is_classifier_enabled", return_value=True
+        with patch("agent_core.tools.permission.bash.is_classifier_enabled") if False else patch(
+            "agent_core.tools.permission.classifier.is_classifier_enabled", return_value=True
         ), patch.dict(os.environ, {"TRANSCRIPT_CLASSIFIER_ENABLED": "true"}):
             # need is_classifier_enabled in bash_permissions to return True
             # bash_permissions imports it lazily inside the function
-            import agent_core.tools.classifier as clf
+            import agent_core.tools.permission.classifier as clf
             with patch.object(clf, "is_classifier_enabled", return_value=True):
                 decision = bash_check_permissions(
                     {"command": "ls"}, ctx, classifier=FakeClassifier(),
@@ -456,14 +456,14 @@ class TestClassifierIntegration:
         ctx = _ctx(is_anthropic_provider=True, no_settings_match=True)
         class FakeClassifier:
             def classify(self, messages, tool_name, tool_input, context):
-                from agent_core.tools.classifier import ClassifierResult
+                from agent_core.tools.permission.classifier import ClassifierResult
                 return ClassifierResult(
                     should_block=False,
                     reason="safe",
                     unavailable=False,
                 )
 
-        import agent_core.tools.classifier as clf
+        import agent_core.tools.permission.classifier as clf
         with patch.object(clf, "is_classifier_enabled", return_value=True):
             decision = bash_check_permissions(
                 {"command": "ls"}, ctx, classifier=FakeClassifier(),
@@ -475,7 +475,7 @@ class TestClassifierIntegration:
         ctx = _ctx(is_anthropic_provider=True)
         class FakeClassifier:
             def classify(self, messages, tool_name, tool_input, context):
-                from agent_core.tools.classifier import ClassifierResult
+                from agent_core.tools.permission.classifier import ClassifierResult
                 return ClassifierResult(
                     should_block=False,
                     reason="unavailable",
@@ -495,7 +495,7 @@ class TestClassifierIntegration:
                 self.called = False
             def classify(self, messages, tool_name, tool_input, context):
                 self.called = True
-                from agent_core.tools.classifier import ClassifierResult
+                from agent_core.tools.permission.classifier import ClassifierResult
                 return ClassifierResult(should_block=True, unavailable=False)
 
         fc = FakeClassifier()

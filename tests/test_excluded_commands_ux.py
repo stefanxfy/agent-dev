@@ -18,17 +18,17 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_core.tools.permission_loader import (
+from agent_core.tools.permission.loader import (
     load_excluded_commands,
     save_excluded_commands,
 )
-from agent_core.tools.permission_types import PermissionRuleSource
-from agent_core.tools.sandbox_decision import (
+from agent_core.tools.permission.types import PermissionRuleSource
+from agent_core.tools.sandbox.decision import (
     _is_excluded_command,
     get_excluded_command_match,
     get_excluded_command_message,
 )
-from agent_core.tools.sandbox_manager import sandbox_manager
+from agent_core.tools.sandbox.manager import sandbox_manager
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -147,13 +147,13 @@ class TestSaveLoadExcludedCommands:
         # mock get_settings_path → tmp_path
         settings_path = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_settings_path",
+            "agent_core.tools.permission.loader.get_settings_path",
             lambda: settings_path,
         )
         # 同样要 mock _settings_for_destination(它内部用 get_settings_path)
         # 因为 _settings_for_destination 在同一 module 里,我们直接 patch 它
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: settings_path,
         )
 
@@ -170,7 +170,7 @@ class TestSaveLoadExcludedCommands:
     def test_save_strips_whitespace_and_drops_empty(self, tmp_path, monkeypatch):
         settings_path = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: settings_path,
         )
 
@@ -186,7 +186,7 @@ class TestSaveLoadExcludedCommands:
     def test_load_returns_empty_when_no_file(self, tmp_path, monkeypatch):
         nonexistent = tmp_path / "nope.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: nonexistent,
         )
         assert load_excluded_commands(PermissionRuleSource.PROJECT) == []
@@ -194,7 +194,7 @@ class TestSaveLoadExcludedCommands:
     def test_load_roundtrip(self, tmp_path, monkeypatch):
         settings_path = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: settings_path,
         )
 
@@ -209,7 +209,7 @@ class TestSaveLoadExcludedCommands:
         settings_path.write_text(json.dumps({"permissions": {"allow": ["Read"]}}),
                                  encoding="utf-8")
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: settings_path,
         )
         # 没有 sandbox 段 → 返空
@@ -221,7 +221,7 @@ class TestSaveLoadExcludedCommands:
             "sandbox": {"excludedCommands": ["git commit", None, 42, "  ", "npm"]},
         }), encoding="utf-8")
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: settings_path,
         )
         loaded = load_excluded_commands(PermissionRuleSource.PROJECT)
@@ -235,7 +235,7 @@ class TestSaveLoadExcludedCommands:
             "permissions": {"allow": ["Read"], "deny": ["Bash(rm:*)"]},
         }), encoding="utf-8")
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader._settings_for_destination",
+            "agent_core.tools.permission.loader._settings_for_destination",
             lambda dest: settings_path,
         )
 
@@ -256,7 +256,7 @@ class TestSaveLoadExcludedCommands:
 class TestIntegration:
     def test_should_use_sandbox_with_excluded(self):
         """被排除的命令:should_use_sandbox 返 False,但应用层仍过 permission check"""
-        from agent_core.tools.sandbox_decision import should_use_sandbox
+        from agent_core.tools.sandbox.decision import should_use_sandbox
 
         # 启用沙箱(新 API:configure_backends + enabled)
         from unittest.mock import MagicMock

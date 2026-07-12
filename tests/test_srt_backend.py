@@ -15,13 +15,13 @@ import subprocess
 
 import pytest
 
-from agent_core.tools.sandbox_backends import (
+from agent_core.tools.sandbox.backends import (
     SandboxBackend,
     SandboxRuntimeConfig,
     SrtBackend,
 )
 
-_SRT_MOD = "agent_core.tools.sandbox_backends.srt_backend"
+_SRT_MOD = "agent_core.tools.sandbox.backends.srt"
 
 
 def test_satisfies_protocol():

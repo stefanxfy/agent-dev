@@ -17,8 +17,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-from .permission_matcher import parse_permission_rule
-from .permission_types import (
+from .matcher import parse_permission_rule
+from .types import (
     PermissionBehavior,
     PermissionRule,
     PermissionRuleSource,

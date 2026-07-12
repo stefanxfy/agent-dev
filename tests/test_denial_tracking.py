@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from agent_core.tools.denial_tracking import (
+from agent_core.tools.permission.denial import (
     DENIAL_LIMITS,
     DenialTrackingState,
     check_denial_limit,
@@ -27,7 +27,7 @@ from agent_core.tools.denial_tracking import (
     reset_denial_state,
     set_denial_state,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,

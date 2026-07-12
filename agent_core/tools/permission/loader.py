@@ -33,8 +33,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from .permission_matcher import parse_all_rules_from_strings
-from .permission_types import (
+from .matcher import parse_all_rules_from_strings
+from .types import (
     AdditionalWorkingDirectory,
     PermissionBehavior,
     PermissionRule,

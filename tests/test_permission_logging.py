@@ -48,8 +48,8 @@ def _records(caplog, name: str) -> list[logging.LogRecord]:
 class TestPermissionLogging:
     def test_permission_engine_logs_decision(self, caplog):
         """permission_engine.check_permissions 命中 deny → 🛡️ [decision] 应在 caplog"""
-        from agent_core.tools.permission_engine import PermissionEngine
-        from agent_core.tools.permission_types import ToolPermissionContext, PermissionMode
+        from agent_core.tools.permission.engine import PermissionEngine
+        from agent_core.tools.permission.types import ToolPermissionContext, PermissionMode
 
         # 强制 deny:global_deny 含 Bash → 命中 step_1a_global_deny
         ctx = ToolPermissionContext(
@@ -79,7 +79,7 @@ class TestPermissionLogging:
 
     def test_denial_tracking_logs_increment(self, caplog):
         """denial_tracking.record_denial → 🛡️ [denial_record]"""
-        from agent_core.tools.denial_tracking import (
+        from agent_core.tools.permission.denial import (
             DenialTrackingState, record_denial, record_success,
         )
         state = DenialTrackingState()
@@ -96,7 +96,7 @@ class TestPermissionLogging:
 
     def test_permission_matcher_logs_match(self, caplog):
         """permission_matcher.match_permission_rule → 🛡️ [match_*]"""
-        from agent_core.tools.permission_matcher import (
+        from agent_core.tools.permission.matcher import (
             ShellPermissionRule, match_permission_rule,
         )
         with caplog.at_level(logging.DEBUG, logger=PERM):
@@ -117,7 +117,7 @@ class TestPermissionLogging:
 class TestSafetyLogging:
     def test_safety_secret_block_logs(self, caplog):
         """safety_check 命中 secret pattern → 🧪 [safety_secret_block]"""
-        from agent_core.tools.safety_check import safety_check
+        from agent_core.tools.permission.safety import safety_check
         # 触发 secret 检测:echo sk-ant-xxxx
         with caplog.at_level(logging.DEBUG, logger=SAFETY):
             result = safety_check("Bash", {"command": "echo sk-ant-aaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
@@ -136,8 +136,8 @@ class TestSafetyLogging:
 class TestSandboxLogging:
     def test_sandbox_decision_logs(self, caplog):
         """sandbox_decision.should_use_sandbox → ⚙️ [should_use_sandbox]"""
-        from agent_core.tools.sandbox_decision import should_use_sandbox
-        from agent_core.tools.sandbox_manager import sandbox_manager
+        from agent_core.tools.sandbox.decision import should_use_sandbox
+        from agent_core.tools.sandbox.manager import sandbox_manager
 
         # 强制 sandbox disabled → 命中 should_use_sandbox_disabled
         sandbox_manager._reset_for_testing()
@@ -152,7 +152,7 @@ class TestSandboxLogging:
 
     def test_sandbox_prompt_logs(self, caplog):
         """sandbox_prompt.get_sandbox_prompt_section → ⚙️ [sandbox_prompt_*]"""
-        from agent_core.tools.sandbox_prompt import get_sandbox_prompt_section
+        from agent_core.tools.sandbox.prompt import get_sandbox_prompt_section
         with caplog.at_level(logging.DEBUG, logger=SANDBOX):
             section = get_sandbox_prompt_section()
 
@@ -170,7 +170,7 @@ class TestAuditLogging:
     def test_audit_logger_logs_record_built(self, caplog, tmp_path):
         """AuditLogger.log → 📋 [audit_record_built]"""
         from agent_core.tools.audit_logger import AuditLogger
-        from agent_core.tools.permission_types import (
+        from agent_core.tools.permission.types import (
             PermissionBehavior, PermissionDecision, PermissionMode, ToolPermissionContext,
         )
 
@@ -200,8 +200,8 @@ class TestClassifierLogging:
     def test_classifier_enabled_check_logs(self, caplog, monkeypatch):
         """is_classifier_enabled → 🤖 [classifier_enabled_check]"""
         monkeypatch.setenv("TRANSCRIPT_CLASSIFIER_ENABLED", "true")
-        from agent_core.tools.classifier import is_classifier_enabled
-        from agent_core.tools.permission_types import PermissionMode
+        from agent_core.tools.permission.classifier import is_classifier_enabled
+        from agent_core.tools.permission.types import PermissionMode
 
         with caplog.at_level(logging.DEBUG, logger=CLASSIFIER):
             enabled = is_classifier_enabled("anthropic", PermissionMode.DEFAULT, no_settings_match=True)
@@ -212,8 +212,8 @@ class TestClassifierLogging:
 
     def test_classify_transcript_too_long(self, caplog):
         """HaikuClassifier.classify with too long transcript → 🤖 [classify_transcript_too_long]"""
-        from agent_core.tools.classifier import HaikuClassifier
-        from agent_core.tools.permission_types import ToolPermissionContext, PermissionMode
+        from agent_core.tools.permission.classifier import HaikuClassifier
+        from agent_core.tools.permission.types import ToolPermissionContext, PermissionMode
 
         # max_transcript_tokens=10 → 1 message ≈ 1000 token 必超
         clf = HaikuClassifier(max_transcript_tokens=10)

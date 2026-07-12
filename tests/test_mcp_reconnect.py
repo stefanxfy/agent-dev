@@ -82,8 +82,8 @@ def _new_mgr(configs, *, health_interval=0.5, concurrency=5):
     查询 bug 的盲点——回调在 mcp loop 查 session_state 拿到 None 早返回）。
     """
     mgr = McpManager(configs, connect_timeout=8, call_timeout=8)
-    mgr._health_interval = health_interval   # 测试加速（默认 30s 太慢）
-    mgr._health_concurrency = concurrency
+    mgr._scheduler._health_interval = health_interval   # 测试加速（默认 30s 太慢）
+    mgr._scheduler._health_concurrency = concurrency
     registry = ToolRegistry()
     mgr.set_active(None, registry)   # 模拟 web/app.py set_active（agent=None，测试不验证 tool_schemas）
 
@@ -191,10 +191,10 @@ def test_topk_batch_size_equals_concurrency():
     mgr, _registry = _new_mgr([], concurrency=3)
     # 手工灌 6 个递增 last_check_at 的 health 条目（s0 最久未检测）
     for i, name in enumerate(["s0", "s1", "s2", "s3", "s4", "s5"]):
-        mgr._health[name] = _ServerHealth("disconnected", float(i), None)
+        mgr._scheduler._health[name] = _ServerHealth("disconnected", float(i), None)
     # 复现 _health_loop 的 batch 选取逻辑（sorted by last_check_at, 取前 K）
-    snapshot = sorted(mgr._health.items(), key=lambda nh: nh[1].last_check_at)
-    batch = [n for n, _ in snapshot[: mgr._health_concurrency]]
+    snapshot = sorted(mgr._scheduler._health.items(), key=lambda nh: nh[1].last_check_at)
+    batch = [n for n, _ in snapshot[: mgr._scheduler._health_concurrency]]
     assert batch == ["s0", "s1", "s2"]   # concurrency=3，最久未检测的优先
 
 
@@ -214,7 +214,7 @@ def test_dispose_stops_scheduler():
     mgr.dispose()   # 调度器 sleep 期间 dispose，应立即打断
     elapsed = time.time() - t0
     assert elapsed < 5.0, f"dispose blocked {elapsed:.1f}s (scheduler 未停)"
-    assert mgr._health_task is None or mgr._health_task.done()
+    assert mgr._scheduler._health_task is None or mgr._scheduler._health_task.done()
 
 
 # ─── stdio: kill → probe 重连 respawn ────────────────────────────────

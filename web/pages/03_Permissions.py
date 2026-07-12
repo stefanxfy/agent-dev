@@ -23,18 +23,18 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
-from agent_core.tools.permission_loader import (
+from agent_core.tools.permission.loader import (
     add_permission_rules_to_settings,
     delete_permission_rule_from_settings,
     load_rules_by_source,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     PermissionRule,
     PermissionRuleSource,
     PermissionRuleValue,
 )
-from agent_core.tools.permission_ui_helpers import (
+from agent_core.tools.permission.ui import (
     build_permission_rule,
     format_rules_by_source,
     render_rule_preview,
@@ -191,7 +191,7 @@ st.divider()
 
 st.subheader("🛡️ 沙箱排除命令")
 
-from agent_core.tools.permission_loader import (
+from agent_core.tools.permission.loader import (
     load_excluded_commands,
     save_excluded_commands,
 )
@@ -214,7 +214,7 @@ if current_excluded:
     for p in current_excluded:
         # 实时显示命中提示(友好消息)
         try:
-            from agent_core.tools.sandbox_decision import get_excluded_command_message
+            from agent_core.tools.sandbox.decision import get_excluded_command_message
             msg = get_excluded_command_message(p)
             if msg:
                 st.caption(f"  • `{p}` → {msg}")

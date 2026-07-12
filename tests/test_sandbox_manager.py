@@ -16,8 +16,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent_core.tools.sandbox_backends import NullBackend, SandboxRuntimeConfig
-from agent_core.tools.sandbox_manager import (
+from agent_core.tools.sandbox.backends import NullBackend, SandboxRuntimeConfig
+from agent_core.tools.sandbox.manager import (
     SandboxConfig,
     SandboxManager,
     sandbox_manager,

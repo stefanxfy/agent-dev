@@ -22,7 +22,7 @@ import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
-from .permission_types import (
+from .types import (
     PermissionBehavior,
     ToolPermissionContext,
 )
@@ -542,7 +542,7 @@ def default_secret_hook(
     Returns:
         ASK 如果命中 secret;否则 ALLOW
     """
-    from .safety_check import contains_secret, _SECRET_CHECK_TOOLS
+    from .safety import contains_secret, _SECRET_CHECK_TOOLS
 
     if tool_name not in _SECRET_CHECK_TOOLS:
         return PreToolUseResult.allow(hook_name="default_secret")
@@ -610,7 +610,7 @@ def default_path_validation_hook(
     Returns:
         DENY 如果命中敏感路径;否则 ALLOW
     """
-    from .safety_check import is_sensitive_path, _PATH_CHECK_TOOLS
+    from .safety import is_sensitive_path, _PATH_CHECK_TOOLS
 
     if tool_name not in _PATH_CHECK_TOOLS:
         return PreToolUseResult.allow(hook_name="default_path")

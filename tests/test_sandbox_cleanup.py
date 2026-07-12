@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from agent_core.tools.sandbox_backends import _cleanup
+from agent_core.tools.sandbox.backends import cleanup as _cleanup
 
 
 # ── scrub_bare_git(防 CC #29316)──

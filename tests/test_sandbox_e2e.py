@@ -30,17 +30,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent_core.tools.base import ToolRegistry
-from agent_core.tools.bash_permissions import bash_check_permissions, check_sandbox_auto_allow
+from agent_core.tools.permission.bash import bash_check_permissions, check_sandbox_auto_allow
 from agent_core.tools.builtin import register_builtin_tools
-from agent_core.tools.permission_engine import PermissionEngine
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.engine import PermissionEngine
+from agent_core.tools.permission.types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,
     PermissionMode,
     ToolPermissionContext,
 )
-from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.tools.sandbox.manager import SandboxManager
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +59,7 @@ def _ctx(**kwargs):
 
 def _enabled_sandbox_fixture(auto_allow=True):
     """返回一个 enabled sandbox 的 patch context manager stack(手动进/出)"""
-    from agent_core.tools.sandbox_backends import NativeBackend
+    from agent_core.tools.sandbox.backends import NativeBackend
 
     mgr = SandboxManager()
     mgr.load_config({"enabled": True, "autoAllowBashIfSandboxed": auto_allow})
@@ -123,14 +123,14 @@ class TestBareGitScrubRegression:
 
     def test_sandbox_manager_scrubs_bare_git_after_command(self, enabled_sandbox, tmp_path):
         # sandbox cleanup 应删除 sandbox tmp 里的 .git 残留
-        from agent_core.tools.sandbox_manager import sandbox_manager
+        from agent_core.tools.sandbox.manager import sandbox_manager
         fake_tmp = tmp_path / "claude-test"
         fake_tmp.mkdir()
         evil_git = fake_tmp / ".git"
         evil_git.mkdir()
         (evil_git / "config").write_text("[alias] x = !rm -rf /")
 
-        with patch("agent_core.tools.sandbox_backends._cleanup.get_sandbox_tmp_dir", return_value=str(fake_tmp)):
+        with patch("agent_core.tools.sandbox.backends.cleanup.get_sandbox_tmp_dir", return_value=str(fake_tmp)):
             sandbox_manager.cleanup_after_command()
         assert not evil_git.exists()
 
@@ -383,7 +383,7 @@ class TestSandboxTmpAndCleanup:
         import tempfile
         monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
         monkeypatch.setattr(os, "getuid", lambda: 54321, raising=False)
-        from agent_core.tools.sandbox_backends._cleanup import get_sandbox_tmp_dir
+        from agent_core.tools.sandbox.backends.cleanup import get_sandbox_tmp_dir
         result = get_sandbox_tmp_dir()
         result_path = Path(result)
         assert result_path.exists()
@@ -395,8 +395,8 @@ class TestSandboxTmpAndCleanup:
         old_time = time.time() - 25 * 3600
         os.utime(old, (old_time, old_time))
 
-        from agent_core.tools.sandbox_backends._cleanup import cleanup_sandbox_tmp_dir
-        with patch("agent_core.tools.sandbox_backends._cleanup.get_sandbox_tmp_dir", return_value=str(tmp_path)):
+        from agent_core.tools.sandbox.backends.cleanup import cleanup_sandbox_tmp_dir
+        with patch("agent_core.tools.sandbox.backends.cleanup.get_sandbox_tmp_dir", return_value=str(tmp_path)):
             cleanup_sandbox_tmp_dir(max_age_hours=24.0)
         assert not old.exists()
 
@@ -454,7 +454,7 @@ class TestRegression:
 
     def test_read_safety_check_still_blocks_sensitive(self):
         # safety_check 对 Read .ssh 仍生效(Phase 1 hook)
-        from agent_core.tools.safety_check import safety_check
+        from agent_core.tools.permission.safety import safety_check
         assert safety_check("Read", {"path": ".ssh/id_rsa"}) is True
         assert safety_check("Read", {"path": "./docs/README.md"}) is False
 

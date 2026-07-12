@@ -274,8 +274,8 @@ with st.sidebar:
             st.link_button("编辑规则 →", "/Permissions")
         # 简要计数
         try:
-            from agent_core.tools.permission_loader import load_rules_by_source
-            from agent_core.tools.permission_ui_helpers import format_rules_by_source
+            from agent_core.tools.permission.loader import load_rules_by_source
+            from agent_core.tools.permission.ui import format_rules_by_source
             _rules = format_rules_by_source(load_rules_by_source())
             _deny = sum(1 for r in _rules if r["behavior"] == "deny")
             _allow = sum(1 for r in _rules if r["behavior"] == "allow")
@@ -750,11 +750,11 @@ def get_agent(session_id=None):
     # M12/M2: 注入 PermissionEngine + AuditLogger + Sandbox(可选,settings.json 不存在时 None)
     # 对齐 docs/tool/tool-security-architecture.md §6.3 + §4.8 + §5.2
     try:
-        from agent_core.tools.permission_loader import load_tool_permission_context, load_settings_json
-        from agent_core.tools.permission_engine import PermissionEngine
-        from agent_core.tools.permission_hook import default_hooks
-        from agent_core.tools.sandbox_manager import sandbox_manager
-        from agent_core.tools.sandbox_backends import NativeBackend, SrtBackend
+        from agent_core.tools.permission.loader import load_tool_permission_context, load_settings_json
+        from agent_core.tools.permission.engine import PermissionEngine
+        from agent_core.tools.permission.hook import default_hooks
+        from agent_core.tools.sandbox.manager import sandbox_manager
+        from agent_core.tools.sandbox.backends import NativeBackend, SrtBackend
         from agent_core.tools.audit_logger import init_audit_logger
 
         # M2: 加载 sandbox 配置(settings.json 的 sandbox 段)
@@ -791,6 +791,27 @@ def get_agent(session_id=None):
             except Exception as audit_err:
                 logging.warning(f"AuditLogger 注入失败,降级为无审计: {audit_err}")
 
+            # 🆕 T-C2 (B.3):订阅 on_tool_call hook — UI 可观测工具调用链
+            # 把最近 50 条执行事件写 st.session_state.tool_call_history,UI 可渲染
+            # callback 异常被 ToolRegistry 吞掉,这里 try/except 双层保险
+            try:
+                def _on_tool_call_subscriber(category, tool_name, status, duration_ms, error=None):
+                    history = st.session_state.setdefault("tool_call_history", [])
+                    history.append({
+                        "ts": time.time(),
+                        "category": category,
+                        "tool_name": tool_name,
+                        "status": status,
+                        "duration_ms": round(duration_ms, 2),
+                        "error": error,
+                    })
+                    # 限长 50,避免长 session 内存膨胀
+                    if len(history) > 50:
+                        del history[: len(history) - 50]
+                registry.set_on_tool_call(_on_tool_call_subscriber)
+            except Exception as hook_err:
+                logging.warning(f"on_tool_call hook 注入失败: {hook_err}")
+
             logging.info(
                 "PermissionEngine 启用: mode=%s, sandbox=%s, hooks=[%s]",
                 perm_context.mode,
@@ -809,7 +830,7 @@ def get_agent(session_id=None):
         from agent_core.mcp import McpManager
         from agent_core.mcp.config import load_mcp_config_from_settings, load_mcp_roots
         from agent_core.mcp.names import is_server_denied
-        from agent_core.tools.permission_loader import load_rules_by_source
+        from agent_core.tools.permission.loader import load_rules_by_source
 
         server_configs = load_mcp_config_from_settings()
         _rules = load_rules_by_source()
@@ -833,8 +854,7 @@ def get_agent(session_id=None):
                 try:
                     from agent_core.mcp.names import server_prefix
                     _registry.unregister_by_prefix(server_prefix(server_name))
-                    for td in m.registered_tools().get(server_name, []):
-                        _registry.register(td)
+                    _registry.register_many(m.registered_tools().get(server_name, []))
                     _rs = getattr(agent, "_run_state", None)
                     if _rs is not None:
                         _rs.tool_schemas = None   # 失效缓存，下次 turn 重准备 schema
@@ -857,16 +877,13 @@ def get_agent(session_id=None):
             for _name, _tool_defs in mgr.registered_tools().items():
                 if is_server_denied(_name, _deny):
                     continue
-                for td in _tool_defs:
-                    registry.register(td)
+                registry.register_many(_tool_defs)
             # resources + prompts 全局工具（只注册一次，多 server 共享；guard 防重复）
             from agent_core.mcp.materialize import materialize_resource_tools, materialize_prompt_tools
             if registry.get("list_mcp_resources") is None:
-                for td in materialize_resource_tools(mgr):
-                    registry.register(td)
+                registry.register_many(materialize_resource_tools(mgr))
             if registry.get("get_mcp_prompt") is None:
-                for td in materialize_prompt_tools(mgr):
-                    registry.register(td)
+                registry.register_many(materialize_prompt_tools(mgr))
             agent._mcp_manager = mgr
     except Exception as e:
         logging.warning(f"McpManager 注入失败，降级为无 MCP: {e}")

@@ -22,8 +22,8 @@ import pytest
 from agent_core.agent_core import ReactAgent
 from agent_core.agent_state import TurnContext
 from agent_core.tools.base import ToolDef, ToolRegistry
-from agent_core.tools.permission_engine import PermissionEngine
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.engine import PermissionEngine
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     PermissionDecision,
     ToolPermissionContext,
@@ -739,7 +739,7 @@ class TestAwaitingPermissionSMTransition:
 
 def _mock_decision(behavior: str) -> Any:
     """构造 PermissionDecision mock 用于 _ask_user_permission_v2 测试。"""
-    from agent_core.tools.permission_types import (
+    from agent_core.tools.permission.types import (
         PermissionBehavior,
         PermissionDecision,
     )
@@ -777,8 +777,8 @@ class TestDenyLoopFix:
         这样 resume_after_permission 才能 append 对应的 tool_result。
         """
         from agent_core.agent_core import _make_tool_result_block
-        from agent_core.tools.permission_engine import PermissionEngine
-        from agent_core.tools.permission_types import ToolPermissionContext
+        from agent_core.tools.permission.engine import PermissionEngine
+        from agent_core.tools.permission.types import ToolPermissionContext
         engine = PermissionEngine(context=ToolPermissionContext(
             always_ask_rules={"projectSettings": ["echo"]},
         ))

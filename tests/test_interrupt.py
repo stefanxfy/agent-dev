@@ -28,8 +28,8 @@ from agent_core.tools.builtin import (
     set_current_cancel_event,
     reset_current_cancel_event,
 )
-from agent_core.tools.permission_engine import PermissionEngine
-from agent_core.tools.permission_types import ToolPermissionContext
+from agent_core.tools.permission.engine import PermissionEngine
+from agent_core.tools.permission.types import ToolPermissionContext
 
 
 # ────────────────────────────────────────────────────────────────────

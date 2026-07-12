@@ -14,13 +14,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent_core.tools.permission_hook import (
+from agent_core.tools.permission.hook import (
     HookRegistry,
     PermissionRequestResult,
     PreToolUseResult,
     make_webhook_permission_request_hook,
 )
-from agent_core.tools.permission_types import ToolPermissionContext
+from agent_core.tools.permission.types import ToolPermissionContext
 
 
 def _ctx():

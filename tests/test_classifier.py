@@ -16,7 +16,7 @@ import os
 
 import pytest
 
-from agent_core.tools.classifier import (
+from agent_core.tools.permission.classifier import (
     DEFAULT_CLASSIFIER_MODEL,
     ENV_CLASSIFIER_ENABLED,
     ClassifierResult,
@@ -25,7 +25,7 @@ from agent_core.tools.classifier import (
     is_classifier_enabled,
     start_speculative_classifier_check,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     PermissionMode,
     ToolPermissionContext,
 )

@@ -16,13 +16,13 @@ from unittest.mock import mock_open, patch
 
 import pytest
 
-from agent_core.tools.sandbox_backends import (
+from agent_core.tools.sandbox.backends import (
     NativeBackend,
     SandboxBackend,
     SandboxRuntimeConfig,
 )
 
-_NATIVE_MOD = "agent_core.tools.sandbox_backends.native_backend"
+_NATIVE_MOD = "agent_core.tools.sandbox.backends.native"
 
 
 def test_satisfies_protocol():

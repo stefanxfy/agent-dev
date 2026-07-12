@@ -127,7 +127,7 @@ def _parse_one(name: str, raw: Any) -> Optional[McpServerConfig]:
 
 def load_mcp_config_from_settings() -> list[McpServerConfig]:
     """复用 permission_loader.load_settings_json，取 mcp.servers 段解析。"""
-    from agent_core.tools.permission_loader import load_settings_json
+    from agent_core.tools.permission.loader import load_settings_json
 
     data = load_settings_json()
     configs = parse_mcp_servers(data)
@@ -186,7 +186,7 @@ def _default_roots() -> list[dict]:
 
 def load_mcp_roots() -> list[dict]:
     """复用 load_settings_json，取 mcp.roots 段（缺省 cwd）。"""
-    from agent_core.tools.permission_loader import load_settings_json
+    from agent_core.tools.permission.loader import load_settings_json
     return parse_mcp_roots(load_settings_json())
 
 

@@ -80,15 +80,50 @@ def _build_description(server_name: str, t: Any) -> str:
     return f"[mcp:{server_name}] {desc}"
 
 
+def _make_mcp_handler(manager: "McpManager", fn, arg_unpacker=None):
+    """C.4 M-C3:MCP handler 工厂 — 统一吞 _cancel_event + 调 manager 方法 + arg 解包。
+
+    fn: callable,接受 *args(已解包)
+    arg_unpacker: 可选 callable,**kwargs → args tuple;默认直接把 kwargs 整体作为单 arg
+
+    用法:
+        _make_handler = lambda m, s, t: _make_mcp_handler(
+            m, lambda kw: m.call_tool(s, t, kw)
+        )
+    """
+    def handler(**kwargs):
+        kwargs.pop("_cancel_event", None)   # MCP 一次性 RPC 不响应取消,吞掉(R8)
+        args = arg_unpacker(kwargs) if arg_unpacker else (kwargs,)
+        return fn(*args)
+    return handler
+
+
 def _make_handler(manager: "McpManager", server: str, tool_name: str):
     """同步 handler 闭包: 调 manager.call_tool（决策 #9: 同步，不改 base.py）。
 
-    接收 base.py 注入的 _cancel_event kwarg 但 MCP 一次性 RPC 不响应取消，吞掉（R8）。
+    C.4 M-C3:复用 _make_mcp_handler 工厂,共享 _cancel_event 吞掉 + 调 manager 模式。
     """
-    def handler(**kwargs):
-        kwargs.pop("_cancel_event", None)
-        return manager.call_tool(server, tool_name, kwargs)
-    return handler
+    def _call(kw):
+        return manager.call_tool(server, tool_name, kw)
+    return _make_mcp_handler(manager, _call)
+
+
+def _content_blocks_to_text(
+    blocks,
+    block_to_str,
+    empty_msg: str = "(empty result)",
+) -> str:
+    """C.4 M-C3:统一 content block 列表渲染 + sanitize。
+
+    blocks: 可迭代 content blocks(可为 None → 当空处理)
+    block_to_str: callable,单 block → str
+    empty_msg: blocks 为空时的占位文本
+
+    输出经 _sanitize_unicode 消毒(防 LLM token 解析炸 / prompt injection)。
+    """
+    parts = [block_to_str(b) for b in (blocks or [])]
+    text = "\n".join(parts) if parts else empty_msg
+    return _sanitize_unicode(text)
 
 
 def _normalize_call_result(result: Any) -> str:
@@ -97,37 +132,44 @@ def _normalize_call_result(result: Any) -> str:
     isError=True → raise RuntimeError（被 ToolRegistry.execute 捕获，返 error result）。
     content 遍历: text 取 .text；image/audio/resource → 安全占位符（MVP 不内联二进制）。
     structuredContent → 追加 JSON。最后 _sanitize_unicode 消毒。
+
+    C.4 M-C3:复用 _content_blocks_to_text 做 join + sanitize,
+    单 block 渲染仍由 _call_content_block_to_str 处理(MCP CallToolResult content 字段)。
     """
     if getattr(result, "isError", False):
         texts = [c.text for c in (result.content or []) if getattr(c, "type", None) == "text"]
         raise RuntimeError(f"MCP tool error: {' '.join(texts) or 'unknown'}")
 
-    parts: list[str] = []
-    for c in (result.content or []):
-        ctype = getattr(c, "type", None)
-        if ctype == "text":
-            parts.append(c.text)
-        elif ctype == "image":
-            data = getattr(c, "data", "") or ""
-            mime = getattr(c, "mimeType", "?")
-            parts.append(f"[image: {mime}, {len(data)} chars base64]")
-        elif ctype == "audio":
-            mime = getattr(c, "mimeType", "?")
-            parts.append(f"[audio: {mime}]")
-        elif ctype == "resource":
-            parts.append(f"[resource: {getattr(c, 'uri', '?')}]")
-        else:
-            parts.append(f"[{ctype or 'unknown'} content]")
+    base_text = _content_blocks_to_text(
+        result.content, _call_content_block_to_str, "(empty result)",
+    )
 
+    # structuredContent 单独追加(base_text 已 sanitize,这里再拼回去再 sanitize 一次即可)
     structured = getattr(result, "structuredContent", None)
     if structured:
         try:
-            parts.append(f"[structured] {json.dumps(structured, ensure_ascii=False)}")
+            structured_str = f"[structured] {json.dumps(structured, ensure_ascii=False)}"
         except (TypeError, ValueError):
-            parts.append("[structured: <unserializable>]")
+            structured_str = "[structured: <unserializable>]"
+        return _sanitize_unicode(f"{base_text}\n{structured_str}" if base_text != "(empty result)" else structured_str)
+    return base_text
 
-    text = "\n".join(parts) if parts else "(empty result)"
-    return _sanitize_unicode(text)
+
+def _call_content_block_to_str(c) -> str:
+    """CallToolResult.content 单 block → str(MCP content 字段语义)。"""
+    ctype = getattr(c, "type", None)
+    if ctype == "text":
+        return getattr(c, "text", "")
+    if ctype == "image":
+        data = getattr(c, "data", "") or ""
+        mime = getattr(c, "mimeType", "?")
+        return f"[image: {mime}, {len(data)} chars base64]"
+    if ctype == "audio":
+        mime = getattr(c, "mimeType", "?")
+        return f"[audio: {mime}]"
+    if ctype == "resource":
+        return f"[resource: {getattr(c, 'uri', '?')}]"
+    return f"[{ctype or 'unknown'} content]"
 
 
 def _sanitize_unicode(text: str) -> str:
@@ -179,38 +221,45 @@ def materialize_resource_tools(manager) -> list:
 
 
 def _make_list_resources_handler(manager):
-    def handler(**kwargs):
-        kwargs.pop("_cancel_event", None)
-        return manager.list_resources(kwargs.get("server"))
-    return handler
+    """C.4 M-C3:复用 _make_mcp_handler 工厂。"""
+    def _call(server_filter):
+        return manager.list_resources(server_filter)
+    return _make_mcp_handler(
+        manager, _call,
+        arg_unpacker=lambda kw: (kw.get("server"),),
+    )
 
 
 def _make_read_resource_handler(manager):
-    def handler(**kwargs):
-        kwargs.pop("_cancel_event", None)
-        return manager.read_resource(kwargs["server"], kwargs["uri"])
-    return handler
+    """C.4 M-C3:复用 _make_mcp_handler 工厂。"""
+    def _call(server, uri):
+        return manager.read_resource(server, uri)
+    return _make_mcp_handler(
+        manager, _call,
+        arg_unpacker=lambda kw: (kw["server"], kw["uri"]),
+    )
 
 
 def _normalize_resource_result(result: Any) -> str:
     """ReadResourceResult → str。contents 是 list[TextResourceContents|BlobResourceContents]。
 
-    text 取 .text；blob（base64 str）→ 占位符；复用 _sanitize_unicode。
+    C.4 M-C3:复用 _content_blocks_to_text + _resource_content_to_str。
     """
-    parts: list[str] = []
-    for c in (result.contents or []):
-        text = getattr(c, "text", None)
-        if text is not None:
-            parts.append(text)
-        else:
-            blob = getattr(c, "blob", None)
-            if blob is not None:
-                mime = getattr(c, "mimeType", "?")
-                parts.append(f"[blob: {mime}, {len(blob)} chars base64]")
-            else:
-                parts.append(f"[{getattr(c, 'uri', '?')} content]")
-    text = "\n".join(parts) if parts else "(empty resource)"
-    return _sanitize_unicode(text)
+    return _content_blocks_to_text(
+        result.contents, _resource_content_to_str, "(empty resource)",
+    )
+
+
+def _resource_content_to_str(c) -> str:
+    """ReadResourceResult.contents 单 block → str(text / blob 占位)。"""
+    text = getattr(c, "text", None)
+    if text is not None:
+        return text
+    blob = getattr(c, "blob", None)
+    if blob is not None:
+        mime = getattr(c, "mimeType", "?")
+        return f"[blob: {mime}, {len(blob)} chars base64]"
+    return f"[{getattr(c, 'uri', '?')} content]"
 
 
 # ── prompts 物化（Phase 2 Step 3：get_mcp_prompt 工具 + 段渲染）─────
@@ -241,20 +290,29 @@ def materialize_prompt_tools(manager) -> list:
 
 
 def _make_get_prompt_handler(manager):
-    def handler(**kwargs):
-        kwargs.pop("_cancel_event", None)
-        return manager.get_prompt(kwargs["server"], kwargs["name"], kwargs.get("arguments"))
-    return handler
+    """C.4 M-C3:复用 _make_mcp_handler 工厂。"""
+    def _call(server, name, arguments):
+        return manager.get_prompt(server, name, arguments)
+    return _make_mcp_handler(
+        manager, _call,
+        arg_unpacker=lambda kw: (kw["server"], kw["name"], kw.get("arguments")),
+    )
 
 
 def _normalize_prompt_result(result: Any) -> str:
-    """GetPromptResult → str。messages 是 list[PromptMessage(role, content: ContentBlock)]。"""
-    parts: list[str] = []
-    for m in (result.messages or []):
-        role = getattr(m, "role", "user")
-        parts.append(f"[{role}] {_content_block_to_text(getattr(m, 'content', None))}")
-    text = "\n".join(parts) if parts else "(empty prompt)"
-    return _sanitize_unicode(text)
+    """GetPromptResult → str。messages 是 list[PromptMessage(role, content: ContentBlock)]。
+
+    C.4 M-C3:复用 _content_blocks_to_text,block 渲染由 _prompt_message_to_str 处理。
+    """
+    return _content_blocks_to_text(
+        result.messages, _prompt_message_to_str, "(empty prompt)",
+    )
+
+
+def _prompt_message_to_str(m) -> str:
+    """GetPromptResult.messages 单条 → str(role + content block)。"""
+    role = getattr(m, "role", "user")
+    return f"[{role}] {_content_block_to_text(getattr(m, 'content', None))}"
 
 
 def _content_block_to_text(content: Any) -> str:

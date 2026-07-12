@@ -26,7 +26,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .permission_types import (
+from .permission.types import (
     PermissionBehavior,
     PermissionDecision,
     ToolPermissionContext,
@@ -87,6 +87,7 @@ class AuditRecord:
     - classifier_used: 是否调过 classifier
     - classifier_decision: classifier 返 allow/deny/None
     - denial_state: denial_tracking 当前 state
+    - tool_category: builtin / shell / read / mcp 等(ToolDef.category;Optional 向后兼容)
     """
     timestamp: float
     session_id: str
@@ -103,6 +104,9 @@ class AuditRecord:
     classifier_used: bool = False
     classifier_decision: Optional[str] = None
     denial_state: Optional[dict] = None
+    # 🆕 T-C2:tool_category 用于区分 builtin / shell / read / mcp 等,
+    # 让 MCP 工具调用在审计中可识别(原 0 消费,2026-07 修复)
+    tool_category: Optional[str] = None
 
 
 def compute_tool_input_hash(tool_input: dict) -> str:
@@ -166,6 +170,7 @@ class AuditLogger:
         denial_state: Optional[dict] = None,
         sandbox_used: Optional[bool] = None,
         stage: Optional[str] = None,
+        tool_category: Optional[str] = None,
     ) -> None:
         """
         记录一次 permission 决策(atomic append,不抛异常影响主流程)
@@ -182,6 +187,7 @@ class AuditLogger:
             denial_state: denial_tracking 当前 state
             sandbox_used: 是否走 sandbox(None → 从 context.sandbox_enabled 推断)
             stage: PermissionEngine 决策阶段(step_1a_global_deny 等)
+            tool_category: 工具类别(builtin / shell / read / mcp …)None 向后兼容
         """
         try:
             audit_logger.debug(
@@ -239,6 +245,7 @@ class AuditLogger:
                 classifier_used=bool(classifier_used),
                 classifier_decision=classifier_decision_str,
                 denial_state=denial_state,
+                tool_category=tool_category,
             )
             audit_logger.info(
                 "📋 [audit_record_built] tool=%s decision=%s reason_type=%s "

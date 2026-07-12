@@ -34,8 +34,8 @@ from typing import Any, Callable, Optional
 
 import pytest
 
-from agent_core.tools.classifier import ClassifierResult, HaikuClassifier
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.classifier import ClassifierResult, HaikuClassifier
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     PermissionMode,
     ToolPermissionContext,
@@ -360,12 +360,12 @@ async def benchmark_scenario(
     """
     if parse_fn is None:
         # 默认用真实 parse_subcommands
-        from agent_core.tools.bash_permissions import parse_subcommands
+        from agent_core.tools.permission.bash import parse_subcommands
         parse_fn = parse_subcommands
 
     if rule_check_fn is None:
         # 默认用真实 _rule_matches(简化版:对每 source 检查一次即可,不深入)
-        from agent_core.tools.bash_permissions import _rule_matches
+        from agent_core.tools.permission.bash import _rule_matches
         def _default_rule_check(source_rules: list[str], tool_input: dict) -> bool:
             for r in source_rules:
                 _rule_matches(r, tool_input.get("command", ""))
@@ -515,7 +515,7 @@ def test_classifier_call_actually_sleeps():
     """
     target_ms = 80.0
     cls = make_classifier(target_ms)
-    from agent_core.tools.permission_types import ToolPermissionContext, PermissionMode
+    from agent_core.tools.permission.types import ToolPermissionContext, PermissionMode
     ctx = ToolPermissionContext(mode=PermissionMode.AUTO)
     t0 = time.perf_counter()
     cls.classify([], "Bash", {"command": "ls"}, ctx)

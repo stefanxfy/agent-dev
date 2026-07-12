@@ -115,7 +115,7 @@ def _reset_sandbox_singleton():
     对非 sandbox 测试无副作用(_reset_for_testing 只重置 sandbox 状态)。
     """
     try:
-        from agent_core.tools.sandbox_manager import sandbox_manager
+        from agent_core.tools.sandbox.manager import sandbox_manager
         sandbox_manager._reset_for_testing()
         yield
         sandbox_manager._reset_for_testing()

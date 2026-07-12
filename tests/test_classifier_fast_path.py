@@ -17,14 +17,14 @@ from typing import Callable, Optional
 
 import pytest
 
-from agent_core.tools.classifier_fast_path import (
+from agent_core.tools.permission.fast_path import (
     FastPathResult,
     _swap_mode,
     check_classifier_fast_path,
     is_auto_mode_allowlisted_tool,
     is_fast_path_disabled_tool,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     PermissionDecision,
     PermissionMode,

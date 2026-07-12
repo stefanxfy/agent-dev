@@ -25,8 +25,8 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .permission_matcher import match_permission_rule, parse_permission_rule
-from .permission_types import (
+from .matcher import match_permission_rule, parse_permission_rule
+from .types import (
     ClassifierReason,
     OtherReason,
     PermissionBehavior,
@@ -571,8 +571,8 @@ def _check_sandbox_auto_allow_conditions(tool_input: dict) -> bool:
     注:should_use_sandbox 内部已检查 is_sandbox_enabled,但这里显式拆开
     便于独立测试 + 对齐 CC 入口条件判断。
     """
-    from .sandbox_decision import should_use_sandbox
-    from .sandbox_manager import sandbox_manager
+    from ..sandbox.decision import should_use_sandbox
+    from ..sandbox.manager import sandbox_manager
 
     if not sandbox_manager.is_sandbox_enabled():
         return False

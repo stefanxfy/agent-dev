@@ -15,13 +15,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent_core.tools.permission_hook import (
+from agent_core.tools.permission.hook import (
     HookRegistry,
     PermissionDeniedResult,
     PreToolUseResult,
     make_retry_hint_denied_hook,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,

@@ -13,18 +13,18 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_core.tools.permission_ui_helpers import (
+from agent_core.tools.permission.ui import (
     _split_rule_str,
     build_permission_rule,
     format_rules_by_source,
     render_rule_preview,
 )
-from agent_core.tools.permission_loader import (
+from agent_core.tools.permission.loader import (
     add_permission_rules_to_settings,
     delete_permission_rule_from_settings,
     load_rules_by_source,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     PermissionRule,
     PermissionRuleSource,
@@ -232,7 +232,7 @@ class TestAddDeleteRoundtrip:
         # mock settings 路径到 tmp
         fake_settings = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_settings_path",
+            "agent_core.tools.permission.loader.get_settings_path",
             lambda: fake_settings,
         )
 
@@ -250,7 +250,7 @@ class TestAddDeleteRoundtrip:
     def test_delete_after_add(self, tmp_path, monkeypatch):
         fake_settings = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_settings_path",
+            "agent_core.tools.permission.loader.get_settings_path",
             lambda: fake_settings,
         )
 
@@ -271,7 +271,7 @@ class TestAddDeleteRoundtrip:
     def test_delete_nonexistent_returns_false(self, tmp_path, monkeypatch):
         fake_settings = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_settings_path",
+            "agent_core.tools.permission.loader.get_settings_path",
             lambda: fake_settings,
         )
 
@@ -288,12 +288,12 @@ class TestAddDeleteRoundtrip:
         # 端到端:add → load_rules_by_source → format_rules_by_source
         fake_settings = tmp_path / "settings.json"
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_settings_path",
+            "agent_core.tools.permission.loader.get_settings_path",
             lambda: fake_settings,
         )
         # local/user 也指向 tmp(避免污染真实文件)
         monkeypatch.setattr(
-            "agent_core.tools.permission_loader.get_local_settings_path",
+            "agent_core.tools.permission.loader.get_local_settings_path",
             lambda: tmp_path / "settings.local.json",
         )
 
@@ -324,7 +324,7 @@ class TestPageFileSmoke:
         # 页面文件应 import permission_ui_helpers(验证接线)
         page = Path(__file__).parent.parent / "web" / "pages" / "03_Permissions.py"
         content = page.read_text(encoding="utf-8")
-        assert "from agent_core.tools.permission_ui_helpers import" in content
+        assert "from agent_core.tools.permission.ui import" in content
         assert "build_permission_rule" in content
         assert "render_rule_preview" in content
 

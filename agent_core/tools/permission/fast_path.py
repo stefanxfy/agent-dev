@@ -20,7 +20,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .permission_types import (
+from .types import (
     OtherReason,
     PermissionBehavior,
     PermissionDecision,

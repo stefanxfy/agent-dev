@@ -28,11 +28,11 @@ from typing import Any, Callable, Optional
 
 import pytest
 
-from agent_core.tools.classifier import HaikuClassifier
-from agent_core.tools.denial_tracking import DenialTrackingState, clear_all_denial_states
-from agent_core.tools.permission_engine import PermissionEngine
-from agent_core.tools.permission_hook import HookRegistry, PreToolUseResult, default_hooks
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.classifier import HaikuClassifier
+from agent_core.tools.permission.denial import DenialTrackingState, clear_all_denial_states
+from agent_core.tools.permission.engine import PermissionEngine
+from agent_core.tools.permission.hook import HookRegistry, PreToolUseResult, default_hooks
+from agent_core.tools.permission.types import (
     AsyncAgentReason,
     ClassifierReason,
     ModeReason,
@@ -45,7 +45,7 @@ from agent_core.tools.permission_types import (
     SafetyCheckReason,
     ToolPermissionContext,
 )
-from agent_core.tools.safety_check import safety_check  # noqa
+from agent_core.tools.permission.safety import safety_check  # noqa
 
 
 @pytest.fixture(autouse=True)
@@ -417,6 +417,153 @@ class TestSourcePriority:
         decision = engine.check_permissions(FakeTool(name="Read"), {"path": "x.py"}, [])
         # Step 1a deny 先检查(高优先级 user 命中) → DENY
         assert decision.behavior == PermissionBehavior.DENY.value
+
+
+# ────────────────────────────────────────────────────────────────────
+# T-M1: MCP 工具走内容级 rule(glob 语义)
+# ────────────────────────────────────────────────────────────────────
+
+class TestMcpContentAware:
+    """T-M1 修复:mcp__<server>__<tool> 必须尊重 rule_content glob 匹配。
+
+    修复前:_check_global_deny_rule 只比较 tool_name,rule_content 被忽略,
+           `mcp__fs__write(/tmp/*)` 等同于 `mcp__fs__write`(任何 input 都 deny)。
+    修复后:_check_path_tool_rule 用 match_wildcard_pattern 走 glob 语义。
+    """
+
+    def test_mcp_glob_deny_matches_path(self):
+        """mcp__fs__write(/tmp/*) + path=/tmp/x → DENY(glob 命中)"""
+        ctx = _ctx(
+            always_deny={"projectSettings": ["mcp__fs__write(/tmp/*)"]},
+        )
+        engine = PermissionEngine(context=ctx)
+        decision = engine.check_permissions(
+            FakeTool(name="mcp__fs__write"),
+            {"path": "/tmp/x"},
+            [],
+        )
+        assert decision.behavior == PermissionBehavior.DENY.value
+        assert isinstance(decision.decision_reason, RuleReason)
+
+    def test_mcp_glob_deny_no_match_path(self):
+        """mcp__fs__write(/tmp/*) + path=/etc/x → 不 DENY(glob 不命中,继续 pipeline)"""
+        ctx = _ctx(
+            always_deny={"projectSettings": ["mcp__fs__write(/tmp/*)"]},
+        )
+        engine = PermissionEngine(context=ctx)
+        decision = engine.check_permissions(
+            FakeTool(name="mcp__fs__write"),
+            {"path": "/etc/x"},
+            [],
+        )
+        # 不被 deny → 继续 Step 1b+ → 默认 ASK
+        assert decision.behavior != PermissionBehavior.DENY.value
+
+    def test_mcp_whole_tool_deny_matches_any_input(self):
+        """mcp__fs__write(无 content) + 任何 input → DENY(整个 tool 命中)"""
+        ctx = _ctx(
+            always_deny={"projectSettings": ["mcp__fs__write"]},
+        )
+        engine = PermissionEngine(context=ctx)
+        decision = engine.check_permissions(
+            FakeTool(name="mcp__fs__write"),
+            {"path": "/anywhere/file.txt"},
+            [],
+        )
+        assert decision.behavior == PermissionBehavior.DENY.value
+
+    def test_builtin_rule_does_not_leak_to_mcp(self):
+        """Edit(/tmp/*)(builtin) + mcp__fs__write(/tmp/x) → 不 DENY(by-design)"""
+        ctx = _ctx(
+            always_deny={"projectSettings": ["Edit(/tmp/*)"]},
+        )
+        engine = PermissionEngine(context=ctx)
+        decision = engine.check_permissions(
+            FakeTool(name="mcp__fs__write"),
+            {"path": "/tmp/x"},
+            [],
+        )
+        # tool_name 不匹配,继续 pipeline → 默认 ASK
+        assert decision.behavior != PermissionBehavior.DENY.value
+        assert decision.behavior == PermissionBehavior.ASK.value
+
+
+# ────────────────────────────────────────────────────────────────────
+# T-C2: tool_category 透传(权限引擎 → audit_logger)
+# ────────────────────────────────────────────────────────────────────
+
+class TestToolCategoryPropagation:
+    """B.2:engine 把 tool.category 透传到 audit record,关闭 MCP 不可观测。"""
+
+    def _make_capture_audit_logger(self):
+        """构造一个 capture-only mock audit_logger,记录 log() 入参。"""
+        from agent_core.tools.audit_logger import AuditLogger
+
+        captured = {"calls": []}
+
+        class CaptureAuditLogger(AuditLogger):
+            def __init__(self):
+                # 跳过父类 __init__(不需要 file IO)
+                self.session_id = "test-session"
+                self.path = None
+
+            def log(self, **kwargs):
+                captured["calls"].append(kwargs)
+
+            def _write_record(self, record):
+                pass
+
+        return CaptureAuditLogger(), captured
+
+    def test_tool_category_mcp_propagated(self):
+        """tool.category='mcp' → audit record tool_category='mcp'"""
+        ctx = _ctx(always_deny={"projectSettings": ["mcp__fs__write"]})
+        audit, captured = self._make_capture_audit_logger()
+        engine = PermissionEngine(context=ctx, audit_logger=audit)
+
+        # tool 带 category='mcp'
+        class _ToolWithCategory(FakeTool):
+            category = "mcp"
+
+        engine.check_permissions(
+            _ToolWithCategory(name="mcp__fs__write"),
+            {"path": "/tmp/x"},
+            [],
+        )
+        assert len(captured["calls"]) == 1
+        assert captured["calls"][0]["tool_category"] == "mcp"
+
+    def test_tool_category_general_propagated(self):
+        """tool.category='general'(默认)→ audit record tool_category='general'"""
+        ctx = _ctx(always_deny={"projectSettings": ["Bash"]})
+        audit, captured = self._make_capture_audit_logger()
+        engine = PermissionEngine(context=ctx, audit_logger=audit)
+
+        class _ToolWithCategory(FakeTool):
+            category = "general"
+
+        engine.check_permissions(
+            _ToolWithCategory(name="Bash"),
+            {"command": "ls"},
+            [],
+        )
+        assert len(captured["calls"]) == 1
+        assert captured["calls"][0]["tool_category"] == "general"
+
+    def test_tool_no_category_defaults_none(self):
+        """FakeTool 无 category 属性 → audit record tool_category=None(向后兼容)"""
+        ctx = _ctx(always_deny={"projectSettings": ["Bash"]})
+        audit, captured = self._make_capture_audit_logger()
+        engine = PermissionEngine(context=ctx, audit_logger=audit)
+
+        # FakeTool 没有 category 属性(getattr default None)
+        engine.check_permissions(
+            FakeTool(name="Bash"),
+            {"command": "ls"},
+            [],
+        )
+        assert len(captured["calls"]) == 1
+        assert captured["calls"][0]["tool_category"] is None
 
 
 # ────────────────────────────────────────────────────────────────────

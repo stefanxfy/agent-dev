@@ -18,14 +18,14 @@ import time
 
 import pytest
 
-from agent_core.tools.permission_hook import (
+from agent_core.tools.permission.hook import (
     HookRegistry,
     PreToolUseResult,
     default_hooks,
     default_path_validation_hook,
     default_secret_hook,
 )
-from agent_core.tools.permission_types import (
+from agent_core.tools.permission.types import (
     PermissionBehavior,
     ToolPermissionContext,
 )

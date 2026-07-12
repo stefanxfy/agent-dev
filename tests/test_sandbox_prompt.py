@@ -18,8 +18,8 @@ from unittest.mock import patch
 
 import pytest
 
-from agent_core.tools.sandbox_prompt import get_sandbox_prompt_section
-from agent_core.tools.sandbox_manager import SandboxManager
+from agent_core.tools.sandbox.prompt import get_sandbox_prompt_section
+from agent_core.tools.sandbox.manager import SandboxManager
 
 
 @pytest.fixture
@@ -35,7 +35,7 @@ def enabled_sandbox(reset_sandbox):
     """启用沙箱 + mock 平台/依赖/初始化"""
     reset_sandbox.load_config({"enabled": True})
     with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True), \
-         patch("agent_core.tools.sandbox_prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+         patch("agent_core.tools.sandbox.prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
         yield reset_sandbox
 
 
@@ -117,7 +117,7 @@ class TestStrictMode:
     def test_strict_mode_adds_strict_section(self, reset_sandbox):
         reset_sandbox.load_config({"enabled": True, "allowUnsandboxedCommands": False})
         with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True), \
-             patch("agent_core.tools.sandbox_prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+             patch("agent_core.tools.sandbox.prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             prompt = get_sandbox_prompt_section()
         assert "STRICT MODE" in prompt
         assert "disabled" in prompt.lower()
@@ -168,7 +168,7 @@ class TestConfigInjection:
             "fsAllowRead": ["/custom/read/path"],
         })
         with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True), \
-             patch("agent_core.tools.sandbox_prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+             patch("agent_core.tools.sandbox.prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             prompt = get_sandbox_prompt_section()
         assert "/custom/read/path" in prompt
 
@@ -178,7 +178,7 @@ class TestConfigInjection:
             "networkAllowedDomains": ["api.example.com"],
         })
         with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True), \
-             patch("agent_core.tools.sandbox_prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+             patch("agent_core.tools.sandbox.prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             prompt = get_sandbox_prompt_section()
         assert "api.example.com" in prompt
 
@@ -188,7 +188,7 @@ class TestConfigInjection:
             "fsDenyWrite": ["/secret/dir"],
         })
         with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True), \
-             patch("agent_core.tools.sandbox_prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+             patch("agent_core.tools.sandbox.prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             prompt = get_sandbox_prompt_section()
         assert "/secret/dir" in prompt
 
@@ -198,6 +198,6 @@ class TestConfigInjection:
             "networkDeniedDomains": ["evil.com"],
         })
         with patch.object(reset_sandbox, "is_sandbox_enabled", return_value=True), \
-             patch("agent_core.tools.sandbox_prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
+             patch("agent_core.tools.sandbox.prompt.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             prompt = get_sandbox_prompt_section()
         assert "evil.com" in prompt
