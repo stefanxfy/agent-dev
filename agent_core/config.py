@@ -73,6 +73,10 @@ ENV_VAR_REGISTRY: tuple[EnvVarSpec, ...] = (
 
     # ── 数据目录 ──
     EnvVarSpec("AGENT_DATA_DIR", str, "", "会话数据目录（空=默认 ~/.agent_data）"),
+
+    # ── MCP 健康检测（Phase 5）──
+    EnvVarSpec("MCP_HEALTH_CHECK_INTERVAL", int, 30, "MCP server 健康检测间隔(秒)"),
+    EnvVarSpec("MCP_HEALTH_CHECK_CONCURRENCY", int, 5, "MCP 健康检测并发上限(top-N 并行)"),
 )
 
 

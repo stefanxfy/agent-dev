@@ -31,7 +31,10 @@ from agent_core.turn_chain import LLMCallHandler, SystemPromptHandler, ToolsSche
 def _make_mock_agent(llm_return=MagicMock()):
     """构造一个最小 mock agent,SystemPromptHandler + LLMCallHandler 都能跑。"""
     agent = MagicMock()
-    agent.system_prompt = "你是一个 helpful 助手。\n## Tools 段\n## Skills 段"
+    # Phase 5: base 从 agent.llm.config.system_prompt 读（不再有 agent.system_prompt 字段）
+    agent.llm.config.system_prompt = "你是一个 helpful 助手。\n## Tools 段\n## Skills 段"
+    # memory_index=None 让 handler._build 跳过 MEMORY 段（否则 MagicMock 会污染 f-string）
+    agent.memory_index = None
     agent.tools.list_schemas.return_value = [
         {"name": "Read", "description": "Read a file", "input_schema": {}},
         {"name": "Write", "description": "Write a file", "input_schema": {}},
@@ -43,9 +46,9 @@ def _make_mock_agent(llm_return=MagicMock()):
         {"role": "assistant", "content": [{"type": "tool_use", "id": "call_001", "name": "Read", "input": {"path": "/x"}}]},
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_001", "content": "OK"}]},
     ]
-    agent.llm = MagicMock()
+    # agent.llm / agent.llm.config 由 MagicMock 自动创建子 mock；
+    # 不要显式 `= MagicMock()` 覆盖前面设的 config.system_prompt（MagicMock 替换会让 base 来源失效）
     agent.llm.chat.return_value = llm_return
-    agent.llm.config = MagicMock()
     # llm.config.provider.name 是 detect_provider() 读的东西
     agent.llm.config.provider.name = "zhipu"
     agent._session_manager = None

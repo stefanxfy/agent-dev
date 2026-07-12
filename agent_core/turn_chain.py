@@ -64,7 +64,6 @@ __all__ = [
     "HandlerResult",
     "Handler",
     "TurnChain",
-    "SystemPromptAssembler",
     "_LLMResult",
     "TcPermissionDecision",
     "MemoryRetrievalHandler",
@@ -338,70 +337,8 @@ class SecurityError(Exception):
 
 
 # ────────────────────────────────────────────────────────────
-# SystemPromptAssembler — system_prompt 装配的统一入口
+# TurnChain — 执行器
 # ────────────────────────────────────────────────────────────
-# build() (startup 一次):装配 base + MEMORY.md + sandbox section + TRUSTING。
-#   由 ReactAgent.__init__ 调一次,产物缓存到 self._cached,赋给 agent.system_prompt。
-#   必须等 permission_engine + memory_index 都 ready 后调(__init__ 末尾位置)。
-
-
-class SystemPromptAssembler:
-    """system_prompt 装配的统一入口。
-
-    Usage(ReactAgent.__init__):
-        self._assembler = SystemPromptAssembler(self)
-        self.system_prompt = self._assembler.build()
-    """
-    name = "system_prompt_assembler"
-
-    def __init__(self, agent):
-        self._agent = agent
-        self._cached: Optional[str] = None  # build() 产物
-
-    def build(self) -> str:
-        """L1 startup:base + sandbox section + MEMORY.md + TRUSTING_RECALL_SECTION。
-
-        Returns:装配好的 system_prompt 字符串(同时缓存到 self._cached)。
-        必须 agent.permission_engine + agent.memory_index 都 ready 后调。
-        """
-        agent = self._agent
-        if agent is None:
-            return ""
-        base = (getattr(agent, "system_prompt", "") or "")
-        sandbox_section = self._get_sandbox_section()
-        if sandbox_section:
-            base = base + "\n\n" + sandbox_section
-        if getattr(agent, "memory_index", None) is None:
-            result = base + "\n" + TRUSTING_RECALL_SECTION
-        else:
-            try:
-                index_content = agent.memory_index.load_index()
-            except Exception as e:
-                _logger.warning(f"MEMORY.md 加载失败,跳过: {e}")
-                result = base + "\n" + TRUSTING_RECALL_SECTION
-            else:
-                if not index_content:
-                    result = base + "\n" + TRUSTING_RECALL_SECTION
-                else:
-                    result = f"{base}\n\n{index_content}\n\n{TRUSTING_RECALL_SECTION}"
-        self._cached = result
-        return result
-
-    def _get_sandbox_section(self) -> str:
-        """获取 sandbox 规则 prompt 段(对齐 doc §5.4)。
-
-        - permission_engine 未注入 → ""(向后兼容)
-        - sandbox 未启用 / loader 抛错 → ""
-        """
-        agent = self._agent
-        if agent is None or getattr(agent, "permission_engine", None) is None:
-            return ""
-        try:
-            from .tools.sandbox_prompt import get_sandbox_prompt_section
-            return get_sandbox_prompt_section()
-        except Exception as e:
-            _logger.debug("sandbox prompt 注入失败,跳过: %s", e)
-            return ""
 
 
 # ────────────────────────────────────────────────────────────
@@ -839,18 +776,18 @@ class MemoryRetrievalHandler:
 
 # ── 2. SystemPromptHandler(inputs_chain) ──────────────────
 class SystemPromptHandler:
-    """inputs_chain:把 base system_prompt append 到 run_state.system_prompt。
+    """inputs_chain: 装配 system_prompt(base+sandbox+MEMORY.md+TRUSTING_RECALL) → append run_state。
 
-    agent.system_prompt 由 SystemPromptAssembler.build() 在 ReactAgent.__init__
-    构造(base + sandbox + MEMORY.md + TRUSTING_RECALL),本 handler 只负责把它
-    累加进 run_state.system_prompt,供 llm_chain 的 LLMCallHandler 读取。
+    原 SystemPromptAssembler.build() 在 ReactAgent.__init__ 调（permission_engine 还没 post-inject
+    → sandbox 段空）+ agent.system_prompt 定型不更新。现合并到本 handler，SETUP 时懒 build
+    （permission_engine/memory_index 已注入），同时修：
+      - sandbox 时序 bug（per-run build 时 permission_engine 已注入）
+      - MEMORY.md stale（per-run 重读，写盘后下个 run 反映）
+      - agent 不再持 system_prompt/_assembler（职责单一：领域核心不管 prompt 装配）
 
-    选项 A 重构 (2026-07-06):不再调 SystemPromptAssembler.place()(那是把 system
-    放进 messages 头部,依赖已删除的 stage_inputs);改为 run_state.append_system 累加。
-    R2 (2026-07-07):累加目标从 turn_ctx 改到 run_state(per-run 持久),resume 路径仍能读到。
-    SystemPromptAssembler.build() 仍被 __init__ 用 → 类保留。
-
-    顺序:inputs_chain 中 ContextCompaction 之后、MemoryRetrievalHandler 之前。
+    选项 A (2026-07-06):不再调 SystemPromptAssembler.place();改为 run_state.append_system。
+    R2 (2026-07-07):累加目标改 run_state(per-run),resume 仍能读到。
+    顺序:inputs_chain ContextCompaction 之后、MemoryRetrievalHandler 之前。
     """
     name = "system_prompt"
 
@@ -859,12 +796,42 @@ class SystemPromptHandler:
 
     def handle(self, ctx: TurnContext) -> HandlerResult:
         agent = self._agent
-        if agent is None or not getattr(agent, "system_prompt", None):
+        if agent is None:
             return HandlerResult()
-        # R2 (2026-07-07):累加到 run_state(per-run)而非 turn_ctx(per-turn),
-        # resume_after_permission 重新走 step() 后 LLMCallHandler 仍能读到完整 system_prompt。
-        ctx.run_state.append_system(agent.system_prompt)
+        section = self._build(agent)
+        if section:
+            ctx.run_state.append_system(section)
         return HandlerResult()
+
+    def _build(self, agent) -> str:
+        """装配 system_prompt：base + [sandbox] + [MEMORY.md] + TRUSTING_RECALL_SECTION。
+        base 从 agent.llm.config.system_prompt 读（agent 不再持 system_prompt 字段）。
+        """
+        base = getattr(getattr(agent.llm, "config", None), "system_prompt", "") or ""
+        sandbox = self._sandbox_section(agent)
+        if sandbox:
+            base = base + "\n\n" + sandbox
+        if getattr(agent, "memory_index", None) is None:
+            return base + "\n" + TRUSTING_RECALL_SECTION
+        try:
+            index_content = agent.memory_index.load_index()
+        except Exception as e:
+            _logger.warning(f"MEMORY.md 加载失败,跳过: {e}")
+            return base + "\n" + TRUSTING_RECALL_SECTION
+        if not index_content:
+            return base + "\n" + TRUSTING_RECALL_SECTION
+        return f"{base}\n\n{index_content}\n\n{TRUSTING_RECALL_SECTION}"
+
+    def _sandbox_section(self, agent) -> str:
+        """sandbox 规则 prompt 段。permission_engine 未注入 / sandbox 未启用 / 加载失败 → ""。"""
+        if getattr(agent, "permission_engine", None) is None:
+            return ""
+        try:
+            from .tools.sandbox_prompt import get_sandbox_prompt_section
+            return get_sandbox_prompt_section()
+        except Exception as e:
+            _logger.debug("sandbox prompt 注入失败,跳过: %s", e)
+            return ""
 
 
 # ── 4. SkillsPromptHandler(inputs_chain, 在 MemoryRetrieval 之后) ──
@@ -942,6 +909,44 @@ class SkillsPromptHandler:
         """调 registry.snapshot() 取已渲染的 skills prompt 文本。空则返 ''。"""
         snap = registry.snapshot()
         return snap.prompt or ""
+
+
+class McpPromptsHandler:
+    """inputs_chain: 把 MCP server 暴露的 prompts 名单段 append 到 run_state.system_prompt。
+
+    Phase 2 Step 3（决策 P2）：仿 SkillsPromptHandler 的段注入模式 —— LLM 看到
+    <available_mcp_prompts> 名单后，用 get_mcp_prompt 工具取渲染后内容（动态，对齐
+    skill 的 Read SKILL.md 模式）。
+    幂等：section 已在 run_state.system_prompt 则跳过（防 chain 重跑翻倍）。
+    guard：agent._mcp_manager 缺失 或 无 prompts → 跳过（无 MCP 时 no-op）。
+    顺序：SkillsPromptHandler 之后（同属 system 段累加）。
+    """
+    name = "mcp_prompts"
+
+    def __init__(self, agent):
+        self._agent = agent
+
+    def handle(self, ctx: TurnContext) -> HandlerResult:
+        agent = self._agent
+        if agent is None:
+            return HandlerResult()
+        mgr = getattr(agent, "_mcp_manager", None)
+        if mgr is None:
+            return HandlerResult()   # 无 MCP → no-op
+        try:
+            prompts_by_server = mgr.registered_prompts()
+        except Exception as e:
+            _logger.warning(f"🔌 McpPrompts registered_prompts failed: {e}")
+            return HandlerResult()
+        if not prompts_by_server or not any(prompts_by_server.values()):
+            return HandlerResult()
+        from agent_core.mcp.materialize import render_mcp_prompts_section
+        section = render_mcp_prompts_section(prompts_by_server)
+        if not section or section in ctx.run_state.system_prompt:
+            return HandlerResult()
+        ctx.run_state.append_system(section)
+        _logger.debug(f"🔌 McpPrompts injected: servers={list(prompts_by_server.keys())}")
+        return HandlerResult()
 
 
 # ── 0. TurnIndicatorHandler(inputs_chain 首位) ────────────

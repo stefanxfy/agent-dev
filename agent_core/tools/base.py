@@ -84,6 +84,33 @@ class ToolRegistry:
                 tool.name, tool.deprecated_since, tool.deprecated_since,
             )
 
+    def unregister(self, name: str) -> bool:
+        """注销单个工具。返回是否曾存在。
+
+        Phase 2 Step 4：list_changed 动态刷新工具集用。
+        """
+        existed = self._tools.pop(name, None) is not None
+        if existed:
+            logger.debug("🧩 tool unregistered: name=%s remaining=%d", name, len(self._tools))
+        return existed
+
+    def unregister_by_prefix(self, prefix: str) -> int:
+        """按前缀批量注销（给 mcp__<server>__ 用），返回注销数量。
+
+        Phase 2 Step 4/5：list_changed 时整 server 工具集刷新用。
+        注意：调用方须同步失效 run_state.tool_schemas（turn_chain.ToolsSchemaPrepareHandler
+        缓存），否则当前 run 的后续 turn 还用老 schema。
+        """
+        names_to_remove = [n for n in self._tools if n.startswith(prefix)]
+        for n in names_to_remove:
+            del self._tools[n]
+        if names_to_remove:
+            logger.debug(
+                "🧩 tools unregistered by prefix=%s count=%d remaining=%d",
+                prefix, len(names_to_remove), len(self._tools),
+            )
+        return len(names_to_remove)
+
     def get(self, name: str) -> Optional[ToolDef]:
         """按名称获取工具定义"""
         return self._tools.get(name)
