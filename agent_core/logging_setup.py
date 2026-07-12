@@ -41,6 +41,7 @@ _SUB_LOGGER_ENV = (
     ("agent_core.classifier", "AGENT_LOG_CLASSIFIER"),   # 🤖 Haiku classifier
     ("agent_core.safety",     "AGENT_LOG_SAFETY"),       # 🧪 safety_check / sensitive_path / secret regex
     ("agent_core.skills",     "AGENT_LOG_SKILLS"),       # 🧩 skill discovery / load / snapshot / handler（specs/001-skill-system）
+    ("agent_core.mcp",        "AGENT_LOG_MCP"),          # 🔌 mcp client 连接/协商/调用/故障隔离/物化
 )
 
 _LEVEL_NAMES = {

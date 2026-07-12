@@ -33,6 +33,7 @@ from agent_core.turn_chain import (
     L3SMExtractTriggerHandler,
     LLMCallHandler,
     LLMCallPersistHandler,
+    McpPromptsHandler,
     MemoryBridgeExtractHandler,
     MemoryRetrievalHandler,
     PermissionCheckHandler,
@@ -97,6 +98,7 @@ def build_default_inputs_chain(agent) -> TurnChain:
         SystemPromptHandler(agent),
         MemoryRetrievalHandler(agent),
         SkillsPromptHandler(agent),
+        McpPromptsHandler(agent),    # Phase 2 Step 3：MCP prompts 名单段注入
     ])
 
 

@@ -177,8 +177,10 @@ class ReactAgent:
             model=getattr(llm_router.config, 'model', 'glm-4'),
         )
 
-        # P2 新增：从 LLMConfig 读取 system_prompt
-        self.system_prompt = self.llm.config.system_prompt
+        # P2 系统 prompt 装配已迁至 SystemPromptHandler(inputs_chain SETUP 时懒 build)
+        # —— 修 sandbox 时序 bug(原 __init__ build 时 permission_engine 还没 post-inject)
+        # + MEMORY.md stale + ReactAgent 瘦身(不持 system_prompt/_assembler)。
+        # base 来源：agent.llm.config.system_prompt(handler._build 直接读,不存 agent)。
 
         # M7 ported: 记忆系统 hooks(若注入,则每次 LLM 调用前检索 + 推送 memory_status)
         self.memory_retriever = memory_retriever
@@ -234,15 +236,6 @@ class ReactAgent:
         # M12: 权限决策待审批请求(给 UI 用)
         self._pending_permission_request: Optional[dict] = None
         self._permission_resolved: Optional[Any] = None  # threading.Event 初始为 None
-
-        # 实例化 SystemPromptAssembler 并构造 system_prompt
-        # = base + sandbox section + MEMORY.md + TRUSTING_RECALL。
-        # SystemPromptHandler 在 inputs_chain 里把 agent.system_prompt append 到 run_state.system_prompt。
-        # R2 (2026-07-07):累加目标从 turn_ctx 改到 run_state(per-run 持久)。
-        # 必须在 system_prompt base + memory_index + permission_engine 都赋值后调。
-        from agent_core.turn_chain import SystemPromptAssembler
-        self._assembler = SystemPromptAssembler(self)
-        self.system_prompt = self._assembler.build()
 
         # Skills 系统（specs/001-skill-system）：注入 skills_config 后启用。
         # SkillsRegistry 是 Facade + cache-aside 快照缓存；SkillsPromptHandler
@@ -808,6 +801,11 @@ class ReactAgent:
             except Exception as e:
                 _logger.warning(f"DistillationLoop.stop 失败: {e}")
             self._distillation_loop = None
+
+        # MCP client: Phase 5 改为跨会话复用——mgr 不跟 agent 生命周期，close 不 dispose。
+        # mgr 存 st.session_state.mcp_manager 跨会话保持，health 调度器持续维护连接；
+        # 真正销毁在进程退出（atexit）或 mcp config 变化（重启 streamlit）。
+        # （agent._mcp_manager 仅是引用，重建时 get_agent 重新注入，无需在此清理）
 
         if self._session_manager:
             try:

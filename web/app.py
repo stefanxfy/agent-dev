@@ -221,6 +221,23 @@ with st.sidebar:
                 else:
                     st.caption("尚未跑过")
 
+    # Phase 5: 🔌 MCP Servers 健康(折叠面板,默认折叠)——仿 Auto-dream,跨线程读 mgr.get_health()
+    with st.expander("🔌 MCP Servers", expanded=False):
+        _mgr = st.session_state.get("mcp_manager")
+        if _mgr is None or getattr(_mgr, "_closed", False):
+            st.caption("(MCP 未初始化)")
+        else:
+            _health = _mgr.get_health()
+            if not _health:
+                st.caption("(无 MCP server 配置)")
+            else:
+                _icons = {"connected": "🟢", "disconnected": "🔴", "connecting": "🟡"}
+                for _name, _h in _health.items():
+                    st.write(f"{_icons.get(_h['status'], '⚪')} **{_name}** — {_h['status']}")
+                    _err = _h.get("last_error")
+                    if _err:
+                        st.caption(f"⚠️ {_err[:80]}")
+
     # M10 C4.1: 📥 待审候选提醒(折叠面板,默认折叠)
     # mem_root 与 get_agent() 同口径(config.agent_data_dir or ~/.agent_data)
     # session_state 不存 mem_root, 这里从 config 现算(sidebar rerun 频繁, 纯读)
@@ -784,6 +801,76 @@ def get_agent(session_id=None):
         # 权限系统初始化失败 → 不阻断 agent(向后兼容)
         logging.warning(f"PermissionEngine 注入失败,降级为无权限检查: {e}")
 
+    # MCP client (agent_core/mcp/) — 消费外部 MCP server 工具（决策 #1-#10）
+    # 范式对齐 permission/sandbox 注入段：失败不阻断 agent（降级为无 MCP）
+    # manager 连接 session 级单例（st.session_state 防 rerun 泄漏 loop 线程）；
+    # tool_defs 每次注册到当前 registry（agent 重建时新 registry 重新注册）
+    try:
+        from agent_core.mcp import McpManager
+        from agent_core.mcp.config import load_mcp_config_from_settings, load_mcp_roots
+        from agent_core.mcp.names import is_server_denied
+        from agent_core.tools.permission_loader import load_rules_by_source
+
+        server_configs = load_mcp_config_from_settings()
+        _rules = load_rules_by_source()
+        _deny = [r for rs in _rules.get("always_deny_rules", {}).values() for r in rs]
+
+        # Streamlit rerun 防泄漏（照 distillation_loop line 793-794 范式）
+        _existing_mgr = st.session_state.get("mcp_manager")
+        if server_configs and (_existing_mgr is None or getattr(_existing_mgr, "_closed", False)):
+            # on_tools_changed: tools/list_changed + 重连断连/恢复 时刷新 ToolRegistry
+            # （unregister_by_prefix + register 新 + 失效 run_state.tool_schemas）。
+            # ⚠️ 回调跑在 mcp loop 线程，不能查 st.session_state（ScriptRunContext 线程局部 →
+            # mcp loop 拿到 None）。改用 mgr 持有的 _active_agent/_active_registry（组合根每次
+            # rerun set_active 更新，跨线程 GIL 安全的引用读；每次更新也顺带解 stale）。
+            _mgr_box = []
+            def _on_tools_changed(server_name):
+                m = _mgr_box[0] if _mgr_box else None
+                agent = getattr(m, "_active_agent", None) if m else None
+                _registry = getattr(m, "_active_registry", None) if m else None
+                if agent is None or _registry is None:
+                    return
+                try:
+                    from agent_core.mcp.names import server_prefix
+                    _registry.unregister_by_prefix(server_prefix(server_name))
+                    for td in m.registered_tools().get(server_name, []):
+                        _registry.register(td)
+                    _rs = getattr(agent, "_run_state", None)
+                    if _rs is not None:
+                        _rs.tool_schemas = None   # 失效缓存，下次 turn 重准备 schema
+                    logging.info("🔌 tools 刷新(server=%s): %d tools",
+                                 server_name, len(m.registered_tools().get(server_name, [])))
+                except Exception as e:
+                    logging.warning(f"🔌 on_tools_changed 失败: {e}")
+            mgr = McpManager(server_configs, deny_rules=_deny, roots=load_mcp_roots(),
+                             on_tools_changed=_on_tools_changed)
+            _mgr_box.append(mgr)
+            mgr.connect_all()                       # {server: [ToolDef]}，故障隔离在内部
+            st.session_state.mcp_manager = mgr
+            logging.info("🔌 McpManager 启用: connected_servers=%s",
+                         list(mgr.registered_tools().keys()))
+        else:
+            mgr = _existing_mgr
+
+        if mgr is not None:
+            # 注册 MCP 工具到当前 registry（第二道 deny strip 兜底；第一道在 connect_all 内）
+            for _name, _tool_defs in mgr.registered_tools().items():
+                if is_server_denied(_name, _deny):
+                    continue
+                for td in _tool_defs:
+                    registry.register(td)
+            # resources + prompts 全局工具（只注册一次，多 server 共享；guard 防重复）
+            from agent_core.mcp.materialize import materialize_resource_tools, materialize_prompt_tools
+            if registry.get("list_mcp_resources") is None:
+                for td in materialize_resource_tools(mgr):
+                    registry.register(td)
+            if registry.get("get_mcp_prompt") is None:
+                for td in materialize_prompt_tools(mgr):
+                    registry.register(td)
+            agent._mcp_manager = mgr
+    except Exception as e:
+        logging.warning(f"McpManager 注入失败，降级为无 MCP: {e}")
+
     # M10 C3.1: 启动 DistillationLoop(后台 daemon,10 分钟检查 4 重门)
     # 用 st.session_state 单例化(避免 Streamlit rerun 每次 leak 一个 daemon 线程)
     try:
@@ -873,6 +960,11 @@ if (st.session_state.agent is None or
     st.session_state.last_session_id = sid
 
 agent = st.session_state.agent
+# Phase 5: 更新 mgr 的 active agent/registry 引用（on_tools_changed 回调跑在 mcp loop 线程，
+# 不能查 streamlit session_state，改用 mgr 持有的引用；每次 rerun 更新解 stale）
+_mcp_mgr = st.session_state.get("mcp_manager")
+if _mcp_mgr is not None and not getattr(_mcp_mgr, "_closed", False) and agent is not None:
+    _mcp_mgr.set_active(agent, agent.tools)
 
 # 从 session 加载聊天历史（session_id 变化时重新加载）
 _loaded_sid = st.session_state.get("_loaded_session_id")

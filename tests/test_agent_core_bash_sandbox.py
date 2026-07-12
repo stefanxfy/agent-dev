@@ -195,24 +195,25 @@ class TestAuditLoggerIntegration:
 # ────────────────────────────────────────────────────────────────────
 
 class TestSystemPromptSandboxSection:
-    def _make_agent_for_prompt(self):
+    """Phase 5 重构：SystemPromptAssembler 删了，装配逻辑内联到 SystemPromptHandler._build/_sandbox_section。
+    base 从 agent.llm.config.system_prompt 读（不再有 agent.system_prompt 字段）。
+    """
+    def _make_agent_for_prompt(self, *, sandbox_enabled=False):
         """构造一个最小 agent(绕过 __init__)用于 prompt 注入测试。
-
-        2026-07-02:__init__ 才会建 _assembler,所以手动建一个,这样
-        agent._assembler.build() / ._get_sandbox_section() 能用。
+        base 通过 llm.config.system_prompt 注入(不再有 agent.system_prompt 字段)。
         """
         from agent_core.agent_core import ReactAgent
-        from agent_core.turn_chain import SystemPromptAssembler
+        from agent_core.turn_chain import SystemPromptHandler
         agent = ReactAgent.__new__(ReactAgent)
-        agent.permission_engine = _make_engine(sandbox_enabled=False)
-        agent.system_prompt = "base prompt"
-        agent.memory_index = None  # SystemPromptAssembler.build() 需要
-        agent._assembler = SystemPromptAssembler(agent)  # 手动建,不走 __init__
+        agent.permission_engine = _make_engine(sandbox_enabled=sandbox_enabled)
+        agent.llm = SimpleNamespace(config=SimpleNamespace(system_prompt="base prompt"))
+        agent.memory_index = None  # SystemPromptHandler._build 需要(None 跳过 MEMORY 段)
+        self._handler = SystemPromptHandler(agent)
         return agent
 
     def test_sandbox_section_omitted_when_disabled(self):
-        agent = self._make_agent_for_prompt()
-        section = agent._assembler._get_sandbox_section()
+        agent = self._make_agent_for_prompt(sandbox_enabled=False)
+        section = self._handler._sandbox_section(agent)
         assert section == ""
 
     def test_sandbox_section_present_when_enabled(self):
@@ -220,8 +221,8 @@ class TestSystemPromptSandboxSection:
         mgr.load_config({"enabled": True})
         with patch.object(mgr, "is_sandbox_enabled", return_value=True), \
              patch("agent_core.tools.sandbox_manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
-            agent = self._make_agent_for_prompt()
-            section = agent._assembler._get_sandbox_section()
+            agent = self._make_agent_for_prompt()  # sandbox_enabled 无关(已 patch is_sandbox_enabled)
+            section = self._handler._sandbox_section(agent)
         assert "## Command sandbox" in section
 
     def test_sandbox_section_injected_into_full_prompt(self):
@@ -230,17 +231,18 @@ class TestSystemPromptSandboxSection:
         with patch.object(mgr, "is_sandbox_enabled", return_value=True), \
              patch("agent_core.tools.sandbox_manager.get_sandbox_tmp_dir", return_value="/tmp/claude-1000"):
             agent = self._make_agent_for_prompt()
-            full = agent._assembler.build()
+            full = self._handler._build(agent)
         assert "base prompt" in full
         assert "## Command sandbox" in full
 
     def test_prompt_omits_sandbox_when_engine_none(self):
         from agent_core.agent_core import ReactAgent
-        from agent_core.turn_chain import SystemPromptAssembler
+        from agent_core.turn_chain import SystemPromptHandler
         agent = ReactAgent.__new__(ReactAgent)
         agent.permission_engine = None
-        agent._assembler = SystemPromptAssembler(agent)  # 手动建
-        assert agent._assembler._get_sandbox_section() == ""
+        agent.llm = SimpleNamespace(config=SimpleNamespace(system_prompt="base"))
+        handler = SystemPromptHandler(agent)
+        assert handler._sandbox_section(agent) == ""
 
     def test_sandbox_prompt_failure_returns_empty(self):
         agent = self._make_agent_for_prompt()
@@ -248,7 +250,7 @@ class TestSystemPromptSandboxSection:
             "agent_core.tools.sandbox_prompt.get_sandbox_prompt_section",
             side_effect=RuntimeError("boom"),
         ):
-            section = agent._assembler._get_sandbox_section()
+            section = self._handler._sandbox_section(agent)
         assert section == ""
 
 
